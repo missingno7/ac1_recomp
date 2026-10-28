@@ -25,6 +25,7 @@ add_library(ac1_runtime STATIC
   src/runtime/ac1_runtime.c
   src/runtime/ac1_network.c
   src/runtime/ac1_files.c
+  src/runtime/ac1_crypto.c
   src/runtime/guest_clock.c
   src/runtime/guest_memory.c
   src/runtime/pe32_loader.c
@@ -42,7 +43,7 @@ if(WIN32)
     src/platform/ac1_dinput8_bridge.cpp)
   target_compile_features(ac1_runtime PRIVATE cxx_std_17)
   target_include_directories(ac1_runtime PRIVATE src/platform)
-  target_link_libraries(ac1_runtime PRIVATE ws2_32 user32 gdi32)
+  target_link_libraries(ac1_runtime PRIVATE ws2_32 user32 gdi32 advapi32)
 endif()
 if(AC1_HOST_D3D9)
   if(NOT WIN32)
@@ -75,6 +76,13 @@ if(NOT ANDROID)
   target_link_libraries(ac1_repeat_run PRIVATE ac1_runtime)
   add_executable(ac1_network_contract EXCLUDE_FROM_ALL tests/network_contract.c)
   target_link_libraries(ac1_network_contract PRIVATE ac1_runtime)
+  add_executable(ac1_crypto_contract EXCLUDE_FROM_ALL
+    tests/crypto_contract.c src/runtime/ac1_crypto.c)
+  target_include_directories(ac1_crypto_contract PRIVATE src/runtime)
+  target_link_libraries(ac1_crypto_contract PRIVATE Threads::Threads)
+  if(WIN32)
+    target_link_libraries(ac1_crypto_contract PRIVATE advapi32)
+  endif()
   if(WIN32)
     add_executable(ac1_window_smoke EXCLUDE_FROM_ALL tests/ac1_window_win32_smoke.c)
     target_include_directories(ac1_window_smoke PRIVATE src/platform)

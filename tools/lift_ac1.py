@@ -11,8 +11,10 @@ import collections
 import hashlib
 import importlib.metadata
 import json
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -198,6 +200,21 @@ def run_selftest() -> None:
     al = table[((ebx & 0xFFFFFFFF) + (eax & 0xFF)) & 0xFF]
     after = (eax & 0xFFFFFF00) | al
     assert after == 0x123456F5 and flags == 0x8D7
+    # Capstone exposes the implicit accumulator as a register operand on
+    # STOS/LODS/SCAS. The AC1 string override must accept these while leaving
+    # SSE MOVSD/CMPSD (XMM operands) to the donor translator.
+    from capstone import Cs, CS_ARCH_X86, CS_MODE_32
+    md = Cs(CS_ARCH_X86, CS_MODE_32)
+    md.detail = True
+    string_fixtures = ("f3aa", "f3ab", "f3ac", "f3ad", "f2ae", "f2af",
+                       "f3a4", "f3a5", "f3a6", "f3a7")
+    for encoding in string_fixtures:
+        insn = next(md.disasm(bytes.fromhex(encoding), 0x401000))
+        translated = translate_directional_string_instruction(insn)
+        assert translated and "c->df ?" in translated[0], (encoding, insn)
+    for encoding in ("f20f10c1", "f20fc2c100"):
+        insn = next(md.disasm(bytes.fromhex(encoding), 0x401000))
+        assert translate_directional_string_instruction(insn) is None, (encoding, insn)
     print("lift control-flow and instruction-adapter self-test: ok")
 
 
@@ -312,9 +329,109 @@ def run_ac1_switch_selftest(binary: Path, pcrecomp: Path) -> None:
         for target in sorted(remap2_targets):
             assert f"_jt == GVA(0x{target:08X})" in remapped_body
         assert "0x01010300" not in remapped_body
+
+        # This scalar memmove switch has an invalid dword in slot 0 because
+        # the nominal table base overlaps the previous JMP+NOP. The guarded
+        # EAX mask selects slots 1..3, all three of which are local CFG blocks.
+        memmove = dis.disassemble_function(0x00F9FB80, build_iat_map(info))
+        if memmove is None or not memmove.blocks:
+            raise AssertionError("AC1 memmove switch regression did not disassemble")
+        memmove_jump = next(
+            ins for block in memmove.blocks.values() for ins in block.instructions
+            if ins.address == 0x00F9FBF5)
+        memmove_targets = {0x00F9FC18, 0x00F9FC44, 0x00F9FC68}
+        assert set(dis.jump_table_targets(memmove_jump)) == memmove_targets
+        assert memmove_targets <= memmove.blocks.keys()
+        memmove_negative_jump = next(
+            ins for block in memmove.blocks.values() for ins in block.instructions
+            if ins.address == 0x00F9FBFC)
+        memmove_negative_targets = {0x00F9FD04, 0x00F9FD0C,
+                                    0x00F9FD18, 0x00F9FD2C}
+        assert memmove_negative_targets <= memmove.blocks.keys()
+        # This second table really is negatively indexed, but only its local
+        # arms are recovered from other switches. Do not expand the CFG here.
+        biased_jump = next(
+            ins for block in memmove.blocks.values() for ins in block.instructions
+            if ins.address == 0x00F9FD6E)
+        biased_targets = {0x00F9FE44, 0x00F9FE4C, 0x00F9FE54,
+                          0x00F9FE5C, 0x00F9FE64, 0x00F9FE6C, 0x00F9FE74}
+        assert biased_targets <= memmove.blocks.keys()
+        assert infer_negated_switch_bound(
+            dis.md, dis.read_bytes, biased_jump,
+            X86_OP_REG, X86_OP_MEM, X86_OP_IMM) == 8
+        assert set(dis.jump_table_targets(biased_jump)) == biased_targets | {0x00F9FE87}
+        assert 0x00498D00 not in memmove.blocks
+        assert dis.jump_table_targets(memmove_negative_jump) == []
+        memmove_spec = {
+            "address": 0x00F9FB80,
+            "size": memmove.size,
+            "blocks": [{
+                "start": block.start,
+                "end": block.end,
+                "successors": sorted(set(block.successors)),
+                "is_exit": block.is_exit,
+                "instructions": [[ins.address, ins.size] for ins in block.instructions],
+            } for block in memmove.blocks.values()],
+        }
+        memmove_body = lift_exact_function(
+            remap_lifter, memmove_spec,
+            lambda va, count: pe.get_data((va - image_base) & 0xFFFFFFFF, count),
+            X86_OP_IMM, X86_OP_MEM)
+        for target in sorted(memmove_targets):
+            assert f"if (_jt == GVA(0x{target:08X})) goto L_{target:08X};" in memmove_body
+            assert f"L_{target:08X}:" in memmove_body
+        for target in sorted(memmove_negative_targets):
+            assert f"if (_jt == GVA(0x{target:08X})) goto L_{target:08X};" in memmove_body
+            assert f"L_{target:08X}:" in memmove_body
+        assert "dispatch_jmp(c, rd32((c->eax*4 + GVA(0x00F9FC08))))" not in memmove_body
+        assert "dispatch_jmp(c, rd32((c->ecx*4 + GVA(0x00F9FD04))))" not in memmove_body
+        assert "0x00498D00" not in memmove_body and "insb" not in memmove_body.lower()
+
+        # Compile and execute the real lifted function against native
+        # memmove, using the original table/code page and portable guest
+        # memory. This catches control-flow mistakes that label assertions
+        # alone cannot detect.
+        compiler = shutil.which("gcc")
+        if compiler:
+            work_dir = ROOT / "work"
+            work_dir.mkdir(exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="memmove_selftest_", dir=work_dir) as temp_name:
+                temp_dir = Path(temp_name)
+                generated_c = temp_dir / "memmove_lifted.c"
+                table_page = temp_dir / "original_page.bin"
+                executable = temp_dir / "memmove_semantics.exe"
+                generated_c.write_text(
+                    '#include "cpu.h"\n' + FP_ADAPTER_HELPERS +
+                    "\n#if defined(AC1_TRACE_EIP)\n"
+                    "#define AC1_SET_GUEST_EIP(cpu, va) ((cpu)->eip = (va))\n"
+                    "#else\n#define AC1_SET_GUEST_EIP(cpu, va) ((void)0)\n#endif\n\n" +
+                    memmove_body + "\n", encoding="utf-8")
+                original_page = read_va(0x00F9F000, 4096)
+                if len(original_page) != 4096:
+                    raise AssertionError("could not read original memmove switch page")
+                table_page.write_bytes(original_page)
+                command = [
+                    compiler, "-std=c11", "-O0", "-DAC1_TRACE_EIP",
+                    "-I", str(ROOT / "src/runtime"),
+                    str(ROOT / "tests/memmove_semantics.c"), str(generated_c),
+                    str(ROOT / "src/runtime/guest_memory.c"),
+                    str(ROOT / "src/runtime/guest_clock.c"), "-lm", "-o", str(executable),
+                ]
+                build = subprocess.run(command, text=True, capture_output=True)
+                if build.returncode:
+                    raise AssertionError("memmove semantic self-test compile failed:\n" +
+                                         build.stdout + build.stderr)
+                result = subprocess.run([str(executable), str(table_page)],
+                                        text=True, capture_output=True)
+                if result.returncode:
+                    raise AssertionError("memmove semantic self-test failed:\n" +
+                                         result.stdout + result.stderr)
+                print(result.stdout.strip())
+        else:
+            print("memmove semantic self-test skipped (gcc not found)")
     finally:
         pe.close()
-    print("AC1 actual-base jump-table self-test: both indirect switches recovered")
+    print("AC1 actual-base jump-table self-test: local, remapped, and negative-index switches recovered")
 
 
 def infer_remapped_switch_limit(md, read_va, jump_insn, reg_type: int,
@@ -414,7 +531,7 @@ def infer_remapped_switch_limit(md, read_va, jump_insn, reg_type: int,
 
 
 def install_ac1_jump_table_bounds(disassembler) -> None:
-    """Apply AC1-local bounds for guarded byte-remapped switch tables."""
+    """Apply AC1-local bounds and discover negatively biased switch tables."""
     from types import MethodType
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
 
@@ -425,9 +542,90 @@ def install_ac1_jump_table_bounds(disassembler) -> None:
             self.md, self.read_bytes, insn, X86_OP_REG, X86_OP_MEM, X86_OP_IMM)
         if inferred is not None:
             limit = min(limit, inferred[0])
-        return original(insn, limit)
+        targets = list(original(insn, limit))
+        if (insn.mnemonic == "jmp" and insn.operands and
+                insn.operands[0].type == X86_OP_MEM and
+                insn.operands[0].mem.scale == 4 and insn.operands[0].mem.index):
+            # Only scan backward when the index was explicitly negated in
+            # the immediately preceding instruction. Unconditional backward
+            # scans can mistake unrelated neighboring code pointers for arms
+            # (for example, a byte table adjacent to a switch). The AC1
+            # memmove switch at F9FD6E is `neg ecx; jmp [ecx*4+F9FE40]`.
+            jump_index = insn.operands[0].mem.index
+            neg = next(self.md.disasm(self.read_bytes(insn.address - 2, 2),
+                                      insn.address - 2), None)
+            bound = infer_negated_switch_bound(
+                self.md, self.read_bytes, insn, X86_OP_REG, X86_OP_MEM, X86_OP_IMM)
+            if (neg is not None and neg.mnemonic == "neg" and neg.operands and
+                    neg.operands[0].type == X86_OP_REG and
+                    neg.operands[0].reg == jump_index and bound is not None):
+                table_va = insn.operands[0].mem.disp & 0xFFFFFFFF
+                # CMP/JB proves the selected negated indexes are -1 through
+                # -(bound-1); index zero is handled by the forward table scan.
+                for index in range(1, min(limit, bound)):
+                    raw = self.read_bytes(table_va - 4 * index, 4)
+                    if not raw or len(raw) < 4:
+                        break
+                    target = int.from_bytes(raw, "little")
+                    if not self.is_code_address(target):
+                        break
+                    if target not in targets:
+                        targets.append(target)
+        return targets
 
     disassembler.jump_table_targets = MethodType(bounded, disassembler)
+
+
+def infer_negated_switch_bound(md, read_va, jump_insn, reg_type: int,
+                               mem_type: int, imm_type: int) -> int | None:
+    """Return the guarded range for `cmp index,N; jb neg; neg index; jmp [index*4+base]`.
+
+    Only this proven unsigned range is used for backward table discovery; a
+    code-address heuristic alone can pick up dwords embedded in unrelated
+    instructions next to the table.
+    """
+    if (jump_insn.mnemonic != "jmp" or not jump_insn.operands or
+            jump_insn.operands[0].type != mem_type):
+        return None
+    mem = jump_insn.operands[0].mem
+    if not mem.index or mem.scale != 4:
+        return None
+    neg_addr = jump_insn.address - 2
+    try:
+        neg = next(md.disasm(read_va(neg_addr, 2), neg_addr), None)
+    except Exception:
+        return None
+    if (neg is None or neg.address + neg.size != jump_insn.address or
+            neg.mnemonic != "neg" or not neg.operands or
+            neg.operands[0].type != reg_type or neg.operands[0].reg != mem.index):
+        return None
+
+    # Try short decodes ending at NEG. Accept only a direct CMP of the index
+    # followed by an unsigned lower-bound branch to this exact NEG.
+    for start in range(max(0, neg_addr - 24), neg_addr):
+        try:
+            stream = list(md.disasm(read_va(start, neg_addr - start), start))
+        except Exception:
+            continue
+        if not stream or stream[-1].address + stream[-1].size != neg_addr:
+            continue
+        for branch_at, branch in enumerate(stream):
+            if branch.mnemonic not in ("jb", "jnae", "jc") or not branch.operands:
+                continue
+            if branch.operands[0].type != imm_type or branch.operands[0].imm != neg_addr:
+                continue
+            if branch_at == 0:
+                continue
+            cmp = stream[branch_at - 1]
+            if (cmp.mnemonic != "cmp" or len(cmp.operands) != 2 or
+                    cmp.operands[0].type != reg_type or
+                    cmp.operands[0].reg != mem.index or
+                    cmp.operands[1].type != imm_type):
+                continue
+            bound = int(cmp.operands[1].imm)
+            if 1 <= bound <= 256:
+                return bound
+    return None
 
 
 def resolve_jump_table_with_limit(lifter, table_va: int, limit: int) -> list[int]:
@@ -444,6 +642,118 @@ def resolve_jump_table_with_limit(lifter, table_va: int, limit: int) -> list[int
             break
         targets.append(target)
     return targets
+
+
+def resolve_jump_table_in_decoded_blocks(lifter, table_va: int,
+                                         block_starts: set[int],
+                                         limit: int = 256) -> list[int]:
+    """Resolve switch entries against the function's already validated CFG.
+
+    The donor disassembler tolerates a leading non-code dword before table
+    arms; the donor lifter stops at that first dword. AC1 has such a table at
+    0x00F9FC08: index zero overlaps the preceding jump, while indices 1..3
+    target local blocks. It also has a table at 0x00F9FD04 addressed by
+    ECX=count-4, so the four entries are at indices -4..-1. The decoded CFG
+    is the authority for arm membership; search both sides of the encoded
+    base, retaining only dwords that name local block starts.
+    """
+    targets = []
+    if not lifter.read_va:
+        return targets
+    # Index zero is shared. Scan outward independently because switch code
+    # may bias the index so its table lies before the encoded base.
+    for direction in (1, -1):
+        misses = 0
+        found = False
+        for distance in range(limit):
+            index = distance * direction
+            try:
+                raw = lifter.read_va(table_va + 4 * index, 4)
+            except Exception:
+                break
+            if not raw or len(raw) < 4:
+                break
+            target = int.from_bytes(raw, "little")
+            if target in block_starts:
+                if target not in targets:
+                    targets.append(target)
+                misses = 0
+                found = True
+            else:
+                misses += 1
+                # Permit an invalid prefix for forward tables whose base is
+                # inside/just before an instruction, then stop after a short
+                # gap. Backward scans start at the last table entry, so stop
+                # at the first gap once a valid run has been found.
+                if found and misses >= 2:
+                    break
+                if not found and misses >= 4:
+                    break
+    return targets
+
+
+def translate_directional_string_instruction(insn) -> list[str] | None:
+    """Lower x86 string operations with the architectural DF pointer stride.
+
+    The pinned donor lifter always increments ESI/EDI for MOVS/STOS/LODS and
+    the compare string ops. AC1's scalar memmove sets DF with STD on its
+    overlap path, so that assumption corrupts backward copies.
+    """
+    parts = insn.mnemonic.lower().split()
+    if not parts:
+        return None
+    if len(parts) == 1 and parts[0] == "cld":
+        return ["c->df = 0;"]
+    if len(parts) == 1 and parts[0] == "std":
+        return ["c->df = 1;"]
+    rep = parts[0] if len(parts) > 1 else None
+    base = parts[-1]
+    if base not in {"movsb", "movsw", "movsd", "stosb", "stosw", "stosd",
+                    "lodsb", "lodsw", "lodsd", "cmpsb", "cmpsw", "cmpsd",
+                    "scasb", "scasw", "scasd"}:
+        return None
+    if insn.operands:
+        from capstone.x86 import X86_OP_REG
+        # Capstone includes the implicit accumulator in STOS/LODS/SCAS. Only
+        # reject XMM operands, which identify the SSE MOVSD/CMPSD forms.
+        if any(operand.type == X86_OP_REG and
+               insn.reg_name(operand.reg).lower().startswith("xmm")
+               for operand in insn.operands):
+            return None
+    width = {"b": 1, "w": 2, "d": 4}[base[-1]]
+    read = {1: "rd8", 2: "rd16", 4: "rd32"}[width]
+    write = {1: "wr8", 2: "wr16", 4: "wr32"}[width]
+    step = f"(c->df ? (uint32_t)-{width} : {width}u)"
+    if base.startswith("movs"):
+        statement = f"{write}(c->edi, {read}(c->esi)); c->esi += _step; c->edi += _step;"
+    elif base.startswith("stos"):
+        value = {1: "R8L(c->eax)", 2: "R16(c->eax)", 4: "c->eax"}[width]
+        statement = f"{write}(c->edi, {value}); c->edi += _step;"
+    elif base.startswith("lods"):
+        if width == 1:
+            load = f"SET8L(c->eax, {read}(c->esi));"
+        elif width == 2:
+            load = f"SET16(c->eax, {read}(c->esi));"
+        else:
+            load = f"c->eax = {read}(c->esi);"
+        statement = f"{load} c->esi += _step;"
+    else:
+        accumulator = {1: "R8L(c->eax)", 2: "R16(c->eax)", 4: "c->eax"}[width]
+        if base.startswith("cmps"):
+            statement = f"flags_sub(c, {read}(c->esi), {read}(c->edi), {width}); c->esi += _step; c->edi += _step;"
+        else:
+            statement = f"flags_sub(c, {accumulator}, {read}(c->edi), {width}); c->edi += _step;"
+        if rep in ("repe", "repz"):
+            return [f"{{ uint32_t _step = {step}; while (c->ecx) {{ {statement} c->ecx--; if (!c->zf) break; }} }}"]
+        if rep in ("repne", "repnz"):
+            return [f"{{ uint32_t _step = {step}; while (c->ecx) {{ {statement} c->ecx--; if (c->zf) break; }} }}"]
+        if rep:
+            return [f"{{ uint32_t _step = {step}; while (c->ecx) {{ {statement} c->ecx--; }} }}"]
+        return [f"{{ uint32_t _step = {step}; {statement} }}"]
+
+    if rep:
+        return [f"{{ uint32_t _step = {step}; while (c->ecx) {{ {statement} c->ecx--; }} }}"]
+    return [f"{{ uint32_t _step = {step}; {statement} }}"]
 
 
 def resolve_tooling(config: dict, args) -> tuple[Path, Path]:
@@ -768,6 +1078,7 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
     lifter.func_start = address
     lifter.func_end = max(block["end"] for block in blocks)
     labels = set()
+    block_starts = {block["start"] for block in blocks}
     for insn in insns:
         if insn.mnemonic.startswith("j") or insn.mnemonic.startswith("loop"):
             for operand in insn.operands:
@@ -780,9 +1091,16 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
                 if lifter.in_image(table_va):
                     inferred = infer_remapped_switch_limit(
                         lifter.md, read_va, insn, X86_OP_REG, X86_OP_MEM, X86_OP_IMM)
-                    targets = (resolve_jump_table_with_limit(lifter, table_va, inferred[0])
-                               if inferred is not None
-                               else lifter.resolve_jumptable(table_va))
+                    if inferred is not None:
+                        targets = resolve_jump_table_with_limit(lifter, table_va, inferred[0])
+                    else:
+                        # Prefer the CFG's validated local blocks. This also
+                        # recovers tables with a leading non-code slot that
+                        # the generic lifter's image-bounded scan truncates.
+                        targets = resolve_jump_table_in_decoded_blocks(
+                            lifter, table_va, block_starts)
+                        if not targets:
+                            targets = lifter.resolve_jumptable(table_va)
                     if targets:
                         lifter.jumptables[insn.address] = targets
                         labels.update(target for target in targets if target in decoded)
@@ -794,7 +1112,10 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
         if insn.address in labels or (entry_jump and insn.address == address):
             output.append(f"L_{insn.address:08X}:")
         output.append(f"    AC1_SET_GUEST_EIP(c, 0x{insn.address:08X}u);")
-        for line in lifter.translate(insn, labels):
+        translated = translate_directional_string_instruction(insn)
+        if translated is None:
+            translated = lifter.translate(insn, labels)
+        for line in translated:
             output.append(f"    {line:<60} /* {insn.address:08X}: {insn.mnemonic} {insn.op_str} */")
         next_decoded = insns[index + 1].address if index + 1 < len(insns) else None
         target = fallthrough_target(insn.mnemonic, insn.address + insn.size, next_decoded)

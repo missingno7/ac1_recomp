@@ -44,6 +44,24 @@ int ac1_files_open(ac1_files *files, const char *guest_path,
 int ac1_files_close(ac1_files *files, uint32_t guest_handle,
                     uint32_t *error_out);
 
+/* Synchronous ReadFile subset used by the archive helpers. `buffer` and the
+ * output pointers are host views of validated guest memory, never guest
+ * addresses. EOF is a successful read with zero bytes. */
+int ac1_files_read(ac1_files *files, uint32_t guest_handle, void *buffer,
+                   uint32_t requested_bytes, uint32_t *bytes_read_out,
+                   uint32_t *error_out);
+
+/* SetFilePointer semantics for a signed low/high displacement. When
+ * `has_distance_high` is zero, distance_low is sign-extended as a LONG; when
+ * nonzero, distance_high:distance_low is a signed 64-bit displacement and
+ * position_high_out is required. `move_method` is FILE_BEGIN/CURRENT/END
+ * (0/1/2). Outputs are valid only when error_out is zero. */
+int ac1_files_seek(ac1_files *files, uint32_t guest_handle,
+                   uint32_t distance_low, int has_distance_high,
+                   uint32_t distance_high, uint32_t move_method,
+                   uint32_t *position_low_out, uint32_t *position_high_out,
+                   uint32_t *error_out);
+
 #ifdef __cplusplus
 }
 #endif

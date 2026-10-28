@@ -16,6 +16,8 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
+_Static_assert(sizeof(off_t) >= sizeof(int64_t),
+               "AC1 file service requires 64-bit host file offsets");
 #endif
 
 enum {
@@ -29,6 +31,9 @@ enum {
     AC1_ERROR_NOT_ENOUGH_MEMORY = 8u,
     AC1_ERROR_INVALID_PARAMETER = 87u,
     AC1_ERROR_TOO_MANY_OPEN_FILES = 4u,
+    AC1_ERROR_NEGATIVE_SEEK = 131u,
+    AC1_ERROR_SEEK_ON_DEVICE = 132u,
+    AC1_ERROR_IO_DEVICE = 1117u,
     AC1_GENERIC_READ = 0x80000000u,
     AC1_OPEN_EXISTING = 3u,
     AC1_FILE_FLAG_RANDOM_ACCESS = 0x10000000u
@@ -55,11 +60,15 @@ static uint32_t error_from_errno(int error)
     case ENOTDIR: return AC1_ERROR_PATH_NOT_FOUND;
     case EACCES:
     case EPERM: return AC1_ERROR_ACCESS_DENIED;
+    case EBADF: return AC1_ERROR_INVALID_HANDLE;
+    case EPIPE: return 109u; /* ERROR_BROKEN_PIPE */
+    case ENOSPC: return 112u; /* ERROR_DISK_FULL */
+    case ESPIPE: return AC1_ERROR_SEEK_ON_DEVICE;
     case EMFILE:
     case ENFILE: return AC1_ERROR_TOO_MANY_OPEN_FILES;
     case ENOMEM: return AC1_ERROR_NOT_ENOUGH_MEMORY;
     case EINVAL: return AC1_ERROR_INVALID_PARAMETER;
-    default: return AC1_ERROR_ACCESS_DENIED;
+    default: return AC1_ERROR_IO_DEVICE;
     }
 }
 #endif
@@ -295,4 +304,162 @@ int ac1_files_close(ac1_files *files, uint32_t guest_handle,
 #endif
     *error_out = 0u;
     return 1;
+}
+
+static int lookup_file_slot(ac1_files *files, uint32_t guest_handle,
+                            size_t *slot_index_out, uint32_t *error_out)
+{
+    if (guest_handle < AC1_FILE_HANDLE_BASE ||
+        ((guest_handle - AC1_FILE_HANDLE_BASE) & 3u) != 0u)
+        return AC1_FILES_NOT_HANDLED;
+    uint32_t slot_index = (guest_handle - AC1_FILE_HANDLE_BASE) / 4u;
+    if (slot_index >= AC1_FILE_HANDLE_SLOTS) return AC1_FILES_NOT_HANDLED;
+    if (files->slots[slot_index] == AC1_HOST_FILE_INVALID) {
+        *error_out = AC1_ERROR_INVALID_HANDLE;
+        return AC1_FILES_HANDLED;
+    }
+    *slot_index_out = slot_index;
+    return AC1_FILES_HANDLED;
+}
+
+int ac1_files_read(ac1_files *files, uint32_t guest_handle, void *buffer,
+                   uint32_t requested_bytes, uint32_t *bytes_read_out,
+                   uint32_t *error_out)
+{
+    if (!files || !error_out) return AC1_FILES_NOT_HANDLED;
+    if (bytes_read_out) *bytes_read_out = 0u;
+    *error_out = 0u;
+    size_t slot_index = 0;
+    int lookup = lookup_file_slot(files, guest_handle, &slot_index, error_out);
+    if (lookup != AC1_FILES_HANDLED || *error_out) return lookup;
+    if (!bytes_read_out || (requested_bytes && !buffer)) {
+        *error_out = AC1_ERROR_INVALID_PARAMETER;
+        return AC1_FILES_HANDLED;
+    }
+
+#ifdef _WIN32
+    DWORD bytes_read = 0;
+    if (!ReadFile(files->slots[slot_index], buffer, requested_bytes,
+                  &bytes_read, NULL)) {
+        *error_out = (uint32_t)GetLastError();
+        return AC1_FILES_HANDLED;
+    }
+    *bytes_read_out = (uint32_t)bytes_read;
+#else
+    if (!requested_bytes) return AC1_FILES_HANDLED;
+    ssize_t bytes_read;
+    do {
+        bytes_read = read(files->slots[slot_index], buffer,
+                          (size_t)requested_bytes);
+    } while (bytes_read < 0 && errno == EINTR);
+    if (bytes_read < 0) {
+        *error_out = error_from_errno(errno);
+        return AC1_FILES_HANDLED;
+    }
+    *bytes_read_out = (uint32_t)bytes_read;
+#endif
+    /* A zero-byte transfer at EOF is success. The caller decides whether a
+     * short read satisfies its higher-level exact-read request. */
+    *error_out = 0u;
+    return AC1_FILES_HANDLED;
+}
+
+#ifndef _WIN32
+static int64_t combine_seek_distance(uint32_t low, int has_high,
+                                     uint32_t high)
+{
+    if (!has_high) return (int64_t)(int32_t)low;
+    return (int64_t)(int32_t)high * INT64_C(4294967296) +
+           (int64_t)(uint64_t)low;
+}
+#endif
+
+int ac1_files_seek(ac1_files *files, uint32_t guest_handle,
+                   uint32_t distance_low, int has_distance_high,
+                   uint32_t distance_high, uint32_t move_method,
+                   uint32_t *position_low_out, uint32_t *position_high_out,
+                   uint32_t *error_out)
+{
+    if (!files || !error_out) return AC1_FILES_NOT_HANDLED;
+    if (position_low_out) *position_low_out = UINT32_MAX;
+    *error_out = 0u;
+    size_t slot_index = 0;
+    int lookup = lookup_file_slot(files, guest_handle, &slot_index, error_out);
+    if (lookup != AC1_FILES_HANDLED || *error_out) return lookup;
+    if (!position_low_out || (has_distance_high && !position_high_out) ||
+        move_method > 2u) {
+        *error_out = AC1_ERROR_INVALID_PARAMETER;
+        return AC1_FILES_HANDLED;
+    }
+#ifdef _WIN32
+    LONG high = (LONG)distance_high;
+    SetLastError(NO_ERROR);
+    DWORD low = SetFilePointer(files->slots[slot_index], (LONG)distance_low,
+                               has_distance_high ? &high : NULL,
+                               move_method == 0u ? FILE_BEGIN
+                                   : move_method == 1u ? FILE_CURRENT : FILE_END);
+    DWORD native_error = GetLastError();
+    if (low == INVALID_SET_FILE_POINTER && native_error != NO_ERROR) {
+        *error_out = (uint32_t)native_error;
+        return AC1_FILES_HANDLED;
+    }
+    uint64_t position;
+    if (has_distance_high) {
+        *position_high_out = (uint32_t)high;
+        position = ((uint64_t)(uint32_t)high << 32) | low;
+    } else {
+        /* SetFilePointer without lpDistanceToMoveHigh has a 32-bit file
+         * position range and INVALID_SET_FILE_POINTER/GetLastError semantics. */
+        position = low;
+    }
+#else
+    int64_t distance = combine_seek_distance(distance_low,
+                                              has_distance_high,
+                                              distance_high);
+    static const int origins[3] = {SEEK_SET, SEEK_CUR, SEEK_END};
+    int64_t base = 0;
+    if (move_method == 1u) {
+        off_t current = lseek(files->slots[slot_index], (off_t)0, SEEK_CUR);
+        if (current < 0) {
+            *error_out = errno == EINVAL ? AC1_ERROR_NEGATIVE_SEEK
+                : error_from_errno(errno);
+            return AC1_FILES_HANDLED;
+        }
+        base = (int64_t)current;
+    } else if (move_method == 2u) {
+        struct stat info;
+        if (fstat(files->slots[slot_index], &info) != 0) {
+            *error_out = error_from_errno(errno);
+            return AC1_FILES_HANDLED;
+        }
+        base = (int64_t)info.st_size;
+    }
+    if ((distance > 0 && base > INT64_MAX - distance) ||
+        (distance < 0 && base < INT64_MIN - distance)) {
+        *error_out = 534u; /* ERROR_ARITHMETIC_OVERFLOW */
+        return AC1_FILES_HANDLED;
+    }
+    int64_t target = base + distance;
+    if (target < 0) {
+        *error_out = AC1_ERROR_NEGATIVE_SEEK;
+        return AC1_FILES_HANDLED;
+    }
+    if (!has_distance_high && target > UINT32_MAX) {
+        *error_out = AC1_ERROR_INVALID_PARAMETER;
+        return AC1_FILES_HANDLED;
+    }
+    off_t result = lseek(files->slots[slot_index], (off_t)distance,
+                         origins[move_method]);
+    if (result < 0) {
+        *error_out = errno == EINVAL ? AC1_ERROR_INVALID_PARAMETER
+            : error_from_errno(errno);
+        return AC1_FILES_HANDLED;
+    }
+    uint64_t position = (uint64_t)result;
+    if (has_distance_high)
+        *position_high_out = (uint32_t)(position >> 32);
+#endif
+    *position_low_out = (uint32_t)position;
+    *error_out = 0u;
+    return AC1_FILES_HANDLED;
 }

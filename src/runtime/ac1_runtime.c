@@ -6,6 +6,7 @@
 #include "pe32_loader.h"
 #include "pcrecomp_heap.h"
 #include "ac1_network.h"
+#include "ac1_crypto.h"
 #include "ac1_files.h"
 #include "initial_dispatch.h"
 #include "bink_dispatch.h"
@@ -4268,6 +4269,98 @@ static int handle_network_import(CPU *cpu, const import_record *import)
     return 1;
 }
 
+static int handle_crypto_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal ||
+        !equal_ascii_fold(import->dll, "ADVAPI32.dll"))
+        return 0;
+
+    if (!strcmp(import->name, "CryptAcquireContextA")) {
+        uint32_t args[5];
+        if (!guest_memory_try_ptr(cpu->esp + 4u, sizeof(args)))
+            stop_guest("CryptAcquireContextA arguments are unmapped", import->token);
+        for (unsigned i = 0u; i < 5u; ++i)
+            args[i] = rd32(cpu->esp + 4u + i * 4u);
+
+        uint32_t *provider_out = (uint32_t *)guest_memory_try_ptr(args[0], 4u);
+        if (!provider_out)
+            stop_guest("CryptAcquireContextA provider output is unmapped", import->token);
+        char provider[260];
+        const char *provider_value = NULL;
+        if (args[2]) {
+            if (!copy_guest_string(args[2], provider, sizeof(provider)))
+                stop_guest("CryptAcquireContextA provider string is unmapped or too long",
+                           import->token);
+            provider_value = provider;
+        }
+        if (args[1] != 0u ||
+            !provider_value ||
+            strcmp(provider_value, "Microsoft Base Cryptographic Provider v1.0") != 0 ||
+            args[3] != 1u ||
+            (args[4] != 0xF0000020u && args[4] != 0xF0000028u)) {
+            char message[256];
+            snprintf(message, sizeof(message),
+                     "CryptAcquireContextA unsupported profile container=0x%08x provider=\"%s\" type=%u flags=0x%08x",
+                     args[1], provider_value ? provider_value : "<null>", args[3], args[4]);
+            stop_guest(message, import->token);
+        }
+
+        uint32_t guest_provider = 0u, error = 0u;
+        int success = ac1_crypto_acquire(NULL, provider_value, args[3], args[4],
+                                         &guest_provider, &error);
+        wr32(args[0], guest_provider);
+        cpu->eax = success ? 1u : 0u;
+        if (!success) last_error = error;
+        if (trace_imports)
+            fprintf(stderr,
+                    "AC1 CryptoAPI: CryptAcquireContextA type=%u flags=0x%08x success=%u handle=0x%08x error=%u\n",
+                    args[3], args[4], success ? 1u : 0u, guest_provider, error);
+        return_stdcall(cpu, 20u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "CryptGenRandom")) {
+        uint32_t args[3];
+        if (!guest_memory_try_ptr(cpu->esp + 4u, sizeof(args)))
+            stop_guest("CryptGenRandom arguments are unmapped", import->token);
+        for (unsigned i = 0u; i < 3u; ++i)
+            args[i] = rd32(cpu->esp + 4u + i * 4u);
+        uint32_t length = args[1];
+        void *buffer = length ? guest_memory_try_ptr(args[2], length) : NULL;
+        if (length && !buffer)
+            stop_guest("CryptGenRandom output buffer is unmapped", import->token);
+        uint32_t error = 0u;
+        int success = ac1_crypto_gen_random(args[0], buffer, length, &error);
+        cpu->eax = success ? 1u : 0u;
+        if (!success) last_error = error;
+        if (trace_imports)
+            fprintf(stderr,
+                    "AC1 CryptoAPI: CryptGenRandom length=%u success=%u error=%u\n",
+                    length, success ? 1u : 0u, error);
+        return_stdcall(cpu, 12u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "CryptReleaseContext")) {
+        uint32_t args[2];
+        if (!guest_memory_try_ptr(cpu->esp + 4u, sizeof(args)))
+            stop_guest("CryptReleaseContext arguments are unmapped", import->token);
+        args[0] = rd32(cpu->esp + 4u);
+        args[1] = rd32(cpu->esp + 8u);
+        uint32_t error = 0u;
+        int success = ac1_crypto_release(args[0], args[1], &error);
+        cpu->eax = success ? 1u : 0u;
+        if (!success) last_error = error;
+        if (trace_imports)
+            fprintf(stderr,
+                    "AC1 CryptoAPI: CryptReleaseContext success=%u error=%u\n",
+                    success ? 1u : 0u, error);
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+    return 0;
+}
+
 static int handle_audio_import(CPU *cpu, const import_record *import)
 {
     if (!import || !import->by_ordinal ||
@@ -4611,6 +4704,7 @@ void dispatch(CPU *cpu, uint32_t target)
             ++trace_import_count;
         }
         int handled = handle_network_import(cpu, import) ||
+                      handle_crypto_import(cpu, import) ||
                       handle_audio_import(cpu, import) ||
                       handle_optional_eax_import(cpu, import) ||
                       handle_bink_import(cpu, import) ||
@@ -5210,6 +5304,7 @@ cleanup:
     }
 #endif
     ac1_network_reset();
+    ac1_crypto_reset();
 #ifdef _WIN32
     if (ds8_configured) {
         ac1_ds8_shutdown();
