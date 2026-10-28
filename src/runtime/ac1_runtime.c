@@ -8,6 +8,7 @@
 #include "ac1_network.h"
 #include "initial_dispatch.h"
 #include "ac1_fingerprint.h"
+#include "../platform/ac1_audio_win32.h"
 #if defined(AC1_HOST_D3D9)
 #include "../graphics/ac1_d3d9_bridge.h"
 #endif
@@ -25,6 +26,7 @@
 #include <windows.h>
 #include <direct.h>
 #include "../platform/ac1_window_win32.h"
+#include "../platform/ac1_ds8_bridge.h"
 #else
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -56,6 +58,7 @@
 #define AC1_WAIT_OBJECT_0 0u
 #define AC1_WAIT_TIMEOUT 258u
 #define AC1_STILL_ACTIVE 259u
+#define AC1_WAIT_CRITICAL_SECTION 3
 
 _Thread_local uint32_t g_image_delta;
 
@@ -133,6 +136,7 @@ static _Thread_local uint32_t guest_thread_affinity_mask;
 static uint32_t image_base;
 #ifdef _WIN32
 static ac1_window_win32 *window_bridge;
+static int ds8_configured;
 #endif
 #if defined(AC1_HOST_D3D9)
 typedef struct { uint32_t guest_address, heap_address; } ac1_d3d9_heap_block;
@@ -332,12 +336,12 @@ static void scheduler_stop_and_join(ac1_scheduler *scheduler)
 {
     if (!scheduler) return;
     scheduler_lock(scheduler);
-    unsigned created = 0u, started = 0u, finished_before_stop = 0u, blocked_at_teardown = 0u;
+    unsigned created = 0u, started = 0u, exited_before_teardown = 0u, blocked_at_teardown = 0u;
     for (unsigned i = 1u; i < scheduler->count; ++i) {
         ac1_guest_thread *thread = &scheduler->threads[i];
         if (thread->spawned) ++created;
         if (thread->started) ++started;
-        if (thread->finished) ++finished_before_stop;
+        if (thread->finished) ++exited_before_teardown;
         if (thread->blocked) ++blocked_at_teardown;
     }
     scheduler->stopping = 1;
@@ -366,8 +370,8 @@ static void scheduler_stop_and_join(ac1_scheduler *scheduler)
         if (thread->spawned) ++joined;
         worker_dispatches += thread->guest_dispatches;
     }
-    fprintf(stderr, "AC1 scheduler summary: workers created=%u started=%u finished-before-stop=%u joined=%u blocked-at-stop=%u guest-dispatches=%llu\n",
-            created, started, finished_before_stop, joined, blocked_at_teardown,
+    fprintf(stderr, "AC1 scheduler summary: workers created=%u started=%u exited-before-teardown=%u joined=%u blocked-at-teardown=%u guest-dispatches=%llu\n",
+            created, started, exited_before_teardown, joined, blocked_at_teardown,
             (unsigned long long)worker_dispatches);
     active_guest_thread = NULL;
     active_scheduler = NULL;
@@ -689,7 +693,19 @@ static void scheduler_checkpoint(void)
             /* Once this thread gets the baton back, let it execute. A regular
              * checkpoint must not immediately hand it to the same peer again. */
             scheduler_refresh_waits(scheduler);
-            if (!thread->blocked) break;
+            if (!thread->blocked) {
+                if (thread->wait_kind == AC1_WAIT_CRITICAL_SECTION) {
+                    if (trace_imports)
+                        fprintf(stderr,
+                                "AC1 CS waiter resumed: thread=%u section=0x%08x owner=%u lockcount=%u\n",
+                                thread->id, thread->wait_handle,
+                                rd32(thread->wait_handle + 12u),
+                                rd32(thread->wait_handle + 4u));
+                    thread->wait_kind = 0;
+                    thread->wait_handle = 0u;
+                }
+                break;
+            }
         } else {
             scheduler_wait_condition(scheduler, scheduler_next_timeout(scheduler));
         }
@@ -1232,7 +1248,183 @@ static uintptr_t d3d9_guest_hwnd_to_host(void *context, uint32_t guest_hwnd)
         ? ac1_window_win32_resolve_hwnd(window_bridge, guest_hwnd) : 0u;
 }
 #endif
+#endif /* AC1_HOST_D3D9 */
 
+#ifdef _WIN32
+static void *ds8_guest_resolve(void *context, uint32_t address,
+                               uint32_t size, uint32_t access)
+{
+    (void)context;
+    if (!size || !access || (access & ~(AC1_DS8_GUEST_READ | AC1_DS8_GUEST_WRITE)))
+        return NULL;
+    return guest_memory_try_ptr(address, size);
+}
+
+static uint32_t ds8_guest_alloc(void *context, uint32_t size, uint32_t alignment)
+{
+    (void)context;
+    if (!process_heap || !size || !alignment || (alignment & (alignment - 1u)) ||
+        alignment > 4096u || size > UINT32_MAX - alignment + 1u)
+        return 0u;
+    uint32_t raw = pcrecomp_heap_alloc(process_heap, size + alignment - 1u, 1);
+    if (!raw) return 0u;
+    uint32_t aligned = (raw + alignment - 1u) & ~(alignment - 1u);
+    if (aligned != raw) {
+        /* The guest heap currently returns at least 8-byte aligned blocks. */
+        pcrecomp_heap_free(process_heap, raw);
+        return 0u;
+    }
+    return raw;
+}
+
+static void ds8_guest_free(void *context, uint32_t address)
+{
+    (void)context;
+    if (process_heap && address) (void)pcrecomp_heap_free(process_heap, address);
+}
+
+static uintptr_t ds8_guest_hwnd_to_host(void *context, uint32_t guest_hwnd)
+{
+    (void)context;
+    return window_bridge
+        ? ac1_window_win32_resolve_hwnd(window_bridge, guest_hwnd) : 0u;
+}
+
+static int ds8_ensure_configured(void)
+{
+    if (ds8_configured) return 1;
+    ac1_ds8_callbacks callbacks;
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.struct_size = sizeof(callbacks);
+    callbacks.guest_resolve = ds8_guest_resolve;
+    callbacks.guest_alloc = ds8_guest_alloc;
+    callbacks.guest_free = ds8_guest_free;
+    callbacks.guest_hwnd_to_host = ds8_guest_hwnd_to_host;
+    if (!ac1_ds8_configure(&callbacks, NULL)) return 0;
+    ds8_configured = 1;
+    return 1;
+}
+
+static int handle_ds8_import(CPU *cpu, const import_record *import)
+{
+    if (!import || !import->by_ordinal ||
+        !equal_ascii_fold(import->dll, "DSOUND.dll") || import->ordinal != 11u)
+        return 0;
+    if (!guest_memory_try_ptr(cpu->esp + 4u, 12u))
+        stop_guest("DirectSoundCreate8 arguments are unmapped", import->token);
+    if (!ds8_ensure_configured())
+        stop_guest(ac1_ds8_last_error()[0]
+                   ? ac1_ds8_last_error()
+                   : "DirectSound bridge configuration failed", import->token);
+
+    uint32_t result = 0u;
+    int status = ac1_ds8_create8(rd32(cpu->esp + 4u),
+                                 rd32(cpu->esp + 8u),
+                                 rd32(cpu->esp + 12u), &result);
+    if (status != AC1_DS8_HANDLED) {
+        last_error = status == AC1_DS8_METHOD_UNSUPPORTED ? 120u : 87u;
+        stop_guest(ac1_ds8_last_error()[0]
+                   ? ac1_ds8_last_error()
+                   : "DirectSoundCreate8 bridge rejected the guest call",
+                   import->token);
+    }
+    cpu->eax = result;
+    return_stdcall(cpu, 12u);
+    return 1;
+}
+
+static int dispatch_ds8_method(CPU *cpu, uint32_t target)
+{
+    int argument_count = ac1_ds8_argument_count(target);
+    if (!argument_count) return 0;
+    if (argument_count < 0 || argument_count > 16) {
+        last_error = argument_count == AC1_DS8_METHOD_UNSUPPORTED ? 120u : 87u;
+        if (trace_imports && target == AC1_DS8_TOKEN_BASE + 5u * 0x1000u + 11u * 0x10u &&
+            guest_memory_try_ptr(cpu->esp + 4u, 8u * 4u)) {
+            fprintf(stderr,
+                    "AC1 DirectSound Lock stack: this=%08x offset=%08x bytes=%08x ptr1out=%08x bytes1out=%08x ptr2out=%08x bytes2out=%08x flags=%08x\n",
+                    rd32(cpu->esp + 4u), rd32(cpu->esp + 8u),
+                    rd32(cpu->esp + 12u), rd32(cpu->esp + 16u),
+                    rd32(cpu->esp + 20u), rd32(cpu->esp + 24u),
+                    rd32(cpu->esp + 28u), rd32(cpu->esp + 32u));
+        }
+        if (trace_imports && target == AC1_DS8_TOKEN_BASE + 5u * 0x1000u + 12u * 0x10u &&
+            guest_memory_try_ptr(cpu->esp + 4u, 4u * 4u)) {
+            fprintf(stderr,
+                    "AC1 DirectSound Play stack: this=%08x reserved=%08x priority=%08x flags=%08x ebp=%08x\n",
+                    rd32(cpu->esp + 4u), rd32(cpu->esp + 8u),
+                    rd32(cpu->esp + 12u), rd32(cpu->esp + 16u), cpu->ebp);
+        }
+        if (trace_imports && target == AC1_DS8_TOKEN_BASE + 5u * 0x1000u + 15u * 0x10u &&
+            guest_memory_try_ptr(cpu->esp + 4u, 2u * 4u)) {
+            fprintf(stderr, "AC1 DirectSound SetVolume stack: this=%08x volume=%08x\n",
+                    rd32(cpu->esp + 4u), rd32(cpu->esp + 8u));
+        }
+        char message[160];
+        if (argument_count == AC1_DS8_METHOD_UNSUPPORTED) {
+            const uint32_t token_offset = target - AC1_DS8_TOKEN_BASE;
+            snprintf(message, sizeof(message),
+                     "unsupported DirectSound interface kind=%u slot=%u",
+                     token_offset / 0x1000u,
+                     (token_offset % 0x1000u) / 0x10u);
+        } else {
+            snprintf(message, sizeof(message), "invalid DirectSound COM method token");
+        }
+        stop_guest(message, target);
+    }
+    if (!guest_memory_try_ptr(cpu->esp + 4u, (size_t)argument_count * 4u))
+        stop_guest("DirectSound COM arguments are unmapped", target);
+    uint32_t arguments[16];
+    for (int i = 0; i < argument_count; ++i)
+        arguments[i] = rd32(cpu->esp + 4u + (uint32_t)i * 4u);
+    if (trace_imports && target == AC1_DS8_TOKEN_BASE + 3u * 0x1000u + 14u * 0x10u &&
+        argument_count == 2 && guest_memory_try_ptr(arguments[1], 18u)) {
+        const uint32_t format = arguments[1];
+        fprintf(stderr,
+                "AC1 DirectSound format: tag=%u channels=%u samples=%u avg_bytes=%u align=%u bits=%u extra=%u\n",
+                rd16(format), rd16(format + 2u), rd32(format + 4u),
+                rd32(format + 8u), rd16(format + 12u), rd16(format + 14u),
+                rd16(format + 16u));
+    }
+    if (trace_imports && target == AC1_DS8_TOKEN_BASE + 2u * 0x1000u + 3u * 0x10u &&
+        argument_count == 4 && guest_memory_try_ptr(arguments[1], 36u)) {
+        const uint32_t descriptor = arguments[1];
+        fprintf(stderr,
+                "AC1 DirectSound buffer descriptor: size=%u flags=0x%08x bytes=%u reserved=%u format=0x%08x algorithm=%08x-%08x-%08x-%08x\n",
+                rd32(descriptor), rd32(descriptor + 4u),
+                rd32(descriptor + 8u), rd32(descriptor + 12u),
+                rd32(descriptor + 16u), rd32(descriptor + 20u),
+                rd32(descriptor + 24u), rd32(descriptor + 28u),
+                rd32(descriptor + 32u));
+    }
+    uint32_t result = 0u;
+    int dispatched = ac1_ds8_dispatch(target, arguments,
+                                      (uint32_t)argument_count, &result);
+    if (dispatched != AC1_DS8_HANDLED) {
+        last_error = dispatched == AC1_DS8_METHOD_UNSUPPORTED ? 120u : 87u;
+        char message[256];
+        if (target == AC1_DS8_TOKEN_BASE + 2u * 0x1000u + 6u * 0x10u &&
+            argument_count == 3) {
+            snprintf(message, sizeof(message),
+                     "DirectSound SetCooperativeLevel bridge failure (HWND=0x%08x priority=%u): %s",
+                     arguments[1], arguments[2],
+                     ac1_ds8_last_error()[0] ? ac1_ds8_last_error() : "unknown failure");
+        } else {
+            snprintf(message, sizeof(message), "%s",
+                     ac1_ds8_last_error()[0]
+                         ? ac1_ds8_last_error()
+                         : "DirectSound COM dispatcher rejected the guest call");
+        }
+        stop_guest(message, target);
+    }
+    cpu->eax = result;
+    return_stdcall(cpu, (uint32_t)argument_count * 4u);
+    scheduler_checkpoint();
+    return 1;
+}
+#endif
+
+#if defined(AC1_HOST_D3D9)
 static int d3d9_ensure_configured(void)
 {
     if (d3d9_configured) return 1;
@@ -1680,13 +1872,35 @@ static int handle_critical_section_import(CPU *cpu, const import_record *import)
             } else {
                 (void)guest_atomic_xadd32(address + 4u, UINT32_MAX);
                 cpu->eax = 0u;
-                if (enter)
-                    stop_guest("contended EnterCriticalSection requires guest-thread scheduling", import->token);
+                if (enter) {
+                    if (!active_guest_thread || !active_scheduler)
+                        stop_guest("contended EnterCriticalSection has no guest scheduler", import->token);
+                    if (trace_imports)
+                        fprintf(stderr,
+                                "AC1 CS wait: thread=%u section=0x%08x owner=%u lockcount=%u\n",
+                                active_guest_thread->id, address, owner,
+                                rd32(address + 4u));
+                    active_guest_thread->blocked = 1;
+                    active_guest_thread->wait_kind = AC1_WAIT_CRITICAL_SECTION;
+                    active_guest_thread->wait_handle = address;
+                    active_guest_thread->wait_deadline = 0u;
+                }
             }
         } else {
             cpu->eax = 0u;
-            if (enter)
-                stop_guest("contended EnterCriticalSection requires guest-thread scheduling", import->token);
+            if (enter) {
+                if (!active_guest_thread || !active_scheduler)
+                    stop_guest("contended EnterCriticalSection has no guest scheduler", import->token);
+                if (trace_imports)
+                    fprintf(stderr,
+                            "AC1 CS wait: thread=%u section=0x%08x owner=%u lockcount=%u\n",
+                            active_guest_thread->id, address, owner,
+                            rd32(address + 4u));
+                active_guest_thread->blocked = 1;
+                active_guest_thread->wait_kind = AC1_WAIT_CRITICAL_SECTION;
+                active_guest_thread->wait_handle = address;
+                active_guest_thread->wait_deadline = 0u;
+            }
         }
         return_stdcall(cpu, 4u);
         return 1;
@@ -1696,8 +1910,39 @@ static int handle_critical_section_import(CPU *cpu, const import_record *import)
         stop_guest("LeaveCriticalSection called by a non-owner", import->token);
     uint32_t recursion = rd32(address + 8u) - 1u;
     wr32(address + 8u, recursion);
-    if (!recursion) wr32(address + 12u, 0u);
+    if (!recursion) {
+        wr32(address + 12u, 0u);
+    }
     (void)guest_atomic_xadd32(address + 4u, UINT32_MAX);
+    if (!recursion) {
+        if (active_scheduler) {
+            scheduler_lock(active_scheduler);
+            for (unsigned i = 0; i < active_scheduler->count; ++i) {
+                ac1_guest_thread *waiter = &active_scheduler->threads[i];
+                if (!waiter->blocked || waiter->finished ||
+                    waiter->wait_kind != AC1_WAIT_CRITICAL_SECTION ||
+                    waiter->wait_handle != address)
+                    continue;
+                uint32_t previous = guest_atomic_xadd32(address + 4u, 1u);
+                if (previous != UINT32_MAX) {
+                    (void)guest_atomic_xadd32(address + 4u, UINT32_MAX);
+                    break;
+                }
+                wr32(address + 8u, 1u);
+                wr32(address + 12u, waiter->id);
+                waiter->blocked = 0;
+                waiter->wait_result = 0u;
+                if (trace_imports)
+                    fprintf(stderr,
+                            "AC1 CS handoff: section=0x%08x waiter=%u lockcount=%u recursion=%u\n",
+                            address, waiter->id, rd32(address + 4u),
+                            rd32(address + 8u));
+                scheduler_notify(active_scheduler);
+                break;
+            }
+            scheduler_unlock(active_scheduler);
+        }
+    }
     return_stdcall(cpu, 4u);
     return 1;
 }
@@ -2793,28 +3038,39 @@ static void window_free_guest(void *context, uint32_t guest_address)
     if (process_heap && guest_address) pcrecomp_heap_free(process_heap, guest_address);
 }
 
-static int window_invoke_wndproc(void *context, CPU *cpu, uint32_t procedure,
-    uint32_t guest_hwnd, uint32_t message, uint32_t wparam, uint32_t lparam,
-    uint32_t *result)
+static int invoke_guest_stdcall_callback(CPU *cpu, uint32_t procedure,
+                                         const uint32_t *arguments,
+                                         uint32_t argument_count,
+                                         uint32_t *result)
 {
-    (void)context;
-    if (!cpu || !procedure || !result || cpu->esp < 5u * sizeof(uint32_t)) return 0;
-    uint32_t frame_address = cpu->esp - 5u * sizeof(uint32_t);
+    if (!cpu || !procedure || !result ||
+        (argument_count && !arguments) || argument_count >= UINT32_MAX / 4u)
+        return 0;
+    uint32_t frame_bytes = (argument_count + 1u) * (uint32_t)sizeof(uint32_t);
+    if (cpu->esp < frame_bytes) return 0;
+    uint32_t frame_address = cpu->esp - frame_bytes;
     uint32_t *frame = (uint32_t *)guest_memory_try_ptr(frame_address,
-                                                       5u * sizeof(uint32_t));
+                                                       frame_bytes);
     if (!frame) return 0;
 
     CPU saved = *cpu;
     frame[0] = AC1_RETURN_SENTINEL;
-    frame[1] = guest_hwnd;
-    frame[2] = message;
-    frame[3] = wparam;
-    frame[4] = lparam;
+    for (uint32_t i = 0u; i < argument_count; ++i)
+        frame[i + 1u] = arguments[i];
     cpu->esp = frame_address;
     dispatch(cpu, procedure);
     *result = cpu->eax;
     *cpu = saved;
     return 1;
+}
+
+static int window_invoke_wndproc(void *context, CPU *cpu, uint32_t procedure,
+    uint32_t guest_hwnd, uint32_t message, uint32_t wparam, uint32_t lparam,
+    uint32_t *result)
+{
+    (void)context;
+    uint32_t arguments[4] = { guest_hwnd, message, wparam, lparam };
+    return invoke_guest_stdcall_callback(cpu, procedure, arguments, 4u, result);
 }
 
 static uint32_t window_current_guest_thread_id(void *context)
@@ -3634,6 +3890,148 @@ static int handle_network_import(CPU *cpu, const import_record *import)
     return 1;
 }
 
+static int handle_audio_import(CPU *cpu, const import_record *import)
+{
+    if (!import || !import->by_ordinal ||
+        !equal_ascii_fold(import->dll, "DSOUND.dll") || import->ordinal != 2u)
+        return 0;
+
+#ifndef _WIN32
+    (void)cpu;
+    return 0;
+#else
+    const uint32_t *guest_arguments = (const uint32_t *)guest_memory_try_ptr(
+        cpu->esp + 4u, 8u);
+    if (!guest_arguments)
+        stop_guest("DirectSoundEnumerateA arguments are unmapped", import->token);
+    uint32_t callback = guest_arguments[0];
+    uint32_t guest_context = guest_arguments[1];
+    if (!callback)
+        stop_guest("DirectSoundEnumerateA received a null guest callback", import->token);
+
+    ac1_audio_device_list devices;
+    int status = ac1_audio_enumerate_a(&devices);
+    if (status == AC1_AUDIO_ENUM_UNSUPPORTED)
+        stop_guest("DirectSoundEnumerateA has no native provider on this platform",
+                   import->token);
+    if (status != AC1_AUDIO_ENUM_HANDLED) {
+        int32_t native_error = devices.native_hresult;
+        ac1_audio_device_list_destroy(&devices);
+        char message[128];
+        snprintf(message, sizeof(message),
+                 "DirectSoundEnumerateA host setup failed (HRESULT=0x%08x)",
+                 (uint32_t)native_error);
+        stop_guest(message, import->token);
+    }
+    if (devices.overflow_flags) {
+        uint32_t overflow = devices.overflow_flags;
+        ac1_audio_device_list_destroy(&devices);
+        char message[128];
+        snprintf(message, sizeof(message),
+                 "DirectSoundEnumerateA host record overflow (flags=0x%08x)", overflow);
+        stop_guest(message, import->token);
+    }
+
+    int32_t native_hresult = devices.native_hresult;
+    if (native_hresult < 0) {
+        ac1_audio_device_list_destroy(&devices);
+        cpu->eax = (uint32_t)native_hresult;
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+    if (!process_heap)
+        stop_guest("DirectSoundEnumerateA process heap is unavailable", import->token);
+
+    uint32_t guest_guid[AC1_AUDIO_ENUM_MAX_DEVICES] = {0};
+    uint32_t guest_description[AC1_AUDIO_ENUM_MAX_DEVICES] = {0};
+    uint32_t guest_module[AC1_AUDIO_ENUM_MAX_DEVICES] = {0};
+    size_t allocated = 0u;
+    for (size_t i = 0u; i < devices.count; ++i) {
+        const ac1_audio_device_record *record = &devices.devices[i];
+        if (record->has_guid) {
+            guest_guid[i] = pcrecomp_heap_alloc(process_heap, 16u, 0);
+            if (!guest_guid[i]) goto audio_guest_allocation_failed;
+            void *destination = guest_memory_try_ptr(guest_guid[i], 16u);
+            if (!destination) goto audio_guest_allocation_failed;
+            memcpy(destination, record->guid, 16u);
+        }
+        size_t description_length = strlen(record->description) + 1u;
+        guest_description[i] = pcrecomp_heap_alloc(process_heap,
+                                                     (uint32_t)description_length, 0);
+        if (!guest_description[i]) goto audio_guest_allocation_failed;
+        void *description_destination = guest_memory_try_ptr(
+            guest_description[i], description_length);
+        if (!description_destination) goto audio_guest_allocation_failed;
+        memcpy(description_destination, record->description, description_length);
+
+        size_t module_length = strlen(record->module) + 1u;
+        guest_module[i] = pcrecomp_heap_alloc(process_heap, (uint32_t)module_length, 0);
+        if (!guest_module[i]) goto audio_guest_allocation_failed;
+        void *module_destination = guest_memory_try_ptr(guest_module[i], module_length);
+        if (!module_destination) goto audio_guest_allocation_failed;
+        memcpy(module_destination, record->module, module_length);
+        allocated = i + 1u;
+    }
+
+    ac1_audio_device_list_destroy(&devices);
+    for (size_t i = 0u; i < allocated; ++i) {
+        uint32_t callback_arguments[4] = {
+            guest_guid[i], guest_description[i], guest_module[i], guest_context
+        };
+        uint32_t callback_result = 0u;
+        if (!invoke_guest_stdcall_callback(cpu, callback, callback_arguments, 4u,
+                                           &callback_result))
+            stop_guest("DirectSoundEnumerateA guest callback frame is unavailable",
+                       callback);
+        if (!callback_result) break;
+    }
+
+    for (size_t i = 0u; i < allocated; ++i) {
+        if (guest_guid[i]) pcrecomp_heap_free(process_heap, guest_guid[i]);
+        if (guest_description[i]) pcrecomp_heap_free(process_heap, guest_description[i]);
+        if (guest_module[i]) pcrecomp_heap_free(process_heap, guest_module[i]);
+    }
+    cpu->eax = (uint32_t)native_hresult;
+    return_stdcall(cpu, 8u);
+    return 1;
+
+audio_guest_allocation_failed:
+    ac1_audio_device_list_destroy(&devices);
+    for (size_t i = 0u; i <= allocated && i < AC1_AUDIO_ENUM_MAX_DEVICES; ++i) {
+        if (guest_guid[i]) pcrecomp_heap_free(process_heap, guest_guid[i]);
+        if (guest_description[i]) pcrecomp_heap_free(process_heap, guest_description[i]);
+        if (guest_module[i]) pcrecomp_heap_free(process_heap, guest_module[i]);
+    }
+    stop_guest("DirectSoundEnumerateA guest record allocation failed", import->token);
+    return 1;
+#endif
+}
+
+/* The pinned EAX.DLL export table identifies ordinal 6 as
+ * EAXDirectSoundCreate8.  The observed caller treats any failing HRESULT as
+ * an optional-provider miss and then calls DSOUND!DirectSoundCreate8 with the
+ * same arguments.  This runtime has no EAX provider, so report that explicit
+ * absence and leave the caller's output pointer null; do not fabricate a
+ * DirectSound object. */
+static int handle_optional_eax_import(CPU *cpu, const import_record *import)
+{
+    if (!import || !import->by_ordinal ||
+        !equal_ascii_fold(import->dll, "EAX.DLL") || import->ordinal != 6u)
+        return 0;
+
+    uint32_t *arguments = (uint32_t *)guest_memory_try_ptr(cpu->esp + 4u, 12u);
+    if (!arguments)
+        stop_guest("EAXDirectSoundCreate8 arguments are unmapped", import->token);
+    uint32_t *output = (uint32_t *)guest_memory_try_ptr(arguments[1], 4u);
+    if (!output)
+        stop_guest("EAXDirectSoundCreate8 output pointer is unmapped", import->token);
+
+    *output = 0u;
+    cpu->eax = 0x80004001u; /* E_NOTIMPL: optional EAX provider is absent. */
+    return_stdcall(cpu, 12u);
+    return 1;
+}
+
 /* Called by generated code for direct calls, jumps and returns. Imports are
  * assigned unique IAT tokens and stop here until a measured implementation is
  * added; an unknown guest address is equally fatal and includes its caller. */
@@ -3702,11 +4100,14 @@ void dispatch(CPU *cpu, uint32_t target)
                         trace_import_count, cpu->eip, target, import->dll, import->name);
             ++trace_import_count;
         }
+        int handled = handle_network_import(cpu, import) ||
+                      handle_audio_import(cpu, import) ||
+                      handle_optional_eax_import(cpu, import) ||
+#ifdef _WIN32
+                      handle_ds8_import(cpu, import) ||
+#endif
 #if defined(AC1_HOST_D3D9)
-        int handled = handle_network_import(cpu, import) ||
                       handle_d3d9_import(cpu, import) ||
-#else
-        int handled = handle_network_import(cpu, import) ||
 #endif
                       handle_module_import(cpu, import) ||
                       handle_profile_import(cpu, import) ||
@@ -3762,6 +4163,9 @@ void dispatch(CPU *cpu, uint32_t target)
 
 #if defined(AC1_HOST_D3D9)
     if (dispatch_d3d9_method(cpu, target)) return;
+#endif
+#ifdef _WIN32
+    if (dispatch_ds8_method(cpu, target)) return;
 #endif
 
     ac1_lifted_fn function = ac1_lifted_lookup(target);
@@ -3888,6 +4292,7 @@ int ac1_run(const char *exe_path)
     dispatch_limit = read_dispatch_limit();
 #ifdef _WIN32
     window_bridge = NULL;
+    ds8_configured = 0;
 #endif
     import_count = 0;
     memset(imports, 0, sizeof(imports));
@@ -4087,6 +4492,12 @@ cleanup:
         scheduler = NULL;
     }
     ac1_network_reset();
+#ifdef _WIN32
+    if (ds8_configured) {
+        ac1_ds8_shutdown();
+        ds8_configured = 0;
+    }
+#endif
 #if defined(AC1_HOST_D3D9)
     if (d3d9_configured) {
         ac1_d3d9_shutdown();

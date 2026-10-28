@@ -45,7 +45,7 @@ ac1_window_win32 *ac1_window_win32_create(
     char *error, size_t error_capacity);
 void ac1_window_win32_destroy(ac1_window_win32 *window);
 
-/* Resolves only a live guest HWND owned by this bridge to its real HWND. */
+/* Resolves a live guest HWND or the bridge's desktop token to its real HWND. */
 uintptr_t ac1_window_win32_resolve_hwnd(ac1_window_win32 *window,
                                         uint32_t guest_hwnd);
 

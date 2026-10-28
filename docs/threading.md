@@ -4,7 +4,7 @@
 
 `src/runtime/ac1_runtime.c` runs guest workers on native OS threads with a guest CPU, stack, TIB, static TLS block/vector, dynamic TLS values, last-error state, and stop boundary per worker. Workers share the process image, guest address space, heaps, import table, TLS allocation bitmap, and synchronization objects. The primary and worker TIBs carry x86 self pointers and client IDs. The runtime has handlers for `CreateThread`, thread waits/exits, events, semaphores, `Sleep`, `SwitchToThread`, and thread-priority calls.
 
-The traced startup has exercised `CreateThread`, worker `TlsGetValue`/`TlsSetValue`, `SetEvent`, and `WaitForSingleObject`. It now creates two workers; both have started. The current startup boundary is `WS2_32.dll!WSAStartup` (version 1.1, guest `WSADATA` at `0x7FEFF880`). Both workers are blocked there; shutdown wakes and joins them. No natural worker `ExitThread` return has been observed yet.
+The traced startup has exercised `CreateThread`, worker `TlsGetValue`/`TlsSetValue`, `SetEvent`, `WaitForSingleObject`, and contended critical sections. It creates four workers during audio initialization. A trace recorded three complete wait, ownership-transfer and resume cycles on critical section `0x01A1609C`, with worker 4108 owning the lock when it resumed. Shutdown wakes and joins the workers before releasing shared memory. The summary distinguishes exits before teardown from blocked workers; diagnostic cancellation does not establish natural completion of game threads.
 
 Guest instructions execute under a serialized baton. A native worker can wait while another guest thread owns the baton, but only one guest CPU executes guest instructions at a time. Native worker creation therefore does not currently provide multicore guest execution. Waits yield cooperatively, and teardown stops and joins workers before shared guest memory is released. `ac1_run` serializes launches so process-global runtime state is not reused concurrently.
 
@@ -18,4 +18,4 @@ Relaxing the baton requires auditing guest shared-memory access, heaps, memory-m
 
 ## Regression checks
 
-`tools/build.ps1 -CheckRepeat` runs the pinned executable twice in one host process and checks that both runs reach the same genuine guest boundary. It exercises two-worker teardown and process-state cleanup sufficiently for a second launch. This is an integration check, not an independent scheduler stress test.
+`tools/build.ps1 -CheckRepeat` runs the pinned executable twice in one host process and checks that both runs reach the same genuine guest boundary. It exercises worker teardown and process-state cleanup for a second launch. `AC1_TRACE_IMPORTS=1` additionally logs critical-section wait, handoff and resume events so worker progress can be distinguished from main-thread progress. This is an integration check, not an independent scheduler stress test.

@@ -387,6 +387,8 @@ void ac1_window_win32_destroy(ac1_window_win32 *ui)
 uintptr_t ac1_window_win32_resolve_hwnd(ac1_window_win32 *ui,
                                         uint32_t guest_hwnd)
 {
+    if (ui && guest_hwnd == AC1_DESKTOP_TOKEN)
+        return (uintptr_t)GetDesktopWindow();
     ac1_window_record *record = record_from_guest(ui, guest_hwnd);
     return record && record->native ? (uintptr_t)record->native : 0;
 }

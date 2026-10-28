@@ -25,7 +25,12 @@ add_library(ac1_runtime STATIC
 set_target_properties(ac1_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(ac1_runtime PUBLIC Threads::Threads)
 if(WIN32)
-  target_sources(ac1_runtime PRIVATE src/platform/ac1_window_win32.c)
+  enable_language(CXX)
+  target_sources(ac1_runtime PRIVATE
+    src/platform/ac1_window_win32.c
+    src/platform/ac1_audio_win32.c
+    src/platform/ac1_ds8_bridge.cpp)
+  target_compile_features(ac1_runtime PRIVATE cxx_std_17)
   target_include_directories(ac1_runtime PRIVATE src/platform)
   target_link_libraries(ac1_runtime PRIVATE ws2_32 user32 gdi32)
 endif()
@@ -33,7 +38,6 @@ if(AC1_HOST_D3D9)
   if(NOT WIN32)
     message(FATAL_ERROR "AC1_HOST_D3D9 currently requires Windows")
   endif()
-  enable_language(CXX)
   set(AC1_D3D9_BUILD_SMOKE OFF)
   add_subdirectory(src/graphics)
   target_compile_definitions(ac1_runtime PRIVATE AC1_HOST_D3D9=1)

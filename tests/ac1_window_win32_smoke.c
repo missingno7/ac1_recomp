@@ -275,6 +275,9 @@ int main(void)
 
     context.window = ac1_window_win32_create(&callbacks, error, sizeof(error));
     CHECK(context.window != NULL);
+    CHECK(call_api(&context, &cpu, "GetDesktopWindow", 0, NULL, 0, 0));
+    CHECK(ac1_window_win32_resolve_hwnd(context.window, cpu.eax) ==
+          (uintptr_t)GetDesktopWindow());
     CHECK(run_one_lifecycle(&context, &cpu, 1));
     ac1_window_win32_destroy(context.window);
     context.window = NULL;
