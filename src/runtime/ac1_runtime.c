@@ -8,6 +8,8 @@
 #include "ac1_network.h"
 #include "ac1_files.h"
 #include "initial_dispatch.h"
+#include "bink_dispatch.h"
+#include "bink_module.h"
 #include "ac1_fingerprint.h"
 #include "../platform/ac1_audio_win32.h"
 #if defined(AC1_HOST_D3D9)
@@ -115,6 +117,10 @@ struct ac1_scheduler {
 static _Thread_local jmp_buf stop_runtime;
 static _Thread_local int runtime_stop_ready;
 static int trace_imports;
+static int trace_object_types;
+static int object_type_registry_traced;
+static unsigned object_type_parent_records;
+static unsigned object_type_descriptor_count;
 static int crt_handoff_logged;
 static _Thread_local unsigned trace_import_count;
 static _Thread_local unsigned trace_callback_count;
@@ -137,6 +143,10 @@ static _Thread_local uint32_t com_apartment_model;
 static uint32_t guest_affinity_mask;
 static _Thread_local uint32_t guest_thread_affinity_mask;
 static uint32_t image_base;
+static uint32_t image_size_loaded;
+static pe32_module bink_image;
+static int bink_image_mapped;
+static char bink_module_path[32768];
 #ifdef _WIN32
 static ac1_window_win32 *window_bridge;
 static int ds8_configured;
@@ -208,12 +218,10 @@ static size_t import_count;
 static _Thread_local char stop_reason[512];
 static _Thread_local char last_run_error[512];
 static void stop_guest(const char *reason, uint32_t target);
-#ifdef _WIN32
 static int invoke_guest_stdcall_callback(CPU *cpu, uint32_t procedure,
                                          const uint32_t *arguments,
                                          uint32_t argument_count,
                                          uint32_t *result);
-#endif
 
 static int prepare_guest_thread(ac1_guest_thread *thread)
 {
@@ -1775,6 +1783,8 @@ static int handle_module_import(CPU *cpu, const import_record *import)
         uint32_t name = rd32(cpu->esp + 4u);
         if (!name) cpu->eax = image_base;
         else if (guest_string_equal(name, "kernel32.dll")) cpu->eax = AC1_KERNEL32_HANDLE;
+        else if (bink_image_mapped && guest_string_equal(name, "binkw32.dll"))
+            cpu->eax = bink_image.load_base;
         else { cpu->eax = 0; last_error = 126u; }
         return_stdcall(cpu, 4u);
         return 1;
@@ -1783,7 +1793,12 @@ static int handle_module_import(CPU *cpu, const import_record *import)
         uint32_t module = rd32(cpu->esp + 4u);
         uint32_t output_address = rd32(cpu->esp + 8u);
         uint32_t capacity = rd32(cpu->esp + 12u);
-        if (module && module != image_base) {
+        const char *module_path = NULL;
+        if (!module || module == image_base)
+            module_path = exe_path_copy;
+        else if (bink_image_mapped && module == bink_image.load_base)
+            module_path = bink_module_path;
+        if (!module_path) {
             cpu->eax = 0u;
             last_error = 126u;
         } else if (!capacity) {
@@ -1792,12 +1807,12 @@ static int handle_module_import(CPU *cpu, const import_record *import)
         } else {
             char *output = (char *)guest_memory_try_ptr(output_address, capacity);
             if (!output) stop_guest("GetModuleFileNameA output is unmapped", import->token);
-            size_t length = strlen(exe_path_copy);
+            size_t length = strlen(module_path);
             if (length + 1u <= capacity) {
-                memcpy(output, exe_path_copy, length + 1u);
+                memcpy(output, module_path, length + 1u);
                 cpu->eax = (uint32_t)length;
             } else {
-                memcpy(output, exe_path_copy, capacity);
+                memcpy(output, module_path, capacity);
                 cpu->eax = capacity;
                 last_error = 122u;
             }
@@ -1809,12 +1824,40 @@ static int handle_module_import(CPU *cpu, const import_record *import)
         uint32_t module = rd32(cpu->esp + 4u);
         uint32_t name = rd32(cpu->esp + 8u);
         const import_record *resolved = NULL;
+        uint32_t bink_export = 0u;
+        char export_error[192] = {0};
         if (module == AC1_KERNEL32_HANDLE)
             resolved = find_named_import("KERNEL32.dll", name);
         else if (module == image_base)
             resolved = find_named_import("AssassinsCreed_Dx9.exe", name);
-        cpu->eax = resolved ? resolved->token : 0;
-        if (!resolved) last_error = 127u; /* ERROR_PROC_NOT_FOUND */
+        else if (bink_image_mapped && module == bink_image.load_base) {
+            if (name <= 0xffffu) {
+                (void)pe32_export_by_ordinal(&bink_image, (uint16_t)name,
+                                             &bink_export, export_error,
+                                             sizeof(export_error));
+            } else {
+                char export_name[256];
+                size_t remaining = 0u;
+                int terminated = 0;
+                while (remaining < sizeof(export_name)) {
+                    if (name > UINT32_MAX - (uint32_t)remaining ||
+                        !guest_memory_try_ptr(name + (uint32_t)remaining, 1u))
+                        stop_guest("GetProcAddress Bink export name is unmapped", import->token);
+                    export_name[remaining] = (char)rd8(name + (uint32_t)remaining);
+                    if (!export_name[remaining]) {
+                        terminated = 1;
+                        break;
+                    }
+                    ++remaining;
+                }
+                if (!terminated)
+                    stop_guest("GetProcAddress Bink export name is unterminated", import->token);
+                (void)pe32_export_by_name(&bink_image, export_name, &bink_export,
+                                          export_error, sizeof(export_error));
+            }
+        }
+        cpu->eax = resolved ? resolved->token : bink_export;
+        if (!cpu->eax) last_error = 127u; /* ERROR_PROC_NOT_FOUND */
         return_stdcall(cpu, 8u);
         return 1;
     }
@@ -3236,6 +3279,32 @@ static int handle_registry_import(CPU *cpu, const import_record *import)
     return 1;
 }
 
+static int invoke_guest_stdcall_callback(CPU *cpu, uint32_t procedure,
+                                         const uint32_t *arguments,
+                                         uint32_t argument_count,
+                                         uint32_t *result)
+{
+    if (!cpu || !procedure || !result ||
+        (argument_count && !arguments) || argument_count >= UINT32_MAX / 4u)
+        return 0;
+    uint32_t frame_bytes = (argument_count + 1u) * (uint32_t)sizeof(uint32_t);
+    if (cpu->esp < frame_bytes) return 0;
+    uint32_t frame_address = cpu->esp - frame_bytes;
+    uint32_t *frame = (uint32_t *)guest_memory_try_ptr(frame_address,
+                                                       frame_bytes);
+    if (!frame) return 0;
+
+    CPU saved = *cpu;
+    frame[0] = AC1_RETURN_SENTINEL;
+    for (uint32_t i = 0u; i < argument_count; ++i)
+        frame[i + 1u] = arguments[i];
+    cpu->esp = frame_address;
+    dispatch(cpu, procedure);
+    *result = cpu->eax;
+    *cpu = saved;
+    return 1;
+}
+
 #ifdef _WIN32
 static int window_read_guest(void *context, uint32_t address,
                              void *output, size_t bytes)
@@ -3272,32 +3341,6 @@ static void window_free_guest(void *context, uint32_t guest_address)
 {
     (void)context;
     if (process_heap && guest_address) pcrecomp_heap_free(process_heap, guest_address);
-}
-
-static int invoke_guest_stdcall_callback(CPU *cpu, uint32_t procedure,
-                                         const uint32_t *arguments,
-                                         uint32_t argument_count,
-                                         uint32_t *result)
-{
-    if (!cpu || !procedure || !result ||
-        (argument_count && !arguments) || argument_count >= UINT32_MAX / 4u)
-        return 0;
-    uint32_t frame_bytes = (argument_count + 1u) * (uint32_t)sizeof(uint32_t);
-    if (cpu->esp < frame_bytes) return 0;
-    uint32_t frame_address = cpu->esp - frame_bytes;
-    uint32_t *frame = (uint32_t *)guest_memory_try_ptr(frame_address,
-                                                       frame_bytes);
-    if (!frame) return 0;
-
-    CPU saved = *cpu;
-    frame[0] = AC1_RETURN_SENTINEL;
-    for (uint32_t i = 0u; i < argument_count; ++i)
-        frame[i + 1u] = arguments[i];
-    cpu->esp = frame_address;
-    dispatch(cpu, procedure);
-    *result = cpu->eax;
-    *cpu = saved;
-    return 1;
 }
 
 static int window_invoke_wndproc(void *context, CPU *cpu, uint32_t procedure,
@@ -3522,6 +3565,46 @@ static int handle_import(CPU *cpu, const import_record *import)
         memset(startup, 0, 68u);
         wr32(output, 68u); /* STARTUPINFOA.cb; remaining default fields are zero. */
         return_stdcall(cpu, 4u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "GetWindowsDirectoryA")) {
+        uint32_t output_address = rd32(cpu->esp + 4u);
+        uint32_t capacity = rd32(cpu->esp + 8u);
+#ifdef _WIN32
+        char *output = capacity
+            ? (char *)guest_memory_try_ptr(output_address, capacity)
+            : NULL;
+        if (capacity && !output)
+            stop_guest("GetWindowsDirectoryA output is unmapped", import->token);
+        cpu->eax = (uint32_t)GetWindowsDirectoryA(output, capacity);
+        if (!cpu->eax) last_error = (uint32_t)GetLastError();
+#else
+        (void)output_address;
+        (void)capacity;
+        stop_guest("GetWindowsDirectoryA is unavailable without a Windows host", import->token);
+#endif
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "GetSystemDirectoryA")) {
+        uint32_t output_address = rd32(cpu->esp + 4u);
+        uint32_t capacity = rd32(cpu->esp + 8u);
+#ifdef _WIN32
+        char *output = capacity
+            ? (char *)guest_memory_try_ptr(output_address, capacity)
+            : NULL;
+        if (capacity && !output)
+            stop_guest("GetSystemDirectoryA output is unmapped", import->token);
+        cpu->eax = (uint32_t)GetSystemDirectoryA(output, capacity);
+        if (!cpu->eax) last_error = (uint32_t)GetLastError();
+#else
+        (void)output_address;
+        (void)capacity;
+        stop_guest("GetSystemDirectoryA is unavailable without a Windows host", import->token);
+#endif
+        return_stdcall(cpu, 8u);
         return 1;
     }
 
@@ -4327,12 +4410,68 @@ static int handle_optional_eax_import(CPU *cpu, const import_record *import)
     return 1;
 }
 
+static int handle_bink_import(CPU *cpu, const import_record *import)
+{
+    uint32_t export_address = 0u;
+    char error[192] = {0};
+    int found;
+
+    if (!import || !equal_ascii_fold(import->dll, "binkw32.dll")) return 0;
+    if (!bink_image_mapped)
+        stop_guest("Bink import executed before its module was mapped", import->token);
+    if (import->by_ordinal) {
+        found = pe32_export_by_ordinal(&bink_image, import->ordinal,
+                                      &export_address, error, sizeof(error));
+    } else {
+        found = pe32_export_by_name(&bink_image, import->name,
+                                    &export_address, error, sizeof(error));
+    }
+    if (!found) {
+        char message[320];
+        if (import->by_ordinal)
+            snprintf(message, sizeof(message),
+                     "pinned Bink export #%u is unavailable: %s",
+                     (unsigned)import->ordinal, error);
+        else
+            snprintf(message, sizeof(message),
+                     "pinned Bink export %s is unavailable: %s",
+                     import->name, error);
+        stop_guest(message, import->token);
+    }
+
+    uint32_t allocator = 0u, free_callback = 0u;
+    int check_set_memory = !import->by_ordinal &&
+                           !strcmp(import->name, "_BinkSetMemory@8");
+    if (check_set_memory) {
+        if (!guest_memory_try_ptr(cpu->esp + 4u, 8u) ||
+            !guest_memory_try_ptr(0x18027C8Cu, 8u))
+            stop_guest("BinkSetMemory arguments or callback globals are unmapped",
+                       import->token);
+        allocator = rd32(cpu->esp + 4u);
+        free_callback = rd32(cpu->esp + 8u);
+    }
+    dispatch(cpu, export_address);
+    if (check_set_memory) {
+        uint32_t stored_allocator = rd32(0x18027C8Cu);
+        uint32_t stored_free = rd32(0x18027C90u);
+        if (stored_allocator != allocator || stored_free != free_callback)
+            stop_guest("BinkSetMemory did not store the supplied guest callbacks",
+                       export_address);
+        fprintf(stderr,
+                "AC1 BinkSetMemory: export=0x%08x allocator=0x%08x free=0x%08x stored=0x%08x,0x%08x\n",
+                export_address, allocator, free_callback,
+                stored_allocator, stored_free);
+    }
+    return 1;
+}
+
 /* Called by generated code for direct calls, jumps and returns. Imports are
  * assigned unique IAT tokens and stop here until a measured implementation is
  * added; an unknown guest address is equally fatal and includes its caller. */
 void dispatch(CPU *cpu, uint32_t target)
 {
     if (!cpu) stop_guest("null CPU state", target);
+    const uint32_t guest_callsite = cpu->eip;
     ++dispatch_count;
     if (dispatch_limit && dispatch_count > dispatch_limit) {
         char reason[128];
@@ -4342,6 +4481,82 @@ void dispatch(CPU *cpu, uint32_t target)
     }
     if (dispatch_depth >= AC1_DISPATCH_DEPTH)
         stop_guest("guest call depth exceeded", target);
+
+    if (trace_object_types && !object_type_registry_traced &&
+        target == 0x0085B160u) {
+        object_type_registry_traced = 1;
+        const uint32_t count_address = 0x01928098u;
+        const uint32_t array_address = 0x01A19EE0u;
+        if (!guest_memory_try_ptr(count_address, 1u)) {
+            fprintf(stderr, "AC1 ObjectTypeInfo registry: count byte is unmapped\n");
+        } else {
+            uint32_t count = rd8(count_address);
+            uint64_t array_bytes = (uint64_t)count * 4u;
+            fprintf(stderr,
+                    "AC1 ObjectTypeInfo registry: caller=0x%08x array=0x%08x count=%u stride=4\n",
+                    cpu->eip, array_address, count);
+            if (count && !guest_memory_try_ptr(array_address, (size_t)array_bytes)) {
+                fprintf(stderr,
+                        "AC1 ObjectTypeInfo registry: populated array range is unmapped (bytes=%llu)\n",
+                        (unsigned long long)array_bytes);
+            } else {
+                for (uint32_t i = 0u; i < count; ++i) {
+                    uint32_t object = rd32(array_address + i * 4u);
+                    uint32_t vtable = 0u, col = 0u, type_descriptor = 0u;
+                    uint32_t methods[3] = {0u, 0u, 0u};
+                    char name[192];
+                    name[0] = '\0';
+                    int object_ok = object && guest_memory_try_ptr(object, 4u);
+                    if (object_ok) vtable = rd32(object);
+                    int vtable_ok = vtable >= 4u &&
+                        guest_memory_try_ptr(vtable - 4u, 20u);
+                    if (vtable_ok) {
+                        col = rd32(vtable - 4u);
+                        for (unsigned slot = 0u; slot < 3u; ++slot)
+                            methods[slot] = rd32(vtable + slot * 4u);
+                    }
+                    int col_ok = col && guest_memory_try_ptr(col, 20u);
+                    int type_ok = 0;
+                    int object_type_name = 0;
+                    if (col_ok && rd32(col) == 0u) {
+                        type_descriptor = rd32(col + 12u);
+                        type_ok = type_descriptor &&
+                            guest_memory_try_ptr(type_descriptor, 12u);
+                    }
+                    if (type_ok && type_descriptor <= UINT32_MAX - 8u) {
+                        uint32_t name_address = type_descriptor + 8u;
+                        size_t n = 0u;
+                        int name_terminated = 0;
+                        while (n + 1u < sizeof(name) &&
+                               name_address <= UINT32_MAX - (uint32_t)n &&
+                               guest_memory_try_ptr(name_address + (uint32_t)n, 1u)) {
+                            name[n] = (char)rd8(name_address + (uint32_t)n);
+                            if (!name[n]) {
+                                name_terminated = 1;
+                                break;
+                            }
+                            ++n;
+                        }
+                        name[n] = '\0';
+                        object_type_name = name_terminated &&
+                            strstr(name, "ObjectTypeInfo@") != NULL;
+                    }
+                    int method_in_image[3];
+                    for (unsigned slot = 0u; slot < 3u; ++slot)
+                        method_in_image[slot] = methods[slot] >= image_base &&
+                            (uint64_t)methods[slot] <
+                                (uint64_t)image_base + image_size_loaded;
+                    fprintf(stderr,
+                            "AC1 ObjectTypeInfo[%u]: object=0x%08x vtable=0x%08x COL=0x%08x TD=0x%08x slots=0x%08x,0x%08x,0x%08x checks=obj:%d,rtti:%d,name:%d,method-in-image:%d,%d,%d name=\"%s\"\n",
+                            i, object, vtable, col, type_descriptor,
+                            methods[0], methods[1], methods[2],
+                            object_ok, vtable_ok && col_ok && type_ok,
+                            object_type_name, method_in_image[0],
+                            method_in_image[1], method_in_image[2], name);
+                }
+            }
+        }
+    }
 
     if (trace_imports && cpu->eip == 0x00F9FA67u)
         fprintf(stderr, "AC1 CRT callback: target=0x%08x index=%u table=0x%08x stride=%u context=0x%08x\n",
@@ -4398,6 +4613,7 @@ void dispatch(CPU *cpu, uint32_t target)
         int handled = handle_network_import(cpu, import) ||
                       handle_audio_import(cpu, import) ||
                       handle_optional_eax_import(cpu, import) ||
+                      handle_bink_import(cpu, import) ||
 #ifdef _WIN32
                       handle_dinput8_import(cpu, import) ||
                       handle_ds8_import(cpu, import) ||
@@ -4500,6 +4716,13 @@ void dispatch(CPU *cpu, uint32_t target)
 #endif
 
     ac1_lifted_fn function = ac1_lifted_lookup(target);
+    if (!function && bink_image_mapped && target >= bink_image.load_base &&
+        (uint64_t)target < (uint64_t)bink_image.load_base + bink_image.image_size) {
+        bink_lifted_fn bink_function = bink_lifted_lookup(target);
+        if (!bink_function)
+            stop_guest("no generated Bink function for guest target", target);
+        function = bink_function;
+    }
     if (!function)
         stop_guest("no generated function for guest target", target);
 
@@ -4516,6 +4739,43 @@ void dispatch(CPU *cpu, uint32_t target)
     ++dispatch_depth;
     function(cpu);
     --dispatch_depth;
+    if (trace_object_types && guest_callsite == 0x0085B197u) {
+        uint32_t descriptor = cpu->eax;
+        unsigned descriptor_index = object_type_descriptor_count++;
+        if (!descriptor || !guest_memory_try_ptr(descriptor, 0x11u)) {
+            fprintf(stderr,
+                    "AC1 ObjectTypeInfo descriptor[%u]: returned=0x%08x fields=unmapped\n",
+                    descriptor_index, descriptor);
+        } else {
+            uint32_t parent_array = rd32(descriptor + 4u);
+            uint32_t parent_count = rd8(descriptor + 0x10u);
+            fprintf(stderr,
+                    "AC1 ObjectTypeInfo descriptor[%u]: returned=0x%08x parent_array=0x%08x count=%u\n",
+                    descriptor_index, descriptor, parent_array, parent_count);
+            if (parent_count &&
+                !guest_memory_try_ptr(parent_array, (size_t)parent_count * 4u)) {
+                fprintf(stderr,
+                        "AC1 ObjectTypeInfo descriptor[%u]: parent array range is unmapped\n",
+                        descriptor_index);
+            } else {
+                for (uint32_t i = 0u; i < parent_count; ++i) {
+                    if (object_type_parent_records >= 4096u) {
+                        fprintf(stderr,
+                                "AC1 ObjectTypeInfo parent callback collection stopped at 4096 entries\n");
+                        break;
+                    }
+                    uint32_t callback = rd32(parent_array + i * 4u);
+                    int method_in_image = callback >= image_base &&
+                        (uint64_t)callback <
+                            (uint64_t)image_base + image_size_loaded;
+                    fprintf(stderr,
+                            "AC1 ObjectTypeInfo descriptor[%u] parent[%u]: target=0x%08x method-in-image=%d\n",
+                            descriptor_index, i, callback, method_in_image);
+                    ++object_type_parent_records;
+                }
+            }
+        }
+    }
     last_guest_target = previous_target;
     scheduler_checkpoint();
 }
@@ -4586,6 +4846,77 @@ static void derive_guest_current_directory(const char *path)
 #endif
 }
 
+static int load_pinned_bink_module(char *error, size_t error_capacity)
+{
+    uint8_t *file_bytes = NULL;
+    size_t file_size = 0u;
+    uint8_t digest[32];
+    char hash[65];
+    int path_length;
+
+    path_length = snprintf(bink_module_path, sizeof(bink_module_path),
+                           "%s/%s", guest_current_directory, "binkw32.dll");
+    if (path_length < 0 || (size_t)path_length >= sizeof(bink_module_path)) {
+        snprintf(error, error_capacity, "pinned Bink DLL path is too long");
+        return 0;
+    }
+#ifdef _WIN32
+    for (size_t i = 0u; i < (size_t)path_length; ++i)
+        if (bink_module_path[i] == '/') bink_module_path[i] = '\\';
+#endif
+    if (!read_file(bink_module_path, &file_bytes, &file_size,
+                   error, error_capacity))
+        return 0;
+    sha256(file_bytes, file_size, digest);
+    digest_hex(digest, hash);
+    if (strcmp(hash, BINK_MODULE_SHA256)) {
+        snprintf(error, error_capacity,
+                 "Bink DLL SHA-256 mismatch: expected %s, found %s",
+                 BINK_MODULE_SHA256, hash);
+        free(file_bytes);
+        return 0;
+    }
+    if (!pe32_load(file_bytes, file_size, BINK_MODULE_PREFERRED_BASE,
+                   &bink_image, error, error_capacity)) {
+        free(file_bytes);
+        return 0;
+    }
+    free(file_bytes);
+    if (bink_image.preferred_base != BINK_MODULE_PREFERRED_BASE ||
+        bink_image.load_base != BINK_MODULE_PREFERRED_BASE ||
+        bink_image.image_size != BINK_MODULE_IMAGE_SIZE ||
+        bink_image.entry_rva != BINK_MODULE_ENTRY_RVA) {
+        snprintf(error, error_capacity,
+                 "pinned Bink PE layout mismatch: preferred=0x%08x load=0x%08x size=0x%08x entry=0x%08x",
+                 bink_image.preferred_base, bink_image.load_base,
+                 bink_image.image_size, bink_image.entry_rva);
+        pe32_unload(&bink_image);
+        return 0;
+    }
+    for (size_t i = 0u; i < BINK_MODULE_EXPORT_COUNT; ++i) {
+        uint32_t by_name = 0u, by_ordinal = 0u;
+        const bink_export_record *record = &bink_export_records[i];
+        if (!pe32_export_by_name(&bink_image, record->name, &by_name,
+                                 error, error_capacity) ||
+            !pe32_export_by_ordinal(&bink_image, record->ordinal, &by_ordinal,
+                                    error, error_capacity) ||
+            by_name != record->guest_va || by_ordinal != record->guest_va) {
+            if (!error[0])
+                snprintf(error, error_capacity,
+                         "pinned Bink export map mismatch at %s ordinal %u",
+                         record->name, (unsigned)record->ordinal);
+            pe32_unload(&bink_image);
+            return 0;
+        }
+    }
+    if (!pe32_link_imports(&bink_image, resolve_import, NULL,
+                           error, error_capacity)) {
+        pe32_unload(&bink_image);
+        return 0;
+    }
+    return 1;
+}
+
 static uint64_t read_dispatch_limit(void)
 {
     const char *setting = getenv("AC1_DISPATCH_LIMIT");
@@ -4628,11 +4959,15 @@ int ac1_run(const char *exe_path)
 #endif
     import_count = 0;
     memset(imports, 0, sizeof(imports));
+    memset(&bink_image, 0, sizeof(bink_image));
+    bink_image_mapped = 0;
+    bink_module_path[0] = '\0';
     process_heap = NULL;
     guest_files = NULL;
     exe_path_copy[0] = '\0';
     command_line_guest_address = 0;
     image_base = 0;
+    image_size_loaded = 0u;
     static_tls_data_base = 0;
     static_tls_vector_base = 0;
     static_tls_template = NULL;
@@ -4652,6 +4987,12 @@ int ac1_run(const char *exe_path)
     memset(sync_objects, 0, sizeof(sync_objects));
     const char *trace_setting = getenv("AC1_TRACE_IMPORTS");
     trace_imports = trace_setting && *trace_setting && strcmp(trace_setting, "0");
+    const char *type_trace_setting = getenv("AC1_TRACE_OBJECT_TYPES");
+    trace_object_types = type_trace_setting && *type_trace_setting &&
+                         strcmp(type_trace_setting, "0");
+    object_type_registry_traced = 0;
+    object_type_parent_records = 0u;
+    object_type_descriptor_count = 0u;
     if (trace_imports)
         fprintf(stderr, "AC1 dispatch guard: limit=%llu (0 disables)\n",
                 (unsigned long long)dispatch_limit);
@@ -4696,16 +5037,31 @@ int ac1_run(const char *exe_path)
         unlock_ac1_run();
         return 4;
     }
+    if (!load_pinned_bink_module(error, sizeof(error))) {
+        snprintf(last_run_error, sizeof(last_run_error),
+                 "pinned Bink module load failed: %s", error);
+        fprintf(stderr, "AC1 native runtime: %s\n", last_run_error);
+        pe32_unload(&image);
+        memset(imports, 0, sizeof(imports));
+        import_count = 0;
+        bink_module_path[0] = '\0';
+        unlock_ac1_run();
+        return 4;
+    }
     space = guest_address_space_create();
     if (!space) {
         snprintf(last_run_error, sizeof(last_run_error), "guest address-space allocation failed");
         fprintf(stderr, "AC1 native runtime: guest address-space allocation failed\n");
+        pe32_unload(&bink_image);
+        bink_module_path[0] = '\0';
         pe32_unload(&image);
         unlock_ac1_run();
         return 5;
     }
     guest_address_space_select(space);
     guest_memory_add(image.image, image.load_base, image.image_size);
+    guest_memory_add(bink_image.image, bink_image.load_base, bink_image.image_size);
+    bink_image_mapped = 1;
     guest_files = ac1_files_create(guest_current_directory);
     if (!guest_files) {
         snprintf(last_run_error, sizeof(last_run_error),
@@ -4778,6 +5134,7 @@ int ac1_run(const char *exe_path)
     cpu->eflags_misc = 2u;
     cpu->fs_base = AC1_TIB_BASE;
     image_base = image.load_base;
+    image_size_loaded = image.image_size;
     wr32(cpu->esp, AC1_RETURN_SENTINEL);
     dispatch_count = 0;
     dispatch_depth = 0;
@@ -4790,6 +5147,20 @@ int ac1_run(const char *exe_path)
 
     if (setjmp(stop_runtime) == 0) {
         runtime_stop_ready = 1;
+        const uint32_t bink_attach_arguments[3] = {
+            bink_image.load_base, 1u, 0u /* DLL_PROCESS_ATTACH, reserved */
+        };
+        uint32_t bink_attach_result = 0u;
+        uint32_t bink_entry = bink_image.load_base + bink_image.entry_rva;
+        if (!invoke_guest_stdcall_callback(cpu, bink_entry,
+                                           bink_attach_arguments, 3u,
+                                           &bink_attach_result))
+            stop_guest("Bink DllMain PROCESS_ATTACH frame setup failed", bink_entry);
+        if (!bink_attach_result)
+            stop_guest("Bink DllMain rejected DLL_PROCESS_ATTACH", bink_entry);
+        fprintf(stderr,
+                "AC1 Bink attached: base=0x%08x entry=0x%08x result=0x%08x\n",
+                bink_image.load_base, bink_entry, bink_attach_result);
         dispatch(cpu, cpu->eip);
         runtime_stop_ready = 0;
         if (cpu->esp == stack_top && rd32(stack_top - 4u) == AC1_RETURN_SENTINEL) {
@@ -4883,8 +5254,11 @@ cleanup:
         if (static_tls_data_base) guest_memory_release(static_tls_data_base);
         guest_memory_release(AC1_TIB_BASE);
         guest_memory_release(AC1_STACK_BASE);
+        if (bink_image_mapped) (void)guest_memory_remove(bink_image.load_base);
         (void)guest_memory_remove(image.load_base);
     }
+    bink_image_mapped = 0;
+    bink_module_path[0] = '\0';
     static_tls_data_base = 0;
     static_tls_vector_base = 0;
     static_tls_template = NULL;
@@ -4893,6 +5267,7 @@ cleanup:
     static_tls_index_address = 0u;
     guest_address_space_select(NULL);
     guest_address_space_destroy(space);
+    pe32_unload(&bink_image);
     pe32_unload(&image);
     memset(imports, 0, sizeof(imports));
     import_count = 0;

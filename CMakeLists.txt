@@ -7,11 +7,18 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 option(AC1_TRACE_EIP "Record the last original instruction address for startup diagnostics" ON)
 option(AC1_HOST_D3D9 "Build the native Windows D3D9 bridge" ${WIN32})
 set(AC1_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/work/lift_initial" CACHE PATH "Private generated AC1 C source")
+set(AC1_BINK_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/work/lift_bink" CACHE PATH "Private generated Bink C source")
 file(GLOB AC1_GENERATED CONFIGURE_DEPENDS
   "${AC1_GENERATED_DIR}/initial.c"
   "${AC1_GENERATED_DIR}/initial_*.c")
+file(GLOB AC1_BINK_GENERATED CONFIGURE_DEPENDS
+  "${AC1_BINK_GENERATED_DIR}/initial_*.c"
+  "${AC1_BINK_GENERATED_DIR}/bink_dispatch.c")
 if(NOT AC1_GENERATED)
   message(FATAL_ERROR "Generate real AC1 functions with tools/lift_ac1.py before building")
+endif()
+if(NOT AC1_BINK_GENERATED)
+  message(FATAL_ERROR "Generate the pinned Bink module with tools/lift_bink.py before building")
 endif()
 
 add_library(ac1_runtime STATIC
@@ -22,7 +29,8 @@ add_library(ac1_runtime STATIC
   src/runtime/guest_memory.c
   src/runtime/pe32_loader.c
   src/runtime/pcrecomp_heap.c
-  ${AC1_GENERATED})
+  ${AC1_GENERATED}
+  ${AC1_BINK_GENERATED})
 set_target_properties(ac1_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(ac1_runtime PUBLIC Threads::Threads)
 if(WIN32)
@@ -46,6 +54,8 @@ if(AC1_HOST_D3D9)
   target_link_libraries(ac1_runtime PRIVATE ac1_d3d9_bridge)
 endif()
 target_include_directories(ac1_runtime PUBLIC src/runtime "${AC1_GENERATED_DIR}")
+set_source_files_properties(src/runtime/ac1_runtime.c PROPERTIES
+  INCLUDE_DIRECTORIES "${AC1_BINK_GENERATED_DIR}")
 if(AC1_TRACE_EIP)
   target_compile_definitions(ac1_runtime PRIVATE AC1_TRACE_EIP)
 endif()

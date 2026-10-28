@@ -35,6 +35,10 @@ try {
     }
     & $Python -B tools/prepare_runtime.py
     if ($LASTEXITCODE -ne 0) { throw 'CPU adapter preparation failed' }
+    $BinkArgs = @('-B', 'tools/lift_bink.py')
+    if (-not $Generate) { $BinkArgs += '--if-needed' }
+    & $Python @BinkArgs
+    if ($LASTEXITCODE -ne 0) { throw 'Bink module generation failed' }
     if ($PrepareOnly) {
         Write-Host ('Native inputs prepared in {0:N2} s' -f $Timer.Elapsed.TotalSeconds)
         return

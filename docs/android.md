@@ -8,9 +8,10 @@ presentation, game input, audio and gameplay are not implemented yet.
 ## Build
 
 Install Android SDK platform 35, NDK 28.2.13676358, CMake 3.22.1 and JDK 17 or
-21. The configured original executable and local pcrecomp checkout must be
-available; the script prepares or refreshes generated C in `work/lift_initial`
-before Gradle. From the repository root, run:
+21. The configured original executable, its adjacent `binkw32.dll`, and the local
+pcrecomp checkout must be available; the script prepares or refreshes generated
+C in `work/lift_initial` and `work/lift_bink` before Gradle. From the repository
+root, run:
 
 ```powershell
 .\tools\build_android.ps1
@@ -38,7 +39,9 @@ unavailable). Runtime settings and game-created files go under the separate
 private `userdata` directory. Choose **Run original startup** to call the native
 harness on a worker thread. The harness currently stops at the first
 unsupported import or guest address; a successful APK build does not establish
-that it can reach the menu, render a frame, or run on an Android device.
+that it can reach the menu, render a frame, or run on an Android device. Bink's
+process initialization is verified on Windows; its directory queries currently
+stop explicitly on Android pending virtual Win32 path support.
 
 The APK contains generated code from the proprietary executable, so this local
 diagnostic package is ignored by Git and must not be redistributed. No game

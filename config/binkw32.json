@@ -1,0 +1,19 @@
+{
+  "binary": "C:/Program Files (x86)/GOG.com/Assassins Creed/binkw32.dll",
+  "sha256": "603d0a96d1f27422f88d78b20ca525975ebe5e0d7667e62b98a3db80766702b4",
+  "preferred_base": "0x18000000",
+  "image_size": "0x38000",
+  "entry_rva": "0x17F0",
+  "root_set": "attach",
+  "observed_seeds": [
+    "0x18002793",
+    "0x18002B7F",
+    "0x18005331",
+    "0x18002725",
+    "0x18002691",
+    "0x18004BCD"
+  ],
+  "max_functions": 10000,
+  "max_depth": 3,
+  "translation_unit_buckets": 16
+}

@@ -2,7 +2,7 @@
 
 This repository currently builds and executes a statically translated portion of the original GOG DX9 executable on a 64-bit Windows host. It also builds an Android ARM64 diagnostic APK from the same generated code and runtime. **The game is not playable yet.** Graphics, menu, audio playback, gameplay, and Android device execution are not verified.
 
-Generated functions are native C compiled ahead of time. Guest registers and 32-bit addresses preserve the original x86 program's semantics; there is no instruction decoder, JIT, Wine, or x86 interpreter in the runtime. Untranslated function targets and unimplemented imports stop with the original instruction address. Only the selected executable fingerprint is accepted.
+Generated functions are native C compiled ahead of time. Guest registers and 32-bit addresses preserve the original x86 program's semantics; there is no instruction decoder, JIT, Wine, or x86 interpreter in the runtime. Untranslated function targets and unimplemented imports stop with the original instruction address. The executable and its adjacent `binkw32.dll` must match the pinned fingerprints.
 
 ## Build and execute
 
@@ -26,6 +26,8 @@ Host tools: MSYS2 MinGW64 GCC and the Android SDK's CMake 3.22.1/Ninja. Python d
 
 The generator assigns functions to 100 fixed groups by address and preserves unchanged files. Existing functions keep their group when the catalog grows, avoiding unnecessary recompilation; a runtime edit does not regenerate game code. Driver/config changes trigger generation automatically. It seeds the original C and C++ initializer tables (1,750 validated function pointers) from the bounds in `config/startup_initializers.json`. Add other observed indirect targets to `initial_discovery.startup_seeds`; `--seed` and `--seed-file` also support focused experiments. Unsupported instructions remain explicit runtime failures.
 
+The same build also translates the required Bink DLL functions using `tools/lift_bink.py` and `config/binkw32.json`. Its 16 stable source groups have a separate dispatcher, and unchanged inputs skip generation. Add observed Bink targets to that configuration's `observed_seeds`. The original DLL remains user-supplied game data; the runtime verifies it and maps its data at the original guest address without loading x86 code into the host process.
+
 ```powershell
 & 'D:\Prog\dukemp_recomp\.venv\Scripts\python.exe' -B tools\lift_ac1.py --selftest
 & 'D:\Prog\dukemp_recomp\.venv\Scripts\python.exe' -B tools\inventory_ac1.py
@@ -46,6 +48,8 @@ The original audio initialization now reads and writes `DARE.INI` through the pr
 On Windows, the original code enumerates actual audio devices, follows its own fallback when optional EAX audio is unavailable, and creates a real DirectSound8 device, primary and secondary buffers, and a 3D listener. Guest COM proxies marshal 32-bit pointers into the native interfaces. Unsupported methods remain diagnostic stops. This Windows audio backend is not yet implemented on Android, and no audible playback is claimed.
 
 The original startup successfully probes `DataPC_Common.forge` through read-only file handles rooted in the installed game directory. Its DirectInput8W mouse and keyboard creation, object enumeration, and data-format setup all return native success. The original callback handles 11 mouse and 127 keyboard records with Unicode names. Native attached-controller enumeration also succeeds (zero controllers on this host). Input acquisition, polling, and interactive control remain unverified. The file service currently supports the observed archive open/close probe; this is not yet archive-content loading.
+
+The pinned Bink 1.8i DLL has SHA-256 `603d0a96d1f27422f88d78b20ca525975ebe5e0d7667e62b98a3db80766702b4`. Its recompiled entry at `0x180017F0` completes `DLL_PROCESS_ATTACH` before EXE execution. The game then calls the original `_BinkSetMemory@8` export at `0x1800DB80`, which stores guest allocator/free callbacks `0x009E8D90` and `0x009E90D0`; the runtime verifies those writes. The preserved host trace is `work/bink_attach_setmemory_verified.log`. Video decoding and playback remain unverified.
 
 The standalone Android DXVK Native dependency also builds with `ports/dxvk_android/build.ps1`, producing an AArch64 shared library with all 54 built-in shaders validated. It is not yet connected to guest D3D9 calls or the APK's surface lifecycle. See [graphics integration](docs/graphics.md), [binary findings](docs/binary.md), [architecture decision](docs/architecture.md), [NFSU2 reuse findings](docs/nfs-reuse.md), and [runtime source notices](src/runtime/NOTICE.md). Duke and Mafia sources were inspected locally, including Mafia's uncommitted changes. NFSU2 provides the primary reference for the D3D9 COM bridge and DXVK Native integration.
 
