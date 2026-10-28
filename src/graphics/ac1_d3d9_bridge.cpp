@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iomanip>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -30,8 +31,10 @@ constexpr uint32_t kKindStride = 0x1000u;
 constexpr uint32_t kSlotStride = 0x10u;
 constexpr uint32_t kD3D9Kind = 1u;
 constexpr uint32_t kDeviceKind = 2u;
+constexpr uint32_t kSurfaceKind = 3u;
 constexpr uint32_t kD3D9VtableSlots = 17u;
 constexpr uint32_t kDeviceVtableSlots = 119u;
+constexpr uint32_t kSurfaceVtableSlots = 17u;
 
 constexpr GUID kIidIUnknown =
     {0x00000000u, 0x0000u, 0x0000u, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
@@ -39,8 +42,14 @@ constexpr GUID kIidIDirect3D9 =
     {0x81bdcbcau, 0x64d4u, 0x426du, {0xae, 0x8d, 0xad, 0x01, 0x47, 0xf4, 0x27, 0x5c}};
 constexpr GUID kIidIDirect3DDevice9 =
     {0xd0223b96u, 0xbf7au, 0x43fdu, {0x92, 0xbd, 0xa4, 0x3b, 0x0d, 0x82, 0xb9, 0xeb}};
+constexpr GUID kIidIDirect3DSurface9 =
+    {0x0cfbaf3au, 0x9ff6u, 0x429au, {0x99, 0xb3, 0xa2, 0x79, 0x6a, 0xf8, 0xb8, 0x9b}};
 
-enum class ObjectKind : uint32_t { D3D9 = kD3D9Kind, Device = kDeviceKind };
+enum class ObjectKind : uint32_t {
+    D3D9 = kD3D9Kind,
+    Device = kDeviceKind,
+    Surface = kSurfaceKind
+};
 
 struct GuestObject {
     IUnknown *native = nullptr;
@@ -96,21 +105,26 @@ static_assert(sizeof(D3DADAPTER_IDENTIFIER9) == 1104,
               "D3DADAPTER_IDENTIFIER9 guest/host ABI mismatch");
 static_assert(sizeof(D3DCAPS9) == 304,
               "D3DCAPS9 guest/host ABI mismatch");
+static_assert(sizeof(D3DSURFACE_DESC) == 32,
+              "D3DSURFACE_DESC guest/host ABI mismatch");
 
 ac1_d3d9_callbacks g_callbacks{};
 void *g_context = nullptr;
 std::map<uint32_t, GuestObject> g_objects;
 std::map<IUnknown *, uint32_t> g_guest_by_native;
 std::mutex g_mutex;
-thread_local std::string g_last_error;
+/* MinGW thread-exit crashes were reproduced with nontrivial TLS destructors. */
+thread_local char g_last_error[1024]{};
 #if defined(_WIN32)
 HMODULE g_d3d9_module = nullptr;
 #endif
 
 void set_error(const std::string &message)
 {
-    g_last_error = message;
-    if (g_callbacks.log) g_callbacks.log(g_context, message.c_str());
+    const size_t length = std::min(message.size(), sizeof(g_last_error) - 1);
+    std::memcpy(g_last_error, message.data(), length);
+    g_last_error[length] = '\0';
+    if (g_callbacks.log) g_callbacks.log(g_context, g_last_error);
 #if defined(_WIN32)
     else {
         std::string line = "AC1 D3D9 bridge: " + message + "\n";
@@ -121,7 +135,7 @@ void set_error(const std::string &message)
 
 void clear_error()
 {
-    g_last_error.clear();
+    g_last_error[0] = '\0';
 }
 
 void *guest_memory(uint32_t address, uint32_t width, uint32_t access)
@@ -154,22 +168,35 @@ uint32_t slot_token(ObjectKind kind, uint32_t slot)
 
 uint32_t slot_count(ObjectKind kind)
 {
-    return kind == ObjectKind::D3D9 ? kD3D9VtableSlots : kDeviceVtableSlots;
+    switch (kind) {
+    case ObjectKind::D3D9: return kD3D9VtableSlots;
+    case ObjectKind::Device: return kDeviceVtableSlots;
+    case ObjectKind::Surface: return kSurfaceVtableSlots;
+    }
+    return 0;
 }
 
 int token_argument_count(uint32_t token)
 {
-    if (token < kTokenBase || token >= kTokenBase + 3 * kKindStride) return 0;
+    if (token < kTokenBase || token >= kTokenBase + 4 * kKindStride) return 0;
     const uint32_t offset = token - kTokenBase;
     const uint32_t kind = offset / kKindStride;
     const uint32_t within_kind = offset % kKindStride;
-    if (kind != kD3D9Kind && kind != kDeviceKind) return 0;
+    if (kind != kD3D9Kind && kind != kDeviceKind && kind != kSurfaceKind) return 0;
     if (within_kind % kSlotStride) return -1;
     const uint32_t method = within_kind / kSlotStride;
     if (method >= slot_count(static_cast<ObjectKind>(kind))) return -1;
 
-    if (kind == kDeviceKind)
-        return method < 3 ? (method == 0 ? 3 : 1) : -2;
+    if (kind == kDeviceKind) {
+        if (method < 3) return method == 0 ? 3 : 1;
+        if (method == 38) return 3;
+        if (method == 40) return 2;
+        return -2;
+    }
+    if (kind == kSurfaceKind) {
+        if (method < 3) return method == 0 ? 3 : 1;
+        return method == 12 ? 2 : -2;
+    }
 
     /* IDirect3D9 slots 0..16. Values include the COM `this` stack word. */
     static constexpr int arities[kD3D9VtableSlots] = {
@@ -275,6 +302,38 @@ bool require_count(uint32_t got, uint32_t expected, const char *method)
     return false;
 }
 
+bool bridge_supports_iid(ObjectKind kind, const GUID &iid)
+{
+    const GUID &supported = kind == ObjectKind::D3D9
+        ? kIidIDirect3D9
+        : kind == ObjectKind::Device ? kIidIDirect3DDevice9
+                                     : kIidIDirect3DSurface9;
+    return std::memcmp(&iid, &kIidIUnknown, sizeof(iid)) == 0 ||
+           std::memcmp(&iid, &supported, sizeof(iid)) == 0;
+}
+
+const char *interface_name(ObjectKind kind)
+{
+    switch (kind) {
+    case ObjectKind::D3D9: return "IDirect3D9";
+    case ObjectKind::Device: return "IDirect3DDevice9";
+    case ObjectKind::Surface: return "IDirect3DSurface9";
+    }
+    return "IUnknown";
+}
+
+void report_unsupported_iid(ObjectKind kind, const GUID &iid)
+{
+    std::ostringstream message;
+    message << interface_name(kind) << "::QueryInterface IID {"
+            << std::hex << std::setfill('0') << std::setw(8) << iid.Data1 << '-'
+            << std::setw(4) << iid.Data2 << '-' << std::setw(4) << iid.Data3 << '-';
+    for (uint8_t byte : iid.Data4)
+        message << std::setw(2) << static_cast<unsigned>(byte);
+    message << "} is not implemented by the bridge; native QueryInterface was not called";
+    set_error(message.str());
+}
+
 uintptr_t host_window(uint32_t guest_hwnd, bool *ok)
 {
     *ok = true;
@@ -342,17 +401,7 @@ HRESULT do_query_interface(GuestObject &object, const uint32_t *args,
         set_error("QueryInterface IID is unmapped");
         return D3DERR_INVALIDCALL;
     }
-    const GUID &supported = object.kind == ObjectKind::D3D9
-        ? kIidIDirect3D9 : kIidIDirect3DDevice9;
-    const bool is_unknown = std::memcmp(&iid, &kIidIUnknown, sizeof(iid)) == 0;
-    const bool is_supported = std::memcmp(&iid, &supported, sizeof(iid)) == 0;
-    if (!is_unknown && !is_supported) {
-        if (!guest_write(args[2], result, sizeof(*result))) {
-            set_error("QueryInterface output pointer is unmapped");
-            return D3DERR_INVALIDCALL;
-        }
-        return E_NOINTERFACE;
-    }
+    /* Dispatch rejects IIDs without a bridge proxy before reaching native QI. */
     void *output = nullptr;
     HRESULT status = object.native->QueryInterface(iid, &output);
     uint32_t guest_output = 0;
@@ -432,6 +481,37 @@ HRESULT create_device(IDirect3D9 *d3d, const uint32_t *args)
         set_error("CreateDevice output pointer became unmapped");
         return D3DERR_INVALIDCALL;
     }
+    return status;
+}
+
+HRESULT get_device_surface(IDirect3DDevice9 *device, const uint32_t *args,
+                           bool depth_stencil)
+{
+    const uint32_t output_address = depth_stencil ? args[1] : args[2];
+    auto *output = static_cast<uint32_t *>(guest_memory(
+        output_address, sizeof(uint32_t), AC1_D3D9_GUEST_WRITE));
+    if (!output) {
+        set_error(depth_stencil
+            ? "GetDepthStencilSurface output pointer is unmapped"
+            : "GetRenderTarget output pointer is unmapped");
+        return D3DERR_INVALIDCALL;
+    }
+    *output = 0;
+
+    IDirect3DSurface9 *surface = nullptr;
+    HRESULT status = depth_stencil
+        ? device->GetDepthStencilSurface(&surface)
+        : device->GetRenderTarget(args[1], &surface);
+    if (FAILED(status)) return status;
+    if (!surface) {
+        set_error("native surface getter succeeded without returning a surface");
+        return E_FAIL;
+    }
+
+    const uint32_t guest_surface = wrap_native(
+        static_cast<IUnknown *>(surface), ObjectKind::Surface, true);
+    if (!guest_surface) return E_OUTOFMEMORY;
+    *output = guest_surface;
     return status;
 }
 
@@ -603,9 +683,77 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
         }
         return guest_count;
     }
+    if (method == 38) {
+        if (!require_count(argc, 3, "IDirect3DDevice9::GetRenderTarget"))
+            return hresult(D3DERR_INVALIDCALL);
+        return hresult(get_device_surface(static_cast<IDirect3DDevice9 *>(object.native),
+                                          args, false));
+    }
+    if (method == 40) {
+        if (!require_count(argc, 2, "IDirect3DDevice9::GetDepthStencilSurface"))
+            return hresult(D3DERR_INVALIDCALL);
+        return hresult(get_device_surface(static_cast<IDirect3DDevice9 *>(object.native),
+                                          args, true));
+    }
     std::ostringstream message;
     message << "IDirect3DDevice9 method " << method
             << " is not implemented; no guest device/frame success is implied";
+    set_error(message.str());
+    return hresult(D3DERR_NOTAVAILABLE);
+}
+
+uint32_t invoke_surface(GuestObject &object, uint32_t method,
+                        const uint32_t *args, uint32_t argc)
+{
+    if (method == 0) {
+        if (!require_count(argc, 3, "IDirect3DSurface9::QueryInterface"))
+            return hresult(D3DERR_INVALIDCALL);
+        uint32_t output = 0;
+        return hresult(do_query_interface(object, args, &output));
+    }
+    if (method == 1) {
+        if (!require_count(argc, 1, "IDirect3DSurface9::AddRef")) return 0;
+        ++object.guest_references;
+        object.native->AddRef();
+        return object.guest_references;
+    }
+    if (method == 2) {
+        if (!require_count(argc, 1, "IDirect3DSurface9::Release")) return 0;
+        if (!object.guest_references) {
+            set_error("IDirect3DSurface9::Release called with zero guest references");
+            return 0;
+        }
+        IUnknown *native = object.native;
+        const uint32_t guest_address = args[0];
+        native->Release();
+        const uint32_t guest_count = --object.guest_references;
+        if (guest_count == 0) {
+            GuestObject retired = object;
+            g_guest_by_native.erase(native);
+            g_objects.erase(guest_address);
+            free_guest_object(guest_address, retired);
+        }
+        return guest_count;
+    }
+    if (method == 12) {
+        if (!require_count(argc, 2, "IDirect3DSurface9::GetDesc"))
+            return hresult(D3DERR_INVALIDCALL);
+        auto *output = static_cast<D3DSURFACE_DESC *>(guest_memory(
+            args[1], sizeof(D3DSURFACE_DESC), AC1_D3D9_GUEST_WRITE));
+        if (!output) {
+            set_error("IDirect3DSurface9::GetDesc output is unmapped");
+            return hresult(D3DERR_INVALIDCALL);
+        }
+        D3DSURFACE_DESC description{};
+        const HRESULT status = static_cast<IDirect3DSurface9 *>(object.native)->GetDesc(
+            &description);
+        if (SUCCEEDED(status)) std::memcpy(output, &description, sizeof(description));
+        return hresult(status);
+    }
+
+    std::ostringstream message;
+    message << "IDirect3DSurface9 method " << method
+            << " is not implemented; no surface success is implied";
     set_error(message.str());
     return hresult(D3DERR_NOTAVAILABLE);
 }
@@ -720,9 +868,25 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
         set_error("COM token called with an unknown guest object or interface kind");
         return -1;
     }
-    *result_out = object->kind == ObjectKind::D3D9
-        ? invoke_d3d9(*object, method, args, arg_count)
-        : invoke_device(*object, method, args, arg_count);
+    if (method == 0) {
+        GUID iid{};
+        if (guest_read(args[1], &iid, sizeof(iid)) &&
+            !bridge_supports_iid(object->kind, iid)) {
+            report_unsupported_iid(object->kind, iid);
+            return -2;
+        }
+    }
+    switch (object->kind) {
+    case ObjectKind::D3D9:
+        *result_out = invoke_d3d9(*object, method, args, arg_count);
+        break;
+    case ObjectKind::Device:
+        *result_out = invoke_device(*object, method, args, arg_count);
+        break;
+    case ObjectKind::Surface:
+        *result_out = invoke_surface(*object, method, args, arg_count);
+        break;
+    }
     return 1;
 }
 
@@ -752,5 +916,5 @@ extern "C" AC1_D3D9_API void ac1_d3d9_shutdown(void)
 
 extern "C" AC1_D3D9_API const char *ac1_d3d9_last_error(void)
 {
-    return g_last_error.c_str();
+    return g_last_error;
 }

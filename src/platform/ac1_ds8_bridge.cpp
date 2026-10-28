@@ -87,19 +87,24 @@ ac1_ds8_callbacks g_callbacks{};
 void *g_context = nullptr;
 std::map<uint32_t, GuestObject> g_objects;
 std::mutex g_mutex;
-thread_local std::string g_last_error;
+/* A standalone CreateThread/Wait probe reproduces MinGW's TLS-dtor heap
+ * failure with thread_local std::string, independent of the game. Keep this
+ * per-thread diagnostic POD so worker exit needs no nontrivial TLS cleanup. */
+thread_local char g_last_error[1024]{};
 HMODULE g_dsound_module = nullptr;
 
 void set_error(const std::string &message)
 {
-    g_last_error = message;
+    const size_t copy_size = std::min(message.size(), sizeof(g_last_error) - 1u);
+    if (copy_size) std::memcpy(g_last_error, message.data(), copy_size);
+    g_last_error[copy_size] = '\0';
     if (g_callbacks.log) g_callbacks.log(g_context, message.c_str());
     else OutputDebugStringA(("AC1 DirectSound bridge: " + message + "\n").c_str());
 }
 
 void clear_error()
 {
-    g_last_error.clear();
+    g_last_error[0] = '\0';
 }
 
 void *guest_memory(uint32_t address, uint32_t size, uint32_t access)
@@ -203,6 +208,8 @@ int token_argument_count(uint32_t token)
         return 8; /* Lock(this, offset, bytes, ptr1, size1, ptr2, size2, flags). */
     if (is_buffer_kind(object_kind) && method == 12u)
         return 4; /* Play(this, reserved1, reserved2, flags). */
+    if (is_buffer_kind(object_kind) && method == 4u)
+        return 3; /* GetCurrentPosition(this, playCursor*, writeCursor*). */
     if (is_buffer_kind(object_kind) && method == 14u)
         return 2; /* SetFormat(this, WAVEFORMATEX*). */
     if (is_buffer_kind(object_kind) && method == 15u)
@@ -824,6 +831,26 @@ extern "C" int ac1_ds8_dispatch(uint32_t token, const uint32_t *args,
         *result_out = static_cast<uint32_t>(result);
         return AC1_DS8_HANDLED;
     }
+    if (is_buffer_kind(kind) && method == 4u) {
+        uint32_t *guest_play_cursor = static_cast<uint32_t *>(
+            guest_memory(args[1], sizeof(uint32_t), AC1_DS8_GUEST_WRITE));
+        uint32_t *guest_write_cursor = static_cast<uint32_t *>(
+            guest_memory(args[2], sizeof(uint32_t), AC1_DS8_GUEST_WRITE));
+        if (!guest_play_cursor || !guest_write_cursor) {
+            set_error("DirectSound GetCurrentPosition output is not writable in guest memory");
+            return AC1_DS8_ERROR;
+        }
+        DWORD play_cursor = 0;
+        DWORD write_cursor = 0;
+        const HRESULT result = native_buffer(object)->GetCurrentPosition(
+            &play_cursor, &write_cursor);
+        if (SUCCEEDED(result)) {
+            *guest_play_cursor = play_cursor;
+            *guest_write_cursor = write_cursor;
+        }
+        *result_out = static_cast<uint32_t>(result);
+        return AC1_DS8_HANDLED;
+    }
     if (is_buffer_kind(kind) && method == 14u)
         return invoke_buffer_set_format(object, args, result_out);
     if (is_buffer_kind(kind) && method == 15u) {
@@ -876,5 +903,5 @@ extern "C" void ac1_ds8_shutdown(void)
 
 extern "C" const char *ac1_ds8_last_error(void)
 {
-    return g_last_error.c_str();
+    return g_last_error;
 }

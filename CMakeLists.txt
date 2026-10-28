@@ -17,6 +17,7 @@ endif()
 add_library(ac1_runtime STATIC
   src/runtime/ac1_runtime.c
   src/runtime/ac1_network.c
+  src/runtime/ac1_files.c
   src/runtime/guest_clock.c
   src/runtime/guest_memory.c
   src/runtime/pe32_loader.c
@@ -29,7 +30,8 @@ if(WIN32)
   target_sources(ac1_runtime PRIVATE
     src/platform/ac1_window_win32.c
     src/platform/ac1_audio_win32.c
-    src/platform/ac1_ds8_bridge.cpp)
+    src/platform/ac1_ds8_bridge.cpp
+    src/platform/ac1_dinput8_bridge.cpp)
   target_compile_features(ac1_runtime PRIVATE cxx_std_17)
   target_include_directories(ac1_runtime PRIVATE src/platform)
   target_link_libraries(ac1_runtime PRIVATE ws2_32 user32 gdi32)
@@ -67,5 +69,8 @@ if(NOT ANDROID)
     add_executable(ac1_window_smoke EXCLUDE_FROM_ALL tests/ac1_window_win32_smoke.c)
     target_include_directories(ac1_window_smoke PRIVATE src/platform)
     target_link_libraries(ac1_window_smoke PRIVATE ac1_runtime)
+    add_executable(ac1_dinput8_smoke EXCLUDE_FROM_ALL src/platform/tests/dinput8_bridge_smoke.cpp)
+    target_compile_features(ac1_dinput8_smoke PRIVATE cxx_std_17)
+    target_link_libraries(ac1_dinput8_smoke PRIVATE ac1_runtime)
   endif()
 endif()

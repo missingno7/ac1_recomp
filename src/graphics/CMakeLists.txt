@@ -22,6 +22,6 @@ option(AC1_D3D9_BUILD_SMOKE "Build a real Direct3DCreate9/GetAdapterCount host s
 if(AC1_D3D9_BUILD_SMOKE)
   enable_testing()
   add_executable(ac1_d3d9_bridge_smoke tests/bridge_smoke.cpp)
-  target_link_libraries(ac1_d3d9_bridge_smoke PRIVATE ac1_d3d9_bridge)
+  target_link_libraries(ac1_d3d9_bridge_smoke PRIVATE ac1_d3d9_bridge user32)
   add_test(NAME ac1_d3d9_bridge_smoke COMMAND ac1_d3d9_bridge_smoke)
 endif()

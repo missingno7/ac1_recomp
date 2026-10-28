@@ -6,6 +6,7 @@
 #include "pe32_loader.h"
 #include "pcrecomp_heap.h"
 #include "ac1_network.h"
+#include "ac1_files.h"
 #include "initial_dispatch.h"
 #include "ac1_fingerprint.h"
 #include "../platform/ac1_audio_win32.h"
@@ -27,6 +28,7 @@
 #include <direct.h>
 #include "../platform/ac1_window_win32.h"
 #include "../platform/ac1_ds8_bridge.h"
+#include "../platform/ac1_dinput8_bridge.h"
 #else
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -121,6 +123,7 @@ static _Thread_local uint64_t dispatch_count;
 static uint64_t dispatch_limit = AC1_DISPATCH_LIMIT_DEFAULT;
 static _Thread_local unsigned dispatch_depth;
 static pcrecomp_heap *process_heap;
+static ac1_files *guest_files;
 static char exe_path_copy[32768];
 static char guest_current_directory[32768];
 static uint32_t command_line_guest_address;
@@ -137,6 +140,7 @@ static uint32_t image_base;
 #ifdef _WIN32
 static ac1_window_win32 *window_bridge;
 static int ds8_configured;
+static int dinput8_configured;
 #endif
 #if defined(AC1_HOST_D3D9)
 typedef struct { uint32_t guest_address, heap_address; } ac1_d3d9_heap_block;
@@ -204,6 +208,12 @@ static size_t import_count;
 static _Thread_local char stop_reason[512];
 static _Thread_local char last_run_error[512];
 static void stop_guest(const char *reason, uint32_t target);
+#ifdef _WIN32
+static int invoke_guest_stdcall_callback(CPU *cpu, uint32_t procedure,
+                                         const uint32_t *arguments,
+                                         uint32_t argument_count,
+                                         uint32_t *result);
+#endif
 
 static int prepare_guest_thread(ac1_guest_thread *thread)
 {
@@ -1333,6 +1343,72 @@ static int handle_ds8_import(CPU *cpu, const import_record *import)
     return 1;
 }
 
+static uintptr_t dinput8_guest_hinstance_to_host(void *context,
+                                                uint32_t guest_hinstance)
+{
+    (void)context;
+    if (guest_hinstance == image_base)
+        return (uintptr_t)GetModuleHandleA(NULL);
+    return 0u;
+}
+
+static int dinput8_ensure_configured(void)
+{
+    if (dinput8_configured) return 1;
+    ac1_dinput8_callbacks callbacks;
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.struct_size = sizeof(callbacks);
+    callbacks.guest_resolve = ds8_guest_resolve;
+    callbacks.guest_alloc = ds8_guest_alloc;
+    callbacks.guest_free = ds8_guest_free;
+    callbacks.guest_hwnd_to_host = ds8_guest_hwnd_to_host;
+    callbacks.guest_hinstance_to_host = dinput8_guest_hinstance_to_host;
+    if (!ac1_dinput8_configure(&callbacks, NULL)) return 0;
+    dinput8_configured = 1;
+    return 1;
+}
+
+static int handle_dinput8_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal ||
+        !equal_ascii_fold(import->dll, "DINPUT8.dll") ||
+        strcmp(import->name, "DirectInput8Create"))
+        return 0;
+    if (!guest_memory_try_ptr(cpu->esp + 4u, 20u))
+        stop_guest("DirectInput8Create arguments are unmapped", import->token);
+    if (!dinput8_ensure_configured())
+        stop_guest(ac1_dinput8_last_error()[0]
+                   ? ac1_dinput8_last_error()
+                   : "DirectInput8 bridge configuration failed", import->token);
+
+    uint32_t guest_hinstance = rd32(cpu->esp + 4u);
+    uint32_t version = rd32(cpu->esp + 8u);
+    uint32_t guest_iid = rd32(cpu->esp + 12u);
+    uint32_t guest_output = rd32(cpu->esp + 16u);
+    uint32_t guest_outer = rd32(cpu->esp + 20u);
+    uint32_t result = 0u;
+    int status = ac1_dinput8_create8(guest_hinstance, version, guest_iid,
+                                     guest_output, guest_outer, &result);
+    if (trace_imports) {
+        uint32_t proxy = guest_memory_try_ptr(guest_output, 4u)
+            ? rd32(guest_output) : 0u;
+        fprintf(stderr,
+                "AC1 DirectInput factory: status=%d HRESULT=0x%08x hinst=0x%08x version=0x%08x iid=0x%08x out=0x%08x proxy=0x%08x outer=0x%08x\n",
+                status, result, guest_hinstance, version, guest_iid,
+                guest_output, proxy, guest_outer);
+    }
+    if (status != AC1_DINPUT8_HANDLED) {
+        last_error = status == AC1_DINPUT8_METHOD_UNSUPPORTED ? 120u : 87u;
+        stop_guest(ac1_dinput8_last_error()[0]
+                   ? ac1_dinput8_last_error()
+                   : "DirectInput8Create bridge rejected the guest call",
+                   import->token);
+    }
+    cpu->eax = result;
+    return_stdcall(cpu, 20u);
+    return 1;
+}
+
 static int dispatch_ds8_method(CPU *cpu, uint32_t target)
 {
     int argument_count = ac1_ds8_argument_count(target);
@@ -1417,6 +1493,166 @@ static int dispatch_ds8_method(CPU *cpu, uint32_t target)
         }
         stop_guest(message, target);
     }
+    cpu->eax = result;
+    return_stdcall(cpu, (uint32_t)argument_count * 4u);
+    scheduler_checkpoint();
+    return 1;
+}
+
+static int dispatch_dinput8_method(CPU *cpu, uint32_t target)
+{
+    int argument_count = ac1_dinput8_argument_count(target);
+    if (!argument_count) return 0;
+    if (argument_count < 0 || argument_count > 16) {
+        last_error = argument_count == AC1_DINPUT8_METHOD_UNSUPPORTED ? 120u : 87u;
+        uint32_t offset = target - AC1_DINPUT8_TOKEN_BASE;
+        char message[160];
+        if (argument_count == AC1_DINPUT8_METHOD_UNSUPPORTED)
+            snprintf(message, sizeof(message),
+                     "unsupported DirectInput interface kind=%u slot=%u",
+                     offset / 0x1000u, (offset % 0x1000u) / 0x10u);
+        else
+            snprintf(message, sizeof(message), "invalid DirectInput COM method token");
+        stop_guest(message, target);
+    }
+    if (!guest_memory_try_ptr(cpu->esp + 4u, (size_t)argument_count * 4u))
+        stop_guest("DirectInput COM arguments are unmapped", target);
+    uint32_t arguments[16];
+    for (int i = 0; i < argument_count; ++i)
+        arguments[i] = rd32(cpu->esp + 4u + (uint32_t)i * 4u);
+
+    uint32_t result = 0u;
+    int status = ac1_dinput8_dispatch(target, arguments,
+                                      (uint32_t)argument_count, &result);
+    if (status != AC1_DINPUT8_HANDLED) {
+        last_error = status == AC1_DINPUT8_METHOD_UNSUPPORTED ? 120u : 87u;
+        stop_guest(ac1_dinput8_last_error()[0]
+                   ? ac1_dinput8_last_error()
+                   : "DirectInput COM dispatcher rejected the guest call",
+                   target);
+    }
+
+    const uint32_t method_offset = target - AC1_DINPUT8_TOKEN_BASE;
+    const uint32_t method_kind = method_offset / 0x1000u;
+    const uint32_t method_slot = (method_offset % 0x1000u) / 0x10u;
+    if (trace_imports &&
+        ((method_kind == 3u && (method_slot == 3u || method_slot == 4u)) ||
+         (method_kind == 5u && (method_slot == 4u || method_slot == 11u)))) {
+        fprintf(stderr,
+                "AC1 DirectInput COM: kind=%u slot=%u HRESULT=0x%08x argc=%d this=0x%08x\n",
+                method_kind, method_slot, result, argument_count, arguments[0]);
+        if (method_kind == 3u && method_slot == 3u && argument_count == 4) {
+            uint32_t proxy = guest_memory_try_ptr(arguments[2], 4u)
+                ? rd32(arguments[2]) : 0u;
+            fprintf(stderr,
+                    "AC1 DirectInput CreateDevice: guid=0x%08x out=0x%08x proxy=0x%08x outer=0x%08x\n",
+                    arguments[1], arguments[2], proxy, arguments[3]);
+        } else if (method_kind == 5u && method_slot == 11u &&
+                   argument_count == 2 &&
+                   guest_memory_try_ptr(arguments[1], 24u)) {
+            uint32_t format = arguments[1];
+            fprintf(stderr,
+                    "AC1 DirectInput SetDataFormat: size=%u object_size=%u flags=0x%08x data_size=%u objects=%u array=0x%08x\n",
+                    rd32(format), rd32(format + 4u), rd32(format + 8u),
+                    rd32(format + 12u), rd32(format + 16u),
+                    rd32(format + 20u));
+        }
+    }
+
+    const uint32_t enum_devices_token = AC1_DINPUT8_TOKEN_BASE +
+        3u * 0x1000u + 4u * 0x10u;
+    const uint32_t enum_objects_token = AC1_DINPUT8_TOKEN_BASE +
+        5u * 0x1000u + 4u * 0x10u;
+    const int is_enum_devices = target == enum_devices_token;
+    const int is_enum_objects = target == enum_objects_token;
+    if (is_enum_devices || is_enum_objects) {
+        const uint32_t callback_index = is_enum_devices ? 2u : 1u;
+        const uint32_t ref_index = is_enum_devices ? 3u : 2u;
+        const uint32_t expected_arity = is_enum_devices ? 5u : 4u;
+        const uint32_t expected_record_size = is_enum_devices ? 0x44cu : 0x240u;
+        if ((uint32_t)argument_count != expected_arity ||
+            !arguments[callback_index])
+            stop_guest("DirectInput enumeration callback/arity is invalid", target);
+        ac1_dinput8_enum_batch batch;
+        memset(&batch, 0, sizeof(batch));
+        int batch_status = ac1_dinput8_enum_batch_take(&batch);
+        if (batch_status != 1) {
+            if (batch_status > 0) ac1_dinput8_enum_batch_free(&batch);
+            stop_guest("DirectInput enumeration did not produce a native batch", target);
+        }
+        if (batch.record_size != expected_record_size || batch.count > 4096u ||
+            batch.count > UINT32_MAX / batch.record_size) {
+            ac1_dinput8_enum_batch_free(&batch);
+            stop_guest("DirectInput enumeration batch has an invalid x86 W record layout",
+                       target);
+        }
+        if (batch.native_hresult != (int32_t)result) {
+            ac1_dinput8_enum_batch_free(&batch);
+            stop_guest("DirectInput enumeration batch/result HRESULT mismatch", target);
+        }
+        uint32_t record_count = batch.count;
+        uint32_t record_size = batch.record_size;
+        uint32_t records_address = 0u;
+        if (record_count) {
+            uint32_t bytes = record_count * record_size;
+            records_address = pcrecomp_heap_alloc(process_heap, bytes, 1);
+            if (!records_address) {
+                ac1_dinput8_enum_batch_free(&batch);
+                stop_guest("DirectInput enumeration guest-record allocation failed",
+                           target);
+            }
+            uint8_t *destination = (uint8_t *)guest_memory_try_ptr(records_address, bytes);
+            if (!destination) {
+                pcrecomp_heap_free(process_heap, records_address);
+                ac1_dinput8_enum_batch_free(&batch);
+                stop_guest("DirectInput enumeration guest-record block is unmapped",
+                           target);
+            }
+            for (uint32_t i = 0u; i < record_count; ++i) {
+                const void *record = ac1_dinput8_enum_batch_record(&batch, i);
+                if (!record) {
+                    pcrecomp_heap_free(process_heap, records_address);
+                    ac1_dinput8_enum_batch_free(&batch);
+                    stop_guest("DirectInput enumeration native record is unavailable",
+                               target);
+                }
+                memcpy(destination + (size_t)i * batch.record_size,
+                       record, record_size);
+            }
+        }
+        ac1_dinput8_enum_batch_free(&batch);
+
+        uint32_t callback_count = 0u;
+        for (uint32_t i = 0u; i < record_count; ++i) {
+            uint32_t callback_arguments[2] = {
+                records_address + i * record_size, arguments[ref_index]
+            };
+            uint32_t callback_result = 0u;
+            if (!invoke_guest_stdcall_callback(cpu, arguments[callback_index],
+                                              callback_arguments, 2u,
+                                              &callback_result)) {
+                if (records_address) pcrecomp_heap_free(process_heap, records_address);
+                stop_guest("DirectInput enumeration guest callback frame is unavailable",
+                           target);
+            }
+            ++callback_count;
+            if (!callback_result) break;
+        }
+        if (trace_imports) {
+            fprintf(stderr,
+                    "AC1 DirectInput enumeration: kind=%u slot=%u HRESULT=0x%08x records=%u record_size=0x%x callback=0x%08x ref=0x%08x delivered=%u",
+                    method_kind, method_slot, result, record_count,
+                    record_size, arguments[callback_index],
+                    arguments[ref_index], callback_count);
+            if (is_enum_devices)
+                fprintf(stderr, " devtype=0x%08x flags=0x%08x\n",
+                        arguments[1], arguments[4]);
+            else
+                fprintf(stderr, " flags=0x%08x\n", arguments[3]);
+        }
+        if (records_address) pcrecomp_heap_free(process_heap, records_address);
+    }
+
     cpu->eax = result;
     return_stdcall(cpu, (uint32_t)argument_count * 4u);
     scheduler_checkpoint();
@@ -3215,6 +3451,65 @@ static int handle_version_import(CPU *cpu, const import_record *import)
     return 1;
 }
 
+static int handle_file_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal ||
+        !equal_ascii_fold(import->dll, "KERNEL32.dll"))
+        return 0;
+
+    if (!strcmp(import->name, "CreateFileA")) {
+        uint32_t arguments[7];
+        if (!guest_memory_try_ptr(cpu->esp + 4u, sizeof(arguments)))
+            stop_guest("CreateFileA arguments are unmapped", import->token);
+        for (unsigned i = 0; i < 7u; ++i)
+            arguments[i] = rd32(cpu->esp + 4u + i * 4u);
+
+        /* The current file service accepts a bounded single path component. */
+        char guest_path[260];
+        if (!copy_guest_string(arguments[0], guest_path, sizeof(guest_path)))
+            stop_guest("CreateFileA path is unmapped or too long", import->token);
+        if (!guest_files)
+            stop_guest("CreateFileA called before file service initialization", import->token);
+
+        uint32_t handle = UINT32_MAX;
+        uint32_t error = 0u;
+        int file_result = ac1_files_open(
+            guest_files, guest_path, arguments[1], arguments[2],
+            arguments[3] != 0u, arguments[4], arguments[5], arguments[6],
+            &handle, &error);
+        if (trace_imports)
+            fprintf(stderr,
+                    "AC1 file probe: path=\"%s\" service=%d handle=0x%08x error=%u\n",
+                    guest_path, file_result, handle, error);
+        if (file_result == AC1_FILES_UNSUPPORTED) {
+            char message[384];
+            snprintf(message, sizeof(message),
+                     "CreateFileA unsupported form path=\"%s\" access=0x%08x share=0x%08x security=0x%08x disposition=%u flags=0x%08x template=0x%08x",
+                     guest_path, arguments[1], arguments[2], arguments[3],
+                     arguments[4], arguments[5], arguments[6]);
+            stop_guest(message, import->token);
+        }
+        if (file_result != AC1_FILES_HANDLED)
+            stop_guest("CreateFileA file service rejected the call shape", import->token);
+        cpu->eax = handle;
+        if (handle == UINT32_MAX) last_error = error;
+        return_stdcall(cpu, 28u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "CloseHandle")) {
+        if (!guest_files) return 0;
+        uint32_t error = 0u;
+        uint32_t handle = rd32(cpu->esp + 4u);
+        if (!ac1_files_close(guest_files, handle, &error)) return 0;
+        cpu->eax = error == 0u;
+        if (error) last_error = error;
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    return 0;
+}
+
 static int handle_import(CPU *cpu, const import_record *import)
 {
     if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
@@ -4104,6 +4399,7 @@ void dispatch(CPU *cpu, uint32_t target)
                       handle_audio_import(cpu, import) ||
                       handle_optional_eax_import(cpu, import) ||
 #ifdef _WIN32
+                      handle_dinput8_import(cpu, import) ||
                       handle_ds8_import(cpu, import) ||
 #endif
 #if defined(AC1_HOST_D3D9)
@@ -4116,6 +4412,7 @@ void dispatch(CPU *cpu, uint32_t target)
                       handle_interlocked_import(cpu, import) ||
                       handle_stdio_import(cpu, import) ||
                       handle_thread_import(cpu, import) ||
+                      handle_file_import(cpu, import) ||
                       handle_sync_import(cpu, import) ||
                       handle_shell_import(cpu, import) ||
                       handle_ole_import(cpu, import) ||
@@ -4134,6 +4431,39 @@ void dispatch(CPU *cpu, uint32_t target)
             snprintf(message, sizeof(message),
                      "unimplemented import WS2_32.dll!#115 (WSAStartup) version=0x%04x wsadata=0x%08x from 0x%08x",
                      rd32(cpu->esp + 4u) & 0xffffu, rd32(cpu->esp + 8u), last_guest_target);
+        else if (!import->by_ordinal && !strcmp(import->name, "CreateFileA")) {
+            uint32_t args[7] = {0};
+            int args_mapped = guest_memory_try_ptr(cpu->esp + 4u, sizeof(args)) != NULL;
+            if (args_mapped)
+                for (unsigned i = 0; i < 7u; ++i)
+                    args[i] = rd32(cpu->esp + 4u + i * 4u);
+            char path[192] = "<unmapped>";
+            if (args_mapped && !copy_guest_string(args[0], path, sizeof(path)))
+                snprintf(path, sizeof(path), "<invalid-or-too-long:0x%08x>", args[0]);
+            snprintf(message, sizeof(message),
+                     "unimplemented import %s!CreateFileA path=\"%s\" access=0x%08x share=0x%08x disposition=%u flags=0x%08x from 0x%08x",
+                     import->dll, path, args_mapped ? args[1] : 0u,
+                     args_mapped ? args[2] : 0u,
+                     args_mapped ? args[4] : 0u,
+                     args_mapped ? args[5] : 0u, last_guest_target);
+        }
+        else if (!import->by_ordinal &&
+                 equal_ascii_fold(import->dll, "DINPUT8.dll") &&
+                 !strcmp(import->name, "DirectInput8Create")) {
+            uint32_t args[5] = {0};
+            int args_mapped = guest_memory_try_ptr(cpu->esp + 4u, sizeof(args)) != NULL;
+            uint32_t return_address = guest_memory_try_ptr(cpu->esp, 4u)
+                ? rd32(cpu->esp) : 0u;
+            if (args_mapped)
+                for (unsigned i = 0; i < 5u; ++i)
+                    args[i] = rd32(cpu->esp + 4u + i * 4u);
+            snprintf(message, sizeof(message),
+                     "unimplemented import DINPUT8.dll!DirectInput8Create return=0x%08x hinst=0x%08x version=0x%08x riid=0x%08x out=0x%08x outer=0x%08x from 0x%08x",
+                     return_address,
+                     args_mapped ? args[0] : 0u, args_mapped ? args[1] : 0u,
+                     args_mapped ? args[2] : 0u, args_mapped ? args[3] : 0u,
+                     args_mapped ? args[4] : 0u, last_guest_target);
+        }
         else if (!import->by_ordinal && !strcmp(import->name, "SetCurrentDirectoryA")) {
             uint32_t path_address = guest_memory_try_ptr(cpu->esp + 4u, 4u)
                 ? rd32(cpu->esp + 4u) : 0u;
@@ -4165,6 +4495,7 @@ void dispatch(CPU *cpu, uint32_t target)
     if (dispatch_d3d9_method(cpu, target)) return;
 #endif
 #ifdef _WIN32
+    if (dispatch_dinput8_method(cpu, target)) return;
     if (dispatch_ds8_method(cpu, target)) return;
 #endif
 
@@ -4293,10 +4624,12 @@ int ac1_run(const char *exe_path)
 #ifdef _WIN32
     window_bridge = NULL;
     ds8_configured = 0;
+    dinput8_configured = 0;
 #endif
     import_count = 0;
     memset(imports, 0, sizeof(imports));
     process_heap = NULL;
+    guest_files = NULL;
     exe_path_copy[0] = '\0';
     command_line_guest_address = 0;
     image_base = 0;
@@ -4373,6 +4706,14 @@ int ac1_run(const char *exe_path)
     }
     guest_address_space_select(space);
     guest_memory_add(image.image, image.load_base, image.image_size);
+    guest_files = ac1_files_create(guest_current_directory);
+    if (!guest_files) {
+        snprintf(last_run_error, sizeof(last_run_error),
+                 "read-only file service initialization failed for game directory");
+        fprintf(stderr, "AC1 native runtime: %s\n", last_run_error);
+        result = 6;
+        goto cleanup;
+    }
     if (!guest_memory_allocate(AC1_STACK_BASE, AC1_STACK_SIZE) ||
         !guest_memory_allocate(AC1_TIB_BASE, AC1_TIB_SIZE)) {
         snprintf(last_run_error, sizeof(last_run_error), "guest stack/TIB allocation failed");
@@ -4491,6 +4832,12 @@ cleanup:
         free(scheduler);
         scheduler = NULL;
     }
+#ifdef _WIN32
+    if (dinput8_configured) {
+        ac1_dinput8_shutdown();
+        dinput8_configured = 0;
+    }
+#endif
     ac1_network_reset();
 #ifdef _WIN32
     if (ds8_configured) {
@@ -4511,6 +4858,10 @@ cleanup:
         window_bridge = NULL;
     }
 #endif
+    if (guest_files) {
+        ac1_files_destroy(guest_files);
+        guest_files = NULL;
+    }
     active_guest_thread = NULL;
     if (process_heap && space) {
         guest_address_space_select(space);
