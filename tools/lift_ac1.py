@@ -26,6 +26,7 @@ CONFIG_PATH = ROOT / "config/ac1_dx9.json"
 DUKE_DEFAULT = Path("D:/Prog/dukemp_recomp/.deps/pcrecomp")
 PYTHON_DEFAULT = Path("D:/Prog/dukemp_recomp/.venv/Scripts/python.exe")
 OUT_DEFAULT = ROOT / "work/lift_initial"
+AC1_ARRAY_CTOR_HELPER = 0x00F9FA43
 
 
 FP_ADAPTER_HELPERS = r"""
@@ -215,6 +216,38 @@ def run_selftest() -> None:
     for encoding in ("f20f10c1", "f20fc2c100"):
         insn = next(md.disasm(bytes.fromhex(encoding), 0x401000))
         assert translate_directional_string_instruction(insn) is None, (encoding, insn)
+    # The callback scanner resolves arg4/arg5 at pre-call ESP+12/+16. Check
+    # that aliasing stores, explicit ESP changes, and implicit stack ops do
+    # not get mistaken for the five-argument push sequence.
+    from types import SimpleNamespace
+    def f9fa43_fixture(middle: bytes = b"", tail: bytes = b""):
+        start = 0x00401000
+        code = bytearray()
+        for value in (0x00420000, 0x00410000):  # cleanup, constructor
+            code += b"\x68" + value.to_bytes(4, "little")
+        code += middle
+        for value in (1, 4):  # count, stride
+            code += b"\x68" + value.to_bytes(4, "little")
+        code += b"\x51"  # base = ECX
+        code += tail
+        call_at = start + len(code)
+        rel = (0x00F9FA43 - (call_at + 5)) & 0xFFFFFFFF
+        code += b"\xE8" + rel.to_bytes(4, "little")
+        instructions = list(md.disasm(bytes(code), start))
+        return SimpleNamespace(blocks={start: SimpleNamespace(instructions=instructions)})
+    safe_edges = ac1_array_constructor_call_edges(f9fa43_fixture())
+    assert safe_edges == [{"callsite": 0x00401015,
+                           "constructor": 0x00410000, "cleanup": 0x00420000}], safe_edges
+    reject_fixtures = (
+        f9fa43_fixture(middle=bytes.fromhex("890424")),  # overwrites ctor after its push
+        f9fa43_fixture(tail=bytes.fromhex("8944240c")),  # call-time arg4 overwrite
+        f9fa43_fixture(tail=bytes.fromhex("89440c0c")),  # indexed ESP alias
+        f9fa43_fixture(tail=bytes.fromhex("83ec04")),    # explicit SUB ESP
+        f9fa43_fixture(tail=bytes.fromhex("9c")),        # implicit PUSHFD
+        f9fa43_fixture(tail=bytes.fromhex("94")),        # XCHG EAX,ESP
+        f9fa43_fixture(tail=bytes.fromhex("89450c")),    # EBP-based alias
+    )
+    assert all(not ac1_array_constructor_call_edges(fixture) for fixture in reject_fixtures)
     print("lift control-flow and instruction-adapter self-test: ok")
 
 
@@ -429,9 +462,45 @@ def run_ac1_switch_selftest(binary: Path, pcrecomp: Path) -> None:
                 print(result.stdout.strip())
         else:
             print("memmove semantic self-test skipped (gcc not found)")
+        run_ac1_array_callback_selftest(dis, info, build_iat_map(info))
     finally:
         pe.close()
     print("AC1 actual-base jump-table self-test: local, remapped, and negative-index switches recovered")
+
+
+def run_ac1_array_callback_selftest(dis, info, iat) -> None:
+    """Pin the helper ABI and the exact constant callback edges in the AC1 image."""
+    callers = (
+        0x004135E0, 0x0041AC00, 0x004834A0, 0x0055EDF0, 0x007C6FC0,
+        0x009113A0, 0x00918CE0, 0x0091A8D0, 0x0092FBE0, 0x00941B90,
+        0x009697B0, 0x0098A920, 0x00992880, 0x00AAEC50, 0x015E2270,
+        0x015F8370, 0x01609490, 0x016094C0, 0x0163A020, 0x0163A050,
+        0x0163A080,
+    )
+    expected_constructors = {
+        0x0040F360, 0x0041A2D0, 0x004830B0, 0x0051E860, 0x0055EAD0,
+        0x005637C0, 0x007872B0, 0x007C2CA0, 0x0090F9F0, 0x0090FA80,
+        0x009184A0, 0x0091A840, 0x0092FB00, 0x009419B0, 0x009697A0,
+        0x009A6FB0, 0x00A0DE10, 0x00A51740, 0x00A517F0, 0x00D72830,
+        0x00D72840,
+    }
+    edges = []
+    for caller in callers:
+        function = dis.disassemble_function(caller, iat)
+        if function is None or not function.blocks:
+            raise AssertionError(f"F9FA43 callback fixture caller 0x{caller:08X} did not decode")
+        edges.extend((caller, edge) for edge in ac1_array_constructor_call_edges(function))
+    assert len(edges) == 22, len(edges)
+    assert {edge["constructor"] for _, edge in edges} == expected_constructors
+    assert (0x0041AC00, {"callsite": 0x0041AC12,
+                         "constructor": 0x0041A2D0, "cleanup": 0x0041AAC0}) in edges
+    assert (0x004834A0, {"callsite": 0x004834E3,
+                         "constructor": 0x004830B0, "cleanup": 0x004830C0}) in edges
+    for _, edge in edges:
+        for target in (edge["constructor"], edge["cleanup"]):
+            if not validate_callback_code_entry(target, dis, info, iat, {}):
+                raise AssertionError(f"F9FA43 argument 0x{target:08X} is not a code entry")
+    print("AC1 F9FA43 callback self-test: 22 direct calls, 21 constant constructors, cleanup entries validated")
 
 
 def infer_remapped_switch_limit(md, read_va, jump_insn, reg_type: int,
@@ -772,6 +841,100 @@ def resolve_tooling(config: dict, args) -> tuple[Path, Path]:
     return python, pcrecomp
 
 
+def ac1_array_constructor_call_edges(function) -> list[dict]:
+    """Extract only proven constant ctor/dtor args for direct calls to F9FA43.
+
+    F9FA43 reads its fourth and fifth stack arguments as constructor and
+    exception-cleanup function pointers. In the current AC1 binary these are
+    pushed as constants before the remaining three arguments. Require five
+    pushes, reject intervening calls/ESP changes, and reject stack writes that
+    could overwrite either pointer slot.
+    """
+    from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
+    from capstone.x86_const import X86_REG_EBP, X86_REG_ESP
+
+    edges = []
+    for block in function.blocks.values():
+        instructions = list(block.instructions)
+        for index, insn in enumerate(instructions):
+            if (insn.mnemonic != "call" or not insn.operands or
+                    insn.operands[0].type != X86_OP_IMM or
+                    (insn.operands[0].imm & 0xFFFFFFFF) != AC1_ARRAY_CTOR_HELPER):
+                continue
+            pushed = []  # nearest push first: arg1, arg2, arg3, ctor, cleanup
+            proven = True
+            for prev in reversed(instructions[:index]):
+                if prev.mnemonic == "push":
+                    pushed.append(prev)
+                    if len(pushed) == 5:
+                        break
+                    continue
+                if prev.mnemonic in ("call", "ret", "retf", "jmp", "leave", "pop",
+                                     "enter", "pushf", "pushfd", "pushfw", "pusha", "pushad",
+                                     "popf", "popfd", "popfw", "popa", "popad"):
+                    proven = False
+                    break
+                # Any explicit ESP register use is conservatively rejected;
+                # this covers destination writes and aliases such as XCHG.
+                if any(operand.type == X86_OP_REG and operand.reg == X86_REG_ESP
+                       for operand in prev.operands):
+                    proven = False
+                    break
+                # Reject writes (and conservatively reads) into the ctor/dtor
+                # slots. Convert current [ESP+disp] to call-time ESP by
+                # accounting for pushes already crossed in this reverse walk:
+                # current ESP is call ESP + 4*later pushes.
+                if prev.operands and prev.operands[0].type == X86_OP_MEM:
+                    mem = prev.operands[0].mem
+                    if mem.base == X86_REG_EBP:
+                        # Without a proven frame-to-ESP relation, an EBP store
+                        # could alias either argument slot.
+                        proven = False
+                        break
+                    if mem.base == X86_REG_ESP:
+                        if mem.index:
+                            proven = False
+                            break
+                        slot = int(mem.disp) + 4 * len(pushed)
+                        width = max(1, prev.operands[0].size)
+                        if ((slot < 16 and slot + width > 12) or
+                                (slot < 20 and slot + width > 16)):
+                            proven = False
+                            break
+            if not proven or len(pushed) != 5:
+                continue
+            ctor_push, cleanup_push = pushed[3], pushed[4]
+            if (not ctor_push.operands or ctor_push.operands[0].type != X86_OP_IMM or
+                    not cleanup_push.operands or cleanup_push.operands[0].type != X86_OP_IMM):
+                continue
+            edges.append({
+                "callsite": insn.address,
+                "constructor": ctor_push.operands[0].imm & 0xFFFFFFFF,
+                "cleanup": cleanup_push.operands[0].imm & 0xFFFFFFFF,
+            })
+    return edges
+
+
+def validate_callback_code_entry(target: int, disassembler, info, iat,
+                                 discovered: dict) -> bool:
+    """Validate a callback as executable code and reject known mid-instruction pointers."""
+    if not (info.code_start <= target < info.code_end and
+            disassembler.is_code_address(target)):
+        return False
+    if not disassembler.probes_as_function_body(target):
+        return False
+    for function in discovered.values():
+        for block in function["blocks"]:
+            for start, size in block["instructions"]:
+                if start < target < start + size:
+                    return False
+    try:
+        candidate = disassembler.disassemble_function(target, iat)
+    except Exception:
+        return False
+    return bool(candidate and candidate.blocks and target in candidate.blocks)
+
+
 def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_depth: int,
                         extra_seeds: list[int]):
     sys.path[:0] = [str(pcrecomp / "tools/pe"), str(pcrecomp / "tools/disasm")]
@@ -789,6 +952,7 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
     queued = set(initial_seeds)
     results = {}
     failures = []
+    callback_edges = []
     while queue and len(results) < max_functions:
         address, depth = queue.popleft()
         if address in results:
@@ -830,7 +994,22 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
             if target not in results and target not in queued and info.code_start <= target < info.code_end:
                 queued.add(target)
                 queue.append((target, depth + 1))
-    return info, dis, results, failures, len(queue), entry, iat
+        for call_edge in ac1_array_constructor_call_edges(function):
+            for role in ("constructor", "cleanup"):
+                target = call_edge[role]
+                if not validate_callback_code_entry(target, dis, info, iat, results):
+                    continue
+                callback_edges.append({
+                    "caller": address,
+                    "callsite": call_edge["callsite"],
+                    "role": role,
+                    "target": target,
+                    "depth": depth + 1,
+                })
+                if target not in results and target not in queued:
+                    queued.add(target)
+                    queue.append((target, depth + 1))
+    return info, dis, results, failures, len(queue), entry, iat, callback_edges
 
 
 def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: Path,
@@ -1215,7 +1394,7 @@ def main() -> int:
     extra_seeds = sorted(set(extra_seeds))
     output_dir.mkdir(parents=True, exist_ok=True)
     start_time = time.perf_counter()
-    info, dis, catalog, discovery_failures, queued, entry, iat = discover_entry_cone(
+    info, dis, catalog, discovery_failures, queued, entry, iat, callback_edges = discover_entry_cone(
         binary, pcrecomp, max_functions, max_depth, extra_seeds
     )
     catalog_doc = {
@@ -1244,6 +1423,7 @@ def main() -> int:
         "queue_remaining": queued,
         "discovered_count": len(catalog),
         "discovery_failures": discovery_failures,
+        "discovered_callback_edges": callback_edges,
         "functions": sorted(catalog.values(), key=lambda item: item["address"]),
     }
     catalog_path = output_dir / "functions.json"

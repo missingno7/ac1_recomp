@@ -16,6 +16,7 @@ namespace {
 constexpr uint32_t kGuestBase = 0x10000000u;
 std::array<uint8_t, 1024u * 1024u> g_guest{};
 uint32_t g_next_allocation = kGuestBase + 0x80000u;
+HWND g_test_window = nullptr;
 
 #pragma pack(push, 4)
 struct TestGuestDataFormat {
@@ -59,7 +60,11 @@ uint32_t allocate(void *, uint32_t size, uint32_t alignment)
 
 void deallocate(void *, uint32_t) {}
 
-uintptr_t map_hwnd(void *, uint32_t) { return 0u; }
+uintptr_t map_hwnd(void *, uint32_t guest_hwnd)
+{
+    return guest_hwnd == 0x1234u
+        ? reinterpret_cast<uintptr_t>(g_test_window) : 0u;
+}
 
 uintptr_t map_hinstance(void *, uint32_t guest_hinstance)
 {
@@ -90,6 +95,19 @@ bool get(uint32_t address, T *value)
     if (!source || !value) return false;
     std::memcpy(value, source, sizeof(T));
     return true;
+}
+
+HWND make_hidden_window()
+{
+    WNDCLASSW window_class{};
+    window_class.lpfnWndProc = DefWindowProcW;
+    window_class.hInstance = GetModuleHandleW(nullptr);
+    window_class.lpszClassName = L"AC1DirectInputBridgeSmokeWindow";
+    if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        return nullptr;
+    return CreateWindowExW(0, window_class.lpszClassName, L"AC1 DirectInput smoke",
+                           WS_OVERLAPPED, 0, 0, 320, 200, nullptr, nullptr,
+                           window_class.hInstance, nullptr);
 }
 
 } // namespace
@@ -335,6 +353,67 @@ int main()
             !check(static_cast<int32_t>(format_hr) >= 0,
                    "native keyboard SetDataFormat succeeded")) {
             std::fprintf(stderr, "SetDataFormat HRESULT=0x%08x\n", format_hr);
+            ac1_dinput8_shutdown();
+            return 1;
+        }
+
+        constexpr uint32_t cooperative_token = AC1_DINPUT8_TOKEN_BASE +
+            5u * 0x1000u + 13u * 0x10u;
+        if (!check(ac1_dinput8_argument_count(cooperative_token) == 3,
+                   "SetCooperativeLevel x86 arity")) {
+            ac1_dinput8_shutdown();
+            return 1;
+        }
+        const uint32_t null_cooperative_args[] = {guest_device, 0u, 6u};
+        uint32_t cooperative_hr = 0u;
+        if (!check(ac1_dinput8_dispatch(cooperative_token, null_cooperative_args,
+                                        3u, &cooperative_hr) == AC1_DINPUT8_HANDLED,
+                   ac1_dinput8_last_error()[0] ? ac1_dinput8_last_error()
+                                               : "native null-HWND SetCooperativeLevel")) {
+            ac1_dinput8_shutdown();
+            return 1;
+        }
+        std::printf("native null-HWND SetCooperativeLevel flags=0x6 HRESULT=0x%08x\n",
+                    cooperative_hr);
+        if (static_cast<int32_t>(cooperative_hr) >= 0) {
+            const uint32_t null_keyboard_cooperative_args[] = {
+                guest_device, 0u, 0x16u
+            };
+            if (!check(ac1_dinput8_dispatch(cooperative_token,
+                                            null_keyboard_cooperative_args, 3u,
+                                            &cooperative_hr) == AC1_DINPUT8_HANDLED,
+                       "native null-HWND keyboard SetCooperativeLevel")) {
+                ac1_dinput8_shutdown();
+                return 1;
+            }
+            std::printf("native null-HWND SetCooperativeLevel flags=0x16 HRESULT=0x%08x\n",
+                        cooperative_hr);
+        }
+        g_test_window = make_hidden_window();
+        if (!check(g_test_window != nullptr, "create hidden HWND for mapping test")) {
+            ac1_dinput8_shutdown();
+            return 1;
+        }
+        const uint32_t mapped_cooperative_args[] = {guest_device, 0x1234u, 6u};
+        if (!check(ac1_dinput8_dispatch(cooperative_token, mapped_cooperative_args,
+                                        3u, &cooperative_hr) == AC1_DINPUT8_HANDLED,
+                   ac1_dinput8_last_error()[0] ? ac1_dinput8_last_error()
+                                               : "mapped-HWND SetCooperativeLevel")) {
+            DestroyWindow(g_test_window);
+            g_test_window = nullptr;
+            ac1_dinput8_shutdown();
+            return 1;
+        }
+        DestroyWindow(g_test_window);
+        g_test_window = nullptr;
+
+        const uint32_t unmapped_cooperative_args[] = {guest_device, 0x5678u, 6u};
+        uint32_t result_sentinel = 0xdeadbeefu;
+        if (!check(ac1_dinput8_dispatch(cooperative_token,
+                                        unmapped_cooperative_args, 3u,
+                                        &result_sentinel) == AC1_DINPUT8_ERROR &&
+                       result_sentinel == 0xdeadbeefu,
+                   "unmapped nonzero HWND reports bridge error without fake HRESULT")) {
             ac1_dinput8_shutdown();
             return 1;
         }

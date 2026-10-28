@@ -305,6 +305,8 @@ int method_argument_count(uint32_t token)
         return 4; /* EnumObjects(this, callback, ref, flags). */
     if (kind == ObjectKind::DeviceW && slot == 11u)
         return 2; /* SetDataFormat(this, guest DIDATAFORMAT*). */
+    if (kind == ObjectKind::DeviceW && slot == 13u)
+        return 3; /* SetCooperativeLevel(this, guest HWND, flags). */
     return AC1_DINPUT8_METHOD_UNSUPPORTED;
 }
 
@@ -526,6 +528,34 @@ int invoke_set_data_format(GuestObject &object, const uint32_t *args,
     native_format.rgodf = native_objects.empty() ? nullptr : native_objects.data();
     const HRESULT result = reinterpret_cast<IDirectInputDevice8W *>(object.native)
         ->SetDataFormat(&native_format);
+    *result_out = static_cast<uint32_t>(result);
+    return AC1_DINPUT8_HANDLED;
+}
+
+int invoke_set_cooperative_level(GuestObject &object, const uint32_t *args,
+                                 uint32_t *result_out)
+{
+    if (object.kind != ObjectKind::DeviceW) {
+        set_error("DirectInput SetCooperativeLevel currently supports only the observed W interface");
+        return AC1_DINPUT8_METHOD_UNSUPPORTED;
+    }
+    uintptr_t host_window = 0u;
+    if (args[1]) {
+        if (!g_callbacks.guest_hwnd_to_host) {
+            set_error("DirectInput SetCooperativeLevel has no guest-HWND translation callback");
+            return AC1_DINPUT8_ERROR;
+        }
+        host_window = g_callbacks.guest_hwnd_to_host(g_context, args[1]);
+        if (!host_window) {
+            std::ostringstream message;
+            message << "DirectInput SetCooperativeLevel guest HWND 0x" << std::hex
+                    << args[1] << " is not mapped to a native window";
+            set_error(message.str());
+            return AC1_DINPUT8_ERROR;
+        }
+    }
+    const HRESULT result = reinterpret_cast<IDirectInputDevice8W *>(object.native)
+        ->SetCooperativeLevel(reinterpret_cast<HWND>(host_window), args[2]);
     *result_out = static_cast<uint32_t>(result);
     return AC1_DINPUT8_HANDLED;
 }
@@ -776,6 +806,8 @@ extern "C" int ac1_dinput8_dispatch(uint32_t token, const uint32_t *args,
         return invoke_enum_objects(object, args, result_out);
     if (kind == ObjectKind::DeviceW && slot == 11u)
         return invoke_set_data_format(object, args, result_out);
+    if (kind == ObjectKind::DeviceW && slot == 13u)
+        return invoke_set_cooperative_level(object, args, result_out);
     set_error("DirectInput method reached an unsupported implementation path");
     return AC1_DINPUT8_METHOD_UNSUPPORTED;
 }

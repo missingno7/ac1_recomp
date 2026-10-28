@@ -45,7 +45,7 @@
 #define AC1_TIB_SIZE 0x00001000u
 #define AC1_IMPORT_BASE 0xF1000000u
 #define AC1_RETURN_SENTINEL 0xFFFFF000u
-#define AC1_DISPATCH_LIMIT_DEFAULT UINT64_C(10000000)
+#define AC1_DISPATCH_LIMIT_DEFAULT UINT64_C(50000000)
 #define AC1_DISPATCH_DEPTH 4096u
 #define AC1_IMPORT_LIMIT 2048u
 #define AC1_PROCESS_HEAP_HANDLE 0xE0000001u
@@ -125,6 +125,7 @@ static unsigned object_type_descriptor_count;
 static int crt_handoff_logged;
 static _Thread_local unsigned trace_import_count;
 static _Thread_local unsigned trace_callback_count;
+static _Thread_local unsigned trace_file_read_count;
 static _Thread_local uint32_t last_guest_target;
 static _Thread_local uint64_t dispatch_count;
 static uint64_t dispatch_limit = AC1_DISPATCH_LIMIT_DEFAULT;
@@ -210,6 +211,10 @@ typedef struct {
     uint8_t kind; /* 1 event, 2 semaphore */
     uint8_t manual_reset;
     uint8_t signaled;
+    uint8_t io_backed;
+#ifdef _WIN32
+    HANDLE host_event;
+#endif
     char name[256];
 } sync_object;
 
@@ -377,6 +382,13 @@ static void scheduler_stop_and_join(ac1_scheduler *scheduler)
             pthread_join(thread->host, NULL);
 #endif
         }
+    }
+    /* Native OVERLAPPED reads may still target guest buffers. Drain them only
+     * after guest workers have stopped, but before releasing any guest stack,
+     * TLS, or heap-backed mappings. */
+    ac1_files_cancel_pending(guest_files);
+    for (unsigned i = 1u; i < scheduler->count; ++i) {
+        ac1_guest_thread *thread = &scheduler->threads[i];
         if (thread->static_tls_vector) guest_memory_release(thread->static_tls_vector);
         if (thread->static_tls_data) guest_memory_release(thread->static_tls_data);
         if (thread->tib_base) guest_memory_release(thread->tib_base);
@@ -1516,11 +1528,18 @@ static int dispatch_dinput8_method(CPU *cpu, uint32_t target)
         last_error = argument_count == AC1_DINPUT8_METHOD_UNSUPPORTED ? 120u : 87u;
         uint32_t offset = target - AC1_DINPUT8_TOKEN_BASE;
         char message[160];
-        if (argument_count == AC1_DINPUT8_METHOD_UNSUPPORTED)
+        if (argument_count == AC1_DINPUT8_METHOD_UNSUPPORTED) {
+            if (trace_imports && offset / 0x1000u == 5u &&
+                (offset % 0x1000u) / 0x10u == 13u &&
+                guest_memory_try_ptr(cpu->esp + 4u, 12u))
+                fprintf(stderr,
+                        "AC1 DirectInput unsupported slot trace: kind=5 slot=13 eip=0x%08x this=0x%08x hwnd=0x%08x flags=0x%08x\n",
+                        cpu->eip, rd32(cpu->esp + 4u), rd32(cpu->esp + 8u),
+                        rd32(cpu->esp + 12u));
             snprintf(message, sizeof(message),
                      "unsupported DirectInput interface kind=%u slot=%u",
                      offset / 0x1000u, (offset % 0x1000u) / 0x10u);
-        else
+        } else
             snprintf(message, sizeof(message), "invalid DirectInput COM method token");
         stop_guest(message, target);
     }
@@ -1546,7 +1565,8 @@ static int dispatch_dinput8_method(CPU *cpu, uint32_t target)
     const uint32_t method_slot = (method_offset % 0x1000u) / 0x10u;
     if (trace_imports &&
         ((method_kind == 3u && (method_slot == 3u || method_slot == 4u)) ||
-         (method_kind == 5u && (method_slot == 4u || method_slot == 11u)))) {
+         (method_kind == 5u && (method_slot == 4u || method_slot == 11u ||
+                               method_slot == 13u)))) {
         fprintf(stderr,
                 "AC1 DirectInput COM: kind=%u slot=%u HRESULT=0x%08x argc=%d this=0x%08x\n",
                 method_kind, method_slot, result, argument_count, arguments[0]);
@@ -1565,6 +1585,11 @@ static int dispatch_dinput8_method(CPU *cpu, uint32_t target)
                     rd32(format), rd32(format + 4u), rd32(format + 8u),
                     rd32(format + 12u), rd32(format + 16u),
                     rd32(format + 20u));
+        } else if (method_kind == 5u && method_slot == 13u &&
+                   argument_count == 3) {
+            fprintf(stderr,
+                    "AC1 DirectInput SetCooperativeLevel: guest_hwnd=0x%08x flags=0x%08x\n",
+                    arguments[1], arguments[2]);
         }
     }
 
@@ -1695,6 +1720,9 @@ static int handle_d3d9_import(CPU *cpu, const import_record *import)
     if (!d3d9_ensure_configured())
         stop_guest(ac1_d3d9_last_error(), import->token);
     cpu->eax = ac1_d3d9_create9(rd32(cpu->esp + 4u));
+    if (trace_imports)
+        fprintf(stderr, "AC1 milestone: Direct3DCreate9 sdk=0x%08x guest=0x%08x\n",
+                rd32(cpu->esp + 4u), cpu->eax);
     if (!cpu->eax && ac1_d3d9_last_error()[0])
         fprintf(stderr, "AC1 D3D9 factory returned null: %s\n", ac1_d3d9_last_error());
     return_stdcall(cpu, 4u);
@@ -1726,6 +1754,12 @@ static int dispatch_d3d9_method(CPU *cpu, uint32_t target)
                    : "D3D9 COM dispatcher rejected the guest call", target);
     }
     cpu->eax = result;
+    if (trace_imports && argument_count == 7 &&
+        target == 0x7e000000u + 1u * 0x1000u + 16u * 0x10u) {
+        fprintf(stderr,
+                "AC1 milestone: IDirect3D9::CreateDevice HRESULT=0x%08x adapter=%u device_type=%u hwnd=0x%08x\n",
+                result, arguments[1], arguments[2], arguments[3]);
+    }
     return_stdcall(cpu, (uint32_t)argument_count * 4u);
     scheduler_checkpoint();
     return 1;
@@ -2318,6 +2352,9 @@ static int handle_stdio_import(CPU *cpu, const import_record *import)
         FILE *stream = handle == AC1_STD_INPUT_HANDLE ? stdin :
                        handle == AC1_STD_OUTPUT_HANDLE ? stdout :
                        handle == AC1_STD_ERROR_HANDLE ? stderr : NULL;
+        /* Console stdio owns only the synthetic standard handles. Let file
+         * service tokens continue to handle ReadFile/WriteFile themselves. */
+        if (!stream) return 0;
         void *guest_buffer = count ? guest_memory_try_ptr(buffer, count) : NULL;
         if (!stream || overlapped || (count && !guest_buffer) ||
             !guest_memory_try_ptr(transferred, 4u)) {
@@ -2888,6 +2925,25 @@ static sync_object *sync_object_named(const char *name)
     return NULL;
 }
 
+static int sync_object_is_signaled(sync_object *object)
+{
+    if (!object) return 0;
+#ifdef _WIN32
+    if (object->kind == 1u && object->host_event)
+        return WaitForSingleObject(object->host_event, 0u) == WAIT_OBJECT_0;
+#endif
+    return object->signaled != 0u;
+}
+
+static void sync_object_consume_event(sync_object *object)
+{
+    if (!object || object->kind != 1u || object->manual_reset) return;
+#ifdef _WIN32
+    if (object->host_event) return; /* The zero-time native wait consumed it. */
+#endif
+    object->signaled = 0u;
+}
+
 static void scheduler_refresh_waits(ac1_scheduler *scheduler)
 {
     uint64_t now = guest_monotonic_ns();
@@ -2913,9 +2969,10 @@ static void scheduler_refresh_waits(ac1_scheduler *scheduler)
         }
         sync_object *object = sync_object_for_handle(thread->wait_handle);
         if (object) {
-            int signaled = object->kind == 1u ? object->signaled != 0u : object->count != 0u;
+            int signaled = object->kind == 1u
+                ? sync_object_is_signaled(object) : object->count != 0u;
             if (signaled) {
-                if (object->kind == 1u && !object->manual_reset) object->signaled = 0u;
+                if (object->kind == 1u) sync_object_consume_event(object);
                 if (object->kind == 2u) --object->count;
                 thread->blocked = 0;
                 thread->wait_result = AC1_WAIT_OBJECT_0;
@@ -2937,14 +2994,38 @@ static uint32_t scheduler_next_timeout(ac1_scheduler *scheduler)
 {
     uint64_t now = guest_monotonic_ns();
     uint64_t nearest = UINT64_MAX;
+#ifdef _WIN32
+    int poll_native_events = 0;
+    if (guest_files && ac1_files_has_pending(guest_files)) {
+        for (unsigned i = 0; i < scheduler->count; ++i) {
+            ac1_guest_thread *thread = &scheduler->threads[i];
+            if (!thread->blocked || thread->wait_kind != 1) continue;
+            sync_object *object = sync_object_for_handle(thread->wait_handle);
+            if (object && object->kind == 1u && object->host_event &&
+                object->io_backed) {
+                poll_native_events = 1;
+                break;
+            }
+        }
+    }
+#endif
     for (unsigned i = 0; i < scheduler->count; ++i) {
         ac1_guest_thread *thread = &scheduler->threads[i];
         if (thread->blocked && thread->wait_deadline && thread->wait_deadline < nearest)
             nearest = thread->wait_deadline;
     }
-    if (nearest == UINT64_MAX) return 0u;
+    if (nearest == UINT64_MAX) {
+#ifdef _WIN32
+        return poll_native_events ? 10u : 0u;
+#else
+        return 0u;
+#endif
+    }
     if (nearest <= now) return 1u;
     uint64_t ms = (nearest - now + 999999u) / 1000000u;
+#ifdef _WIN32
+    if (poll_native_events && ms > 10u) return 10u;
+#endif
     return ms > UINT32_MAX ? UINT32_MAX : (uint32_t)(ms ? ms : 1u);
 }
 
@@ -2959,6 +3040,19 @@ static sync_object *sync_object_create(uint8_t kind)
         }
     }
     return NULL;
+}
+
+static void sync_objects_destroy(void)
+{
+#ifdef _WIN32
+    for (uint32_t slot = 0; slot < AC1_MAX_SYNC_OBJECTS; ++slot) {
+        if (sync_objects[slot].host_event) {
+            CloseHandle(sync_objects[slot].host_event);
+            sync_objects[slot].host_event = NULL;
+        }
+    }
+#endif
+    memset(sync_objects, 0, sizeof(sync_objects));
 }
 
 static int handle_sync_import(CPU *cpu, const import_record *import)
@@ -2982,8 +3076,21 @@ static int handle_sync_import(CPU *cpu, const import_record *import)
         else if (!(object = sync_object_create(1u))) { cpu->eax = 0u; last_error = 8u; }
         else {
             object->manual_reset = manual_reset != 0u;
+#ifndef _WIN32
             object->signaled = initial_state != 0u;
+#endif
             if (object_name[0]) memcpy(object->name, object_name, strlen(object_name) + 1u);
+#ifdef _WIN32
+            object->host_event = CreateEventA(NULL, object->manual_reset,
+                                               initial_state != 0u, NULL);
+            if (!object->host_event) {
+                last_error = (uint32_t)GetLastError();
+                memset(object, 0, sizeof(*object));
+                cpu->eax = 0u;
+                return_stdcall(cpu, 16u);
+                return 1;
+            }
+#endif
             cpu->eax = object->handle;
         }
         return_stdcall(cpu, 16u);
@@ -3022,8 +3129,26 @@ static int handle_sync_import(CPU *cpu, const import_record *import)
         if (!object || object->kind != 1u) {
             cpu->eax = 0u; last_error = 6u;
         } else {
-            object->signaled = !strcmp(name, "SetEvent");
-            cpu->eax = 1u;
+            int native_success = 1;
+#ifdef _WIN32
+            if (object->host_event)
+                native_success = !strcmp(name, "SetEvent")
+                    ? SetEvent(object->host_event)
+                    : ResetEvent(object->host_event);
+#endif
+            if (!native_success) {
+                cpu->eax = 0u;
+#ifdef _WIN32
+                last_error = (uint32_t)GetLastError();
+#else
+                last_error = 6u;
+#endif
+            } else {
+#ifndef _WIN32
+                object->signaled = !strcmp(name, "SetEvent");
+#endif
+                cpu->eax = 1u;
+            }
         }
         return_stdcall(cpu, 4u);
         return 1;
@@ -3069,9 +3194,10 @@ static int handle_sync_import(CPU *cpu, const import_record *import)
         } else if (!object) {
             cpu->eax = UINT32_MAX; last_error = 6u;
         } else {
-            int signaled = object->kind == 1u ? object->signaled != 0u : object->count != 0u;
+            int signaled = object->kind == 1u
+                ? sync_object_is_signaled(object) : object->count != 0u;
             if (signaled) {
-                if (object->kind == 1u && !object->manual_reset) object->signaled = 0u;
+                if (object->kind == 1u) sync_object_consume_event(object);
                 if (object->kind == 2u) --object->count;
                 cpu->eax = AC1_WAIT_OBJECT_0;
             } else if (!timeout) cpu->eax = AC1_WAIT_TIMEOUT;
@@ -3094,7 +3220,18 @@ static int handle_sync_import(CPU *cpu, const import_record *import)
         sync_object *object = sync_object_for_handle(handle);
         if (thread) { thread->closed = 1; cpu->eax = 1u; }
         else if (!object) { cpu->eax = 0u; last_error = 6u; }
-        else { memset(object, 0, sizeof(*object)); cpu->eax = 1u; }
+        else {
+#ifdef _WIN32
+            if (object->host_event && !CloseHandle(object->host_event)) {
+                cpu->eax = 0u;
+                last_error = (uint32_t)GetLastError();
+                return_stdcall(cpu, 4u);
+                return 1;
+            }
+#endif
+            memset(object, 0, sizeof(*object));
+            cpu->eax = 1u;
+        }
         return_stdcall(cpu, 4u);
         return 1;
     }
@@ -3401,7 +3538,14 @@ static int handle_window_import(CPU *cpu, const import_record *import)
     char error[256] = {0};
     int status = ac1_window_win32_call(window_bridge, cpu, import->name,
                                        &last_error, error, sizeof(error));
-    if (status == AC1_WINDOW_WIN32_HANDLED) return 1;
+    if (status == AC1_WINDOW_WIN32_HANDLED) {
+        if (trace_imports &&
+            (!strcmp(import->name, "RegisterClassExA") ||
+             !strcmp(import->name, "CreateWindowExA")))
+            fprintf(stderr, "AC1 milestone: %s result=0x%08x guest_call=0x%08x\n",
+                    import->name, cpu->eax, last_guest_target);
+        return 1;
+    }
     if (status == AC1_WINDOW_WIN32_ERROR)
         stop_guest(error[0] ? error : "Win32 USER32 bridge rejected call state",
                    import->token);
@@ -3541,14 +3685,218 @@ static int handle_file_import(CPU *cpu, const import_record *import)
         return 1;
     }
 
+    if (!strcmp(import->name, "ReadFile")) {
+        if (!guest_files) return 0;
+        if (!guest_memory_try_ptr(cpu->esp + 4u, 20u))
+            stop_guest("ReadFile arguments are unmapped", import->token);
+        const uint32_t handle = rd32(cpu->esp + 4u);
+        const uint32_t buffer_address = rd32(cpu->esp + 8u);
+        const uint32_t requested = rd32(cpu->esp + 12u);
+        const uint32_t transferred_address = rd32(cpu->esp + 16u);
+        const uint32_t overlapped_address = rd32(cpu->esp + 20u);
+        void *buffer = requested
+            ? guest_memory_try_ptr(buffer_address, requested)
+            : NULL;
+        if (requested && !buffer)
+            stop_guest("ReadFile buffer is unmapped", import->token);
+        uint32_t bytes_read = 0u;
+        uint32_t error = 0u;
+        ac1_files_overlapped_snapshot snapshot = {0};
+        int file_result;
+        if (overlapped_address) {
+            if (transferred_address)
+                stop_guest("ReadFile overlapped call supplied a byte-count pointer",
+                           import->token);
+            if (!guest_memory_try_ptr(overlapped_address, 20u))
+                stop_guest("ReadFile OVERLAPPED is unmapped", import->token);
+            if (trace_imports)
+                fprintf(stderr,
+                        "AC1 guest OVERLAPPED: address=0x%08x internal=0x%08x internal_high=0x%08x offset=0x%08x:%08x hEvent=0x%08x\n",
+                        overlapped_address, rd32(overlapped_address),
+                        rd32(overlapped_address + 4u),
+                        rd32(overlapped_address + 12u),
+                        rd32(overlapped_address + 8u),
+                        rd32(overlapped_address + 16u));
+            const uint32_t event_handle = rd32(overlapped_address + 16u);
+            sync_object *event_object = NULL;
+            void *host_event = NULL;
+            if (event_handle) {
+                event_object = sync_object_for_handle(event_handle);
+                if (!event_object || event_object->kind != 1u)
+                    stop_guest("ReadFile OVERLAPPED.hEvent is not a guest event handle",
+                               import->token);
+#ifdef _WIN32
+                host_event = event_object->host_event;
+                if (!host_event)
+                    stop_guest("ReadFile guest event lacks a native event", import->token);
+#endif
+            }
+            file_result = ac1_files_read_overlapped(
+                guest_files, handle, buffer, requested, overlapped_address,
+                rd32(overlapped_address + 8u),
+                rd32(overlapped_address + 12u), host_event, &error, &snapshot);
+            if (event_object && file_result == AC1_FILES_HANDLED) {
+                event_object->io_backed = error == 997u;
+#ifndef _WIN32
+                if (error == 0u)
+                    event_object->signaled = 1u;
+#endif
+            }
+        } else {
+            uint32_t *transferred = (uint32_t *)guest_memory_try_ptr(
+                transferred_address, sizeof(uint32_t));
+            if (!transferred)
+                stop_guest("ReadFile byte-count output is unmapped", import->token);
+            file_result = ac1_files_read(
+                guest_files, handle, buffer, requested, &bytes_read, &error);
+            if (file_result == AC1_FILES_HANDLED)
+                *transferred = bytes_read;
+        }
+        if (file_result == AC1_FILES_NOT_HANDLED) return 0;
+        if (file_result != AC1_FILES_HANDLED)
+            stop_guest("ReadFile file service rejected the call", import->token);
+        if (overlapped_address && snapshot.valid) {
+            wr32(overlapped_address, snapshot.internal);
+            wr32(overlapped_address + 4u, snapshot.internal_high);
+        }
+        cpu->eax = error == 0u;
+        if (error) last_error = error;
+        if (trace_imports && trace_file_read_count++ < 16u) {
+            const uint8_t *bytes = (const uint8_t *)buffer;
+            fprintf(stderr,
+                    "AC1 file read: handle=0x%08x request=%u ovl=0x%08x offset=0x%08x:%08x success=%u bytes=%u error=%u first=",
+                    handle, requested, overlapped_address,
+                    overlapped_address ? rd32(overlapped_address + 12u) : 0u,
+                    overlapped_address ? rd32(overlapped_address + 8u) : 0u,
+                    cpu->eax, bytes_read, error);
+            for (uint32_t i = 0; !overlapped_address && bytes &&
+                                  i < bytes_read && i < 8u; ++i)
+                fprintf(stderr, "%02x", bytes[i]);
+            fputc('\n', stderr);
+        }
+        return_stdcall(cpu, 20u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "GetOverlappedResult")) {
+        if (!guest_files) return 0;
+        if (!guest_memory_try_ptr(cpu->esp + 4u, 16u))
+            stop_guest("GetOverlappedResult arguments are unmapped", import->token);
+        const uint32_t handle = rd32(cpu->esp + 4u);
+        const uint32_t overlapped_address = rd32(cpu->esp + 8u);
+        const uint32_t transferred_address = rd32(cpu->esp + 12u);
+        const uint32_t wait = rd32(cpu->esp + 16u);
+        if (!guest_memory_try_ptr(overlapped_address, 20u))
+            stop_guest("GetOverlappedResult OVERLAPPED is unmapped", import->token);
+        uint32_t *transferred = (uint32_t *)guest_memory_try_ptr(
+            transferred_address, sizeof(uint32_t));
+        if (!transferred)
+            stop_guest("GetOverlappedResult byte-count output is unmapped",
+                       import->token);
+        uint32_t bytes_read = 0u;
+        uint32_t error = 0u;
+        ac1_files_overlapped_snapshot snapshot = {0};
+        const int file_result = ac1_files_get_overlapped_result(
+            guest_files, handle, overlapped_address, wait,
+            &bytes_read, &error, &snapshot);
+        if (file_result == AC1_FILES_NOT_HANDLED) return 0;
+        if (file_result != AC1_FILES_HANDLED)
+            stop_guest("GetOverlappedResult file service rejected the call",
+                       import->token);
+        if (snapshot.valid) {
+            wr32(overlapped_address, snapshot.internal);
+            wr32(overlapped_address + 4u, snapshot.internal_high);
+        }
+        cpu->eax = error == 0u;
+        if (cpu->eax) *transferred = bytes_read;
+        if (error) last_error = error;
+        if (trace_imports && trace_file_read_count++ < 16u)
+            fprintf(stderr,
+                    "AC1 overlapped result: handle=0x%08x ovl=0x%08x wait=%u success=%u bytes=%u error=%u\n",
+                    handle, overlapped_address, wait, cpu->eax, bytes_read, error);
+        return_stdcall(cpu, 16u);
+        return 1;
+    }
+
     if (!strcmp(import->name, "CloseHandle")) {
         if (!guest_files) return 0;
         uint32_t error = 0u;
         uint32_t handle = rd32(cpu->esp + 4u);
         if (!ac1_files_close(guest_files, handle, &error)) return 0;
         cpu->eax = error == 0u;
+        if (trace_imports)
+            fprintf(stderr,
+                    "AC1 file close: handle=0x%08x success=%u error=%u\n",
+                    handle, cpu->eax, error);
         if (error) last_error = error;
         return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (!strcmp(import->name, "SetFilePointer")) {
+        if (!guest_files) return 0;
+        if (!guest_memory_try_ptr(cpu->esp + 4u, 16u))
+            stop_guest("SetFilePointer arguments are unmapped", import->token);
+        const uint32_t handle = rd32(cpu->esp + 4u);
+        const uint32_t distance_low = rd32(cpu->esp + 8u);
+        const uint32_t distance_high_address = rd32(cpu->esp + 12u);
+        const uint32_t move_method = rd32(cpu->esp + 16u);
+        const int has_distance_high = distance_high_address != 0u;
+        uint32_t distance_high = 0u;
+        if (has_distance_high) {
+            if (!guest_memory_try_ptr(distance_high_address, 4u))
+                stop_guest("SetFilePointer high-distance pointer is unmapped",
+                           import->token);
+            distance_high = rd32(distance_high_address);
+        }
+        uint32_t position_low = UINT32_MAX;
+        uint32_t position_high = 0u;
+        uint32_t error = 0u;
+        int file_result = ac1_files_seek(
+            guest_files, handle, distance_low, has_distance_high,
+            distance_high, move_method, &position_low,
+            has_distance_high ? &position_high : NULL, &error);
+        if (file_result == AC1_FILES_NOT_HANDLED) return 0;
+        if (file_result != AC1_FILES_HANDLED)
+            stop_guest("SetFilePointer file service rejected the call", import->token);
+        if (!error && has_distance_high)
+            wr32(distance_high_address, position_high);
+        cpu->eax = error ? UINT32_MAX : position_low;
+        if (error) last_error = error;
+        else if (position_low == UINT32_MAX) last_error = 0u;
+        if (trace_imports)
+            fprintf(stderr,
+                    "AC1 file seek: handle=0x%08x distance=0x%08x:%08x method=%u high_out=0x%08x position=0x%08x:%08x error=%u\n",
+                    handle, distance_high, distance_low, move_method,
+                    distance_high_address, position_high, position_low, error);
+        return_stdcall(cpu, 16u);
+        return 1;
+    }
+    if (!strcmp(import->name, "GetFileSizeEx")) {
+        if (!guest_files) return 0;
+        if (!guest_memory_try_ptr(cpu->esp + 4u, 8u))
+            stop_guest("GetFileSizeEx arguments are unmapped", import->token);
+        const uint32_t handle = rd32(cpu->esp + 4u);
+        const uint32_t size_address = rd32(cpu->esp + 8u);
+        if (!guest_memory_try_ptr(size_address, 8u))
+            stop_guest("GetFileSizeEx size output is unmapped", import->token);
+        uint64_t size = 0u;
+        uint32_t error = 0u;
+        int file_result = ac1_files_get_size(guest_files, handle, &size, &error);
+        if (file_result == AC1_FILES_NOT_HANDLED) return 0;
+        if (file_result != AC1_FILES_HANDLED)
+            stop_guest("GetFileSizeEx file service rejected the call", import->token);
+        cpu->eax = error == 0u;
+        if (!error) {
+            wr32(size_address, (uint32_t)size);
+            wr32(size_address + 4u, (uint32_t)(size >> 32));
+        } else {
+            last_error = error;
+        }
+        if (trace_imports)
+            fprintf(stderr,
+                    "AC1 file size: handle=0x%08x success=%u size=%llu error=%u\n",
+                    handle, cpu->eax, (unsigned long long)size, error);
+        return_stdcall(cpu, 8u);
         return 1;
     }
     return 0;
@@ -5092,6 +5440,7 @@ int ac1_run(const char *exe_path)
                 (unsigned long long)dispatch_limit);
     trace_import_count = 0;
     trace_callback_count = 0;
+    trace_file_read_count = 0;
     crt_handoff_logged = 0;
     memcpy(exe_path_copy, exe_path, strlen(exe_path) + 1u);
     derive_guest_current_directory(exe_path_copy);
@@ -5328,6 +5677,7 @@ cleanup:
         ac1_files_destroy(guest_files);
         guest_files = NULL;
     }
+    sync_objects_destroy();
     active_guest_thread = NULL;
     if (process_heap && space) {
         guest_address_space_select(space);
