@@ -1,0 +1,18 @@
+{
+  "binary_sha256": "2fa8d50c60398cc249c6d908de46b15f48e445dd0c605b5956e94fa2f445a713",
+  "pointer_width": 4,
+  "tables": [
+    {
+      "name": "c_initterm_e",
+      "start_va": "0x0167FCE0",
+      "end_va_exclusive": "0x01680004",
+      "description": "MSVC _initterm_e initializer function pointer range"
+    },
+    {
+      "name": "cpp_initializer",
+      "start_va": "0x0167C000",
+      "end_va_exclusive": "0x0167FBDC",
+      "description": "MSVC C++ dynamic initializer function pointer range"
+    }
+  ]
+}

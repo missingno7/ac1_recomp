@@ -1,0 +1,3626 @@
+#define _GNU_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#include "ac1_runtime.h"
+#include "cpu.h"
+#include "guest_memory.h"
+#include "pe32_loader.h"
+#include "pcrecomp_heap.h"
+#include "ac1_network.h"
+#include "initial_dispatch.h"
+#include "ac1_fingerprint.h"
+#if defined(AC1_HOST_D3D9)
+#include "../graphics/ac1_d3d9_bridge.h"
+#endif
+
+#include <setjmp.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <direct.h>
+#include "../platform/ac1_window_win32.h"
+#else
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <pthread.h>
+#include <sched.h>
+#endif
+
+#define AC1_STACK_BASE 0x7FE00000u
+#define AC1_STACK_SIZE 0x00100000u
+#define AC1_TIB_BASE 0x7FFD0000u
+#define AC1_TIB_SIZE 0x00001000u
+#define AC1_IMPORT_BASE 0xF1000000u
+#define AC1_RETURN_SENTINEL 0xFFFFF000u
+#define AC1_DISPATCH_LIMIT_DEFAULT UINT64_C(10000000)
+#define AC1_DISPATCH_DEPTH 4096u
+#define AC1_IMPORT_LIMIT 2048u
+#define AC1_PROCESS_HEAP_HANDLE 0xE0000001u
+#define AC1_PRIVATE_HEAP_BASE 0xE0000100u
+#define AC1_MAX_PRIVATE_HEAPS 32u
+#define AC1_KERNEL32_HANDLE 0x76000000u
+#define AC1_STD_INPUT_HANDLE 0xE1000001u
+#define AC1_STD_OUTPUT_HANDLE 0xE1000002u
+#define AC1_STD_ERROR_HANDLE 0xE1000003u
+#define AC1_TLS_SLOTS 1088u
+#define AC1_SYNC_HANDLE_BASE 0xE2000000u
+#define AC1_MAX_SYNC_OBJECTS 64u
+#define AC1_THREAD_HANDLE_BASE 0xE3000000u
+#define AC1_MAX_THREADS 32u
+#define AC1_WAIT_OBJECT_0 0u
+#define AC1_WAIT_TIMEOUT 258u
+#define AC1_STILL_ACTIVE 259u
+
+_Thread_local uint32_t g_image_delta;
+
+typedef struct ac1_guest_thread ac1_guest_thread;
+typedef struct ac1_scheduler ac1_scheduler;
+static _Thread_local ac1_guest_thread *active_guest_thread;
+
+struct ac1_guest_thread {
+    ac1_scheduler *scheduler;
+    unsigned slot;
+    uint32_t id, handle, start, parameter, exit_code, image_delta;
+    uint64_t guest_dispatches;
+    uint32_t stack_base, stack_size, tib_base;
+    uint32_t static_tls_data, static_tls_vector;
+    uint32_t affinity_mask;
+    uint32_t tls_values[AC1_TLS_SLOTS];
+    CPU cpu;
+#ifdef _WIN32
+    HANDLE host;
+#else
+    pthread_t host;
+#endif
+    jmp_buf exit_env;
+    int spawned, started, finished, closed, suspended, blocked;
+    int wait_kind;
+    int priority;
+    int priority_boost_disabled;
+    uint32_t wait_handle, wait_result;
+    uint64_t wait_deadline;
+};
+
+struct ac1_scheduler {
+#ifdef _WIN32
+    CRITICAL_SECTION mutex;
+    CONDITION_VARIABLE condition;
+#else
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+#endif
+    guest_address_space *space;
+    ac1_guest_thread threads[AC1_MAX_THREADS];
+    unsigned count, owner;
+    uint32_t next_thread_id;
+    int stopping, failed;
+    uint32_t failure_target;
+    uint32_t failure_caller, failure_thread_id;
+    CPU failure_cpu;
+    uint32_t failure_stack[8];
+    char failure_reason[512];
+};
+
+static _Thread_local jmp_buf stop_runtime;
+static _Thread_local int runtime_stop_ready;
+static int trace_imports;
+static int crt_handoff_logged;
+static _Thread_local unsigned trace_import_count;
+static _Thread_local unsigned trace_callback_count;
+static _Thread_local uint32_t last_guest_target;
+static _Thread_local uint64_t dispatch_count;
+static uint64_t dispatch_limit = AC1_DISPATCH_LIMIT_DEFAULT;
+static _Thread_local unsigned dispatch_depth;
+static pcrecomp_heap *process_heap;
+static char exe_path_copy[32768];
+static char guest_current_directory[32768];
+static uint32_t command_line_guest_address;
+static struct { uint32_t handle; pcrecomp_heap *heap; } private_heaps[AC1_MAX_PRIVATE_HEAPS];
+static _Thread_local uint32_t last_error;
+static uint32_t max_guest_handles;
+static uint32_t unhandled_exception_filter;
+static char user_data_root[32768];
+static _Thread_local uint32_t com_init_count;
+static _Thread_local uint32_t com_apartment_model;
+static uint32_t guest_affinity_mask;
+static _Thread_local uint32_t guest_thread_affinity_mask;
+static uint32_t image_base;
+#ifdef _WIN32
+static ac1_window_win32 *window_bridge;
+#endif
+#if defined(AC1_HOST_D3D9)
+typedef struct { uint32_t guest_address, heap_address; } ac1_d3d9_heap_block;
+static ac1_d3d9_heap_block d3d9_heap_blocks[256];
+static int d3d9_configured;
+#endif
+static uint8_t tls_used[AC1_TLS_SLOTS];
+static _Thread_local uint32_t tls_values[AC1_TLS_SLOTS];
+static _Thread_local uint32_t static_tls_data_base;
+static _Thread_local uint32_t static_tls_vector_base;
+static const uint8_t *static_tls_template;
+static uint32_t static_tls_template_size;
+static uint32_t static_tls_zero_fill;
+static uint32_t static_tls_index_address;
+static ac1_scheduler *active_scheduler;
+
+static void scheduler_lock(ac1_scheduler *scheduler);
+static void scheduler_unlock(ac1_scheduler *scheduler);
+static void scheduler_notify(ac1_scheduler *scheduler);
+static void scheduler_wait_condition(ac1_scheduler *scheduler, uint32_t milliseconds);
+static void scheduler_destroy_primitives(ac1_scheduler *scheduler);
+static unsigned scheduler_next_runnable(ac1_scheduler *scheduler, unsigned after);
+static ac1_guest_thread *thread_for_handle(uint32_t handle);
+static int equal_ascii_fold(const char *a, const char *b);
+static void return_stdcall(CPU *cpu, uint32_t argument_bytes);
+
+#ifdef _WIN32
+static CRITICAL_SECTION ac1_run_lock;
+static INIT_ONCE ac1_run_lock_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK init_ac1_run_lock(PINIT_ONCE once, PVOID param, PVOID *context)
+{
+    (void)once; (void)param; (void)context;
+    InitializeCriticalSection(&ac1_run_lock);
+    return TRUE;
+}
+static void lock_ac1_run(void) { InitOnceExecuteOnce(&ac1_run_lock_once, init_ac1_run_lock, NULL, NULL); EnterCriticalSection(&ac1_run_lock); }
+static void unlock_ac1_run(void) { LeaveCriticalSection(&ac1_run_lock); }
+#else
+static pthread_mutex_t ac1_run_lock = PTHREAD_MUTEX_INITIALIZER;
+static void lock_ac1_run(void) { pthread_mutex_lock(&ac1_run_lock); }
+static void unlock_ac1_run(void) { pthread_mutex_unlock(&ac1_run_lock); }
+#endif
+
+typedef struct {
+    uint32_t token;
+    char dll[96];
+    char name[160];
+    uint16_t ordinal;
+    int by_ordinal;
+} import_record;
+
+typedef struct {
+    uint32_t handle;
+    uint32_t count;
+    uint32_t maximum;
+    uint8_t kind; /* 1 event, 2 semaphore */
+    uint8_t manual_reset;
+    uint8_t signaled;
+    char name[256];
+} sync_object;
+
+static import_record imports[AC1_IMPORT_LIMIT];
+static sync_object sync_objects[AC1_MAX_SYNC_OBJECTS];
+static size_t import_count;
+static _Thread_local char stop_reason[512];
+static _Thread_local char last_run_error[512];
+static void stop_guest(const char *reason, uint32_t target);
+
+static int prepare_guest_thread(ac1_guest_thread *thread)
+{
+    thread->stack_base = guest_memory_find_gap(0x60000000u, thread->stack_size,
+                                                0x10000u, 0x70000000u);
+    thread->tib_base = guest_memory_find_gap(0x7F000000u, AC1_TIB_SIZE,
+                                              0x10000u, 0x7FF00000u);
+    if (!thread->stack_base || !thread->tib_base ||
+        !guest_memory_allocate(thread->stack_base, thread->stack_size) ||
+        !guest_memory_allocate(thread->tib_base, AC1_TIB_SIZE))
+        return 0;
+
+    uint32_t stack_top = thread->stack_base + thread->stack_size - 0x100u;
+    thread->cpu.esp = stack_top - 8u;
+    thread->cpu.eip = thread->start;
+    thread->cpu.eflags_misc = 2u;
+    thread->cpu.fs_base = thread->tib_base;
+    wr32(thread->cpu.esp, AC1_RETURN_SENTINEL);
+    wr32(thread->cpu.esp + 4u, thread->parameter);
+    wr32(thread->tib_base, UINT32_MAX);
+    wr32(thread->tib_base + 4u, stack_top);
+    wr32(thread->tib_base + 8u, thread->stack_base);
+    wr32(thread->tib_base + 0x18u, thread->tib_base);
+    wr32(thread->tib_base + 0x20u, 1u);
+    wr32(thread->tib_base + 0x24u, thread->id);
+
+    if (static_tls_index_address) {
+        uint32_t total = static_tls_template_size + static_tls_zero_fill;
+        if (!total) total = 1u;
+        thread->static_tls_data = guest_memory_find_gap(0x70000000u, total, 16u,
+                                                         AC1_STACK_BASE);
+        thread->static_tls_vector = guest_memory_find_gap(0x7FC00000u,
+                                                          64u * 4u, 16u,
+                                                          AC1_TIB_BASE);
+        if (!thread->static_tls_data || !thread->static_tls_vector ||
+            !guest_memory_allocate(thread->static_tls_data, total) ||
+            !guest_memory_allocate(thread->static_tls_vector, 64u * 4u))
+            return 0;
+        memset(guest_ptr(thread->static_tls_data, total), 0, total);
+        if (static_tls_template_size)
+            memcpy(guest_ptr(thread->static_tls_data, static_tls_template_size),
+                   static_tls_template, static_tls_template_size);
+        wr32(static_tls_index_address, 0u);
+        wr32(thread->static_tls_vector, thread->static_tls_data);
+        wr32(thread->tib_base + 0x2cu, thread->static_tls_vector);
+        thread->tls_values[0] = thread->static_tls_data;
+    }
+    return 1;
+}
+
+static void run_guest_thread(ac1_guest_thread *thread)
+{
+    ac1_scheduler *scheduler = thread->scheduler;
+    scheduler_lock(scheduler);
+    while (!scheduler->stopping && !scheduler->failed && scheduler->owner != thread->slot)
+        scheduler_wait_condition(scheduler, 0u);
+    int can_run = !scheduler->stopping && !scheduler->failed;
+    thread->started = can_run;
+    scheduler_unlock(scheduler);
+
+    if (can_run) {
+        /* Read mutable per-process/thread state only after receiving the guest
+         * baton. The primary thread can still service imports while this worker
+         * is waiting, including SetThreadAffinityMask. */
+        active_guest_thread = thread;
+        guest_address_space_select(scheduler->space);
+        static_tls_data_base = thread->static_tls_data;
+        static_tls_vector_base = thread->static_tls_vector;
+        guest_thread_affinity_mask = thread->affinity_mask;
+        memcpy(tls_values, thread->tls_values, sizeof(tls_values));
+        last_error = 0u;
+        com_init_count = 0u;
+        com_apartment_model = UINT32_MAX;
+        g_image_delta = thread->image_delta;
+        dispatch_count = 0u;
+        dispatch_depth = 0u;
+        trace_import_count = 0u;
+        last_guest_target = thread->start;
+    }
+
+    if (can_run && setjmp(thread->exit_env) == 0) {
+        if (trace_imports)
+            fprintf(stderr, "AC1 guest worker start id=%u start=0x%08x parameter=0x%08x stack=0x%08x tib=0x%08x\n",
+                    thread->id, thread->start, thread->parameter,
+                    thread->stack_base, thread->tib_base);
+        if (setjmp(stop_runtime) == 0) {
+            runtime_stop_ready = 1;
+            dispatch(&thread->cpu, thread->start);
+            runtime_stop_ready = 0;
+            thread->exit_code = thread->cpu.eax;
+        } else {
+            runtime_stop_ready = 0;
+        }
+    }
+    runtime_stop_ready = 0;
+
+    scheduler_lock(scheduler);
+    thread->guest_dispatches = dispatch_count;
+    thread->finished = 1;
+    if (scheduler->failed) scheduler->owner = 0u;
+    else if (scheduler->owner == thread->slot) {
+        unsigned next = scheduler_next_runnable(scheduler, thread->slot);
+        scheduler->owner = next < scheduler->count ? next : 0u;
+    }
+    int worker_failed = scheduler->failed;
+    scheduler_notify(scheduler);
+    scheduler_unlock(scheduler);
+    if (thread->started && trace_imports)
+        fprintf(stderr, "AC1 guest worker end id=%u exit=0x%08x failed=%d\n",
+                thread->id, thread->exit_code, worker_failed);
+    active_guest_thread = NULL;
+    guest_address_space_select(NULL);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI guest_thread_entry(LPVOID parameter)
+{
+    run_guest_thread((ac1_guest_thread *)parameter);
+    return 0u;
+}
+#else
+static void *guest_thread_entry(void *parameter)
+{
+    run_guest_thread((ac1_guest_thread *)parameter);
+    return NULL;
+}
+#endif
+
+static void scheduler_stop_and_join(ac1_scheduler *scheduler)
+{
+    if (!scheduler) return;
+    scheduler_lock(scheduler);
+    unsigned created = 0u, started = 0u, finished_before_stop = 0u, blocked_at_teardown = 0u;
+    for (unsigned i = 1u; i < scheduler->count; ++i) {
+        ac1_guest_thread *thread = &scheduler->threads[i];
+        if (thread->spawned) ++created;
+        if (thread->started) ++started;
+        if (thread->finished) ++finished_before_stop;
+        if (thread->blocked) ++blocked_at_teardown;
+    }
+    scheduler->stopping = 1;
+    scheduler_notify(scheduler);
+    scheduler_unlock(scheduler);
+    guest_address_space_select(scheduler->space);
+    for (unsigned i = 1u; i < scheduler->count; ++i) {
+        ac1_guest_thread *thread = &scheduler->threads[i];
+        if (thread->spawned) {
+#ifdef _WIN32
+            WaitForSingleObject(thread->host, INFINITE);
+            CloseHandle(thread->host);
+#else
+            pthread_join(thread->host, NULL);
+#endif
+        }
+        if (thread->static_tls_vector) guest_memory_release(thread->static_tls_vector);
+        if (thread->static_tls_data) guest_memory_release(thread->static_tls_data);
+        if (thread->tib_base) guest_memory_release(thread->tib_base);
+        if (thread->stack_base) guest_memory_release(thread->stack_base);
+    }
+    unsigned joined = 0u;
+    uint64_t worker_dispatches = 0u;
+    for (unsigned i = 1u; i < scheduler->count; ++i) {
+        ac1_guest_thread *thread = &scheduler->threads[i];
+        if (thread->spawned) ++joined;
+        worker_dispatches += thread->guest_dispatches;
+    }
+    fprintf(stderr, "AC1 scheduler summary: workers created=%u started=%u finished-before-stop=%u joined=%u blocked-at-stop=%u guest-dispatches=%llu\n",
+            created, started, finished_before_stop, joined, blocked_at_teardown,
+            (unsigned long long)worker_dispatches);
+    active_guest_thread = NULL;
+    active_scheduler = NULL;
+    scheduler_destroy_primitives(scheduler);
+}
+
+static int create_guest_thread(CPU *cpu, const import_record *import)
+{
+    if (!active_scheduler || !active_guest_thread) return 0;
+    uint32_t attributes = rd32(cpu->esp + 4u);
+    uint32_t requested_stack = rd32(cpu->esp + 8u);
+    uint32_t start = rd32(cpu->esp + 12u);
+    uint32_t parameter = rd32(cpu->esp + 16u);
+    uint32_t flags = rd32(cpu->esp + 20u);
+    uint32_t thread_id_output = rd32(cpu->esp + 24u);
+    if (attributes || !start || (flags & ~(4u | 0x10000u)) ||
+        active_scheduler->count >= AC1_MAX_THREADS) {
+        cpu->eax = 0u;
+        last_error = attributes ? 87u : 8u;
+        return_stdcall(cpu, 24u);
+        return 1;
+    }
+    if (thread_id_output && !guest_memory_try_ptr(thread_id_output, 4u))
+        stop_guest("CreateThread thread-id output is unmapped", import->token);
+    uint32_t stack_size = requested_stack ? requested_stack : 0x00100000u;
+    if (stack_size > 0x01000000u) {
+        cpu->eax = 0u;
+        last_error = 8u;
+        return_stdcall(cpu, 24u);
+        return 1;
+    }
+    stack_size = (stack_size + 0xffffu) & ~0xffffu;
+    if (!stack_size) stack_size = 0x00100000u;
+
+    ac1_scheduler *scheduler = active_scheduler;
+    unsigned slot = scheduler->count;
+    ac1_guest_thread *thread = &scheduler->threads[slot];
+    memset(thread, 0, sizeof(*thread));
+    thread->scheduler = scheduler;
+    thread->slot = slot;
+    thread->id = scheduler->next_thread_id;
+    scheduler->next_thread_id += 4u;
+    thread->handle = AC1_THREAD_HANDLE_BASE + slot * 4u;
+    thread->start = start;
+    thread->parameter = parameter;
+    thread->stack_size = stack_size;
+    thread->image_delta = g_image_delta;
+    thread->affinity_mask = guest_affinity_mask;
+    thread->suspended = (flags & 4u) != 0u;
+    if (!prepare_guest_thread(thread)) {
+        if (thread->static_tls_vector) guest_memory_release(thread->static_tls_vector);
+        if (thread->static_tls_data) guest_memory_release(thread->static_tls_data);
+        if (thread->tib_base) guest_memory_release(thread->tib_base);
+        if (thread->stack_base) guest_memory_release(thread->stack_base);
+        memset(thread, 0, sizeof(*thread));
+        cpu->eax = 0u;
+        last_error = 8u;
+        return_stdcall(cpu, 24u);
+        return 1;
+    }
+
+    scheduler_lock(scheduler);
+#ifdef _WIN32
+    thread->host = CreateThread(NULL, 0, guest_thread_entry, thread, 0, NULL);
+    thread->spawned = thread->host != NULL;
+#else
+    thread->spawned = pthread_create(&thread->host, NULL, guest_thread_entry, thread) == 0;
+#endif
+    if (thread->spawned) ++scheduler->count;
+    scheduler_notify(scheduler);
+    scheduler_unlock(scheduler);
+    if (!thread->spawned) {
+        if (thread->static_tls_vector) guest_memory_release(thread->static_tls_vector);
+        if (thread->static_tls_data) guest_memory_release(thread->static_tls_data);
+        if (thread->tib_base) guest_memory_release(thread->tib_base);
+        if (thread->stack_base) guest_memory_release(thread->stack_base);
+        memset(thread, 0, sizeof(*thread));
+        cpu->eax = 0u;
+        last_error = 8u;
+        return_stdcall(cpu, 24u);
+        return 1;
+    }
+    if (thread_id_output) wr32(thread_id_output, thread->id);
+    cpu->eax = thread->handle;
+    last_error = 0u;
+    return_stdcall(cpu, 24u);
+    return 1;
+}
+
+static int handle_thread_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
+        return 0;
+    if (!strcmp(import->name, "CreateThread")) return create_guest_thread(cpu, import);
+    if (!strcmp(import->name, "Sleep")) {
+        uint32_t milliseconds = rd32(cpu->esp + 4u);
+        if (active_guest_thread && active_scheduler && milliseconds) {
+            active_guest_thread->blocked = 1;
+            active_guest_thread->wait_kind = 2;
+            active_guest_thread->wait_deadline = milliseconds == UINT32_MAX ? 0u :
+                guest_monotonic_ns() + (uint64_t)milliseconds * 1000000u;
+        }
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (!strcmp(import->name, "SwitchToThread")) {
+        int another = active_scheduler && active_scheduler->count > 1u;
+        cpu->eax = another ? 1u : 0u;
+        return_stdcall(cpu, 0u);
+        return 1;
+    }
+    if (!strcmp(import->name, "ResumeThread") || !strcmp(import->name, "SuspendThread")) {
+        uint32_t handle = rd32(cpu->esp + 4u);
+        ac1_guest_thread *thread = thread_for_handle(handle);
+        if (!thread) {
+            cpu->eax = UINT32_MAX;
+            last_error = 6u;
+        } else {
+            cpu->eax = thread->suspended ? 1u : 0u;
+            if (!strcmp(import->name, "ResumeThread")) thread->suspended = 0;
+            else thread->suspended = 1;
+            if (active_scheduler) {
+                scheduler_lock(active_scheduler);
+                scheduler_notify(active_scheduler);
+                scheduler_unlock(active_scheduler);
+            }
+            last_error = 0u;
+        }
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (!strcmp(import->name, "GetExitCodeThread")) {
+        uint32_t output = rd32(cpu->esp + 8u);
+        ac1_guest_thread *thread = thread_for_handle(rd32(cpu->esp + 4u));
+        if (!thread || !guest_memory_try_ptr(output, 4u)) {
+            cpu->eax = 0u;
+            last_error = thread ? 87u : 6u;
+        } else {
+            wr32(output, thread->finished ? thread->exit_code : AC1_STILL_ACTIVE);
+            cpu->eax = 1u;
+            last_error = 0u;
+        }
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+    if (!strcmp(import->name, "GetThreadId")) {
+        ac1_guest_thread *thread = thread_for_handle(rd32(cpu->esp + 4u));
+        cpu->eax = thread ? thread->id : 0u;
+        last_error = thread ? 0u : 6u;
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (!strcmp(import->name, "SetThreadPriority")) {
+        uint32_t handle = rd32(cpu->esp + 4u);
+        int32_t priority = (int32_t)rd32(cpu->esp + 8u);
+        ac1_guest_thread *thread = thread_for_handle(handle);
+        if (handle == UINT32_MAX - 1u) thread = active_guest_thread;
+        if (!thread || priority < -15 || priority > 15) {
+            cpu->eax = 0u;
+            last_error = thread ? 87u : 6u;
+        } else {
+            thread->priority = priority;
+            cpu->eax = 1u;
+            last_error = 0u;
+        }
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+    if (!strcmp(import->name, "GetThreadPriority")) {
+        uint32_t handle = rd32(cpu->esp + 4u);
+        ac1_guest_thread *thread = thread_for_handle(handle);
+        if (handle == UINT32_MAX - 1u) thread = active_guest_thread;
+        cpu->eax = thread ? (uint32_t)thread->priority : UINT32_C(0x7fffffff);
+        last_error = thread ? 0u : 6u;
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (!strcmp(import->name, "SetThreadPriorityBoost")) {
+        ac1_guest_thread *thread = thread_for_handle(rd32(cpu->esp + 4u));
+        if (!thread && rd32(cpu->esp + 4u) == UINT32_MAX - 1u)
+            thread = active_guest_thread;
+        if (!thread) {
+            cpu->eax = 0u;
+            last_error = 6u;
+        } else {
+            thread->priority_boost_disabled = rd32(cpu->esp + 8u) != 0u;
+            cpu->eax = 1u;
+            last_error = 0u;
+        }
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+    if (!strcmp(import->name, "ExitThread")) {
+        if (!active_guest_thread || active_guest_thread->slot == 0u)
+            stop_guest("ExitThread on the primary guest thread is unsupported", import->token);
+        active_guest_thread->exit_code = rd32(cpu->esp + 4u);
+        longjmp(active_guest_thread->exit_env, 1);
+    }
+    return 0;
+}
+
+static void scheduler_lock(ac1_scheduler *scheduler)
+{
+#ifdef _WIN32
+    EnterCriticalSection(&scheduler->mutex);
+#else
+    pthread_mutex_lock(&scheduler->mutex);
+#endif
+}
+
+static void scheduler_unlock(ac1_scheduler *scheduler)
+{
+#ifdef _WIN32
+    LeaveCriticalSection(&scheduler->mutex);
+#else
+    pthread_mutex_unlock(&scheduler->mutex);
+#endif
+}
+
+static void scheduler_notify(ac1_scheduler *scheduler)
+{
+#ifdef _WIN32
+    WakeAllConditionVariable(&scheduler->condition);
+#else
+    pthread_cond_broadcast(&scheduler->condition);
+#endif
+}
+
+static void scheduler_wait_condition(ac1_scheduler *scheduler, uint32_t milliseconds)
+{
+#ifdef _WIN32
+    SleepConditionVariableCS(&scheduler->condition, &scheduler->mutex,
+                             milliseconds ? milliseconds : INFINITE);
+#else
+    if (!milliseconds) {
+        pthread_cond_wait(&scheduler->condition, &scheduler->mutex);
+    } else {
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        uint64_t ns = (uint64_t)until.tv_nsec + (uint64_t)milliseconds * 1000000u;
+        until.tv_sec += (time_t)(ns / 1000000000u);
+        until.tv_nsec = (long)(ns % 1000000000u);
+        (void)pthread_cond_timedwait(&scheduler->condition, &scheduler->mutex, &until);
+    }
+#endif
+}
+
+static void scheduler_initialize(ac1_scheduler *scheduler, guest_address_space *space)
+{
+    memset(scheduler, 0, sizeof(*scheduler));
+#ifdef _WIN32
+    InitializeCriticalSection(&scheduler->mutex);
+    InitializeConditionVariable(&scheduler->condition);
+#else
+    pthread_mutex_init(&scheduler->mutex, NULL);
+    pthread_cond_init(&scheduler->condition, NULL);
+#endif
+    scheduler->space = space;
+    scheduler->count = 1u;
+    scheduler->owner = 0u;
+    scheduler->next_thread_id = 0x1000u;
+}
+
+static void scheduler_destroy_primitives(ac1_scheduler *scheduler)
+{
+#ifdef _WIN32
+    DeleteCriticalSection(&scheduler->mutex);
+#else
+    pthread_cond_destroy(&scheduler->condition);
+    pthread_mutex_destroy(&scheduler->mutex);
+#endif
+}
+
+static ac1_guest_thread *thread_for_handle(uint32_t handle)
+{
+    if (!active_scheduler || handle < AC1_THREAD_HANDLE_BASE || (handle & 3u)) return NULL;
+    unsigned slot = (handle - AC1_THREAD_HANDLE_BASE) / 4u;
+    if (slot >= active_scheduler->count) return NULL;
+    ac1_guest_thread *thread = &active_scheduler->threads[slot];
+    return thread->handle == handle && !thread->closed ? thread : NULL;
+}
+
+static void scheduler_refresh_waits(ac1_scheduler *scheduler);
+static uint32_t scheduler_next_timeout(ac1_scheduler *scheduler);
+
+static unsigned scheduler_next_runnable(ac1_scheduler *scheduler, unsigned after)
+{
+    scheduler_refresh_waits(scheduler);
+    int best_priority = INT32_MIN;
+    unsigned best = scheduler->count;
+    for (unsigned step = 1; step <= scheduler->count; ++step) {
+        unsigned slot = (after + step) % scheduler->count;
+        ac1_guest_thread *thread = &scheduler->threads[slot];
+        if (!thread->finished && !thread->suspended && !thread->blocked &&
+            thread->priority > best_priority) {
+            best = slot;
+            best_priority = thread->priority;
+        }
+    }
+    return best;
+}
+
+static void scheduler_checkpoint(void)
+{
+    ac1_scheduler *scheduler = active_scheduler;
+    ac1_guest_thread *thread = active_guest_thread;
+    if (!scheduler || !thread || scheduler->count < 2u) return;
+    scheduler_lock(scheduler);
+    for (;;) {
+        if (scheduler->failed || scheduler->stopping) break;
+        unsigned next = scheduler_next_runnable(scheduler, thread->slot);
+        if (next == thread->slot) break;
+        if (next < scheduler->count) {
+            scheduler->owner = next;
+            scheduler_notify(scheduler);
+            while (!scheduler->stopping && !scheduler->failed &&
+                   scheduler->owner != thread->slot)
+                scheduler_wait_condition(scheduler, 0u);
+            /* Once this thread gets the baton back, let it execute. A regular
+             * checkpoint must not immediately hand it to the same peer again. */
+            scheduler_refresh_waits(scheduler);
+            if (!thread->blocked) break;
+        } else {
+            scheduler_wait_condition(scheduler, scheduler_next_timeout(scheduler));
+        }
+    }
+    int failed = scheduler->failed;
+    int stopping = scheduler->stopping;
+    uint32_t target = scheduler->failure_target;
+    char failure_reason[sizeof(scheduler->failure_reason)];
+    snprintf(failure_reason, sizeof(failure_reason), "%s", scheduler->failure_reason);
+    scheduler_unlock(scheduler);
+    if ((stopping || failed) && thread->slot != 0u)
+        longjmp(thread->exit_env, 1);
+    if (failed) stop_guest(failure_reason[0] ? failure_reason : "guest worker failed", target);
+}
+
+const char *ac1_last_error(void) { return last_run_error; }
+
+int ac1_set_userdata_root(const char *path)
+{
+    if (!path || !*path || strlen(path) >= sizeof(user_data_root)) return 0;
+#ifdef _WIN32
+    int absolute = (path[0] == '\\' && path[1] == '\\') ||
+                   (((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) &&
+                    path[1] == ':' && (path[2] == '\\' || path[2] == '/'));
+#else
+    int absolute = path[0] == '/';
+#endif
+    if (!absolute) return 0;
+    lock_ac1_run();
+    memcpy(user_data_root, path, strlen(path) + 1u);
+    unlock_ac1_run();
+    return 1;
+}
+
+static int directory_exists(const char *path)
+{
+#ifdef _WIN32
+    DWORD attrs = GetFileAttributesA(path);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    struct stat st;
+    return !stat(path, &st) && S_ISDIR(st.st_mode);
+#endif
+}
+
+static int make_one_directory(const char *path)
+{
+#ifdef _WIN32
+    if (!_mkdir(path) || (errno == EEXIST && directory_exists(path))) return 1;
+    return directory_exists(path);
+#else
+    if (!mkdir(path, 0700) || (errno == EEXIST && directory_exists(path))) return 1;
+    return directory_exists(path);
+#endif
+}
+
+static int ensure_directory_tree(const char *path)
+{
+    char copy[32768];
+    size_t length = strlen(path);
+    if (!length || length >= sizeof(copy)) return 0;
+    memcpy(copy, path, length + 1u);
+    size_t start = 1u;
+#ifdef _WIN32
+    if (length >= 3u && copy[1] == ':') start = 3u;
+#endif
+    for (size_t i = start; i <= length; ++i) {
+        if (copy[i] == '\\' || copy[i] == '/' || copy[i] == '\0') {
+            char saved = copy[i];
+            copy[i] = '\0';
+            if (copy[0] && !directory_exists(copy) && !make_one_directory(copy)) return 0;
+            copy[i] = saved;
+        }
+    }
+    return directory_exists(copy);
+}
+
+static int get_user_data_root(char *output, size_t capacity)
+{
+    if (user_data_root[0]) {
+        size_t n = strlen(user_data_root);
+        if (n >= capacity) return 0;
+        memcpy(output, user_data_root, n + 1u);
+        return 1;
+    }
+#ifdef AC1_DEFAULT_USERDATA_ROOT
+    {
+        const char *configured_root = AC1_DEFAULT_USERDATA_ROOT;
+        size_t n = strlen(configured_root);
+        if (n >= capacity) return 0;
+        memcpy(output, configured_root, n + 1u);
+        return 1;
+    }
+#else
+#ifdef _WIN32
+    DWORD n = GetCurrentDirectoryA((DWORD)capacity, output);
+    if (!n || n >= capacity) return 0;
+    const char *suffix = "\\work\\userdata";
+#else
+    if (!getcwd(output, capacity)) return 0;
+    size_t n = strlen(output);
+    const char *suffix = "/work/userdata";
+#endif
+    size_t suffix_length = strlen(suffix);
+    if ((size_t)n + suffix_length >= capacity) return 0;
+    memcpy(output + n, suffix, suffix_length + 1u);
+    return 1;
+#endif
+}
+
+#ifdef _WIN32
+extern char **_environ;
+#else
+extern char **environ;
+#endif
+
+static size_t utf8_to_utf16_count(const unsigned char *text)
+{
+    size_t units = 0;
+    while (*text) {
+        uint32_t cp;
+        size_t n;
+        if (*text < 0x80u) { cp = *text; n = 1; }
+        else if ((*text & 0xe0u) == 0xc0u && text[1]) {
+            cp = ((uint32_t)(text[0] & 0x1fu) << 6) | (text[1] & 0x3fu); n = cp >= 0x80u ? 2u : 1u;
+        } else if ((*text & 0xf0u) == 0xe0u && text[1] && text[2]) {
+            cp = ((uint32_t)(text[0] & 0x0fu) << 12) | ((uint32_t)(text[1] & 0x3fu) << 6) | (text[2] & 0x3fu); n = cp >= 0x800u ? 3u : 1u;
+        } else if ((*text & 0xf8u) == 0xf0u && text[1] && text[2] && text[3]) {
+            cp = ((uint32_t)(text[0] & 7u) << 18) | ((uint32_t)(text[1] & 0x3fu) << 12) | ((uint32_t)(text[2] & 0x3fu) << 6) | (text[3] & 0x3fu); n = cp >= 0x10000u && cp <= 0x10ffffu ? 4u : 1u;
+        } else { cp = 0xfffdu; n = 1u; }
+        (void)cp;
+        units += n == 4u ? 2u : 1u;
+        text += n;
+    }
+    return units;
+}
+
+static uint16_t *utf8_to_utf16_write(uint16_t *out, const unsigned char *text)
+{
+    while (*text) {
+        uint32_t cp;
+        size_t n;
+        if (*text < 0x80u) { cp = *text; n = 1; }
+        else if ((*text & 0xe0u) == 0xc0u && text[1]) {
+            cp = ((uint32_t)(text[0] & 0x1fu) << 6) | (text[1] & 0x3fu); n = cp >= 0x80u ? 2u : 1u;
+            if (n == 1u) cp = 0xfffdu;
+        } else if ((*text & 0xf0u) == 0xe0u && text[1] && text[2]) {
+            cp = ((uint32_t)(text[0] & 0x0fu) << 12) | ((uint32_t)(text[1] & 0x3fu) << 6) | (text[2] & 0x3fu); n = cp >= 0x800u && !(cp >= 0xd800u && cp <= 0xdfffu) ? 3u : 1u;
+            if (n == 1u) cp = 0xfffdu;
+        } else if ((*text & 0xf8u) == 0xf0u && text[1] && text[2] && text[3]) {
+            cp = ((uint32_t)(text[0] & 7u) << 18) | ((uint32_t)(text[1] & 0x3fu) << 12) | ((uint32_t)(text[2] & 0x3fu) << 6) | (text[3] & 0x3fu); n = cp >= 0x10000u && cp <= 0x10ffffu ? 4u : 1u;
+            if (n == 1u) cp = 0xfffdu;
+        } else { cp = 0xfffdu; n = 1u; }
+        if (n == 4u) { cp -= 0x10000u; *out++ = (uint16_t)(0xd800u + (cp >> 10)); *out++ = (uint16_t)(0xdc00u + (cp & 0x3ffu)); }
+        else *out++ = (uint16_t)cp;
+        text += n;
+    }
+    *out++ = 0;
+    return out;
+}
+
+static size_t emit_utf8(uint32_t cp, uint8_t *out)
+{
+    if (cp <= 0x7fu) { if (out) out[0] = (uint8_t)cp; return 1u; }
+    if (cp <= 0x7ffu) {
+        if (out) { out[0] = (uint8_t)(0xc0u | (cp >> 6)); out[1] = (uint8_t)(0x80u | (cp & 0x3fu)); }
+        return 2u;
+    }
+    if (cp <= 0xffffu) {
+        if (out) { out[0] = (uint8_t)(0xe0u | (cp >> 12)); out[1] = (uint8_t)(0x80u | ((cp >> 6) & 0x3fu)); out[2] = (uint8_t)(0x80u | (cp & 0x3fu)); }
+        return 3u;
+    }
+    if (out) { out[0] = (uint8_t)(0xf0u | (cp >> 18)); out[1] = (uint8_t)(0x80u | ((cp >> 12) & 0x3fu)); out[2] = (uint8_t)(0x80u | ((cp >> 6) & 0x3fu)); out[3] = (uint8_t)(0x80u | (cp & 0x3fu)); }
+    return 4u;
+}
+
+static int cp1252_byte(uint32_t cp, uint8_t *byte)
+{
+    static const uint16_t upper[32] = {
+        0x20ac,0x0081,0x201a,0x0192,0x201e,0x2026,0x2020,0x2021,
+        0x02c6,0x2030,0x0160,0x2039,0x0152,0x008d,0x017d,0x008f,
+        0x0090,0x2018,0x2019,0x201c,0x201d,0x2022,0x2013,0x2014,
+        0x02dc,0x2122,0x0161,0x203a,0x0153,0x009d,0x017e,0x0178
+    };
+    if (cp <= 0xffu && !(cp >= 0x80u && cp <= 0x9fu)) { *byte = (uint8_t)cp; return 1; }
+    for (unsigned i = 0; i < 32u; ++i) if (upper[i] == cp) { *byte = (uint8_t)(0x80u + i); return 1; }
+    return 0;
+}
+
+static size_t convert_wide_to_ansi(const uint16_t *source, size_t units,
+                                   int utf8, uint8_t replacement,
+                                   uint8_t *output, int *used_default)
+{
+    size_t bytes = 0;
+    for (size_t i = 0; i < units; ++i) {
+        uint32_t cp = source[i];
+        if (cp >= 0xd800u && cp <= 0xdbffu && i + 1u < units &&
+            source[i + 1u] >= 0xdc00u && source[i + 1u] <= 0xdfffu) {
+            cp = 0x10000u + (((cp - 0xd800u) << 10) | (source[++i] - 0xdc00u));
+        } else if (cp >= 0xd800u && cp <= 0xdfffu) {
+            cp = 0xfffdu;
+        }
+        if (utf8) {
+            bytes += emit_utf8(cp, output ? output + bytes : NULL);
+        } else {
+            uint8_t value;
+            if (!cp1252_byte(cp, &value)) { value = replacement; if (used_default) *used_default = 1; }
+            if (output) output[bytes] = value;
+            ++bytes;
+        }
+    }
+    return bytes;
+}
+
+static uint32_t cp1252_codepoint(uint8_t byte)
+{
+    static const uint16_t upper[32] = {
+        0x20ac,0x0081,0x201a,0x0192,0x201e,0x2026,0x2020,0x2021,
+        0x02c6,0x2030,0x0160,0x2039,0x0152,0x008d,0x017d,0x008f,
+        0x0090,0x2018,0x2019,0x201c,0x201d,0x2022,0x2013,0x2014,
+        0x02dc,0x2122,0x0161,0x203a,0x0153,0x009d,0x017e,0x0178
+    };
+    return byte >= 0x80u && byte <= 0x9fu ? upper[byte - 0x80u] : byte;
+}
+
+static size_t convert_ansi_to_wide(const uint8_t *source, size_t bytes,
+                                   int utf8, uint16_t *output, int strict,
+                                   int *valid)
+{
+    size_t units = 0;
+    *valid = 1;
+    for (size_t i = 0; i < bytes;) {
+        uint32_t cp;
+        size_t n = 1u;
+        uint8_t b = source[i];
+        if (!utf8) cp = cp1252_codepoint(b);
+        else if (b < 0x80u) cp = b;
+        else {
+            if (b >= 0xc2u && b <= 0xdfu && i + 1u < bytes && (source[i + 1u] & 0xc0u) == 0x80u) {
+                cp = ((uint32_t)(b & 0x1fu) << 6) | (source[i + 1u] & 0x3fu); n = 2u;
+            } else if (b >= 0xe0u && b <= 0xefu && i + 2u < bytes &&
+                       (source[i + 1u] & 0xc0u) == 0x80u && (source[i + 2u] & 0xc0u) == 0x80u) {
+                cp = ((uint32_t)(b & 0x0fu) << 12) | ((uint32_t)(source[i + 1u] & 0x3fu) << 6) | (source[i + 2u] & 0x3fu);
+                if (cp < 0x800u || (cp >= 0xd800u && cp <= 0xdfffu)) { cp = 0xfffdu; n = 1u; }
+                else n = 3u;
+            } else if (b >= 0xf0u && b <= 0xf4u && i + 3u < bytes &&
+                       (source[i + 1u] & 0xc0u) == 0x80u && (source[i + 2u] & 0xc0u) == 0x80u && (source[i + 3u] & 0xc0u) == 0x80u) {
+                cp = ((uint32_t)(b & 7u) << 18) | ((uint32_t)(source[i + 1u] & 0x3fu) << 12) | ((uint32_t)(source[i + 2u] & 0x3fu) << 6) | (source[i + 3u] & 0x3fu);
+                if (cp < 0x10000u || cp > 0x10ffffu) { cp = 0xfffdu; n = 1u; }
+                else n = 4u;
+            } else { cp = 0xfffdu; *valid = 0; }
+            if (!*valid && strict) return 0;
+        }
+        if (output) {
+            if (cp <= 0xffffu) output[units] = (uint16_t)cp;
+            else {
+                cp -= 0x10000u;
+                output[units] = (uint16_t)(0xd800u + (cp >> 10));
+                output[units + 1u] = (uint16_t)(0xdc00u + (cp & 0x3ffu));
+            }
+        }
+        units += cp > 0xffffu ? 2u : 1u;
+        i += n;
+    }
+    return units;
+}
+
+#ifndef _WIN32
+static uint16_t simple_case_map(uint16_t c, int upper)
+{
+    if (upper) {
+        if (c >= 'a' && c <= 'z') return (uint16_t)(c - ('a' - 'A'));
+        if ((c >= 0x00e0u && c <= 0x00f6u) || (c >= 0x00f8u && c <= 0x00feu)) return (uint16_t)(c - 0x20u);
+        if (c == 0x00ffu) return 0x0178u;
+    } else {
+        if (c >= 'A' && c <= 'Z') return (uint16_t)(c + ('a' - 'A'));
+        if ((c >= 0x00c0u && c <= 0x00d6u) || (c >= 0x00d8u && c <= 0x00deu)) return (uint16_t)(c + 0x20u);
+        if (c == 0x0178u) return 0x00ffu;
+    }
+    return c;
+}
+#endif
+
+static uint32_t rotr32(uint32_t value, unsigned count)
+{
+    return (value >> count) | (value << (32u - count));
+}
+
+static void sha256_block(uint32_t state[8], const uint8_t block[64])
+{
+    static const uint32_t k[64] = {
+        0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+        0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+        0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+        0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+        0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+        0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+        0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+        0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u,
+    };
+    uint32_t w[64];
+    for (unsigned i = 0; i < 16; ++i)
+        w[i] = ((uint32_t)block[i * 4u] << 24) | ((uint32_t)block[i * 4u + 1u] << 16) |
+               ((uint32_t)block[i * 4u + 2u] << 8) | block[i * 4u + 3u];
+    for (unsigned i = 16; i < 64; ++i) {
+        uint32_t s0 = rotr32(w[i - 15u], 7) ^ rotr32(w[i - 15u], 18) ^ (w[i - 15u] >> 3);
+        uint32_t s1 = rotr32(w[i - 2u], 17) ^ rotr32(w[i - 2u], 19) ^ (w[i - 2u] >> 10);
+        w[i] = w[i - 16u] + s0 + w[i - 7u] + s1;
+    }
+    uint32_t a=state[0],b=state[1],c=state[2],d=state[3],e=state[4],f=state[5],g=state[6],h=state[7];
+    for (unsigned i = 0; i < 64; ++i) {
+        uint32_t s1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t t1 = h + s1 + ch + k[i] + w[i];
+        uint32_t s0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = s0 + maj;
+        h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+    state[0]+=a; state[1]+=b; state[2]+=c; state[3]+=d;
+    state[4]+=e; state[5]+=f; state[6]+=g; state[7]+=h;
+}
+
+static void sha256(const uint8_t *data, size_t size, uint8_t digest[32])
+{
+    uint32_t state[8] = {0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,
+                         0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u};
+    size_t full = size / 64u;
+    for (size_t i = 0; i < full; ++i) sha256_block(state, data + i * 64u);
+    size_t remainder = size % 64u;
+    uint8_t tail[128] = {0};
+    memcpy(tail, data + full * 64u, remainder);
+    tail[remainder] = 0x80u;
+    size_t tail_size = remainder < 56u ? 64u : 128u;
+    uint64_t bit_length = (uint64_t)size * 8u;
+    for (unsigned i = 0; i < 8; ++i)
+        tail[tail_size - 1u - i] = (uint8_t)(bit_length >> (i * 8u));
+    sha256_block(state, tail);
+    if (tail_size == 128u) sha256_block(state, tail + 64u);
+    for (unsigned i = 0; i < 8; ++i) {
+        digest[i * 4u] = (uint8_t)(state[i] >> 24);
+        digest[i * 4u + 1u] = (uint8_t)(state[i] >> 16);
+        digest[i * 4u + 2u] = (uint8_t)(state[i] >> 8);
+        digest[i * 4u + 3u] = (uint8_t)state[i];
+    }
+}
+
+static void digest_hex(const uint8_t digest[32], char hex[65])
+{
+    static const char digits[] = "0123456789abcdef";
+    for (unsigned i = 0; i < 32; ++i) {
+        hex[i * 2u] = digits[digest[i] >> 4];
+        hex[i * 2u + 1u] = digits[digest[i] & 15u];
+    }
+    hex[64] = '\0';
+}
+
+static uint16_t image_u16(const uint8_t *data)
+{
+    return (uint16_t)(data[0] | ((uint16_t)data[1] << 8));
+}
+
+static uint32_t image_u32(const uint8_t *data)
+{
+    return (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+           ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+}
+
+static int initialize_static_tls(pe32_module *image, char *error, size_t error_capacity)
+{
+    if (!image || !image->image || image->image_size < 0x40u) {
+        snprintf(error, error_capacity, "invalid image for static TLS setup");
+        return 0;
+    }
+    uint32_t nt = image_u32(image->image + 0x3cu);
+    if ((uint64_t)nt + 24u + 96u > image->image_size ||
+        image_u32(image->image + nt) != 0x00004550u) {
+        snprintf(error, error_capacity, "invalid PE headers during static TLS setup");
+        return 0;
+    }
+    uint16_t optional_size = image_u16(image->image + nt + 20u);
+    uint32_t optional = nt + 24u;
+    if (optional_size < 96u || (uint64_t)optional + optional_size > image->image_size ||
+        image_u16(image->image + optional) != 0x010bu) {
+        snprintf(error, error_capacity, "invalid PE32 optional header during static TLS setup");
+        return 0;
+    }
+    uint32_t directory_count = image_u32(image->image + optional + 92u);
+    if (directory_count <= 9u) return 1;
+    uint32_t directory = optional + 96u + 9u * 8u;
+    if ((uint64_t)directory + 8u > (uint64_t)optional + optional_size) {
+        snprintf(error, error_capacity, "TLS data-directory entry is truncated");
+        return 0;
+    }
+    uint32_t tls_rva = image_u32(image->image + directory);
+    uint32_t tls_size = image_u32(image->image + directory + 4u);
+    if (!tls_rva && !tls_size) return 1;
+    if (!tls_rva || tls_size < 24u || (uint64_t)tls_rva + 24u > image->image_size) {
+        snprintf(error, error_capacity, "invalid PE32 TLS directory");
+        return 0;
+    }
+    const uint8_t *tls = image->image + tls_rva;
+    uint32_t raw_start = image_u32(tls + 0u);
+    uint32_t raw_end = image_u32(tls + 4u);
+    uint32_t index_va = image_u32(tls + 8u);
+    uint32_t callbacks_va = image_u32(tls + 12u);
+    uint32_t zero_fill = image_u32(tls + 16u);
+    if (raw_end < raw_start || raw_start < image->load_base ||
+        (uint64_t)raw_end - image->load_base > image->image_size ||
+        index_va < image->load_base || (uint64_t)index_va + 4u > (uint64_t)image->load_base + image->image_size) {
+        snprintf(error, error_capacity, "TLS template or index is outside the image");
+        return 0;
+    }
+    if (zero_fill > 0x1000000u || (uint64_t)(raw_end - raw_start) + zero_fill > 0x1000000u) {
+        snprintf(error, error_capacity, "TLS template exceeds the bounded initial profile");
+        return 0;
+    }
+    if (callbacks_va) {
+        if (callbacks_va < image->load_base ||
+            (uint64_t)callbacks_va + 4u > (uint64_t)image->load_base + image->image_size) {
+            snprintf(error, error_capacity, "TLS callback vector is outside the image");
+            return 0;
+        }
+        uint32_t callback = image_u32(image->image + (callbacks_va - image->load_base));
+        if (callback) {
+            snprintf(error, error_capacity, "static TLS callbacks are not yet implemented (first=0x%08x)", callback);
+            return 0;
+        }
+    }
+
+    uint32_t index = 0u; /* Single executable module; its loader-assigned TLS index is zero. */
+    uint32_t template_size = raw_end - raw_start;
+    uint32_t total_size = template_size + zero_fill;
+    if (!total_size) total_size = 1u;
+    static_tls_template = image->image + (raw_start - image->load_base);
+    static_tls_template_size = template_size;
+    static_tls_zero_fill = zero_fill;
+    static_tls_index_address = index_va;
+    static_tls_data_base = guest_memory_find_gap(0x70000000u, total_size, 16u, AC1_STACK_BASE);
+    static_tls_vector_base = guest_memory_find_gap(0x7FC00000u, 64u * 4u, 16u, AC1_TIB_BASE);
+    if (!static_tls_data_base || !static_tls_vector_base) {
+        snprintf(error, error_capacity, "no guest range for static TLS block/vector");
+        return 0;
+    }
+    uint8_t *tls_data = (uint8_t *)guest_memory_allocate(static_tls_data_base, total_size);
+    uint32_t *tls_vector = (uint32_t *)guest_memory_allocate(static_tls_vector_base, 64u * 4u);
+    void *index_pointer = guest_memory_try_ptr(index_va, 4u);
+    if (!tls_data || !tls_vector || !index_pointer) {
+        snprintf(error, error_capacity, "could not allocate or map static TLS data");
+        return 0;
+    }
+    memset(tls_data, 0, total_size);
+    if (template_size)
+        memcpy(tls_data, image->image + (raw_start - image->load_base), template_size);
+    tls_vector[index] = static_tls_data_base;
+    memcpy(index_pointer, &index, sizeof(index));
+    wr32(AC1_TIB_BASE + 0x2cu, static_tls_vector_base);
+    tls_used[index] = 1u;
+    tls_values[index] = static_tls_data_base;
+    return 1;
+}
+
+static void stop_guest(const char *reason, uint32_t target);
+
+void ac1_unsupported_instruction(uint32_t guest_va, const char *reason)
+{
+    stop_guest(reason ? reason : "unsupported translated instruction", guest_va);
+}
+
+static int equal_ascii_fold(const char *a, const char *b)
+{
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a++;
+        unsigned char cb = (unsigned char)*b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca + ('a' - 'A'));
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb + ('a' - 'A'));
+        if (ca != cb) return 0;
+    }
+    return *a == *b;
+}
+
+static void return_stdcall(CPU *cpu, uint32_t argument_bytes)
+{
+    cpu->eip = rd32(cpu->esp);
+    cpu->esp += 4u + argument_bytes;
+}
+
+static pcrecomp_heap *heap_by_handle(uint32_t handle)
+{
+    if (handle == AC1_PROCESS_HEAP_HANDLE) return process_heap;
+    for (size_t i = 0; i < AC1_MAX_PRIVATE_HEAPS; ++i)
+        if (private_heaps[i].handle == handle) return private_heaps[i].heap;
+    return NULL;
+}
+
+#if defined(AC1_HOST_D3D9)
+static void *d3d9_guest_resolve(void *context, uint32_t address,
+                               uint32_t size, uint32_t access)
+{
+    (void)context;
+    if (!size || !access || (access & ~(AC1_D3D9_GUEST_READ | AC1_D3D9_GUEST_WRITE)))
+        return NULL;
+    return guest_memory_try_ptr(address, size);
+}
+
+static uint32_t d3d9_guest_alloc(void *context, uint32_t size, uint32_t alignment)
+{
+    (void)context;
+    if (!process_heap || !size || !alignment || (alignment & (alignment - 1u)) ||
+        alignment > 4096u || size > UINT32_MAX - alignment + 1u)
+        return 0u;
+    size_t slot;
+    for (slot = 0; slot < sizeof(d3d9_heap_blocks) / sizeof(d3d9_heap_blocks[0]); ++slot)
+        if (!d3d9_heap_blocks[slot].guest_address) break;
+    if (slot == sizeof(d3d9_heap_blocks) / sizeof(d3d9_heap_blocks[0])) return 0u;
+    uint32_t raw = pcrecomp_heap_alloc(process_heap, size + alignment - 1u, 1);
+    if (!raw) return 0u;
+    uint32_t aligned = (raw + alignment - 1u) & ~(alignment - 1u);
+    d3d9_heap_blocks[slot].guest_address = aligned;
+    d3d9_heap_blocks[slot].heap_address = raw;
+    return aligned;
+}
+
+static void d3d9_guest_free(void *context, uint32_t address)
+{
+    (void)context;
+    for (size_t i = 0; i < sizeof(d3d9_heap_blocks) / sizeof(d3d9_heap_blocks[0]); ++i) {
+        if (d3d9_heap_blocks[i].guest_address != address) continue;
+        if (process_heap) pcrecomp_heap_free(process_heap, d3d9_heap_blocks[i].heap_address);
+        memset(&d3d9_heap_blocks[i], 0, sizeof(d3d9_heap_blocks[i]));
+        return;
+    }
+}
+
+#ifdef _WIN32
+static uintptr_t d3d9_guest_hwnd_to_host(void *context, uint32_t guest_hwnd)
+{
+    (void)context;
+    return window_bridge
+        ? ac1_window_win32_resolve_hwnd(window_bridge, guest_hwnd) : 0u;
+}
+#endif
+
+static int d3d9_ensure_configured(void)
+{
+    if (d3d9_configured) return 1;
+    ac1_d3d9_callbacks callbacks;
+    memset(&callbacks, 0, sizeof(callbacks));
+    callbacks.struct_size = sizeof(callbacks);
+    callbacks.guest_resolve = d3d9_guest_resolve;
+    callbacks.guest_alloc = d3d9_guest_alloc;
+    callbacks.guest_free = d3d9_guest_free;
+#ifdef _WIN32
+    callbacks.guest_hwnd_to_host = d3d9_guest_hwnd_to_host;
+#endif
+    if (!ac1_d3d9_configure(&callbacks, NULL)) return 0;
+    d3d9_configured = 1;
+    return 1;
+}
+
+static int handle_d3d9_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "d3d9.dll") ||
+        strcmp(import->name, "Direct3DCreate9"))
+        return 0;
+    if (!d3d9_ensure_configured())
+        stop_guest(ac1_d3d9_last_error(), import->token);
+    cpu->eax = ac1_d3d9_create9(rd32(cpu->esp + 4u));
+    if (!cpu->eax && ac1_d3d9_last_error()[0])
+        fprintf(stderr, "AC1 D3D9 factory returned null: %s\n", ac1_d3d9_last_error());
+    return_stdcall(cpu, 4u);
+    return 1;
+}
+
+static int dispatch_d3d9_method(CPU *cpu, uint32_t target)
+{
+    int argument_count = ac1_d3d9_argument_count(target);
+    if (!argument_count) return 0;
+    if (argument_count < 0 || argument_count > 16) {
+        last_error = argument_count == -2 ? 120u : 87u;
+        stop_guest(argument_count == -2
+                   ? "unsupported D3D9 COM method"
+                   : "invalid D3D9 COM method token", target);
+    }
+    if (!guest_memory_try_ptr(cpu->esp + 4u, (size_t)argument_count * 4u))
+        stop_guest("D3D9 COM arguments are unmapped", target);
+    uint32_t arguments[16];
+    for (int i = 0; i < argument_count; ++i)
+        arguments[i] = rd32(cpu->esp + 4u + (uint32_t)i * 4u);
+    uint32_t result = 0u;
+    int dispatched = ac1_d3d9_dispatch(target, arguments,
+                                       (uint32_t)argument_count, &result);
+    if (dispatched != 1) {
+        last_error = dispatched == -2 ? 120u : 87u;
+        stop_guest(ac1_d3d9_last_error()[0]
+                   ? ac1_d3d9_last_error()
+                   : "D3D9 COM dispatcher rejected the guest call", target);
+    }
+    cpu->eax = result;
+    return_stdcall(cpu, (uint32_t)argument_count * 4u);
+    scheduler_checkpoint();
+    return 1;
+}
+#endif
+
+static uint32_t current_host_thread_id(void)
+{
+    if (active_guest_thread) return active_guest_thread->id;
+#ifdef _WIN32
+    return (uint32_t)GetCurrentThreadId();
+#else
+    return (uint32_t)syscall(SYS_gettid);
+#endif
+}
+
+static int guest_string_equal(uint32_t address, const char *expected)
+{
+    if (!address || !expected) return 0;
+    for (size_t i = 0; i < 260u; ++i) {
+        const uint8_t *byte = (const uint8_t *)guest_memory_try_ptr(address + (uint32_t)i, 1u);
+        if (!byte) return 0;
+        unsigned char a = *byte;
+        unsigned char b = (unsigned char)expected[i];
+        if (a >= 'A' && a <= 'Z') a = (unsigned char)(a + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = (unsigned char)(b + ('a' - 'A'));
+        if (a != b) return 0;
+        if (!a) return 1;
+    }
+    return 0;
+}
+
+static const import_record *find_named_import(const char *dll, uint32_t name_address)
+{
+    if (!name_address || name_address <= 0xFFFFu) return NULL;
+    char name[160];
+    size_t length = 0;
+    for (; length + 1u < sizeof(name); ++length) {
+        const uint8_t *byte = (const uint8_t *)guest_memory_try_ptr(name_address + (uint32_t)length, 1u);
+        if (!byte) return NULL;
+        name[length] = (char)*byte;
+        if (!name[length]) break;
+    }
+    if (length + 1u >= sizeof(name) || name[length]) return NULL;
+    for (size_t i = 0; i < import_count; ++i)
+        if (!imports[i].by_ordinal && equal_ascii_fold(imports[i].dll, dll) &&
+            !strcmp(imports[i].name, name)) return &imports[i];
+    return NULL;
+}
+
+static int handle_module_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
+        return 0;
+    if (!strcmp(import->name, "GetModuleHandleA")) {
+        uint32_t name = rd32(cpu->esp + 4u);
+        if (!name) cpu->eax = image_base;
+        else if (guest_string_equal(name, "kernel32.dll")) cpu->eax = AC1_KERNEL32_HANDLE;
+        else { cpu->eax = 0; last_error = 126u; }
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (!strcmp(import->name, "GetModuleFileNameA")) {
+        uint32_t module = rd32(cpu->esp + 4u);
+        uint32_t output_address = rd32(cpu->esp + 8u);
+        uint32_t capacity = rd32(cpu->esp + 12u);
+        if (module && module != image_base) {
+            cpu->eax = 0u;
+            last_error = 126u;
+        } else if (!capacity) {
+            cpu->eax = 0u;
+            last_error = 122u;
+        } else {
+            char *output = (char *)guest_memory_try_ptr(output_address, capacity);
+            if (!output) stop_guest("GetModuleFileNameA output is unmapped", import->token);
+            size_t length = strlen(exe_path_copy);
+            if (length + 1u <= capacity) {
+                memcpy(output, exe_path_copy, length + 1u);
+                cpu->eax = (uint32_t)length;
+            } else {
+                memcpy(output, exe_path_copy, capacity);
+                cpu->eax = capacity;
+                last_error = 122u;
+            }
+        }
+        return_stdcall(cpu, 12u);
+        return 1;
+    }
+    if (!strcmp(import->name, "GetProcAddress")) {
+        uint32_t module = rd32(cpu->esp + 4u);
+        uint32_t name = rd32(cpu->esp + 8u);
+        const import_record *resolved = NULL;
+        if (module == AC1_KERNEL32_HANDLE)
+            resolved = find_named_import("KERNEL32.dll", name);
+        else if (module == image_base)
+            resolved = find_named_import("AssassinsCreed_Dx9.exe", name);
+        cpu->eax = resolved ? resolved->token : 0;
+        if (!resolved) last_error = 127u; /* ERROR_PROC_NOT_FOUND */
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+    return 0;
+}
+
+static int handle_heap_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
+        return 0;
+    const char *name = import->name;
+    if (!strcmp(name, "GetProcessHeap")) {
+        if (!process_heap) stop_guest("process heap is not initialized", import->token);
+        cpu->eax = AC1_PROCESS_HEAP_HANDLE;
+        return_stdcall(cpu, 0);
+        return 1;
+    }
+    if (!strcmp(name, "GetLastError")) {
+        cpu->eax = last_error;
+        return_stdcall(cpu, 0);
+        return 1;
+    }
+    if (!strcmp(name, "SetLastError")) {
+        last_error = rd32(cpu->esp + 4u);
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (!strcmp(name, "FreeEnvironmentStringsW")) {
+        uint32_t block = rd32(cpu->esp + 4u);
+        cpu->eax = block && process_heap && pcrecomp_heap_free(process_heap, block);
+        if (!cpu->eax) last_error = 87u;
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (!strcmp(name, "HeapCreate")) {
+        uint32_t flags = rd32(cpu->esp + 4u);
+        uint32_t initial_size = rd32(cpu->esp + 8u);
+        uint32_t maximum_size = rd32(cpu->esp + 12u);
+        if ((flags & ~1u) || maximum_size)
+            stop_guest("HeapCreate requires a growable non-executable heap", import->token);
+        size_t slot;
+        for (slot = 0; slot < AC1_MAX_PRIVATE_HEAPS; ++slot)
+            if (!private_heaps[slot].heap) break;
+        if (slot == AC1_MAX_PRIVATE_HEAPS) {
+            cpu->eax = 0;
+            last_error = 8u;
+        } else {
+            pcrecomp_heap *heap = pcrecomp_heap_create(initial_size);
+            if (!heap) {
+                cpu->eax = 0;
+                last_error = 8u;
+            } else {
+                private_heaps[slot].handle = AC1_PRIVATE_HEAP_BASE + (uint32_t)slot * 4u;
+                private_heaps[slot].heap = heap;
+                cpu->eax = private_heaps[slot].handle;
+            }
+        }
+        return_stdcall(cpu, 12u);
+        return 1;
+    }
+    if (!strcmp(name, "HeapDestroy")) {
+        uint32_t handle = rd32(cpu->esp + 4u);
+        size_t slot;
+        for (slot = 0; slot < AC1_MAX_PRIVATE_HEAPS; ++slot)
+            if (private_heaps[slot].handle == handle && private_heaps[slot].heap) break;
+        if (slot == AC1_MAX_PRIVATE_HEAPS) {
+            cpu->eax = 0;
+            last_error = handle == AC1_PROCESS_HEAP_HANDLE ? 87u : 6u;
+        } else {
+            pcrecomp_heap_destroy(private_heaps[slot].heap);
+            private_heaps[slot].heap = NULL;
+            private_heaps[slot].handle = 0;
+            cpu->eax = 1;
+        }
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (!strcmp(name, "GetCurrentProcessId")) {
+#ifdef _WIN32
+        cpu->eax = (uint32_t)GetCurrentProcessId();
+#else
+        cpu->eax = (uint32_t)getpid();
+#endif
+        return_stdcall(cpu, 0);
+        return 1;
+    }
+    if (!strcmp(name, "GetCurrentProcess")) {
+        cpu->eax = UINT32_MAX; /* Current-process pseudo handle. */
+        return_stdcall(cpu, 0u);
+        return 1;
+    }
+    if (!strcmp(name, "GetProcessAffinityMask")) {
+        uint32_t process = rd32(cpu->esp + 4u);
+        uint32_t process_mask_address = rd32(cpu->esp + 8u);
+        uint32_t system_mask_address = rd32(cpu->esp + 12u);
+        uint8_t *process_mask = (uint8_t *)guest_memory_try_ptr(process_mask_address, 4u);
+        uint8_t *system_mask = (uint8_t *)guest_memory_try_ptr(system_mask_address, 4u);
+        if (process != UINT32_MAX || !process_mask || !system_mask) {
+            cpu->eax = 0u;
+            last_error = process != UINT32_MAX ? 6u : 87u;
+        } else {
+#ifdef _WIN32
+            SYSTEM_INFO host_info;
+            GetSystemInfo(&host_info);
+            uint32_t count = host_info.dwNumberOfProcessors;
+#else
+            long host_count = sysconf(_SC_NPROCESSORS_ONLN);
+            uint32_t count = host_count > 0 ? (uint32_t)host_count : 1u;
+#endif
+            if (!count) count = 1u;
+            if (count > 32u) count = 32u;
+            uint32_t mask = count == 32u ? UINT32_MAX : ((1u << count) - 1u);
+            wr32(process_mask_address, mask);
+            wr32(system_mask_address, mask);
+            guest_affinity_mask = mask;
+            guest_thread_affinity_mask = mask;
+            cpu->eax = 1u;
+        }
+        return_stdcall(cpu, 12u);
+        return 1;
+    }
+    if (!strcmp(name, "TlsAlloc")) {
+        uint32_t index;
+        for (index = 0; index < AC1_TLS_SLOTS; ++index)
+            if (!tls_used[index]) break;
+        if (index == AC1_TLS_SLOTS) {
+            cpu->eax = UINT32_MAX;
+            last_error = 8u;
+        } else {
+            tls_used[index] = 1u;
+            tls_values[index] = 0u;
+            cpu->eax = index;
+        }
+        return_stdcall(cpu, 0u);
+        return 1;
+    }
+    if (!strcmp(name, "TlsFree")) {
+        uint32_t index = rd32(cpu->esp + 4u);
+        if (index >= AC1_TLS_SLOTS || !tls_used[index]) {
+            cpu->eax = 0u;
+            last_error = 87u;
+        } else {
+            tls_used[index] = 0u;
+            tls_values[index] = 0u;
+            cpu->eax = 1u;
+        }
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (!strcmp(name, "TlsGetValue")) {
+        uint32_t index = rd32(cpu->esp + 4u);
+        if (index >= AC1_TLS_SLOTS || !tls_used[index]) {
+            cpu->eax = 0u;
+            last_error = 87u;
+        } else {
+            cpu->eax = tls_values[index];
+            last_error = 0u;
+        }
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (!strcmp(name, "TlsSetValue")) {
+        uint32_t index = rd32(cpu->esp + 4u);
+        if (index >= AC1_TLS_SLOTS || !tls_used[index]) {
+            cpu->eax = 0u;
+            last_error = 87u;
+        } else {
+            tls_values[index] = rd32(cpu->esp + 8u);
+            cpu->eax = 1u;
+        }
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+    if (!strcmp(name, "GetCurrentThreadId")) {
+        cpu->eax = current_host_thread_id();
+        return_stdcall(cpu, 0);
+        return 1;
+    }
+    if (!strcmp(name, "GetCurrentThread")) {
+        cpu->eax = UINT32_MAX - 1u; /* Current-thread pseudo handle. */
+        return_stdcall(cpu, 0u);
+        return 1;
+    }
+    if (!strcmp(name, "SetThreadAffinityMask")) {
+        uint32_t handle = rd32(cpu->esp + 4u);
+        uint32_t mask = rd32(cpu->esp + 8u);
+        ac1_guest_thread *thread = thread_for_handle(handle);
+        if (handle == UINT32_MAX - 1u) thread = active_guest_thread;
+        if (!thread || !mask || (guest_affinity_mask && (mask & ~guest_affinity_mask))) {
+            cpu->eax = 0u;
+            last_error = !thread ? 6u : 87u;
+        } else {
+            uint32_t previous = thread->affinity_mask ? thread->affinity_mask : guest_affinity_mask;
+            thread->affinity_mask = mask;
+            if (thread == active_guest_thread) guest_thread_affinity_mask = mask;
+            cpu->eax = previous;
+            last_error = 0u;
+        }
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+    if (!strcmp(name, "GetTickCount")) {
+        cpu->eax = (uint32_t)(guest_monotonic_ns() / UINT64_C(1000000));
+        return_stdcall(cpu, 0);
+        return 1;
+    }
+    int allocate = !strcmp(name, "HeapAlloc");
+    int release = !strcmp(name, "HeapFree");
+    int resize = !strcmp(name, "HeapReAlloc");
+    int size = !strcmp(name, "HeapSize");
+    if (!allocate && !release && !resize && !size) return 0;
+    pcrecomp_heap *heap = heap_by_handle(rd32(cpu->esp + 4u));
+    if (!heap) {
+        cpu->eax = size ? UINT32_MAX : 0;
+        last_error = 6u; /* ERROR_INVALID_HANDLE */
+        return_stdcall(cpu, resize ? 16u : 12u);
+        return 1;
+    }
+
+    uint32_t flags = rd32(cpu->esp + 8u);
+    if (allocate) {
+        if (flags & ~9u) stop_guest("HeapAlloc flags are unsupported", import->token);
+        cpu->eax = pcrecomp_heap_alloc(heap, rd32(cpu->esp + 12u), !!(flags & 8u));
+        return_stdcall(cpu, 12u);
+    } else if (release) {
+        if (flags & ~1u) stop_guest("HeapFree flags are unsupported", import->token);
+        uint32_t address = rd32(cpu->esp + 12u);
+        cpu->eax = address && pcrecomp_heap_free(heap, address);
+        if (!cpu->eax) last_error = 87u; /* ERROR_INVALID_PARAMETER */
+        return_stdcall(cpu, 12u);
+    } else if (resize) {
+        if (flags & ~25u) stop_guest("HeapReAlloc flags are unsupported", import->token);
+        cpu->eax = pcrecomp_heap_realloc(heap, rd32(cpu->esp + 12u),
+                                         rd32(cpu->esp + 16u), !!(flags & 8u),
+                                         !!(flags & 0x10u));
+        return_stdcall(cpu, 16u);
+    } else {
+        if (flags & ~1u) stop_guest("HeapSize flags are unsupported", import->token);
+        cpu->eax = pcrecomp_heap_size(heap, rd32(cpu->esp + 12u));
+        if (cpu->eax == UINT32_MAX) last_error = 87u;
+        return_stdcall(cpu, 12u);
+    }
+    return 1;
+}
+
+static int handle_critical_section_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
+        return 0;
+    const char *name = import->name;
+    int init_spin = !strcmp(name, "InitializeCriticalSectionAndSpinCount");
+    int init = !strcmp(name, "InitializeCriticalSection");
+    int destroy = !strcmp(name, "DeleteCriticalSection");
+    int enter = !strcmp(name, "EnterCriticalSection");
+    int leave = !strcmp(name, "LeaveCriticalSection");
+    int try_enter = !strcmp(name, "TryEnterCriticalSection");
+    if (!init_spin && !init && !destroy && !enter && !leave && !try_enter) return 0;
+
+    uint32_t address = rd32(cpu->esp + 4u);
+    uint8_t *section = (uint8_t *)guest_memory_try_ptr(address, 24u);
+    if (!section) stop_guest("critical-section object is unmapped", import->token);
+    if (init_spin || init) {
+        uint32_t spin = init_spin ? rd32(cpu->esp + 8u) : 0u;
+        memset(section, 0, 24u);
+        wr32(address + 4u, UINT32_MAX);
+        wr32(address + 20u, spin);
+        cpu->eax = 1u;
+        return_stdcall(cpu, init_spin ? 8u : 4u);
+        return 1;
+    }
+    if (destroy) {
+        memset(section, 0, 24u);
+        wr32(address + 4u, UINT32_MAX);
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+
+    uint32_t owner = rd32(address + 12u);
+    uint32_t thread = current_host_thread_id();
+    if (enter || try_enter) {
+        if (owner == thread) {
+            (void)guest_atomic_xadd32(address + 4u, 1u);
+            wr32(address + 8u, rd32(address + 8u) + 1u);
+            cpu->eax = 1u;
+        } else if (!owner) {
+            uint32_t prior = guest_atomic_xadd32(address + 4u, 1u);
+            if (prior == UINT32_MAX) {
+                wr32(address + 8u, 1u);
+                wr32(address + 12u, thread);
+                cpu->eax = 1u;
+            } else {
+                (void)guest_atomic_xadd32(address + 4u, UINT32_MAX);
+                cpu->eax = 0u;
+                if (enter)
+                    stop_guest("contended EnterCriticalSection requires guest-thread scheduling", import->token);
+            }
+        } else {
+            cpu->eax = 0u;
+            if (enter)
+                stop_guest("contended EnterCriticalSection requires guest-thread scheduling", import->token);
+        }
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+
+    if (owner != thread || !rd32(address + 8u))
+        stop_guest("LeaveCriticalSection called by a non-owner", import->token);
+    uint32_t recursion = rd32(address + 8u) - 1u;
+    wr32(address + 8u, recursion);
+    if (!recursion) wr32(address + 12u, 0u);
+    (void)guest_atomic_xadd32(address + 4u, UINT32_MAX);
+    return_stdcall(cpu, 4u);
+    return 1;
+}
+
+static int handle_interlocked_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
+        return 0;
+    const char *name = import->name;
+    uint32_t address = rd32(cpu->esp + 4u);
+    if (!strcmp(name, "InterlockedIncrement")) {
+        cpu->eax = guest_atomic_xadd32(address, 1u) + 1u;
+        return_stdcall(cpu, 4u);
+    } else if (!strcmp(name, "InterlockedDecrement")) {
+        cpu->eax = guest_atomic_xadd32(address, UINT32_MAX) - 1u;
+        return_stdcall(cpu, 4u);
+    } else if (!strcmp(name, "InterlockedExchange")) {
+        cpu->eax = guest_atomic_xchg32(address, rd32(cpu->esp + 8u));
+        return_stdcall(cpu, 8u);
+    } else if (!strcmp(name, "InterlockedExchangeAdd")) {
+        cpu->eax = guest_atomic_xadd32(address, rd32(cpu->esp + 8u));
+        return_stdcall(cpu, 8u);
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+static int handle_stdio_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
+        return 0;
+    const char *name = import->name;
+    if (!strcmp(name, "GetStdHandle")) {
+        int32_t which = (int32_t)rd32(cpu->esp + 4u);
+        if (which == -10) cpu->eax = AC1_STD_INPUT_HANDLE;
+        else if (which == -11) cpu->eax = AC1_STD_OUTPUT_HANDLE;
+        else if (which == -12) cpu->eax = AC1_STD_ERROR_HANDLE;
+        else { cpu->eax = 0u; last_error = 87u; }
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (!strcmp(name, "SetHandleCount")) {
+        uint32_t requested = rd32(cpu->esp + 4u);
+        if (requested < 3u) requested = 3u;
+        if (requested > 2048u) requested = 2048u;
+        max_guest_handles = requested;
+        cpu->eax = requested;
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (!strcmp(name, "GetFileType")) {
+        uint32_t handle = rd32(cpu->esp + 4u);
+        cpu->eax = (handle == AC1_STD_INPUT_HANDLE || handle == AC1_STD_OUTPUT_HANDLE ||
+                    handle == AC1_STD_ERROR_HANDLE) ? 2u : 0u; /* FILE_TYPE_CHAR */
+        if (!cpu->eax) last_error = 6u;
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (!strcmp(name, "GetConsoleMode")) {
+        uint32_t handle = rd32(cpu->esp + 4u);
+        uint32_t output = rd32(cpu->esp + 8u);
+        if (!guest_memory_try_ptr(output, 4u))
+            stop_guest("GetConsoleMode output is unmapped", import->token);
+        if (handle == AC1_STD_INPUT_HANDLE) {
+            wr32(output, 0x0007u); /* processed, line and echo input */
+            cpu->eax = 1u;
+        } else if (handle == AC1_STD_OUTPUT_HANDLE || handle == AC1_STD_ERROR_HANDLE) {
+            wr32(output, 0x0003u); /* processed output and wrap at end of line */
+            cpu->eax = 1u;
+        } else {
+            cpu->eax = 0u;
+            last_error = 6u;
+        }
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+    if (!strcmp(name, "SetConsoleMode")) {
+        uint32_t handle = rd32(cpu->esp + 4u);
+        (void)rd32(cpu->esp + 8u);
+        cpu->eax = (handle == AC1_STD_INPUT_HANDLE || handle == AC1_STD_OUTPUT_HANDLE ||
+                    handle == AC1_STD_ERROR_HANDLE);
+        if (!cpu->eax) last_error = 6u;
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+    if (!strcmp(name, "ReadFile") || !strcmp(name, "WriteFile")) {
+        uint32_t handle = rd32(cpu->esp + 4u);
+        uint32_t buffer = rd32(cpu->esp + 8u);
+        uint32_t count = rd32(cpu->esp + 12u);
+        uint32_t transferred = rd32(cpu->esp + 16u);
+        uint32_t overlapped = rd32(cpu->esp + 20u);
+        FILE *stream = handle == AC1_STD_INPUT_HANDLE ? stdin :
+                       handle == AC1_STD_OUTPUT_HANDLE ? stdout :
+                       handle == AC1_STD_ERROR_HANDLE ? stderr : NULL;
+        void *guest_buffer = count ? guest_memory_try_ptr(buffer, count) : NULL;
+        if (!stream || overlapped || (count && !guest_buffer) ||
+            !guest_memory_try_ptr(transferred, 4u)) {
+            cpu->eax = 0u;
+            last_error = 87u;
+        } else {
+            size_t amount;
+            if (!strcmp(name, "ReadFile")) {
+                amount = fread(guest_buffer, 1u, count, stream);
+                if (ferror(stream)) { cpu->eax = 0u; last_error = 5u; }
+                else cpu->eax = 1u;
+            } else {
+                amount = fwrite(guest_buffer, 1u, count, stream);
+                (void)fflush(stream);
+                if (amount != count) { cpu->eax = 0u; last_error = 29u; }
+                else cpu->eax = 1u;
+            }
+            wr32(transferred, (uint32_t)amount);
+        }
+        return_stdcall(cpu, 20u);
+        return 1;
+    }
+    return 0;
+}
+
+static sync_object *sync_object_for_handle(uint32_t handle)
+{
+    if (handle < AC1_SYNC_HANDLE_BASE || (handle - AC1_SYNC_HANDLE_BASE) % 4u)
+        return NULL;
+    uint32_t slot = (handle - AC1_SYNC_HANDLE_BASE) / 4u;
+    if (slot >= AC1_MAX_SYNC_OBJECTS || sync_objects[slot].handle != handle)
+        return NULL;
+    return &sync_objects[slot];
+}
+
+static int copy_guest_string(uint32_t address, char *output, size_t capacity)
+{
+    if (!address || !output || !capacity) return 0;
+    for (size_t i = 0; i + 1u < capacity; ++i) {
+        uint8_t *character = (uint8_t *)guest_memory_try_ptr(address + (uint32_t)i, 1u);
+        if (!character) return 0;
+        output[i] = (char)*character;
+        if (!*character) return 1;
+    }
+    output[capacity - 1u] = '\0';
+    return 0;
+}
+
+static sync_object *sync_object_named(const char *name)
+{
+    if (!name || !*name) return NULL;
+    for (uint32_t slot = 0; slot < AC1_MAX_SYNC_OBJECTS; ++slot)
+        if (sync_objects[slot].handle && !strcmp(sync_objects[slot].name, name))
+            return &sync_objects[slot];
+    return NULL;
+}
+
+static void scheduler_refresh_waits(ac1_scheduler *scheduler)
+{
+    uint64_t now = guest_monotonic_ns();
+    for (unsigned i = 0; i < scheduler->count; ++i) {
+        ac1_guest_thread *thread = &scheduler->threads[i];
+        if (!thread->blocked) continue;
+        if (thread->wait_kind == 2) {
+            if (thread->wait_deadline && now >= thread->wait_deadline) {
+                thread->blocked = 0;
+                thread->wait_result = AC1_WAIT_TIMEOUT;
+                thread->wait_kind = 0;
+            }
+            continue;
+        }
+        if (thread->wait_kind != 1) continue;
+        ac1_guest_thread *waited_thread = thread_for_handle(thread->wait_handle);
+        if (waited_thread && waited_thread->finished) {
+            thread->blocked = 0;
+            thread->wait_result = AC1_WAIT_OBJECT_0;
+            thread->cpu.eax = AC1_WAIT_OBJECT_0;
+            thread->wait_kind = 0;
+            continue;
+        }
+        sync_object *object = sync_object_for_handle(thread->wait_handle);
+        if (object) {
+            int signaled = object->kind == 1u ? object->signaled != 0u : object->count != 0u;
+            if (signaled) {
+                if (object->kind == 1u && !object->manual_reset) object->signaled = 0u;
+                if (object->kind == 2u) --object->count;
+                thread->blocked = 0;
+                thread->wait_result = AC1_WAIT_OBJECT_0;
+                thread->cpu.eax = AC1_WAIT_OBJECT_0;
+                thread->wait_kind = 0;
+                continue;
+            }
+        }
+        if (thread->wait_deadline && now >= thread->wait_deadline) {
+            thread->blocked = 0;
+            thread->wait_result = AC1_WAIT_TIMEOUT;
+            thread->cpu.eax = AC1_WAIT_TIMEOUT;
+            thread->wait_kind = 0;
+        }
+    }
+}
+
+static uint32_t scheduler_next_timeout(ac1_scheduler *scheduler)
+{
+    uint64_t now = guest_monotonic_ns();
+    uint64_t nearest = UINT64_MAX;
+    for (unsigned i = 0; i < scheduler->count; ++i) {
+        ac1_guest_thread *thread = &scheduler->threads[i];
+        if (thread->blocked && thread->wait_deadline && thread->wait_deadline < nearest)
+            nearest = thread->wait_deadline;
+    }
+    if (nearest == UINT64_MAX) return 0u;
+    if (nearest <= now) return 1u;
+    uint64_t ms = (nearest - now + 999999u) / 1000000u;
+    return ms > UINT32_MAX ? UINT32_MAX : (uint32_t)(ms ? ms : 1u);
+}
+
+static sync_object *sync_object_create(uint8_t kind)
+{
+    for (uint32_t slot = 0; slot < AC1_MAX_SYNC_OBJECTS; ++slot) {
+        if (!sync_objects[slot].handle) {
+            memset(&sync_objects[slot], 0, sizeof(sync_objects[slot]));
+            sync_objects[slot].handle = AC1_SYNC_HANDLE_BASE + slot * 4u;
+            sync_objects[slot].kind = kind;
+            return &sync_objects[slot];
+        }
+    }
+    return NULL;
+}
+
+static int handle_sync_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
+        return 0;
+    const char *name = import->name;
+    if (!strcmp(name, "CreateEventA")) {
+        uint32_t attributes = rd32(cpu->esp + 4u);
+        uint32_t manual_reset = rd32(cpu->esp + 8u);
+        uint32_t initial_state = rd32(cpu->esp + 12u);
+        uint32_t name_address = rd32(cpu->esp + 16u);
+        if (attributes)
+            stop_guest("CreateEventA security attributes are unsupported", import->token);
+        char object_name[256] = {0};
+        if (name_address && !copy_guest_string(name_address, object_name, sizeof(object_name)))
+            stop_guest("CreateEventA object name is unmapped or too long", import->token);
+        sync_object *object = sync_object_named(object_name);
+        if (object && object->kind != 1u) { cpu->eax = 0u; last_error = 6u; }
+        else if (object) { cpu->eax = object->handle; last_error = 183u; }
+        else if (!(object = sync_object_create(1u))) { cpu->eax = 0u; last_error = 8u; }
+        else {
+            object->manual_reset = manual_reset != 0u;
+            object->signaled = initial_state != 0u;
+            if (object_name[0]) memcpy(object->name, object_name, strlen(object_name) + 1u);
+            cpu->eax = object->handle;
+        }
+        return_stdcall(cpu, 16u);
+        return 1;
+    }
+    if (!strcmp(name, "CreateSemaphoreA")) {
+        uint32_t attributes = rd32(cpu->esp + 4u);
+        uint32_t initial = rd32(cpu->esp + 8u);
+        uint32_t maximum = rd32(cpu->esp + 12u);
+        uint32_t name_address = rd32(cpu->esp + 16u);
+        if (attributes)
+            stop_guest("CreateSemaphoreA security attributes are unsupported", import->token);
+        char object_name[256] = {0};
+        if (name_address && !copy_guest_string(name_address, object_name, sizeof(object_name)))
+            stop_guest("CreateSemaphoreA object name is unmapped or too long", import->token);
+        if (!maximum || initial > maximum) {
+            cpu->eax = 0u; last_error = 87u;
+        } else {
+            sync_object *object = sync_object_named(object_name);
+            if (object && object->kind != 2u) { cpu->eax = 0u; last_error = 6u; }
+            else if (object) { cpu->eax = object->handle; last_error = 183u; }
+            else if (!(object = sync_object_create(2u))) { cpu->eax = 0u; last_error = 8u; }
+            else {
+                if (object_name[0]) memcpy(object->name, object_name, strlen(object_name) + 1u);
+                object->count = initial;
+                object->maximum = maximum;
+                cpu->eax = object->handle;
+            }
+        }
+        return_stdcall(cpu, 16u);
+        return 1;
+    }
+    if (!strcmp(name, "SetEvent") || !strcmp(name, "ResetEvent")) {
+        uint32_t handle = rd32(cpu->esp + 4u);
+        sync_object *object = sync_object_for_handle(handle);
+        if (!object || object->kind != 1u) {
+            cpu->eax = 0u; last_error = 6u;
+        } else {
+            object->signaled = !strcmp(name, "SetEvent");
+            cpu->eax = 1u;
+        }
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (!strcmp(name, "ReleaseSemaphore")) {
+        uint32_t handle = rd32(cpu->esp + 4u);
+        uint32_t release_count = rd32(cpu->esp + 8u);
+        uint32_t previous_address = rd32(cpu->esp + 12u);
+        sync_object *object = sync_object_for_handle(handle);
+        if (!object || object->kind != 2u) {
+            cpu->eax = 0u; last_error = 6u;
+        } else if (!release_count || release_count > object->maximum - object->count) {
+            cpu->eax = 0u; last_error = 298u; /* ERROR_TOO_MANY_POSTS */
+        } else {
+            if (previous_address) {
+                if (!guest_memory_try_ptr(previous_address, 4u))
+                    stop_guest("ReleaseSemaphore previous-count output is unmapped", import->token);
+                wr32(previous_address, object->count);
+            }
+            object->count += release_count;
+            cpu->eax = 1u;
+        }
+        return_stdcall(cpu, 12u);
+        return 1;
+    }
+    if (!strcmp(name, "WaitForSingleObject")) {
+        uint32_t handle = rd32(cpu->esp + 4u);
+        uint32_t timeout = rd32(cpu->esp + 8u);
+        ac1_guest_thread *thread = thread_for_handle(handle);
+        sync_object *object = sync_object_for_handle(handle);
+        if (thread) {
+            if (thread->finished) cpu->eax = AC1_WAIT_OBJECT_0;
+            else if (!timeout) cpu->eax = AC1_WAIT_TIMEOUT;
+            else if (!active_scheduler || !active_guest_thread)
+                stop_guest("WaitForSingleObject thread wait lacks scheduler state", import->token);
+            else {
+                active_guest_thread->blocked = 1;
+                active_guest_thread->wait_kind = 1;
+                active_guest_thread->wait_handle = handle;
+                active_guest_thread->wait_deadline = timeout == UINT32_MAX ? 0u :
+                    guest_monotonic_ns() + (uint64_t)timeout * 1000000u;
+            }
+        } else if (!object) {
+            cpu->eax = UINT32_MAX; last_error = 6u;
+        } else {
+            int signaled = object->kind == 1u ? object->signaled != 0u : object->count != 0u;
+            if (signaled) {
+                if (object->kind == 1u && !object->manual_reset) object->signaled = 0u;
+                if (object->kind == 2u) --object->count;
+                cpu->eax = AC1_WAIT_OBJECT_0;
+            } else if (!timeout) cpu->eax = AC1_WAIT_TIMEOUT;
+            else if (!active_scheduler || !active_guest_thread)
+                stop_guest("WaitForSingleObject wait lacks scheduler state", import->token);
+            else {
+                active_guest_thread->blocked = 1;
+                active_guest_thread->wait_kind = 1;
+                active_guest_thread->wait_handle = handle;
+                active_guest_thread->wait_deadline = timeout == UINT32_MAX ? 0u :
+                    guest_monotonic_ns() + (uint64_t)timeout * 1000000u;
+            }
+        }
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+    if (!strcmp(name, "CloseHandle")) {
+        uint32_t handle = rd32(cpu->esp + 4u);
+        ac1_guest_thread *thread = thread_for_handle(handle);
+        sync_object *object = sync_object_for_handle(handle);
+        if (thread) { thread->closed = 1; cpu->eax = 1u; }
+        else if (!object) { cpu->eax = 0u; last_error = 6u; }
+        else { memset(object, 0, sizeof(*object)); cpu->eax = 1u; }
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    return 0;
+}
+
+static int handle_shell_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "SHELL32.dll"))
+        return 0;
+    if (!strcmp(import->name, "SHCreateDirectoryExA")) {
+        uint32_t path_address = rd32(cpu->esp + 8u);
+        uint32_t security_attributes = rd32(cpu->esp + 12u);
+        if (security_attributes)
+            stop_guest("SHCreateDirectoryExA security attributes are unsupported", import->token);
+        char *guest_path = (char *)guest_memory_try_ptr(path_address, 1u);
+        if (!guest_path) stop_guest("SHCreateDirectoryExA path is unmapped", import->token);
+        char path[32768];
+        size_t length = 0;
+        while (length + 1u < sizeof(path)) {
+            char *ch = (char *)guest_memory_try_ptr(path_address + (uint32_t)length, 1u);
+            if (!ch) stop_guest("SHCreateDirectoryExA path is unmapped", import->token);
+            path[length] = *ch;
+            if (!*ch) break;
+            ++length;
+        }
+        if (length + 1u >= sizeof(path))
+            stop_guest("SHCreateDirectoryExA path is too long", import->token);
+        char root[32768];
+        if (!get_user_data_root(root, sizeof(root))) {
+            cpu->eax = 3u;
+            return_stdcall(cpu, 12u);
+            return 1;
+        }
+        size_t root_length = strlen(root);
+        int in_root = length >= root_length;
+        for (size_t i = 0; in_root && i < root_length; ++i) {
+            unsigned char a = (unsigned char)path[i], b = (unsigned char)root[i];
+            if (a >= 'A' && a <= 'Z') a = (unsigned char)(a + ('a' - 'A'));
+            if (b >= 'A' && b <= 'Z') b = (unsigned char)(b + ('a' - 'A'));
+            if (a != b) in_root = 0;
+        }
+        in_root = in_root && (length == root_length || path[root_length] == '/' || path[root_length] == '\\');
+        for (size_t i = 0; in_root && i + 1u < length; ++i) {
+            if ((path[i] == '.' && path[i + 1u] == '.') &&
+                (i == 0u || path[i - 1u] == '/' || path[i - 1u] == '\\') &&
+                (i + 2u == length || path[i + 2u] == '/' || path[i + 2u] == '\\'))
+                in_root = 0;
+        }
+        if (!in_root) cpu->eax = 5u; /* ERROR_ACCESS_DENIED: never create beside the game. */
+        else if (directory_exists(path)) cpu->eax = 183u; /* ERROR_ALREADY_EXISTS */
+        else if (ensure_directory_tree(path)) cpu->eax = 0u;
+        else cpu->eax = 5u;
+        return_stdcall(cpu, 12u);
+        return 1;
+    }
+    if (strcmp(import->name, "SHGetSpecialFolderPathA")) return 0;
+    uint32_t output_address = rd32(cpu->esp + 8u);
+    uint32_t csidl = rd32(cpu->esp + 12u) & 0x7fffu;
+    uint32_t create = rd32(cpu->esp + 16u);
+    const char *subdirectory = NULL;
+    switch (csidl) {
+    case 0x05u: subdirectory = "documents"; break;       /* CSIDL_PERSONAL */
+    case 0x1au: subdirectory = "roaming"; break;        /* CSIDL_APPDATA */
+    case 0x1cu: subdirectory = "local"; break;          /* CSIDL_LOCAL_APPDATA */
+    case 0x23u: subdirectory = "common"; break;         /* CSIDL_COMMON_APPDATA */
+    default:
+        cpu->eax = 0u;
+        last_error = 50u; /* ERROR_NOT_SUPPORTED */
+        return_stdcall(cpu, 16u);
+        return 1;
+    }
+    char root[32768];
+    char path[32768];
+    if (!get_user_data_root(root, sizeof(root))) {
+        cpu->eax = 0u;
+        last_error = 3u;
+        return_stdcall(cpu, 16u);
+        return 1;
+    }
+    size_t root_length = strlen(root);
+    int separator = root_length && root[root_length - 1u] != '/' && root[root_length - 1u] != '\\';
+    int written = snprintf(path, sizeof(path), "%s%s%s", root, separator ? "/" : "", subdirectory);
+    if (written < 0 || (size_t)written >= sizeof(path) || (size_t)written >= 260u) {
+        cpu->eax = 0u;
+        last_error = 206u; /* ERROR_FILENAME_EXCED_RANGE */
+        return_stdcall(cpu, 16u);
+        return 1;
+    }
+    char *output = (char *)guest_memory_try_ptr(output_address, 260u);
+    if (!output) stop_guest("SHGetSpecialFolderPathA output is unmapped", import->token);
+    if (create && !ensure_directory_tree(path)) {
+        cpu->eax = 0u;
+        last_error = 5u;
+    } else {
+        memcpy(output, path, (size_t)written + 1u);
+        cpu->eax = 1u;
+    }
+    return_stdcall(cpu, 16u);
+    return 1;
+}
+
+static int handle_ole_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "ole32.dll"))
+        return 0;
+    if (!strcmp(import->name, "CoCreateInstance")) {
+        static const uint8_t game_explorer_clsid[16] = {
+            0x90,0xa9,0x5e,0x9a,0x34,0x30,0x6f,0x4d,
+            0x91,0x28,0x01,0xf3,0xc6,0x10,0x22,0xbc
+        };
+        static const uint8_t game_explorer_iid[16] = {
+            0x72,0xfb,0xb2,0xe7,0x28,0xd7,0xb3,0x49,
+            0xa5,0xf2,0x18,0xeb,0xf5,0xf1,0x34,0x9e
+        };
+        uint32_t clsid_address = rd32(cpu->esp + 4u);
+        uint32_t outer = rd32(cpu->esp + 8u);
+        uint32_t context = rd32(cpu->esp + 12u);
+        uint32_t iid_address = rd32(cpu->esp + 16u);
+        uint32_t output_address = rd32(cpu->esp + 20u);
+        uint8_t *clsid = (uint8_t *)guest_memory_try_ptr(clsid_address, 16u);
+        uint8_t *iid = (uint8_t *)guest_memory_try_ptr(iid_address, 16u);
+        if (!clsid || !iid)
+            stop_guest("CoCreateInstance GUID is unmapped", import->token);
+        if (outer || context != 1u || memcmp(clsid, game_explorer_clsid, 16u) ||
+            memcmp(iid, game_explorer_iid, 16u))
+            stop_guest("unsupported CoCreateInstance class/interface/context", import->token);
+        if (!guest_memory_try_ptr(output_address, 4u))
+            stop_guest("CoCreateInstance output pointer is unmapped", import->token);
+        /* Game Explorer is absent from the Android runtime and current host
+         * profile. Windows callers are documented to handle this optional
+         * parental-controls component being unregistered. */
+        wr32(output_address, 0u);
+        cpu->eax = 0x80040154u; /* REGDB_E_CLASSNOTREG */
+        return_stdcall(cpu, 20u);
+        return 1;
+    }
+    if (!strcmp(import->name, "CoInitialize") || !strcmp(import->name, "CoInitializeEx")) {
+        int initialize_ex = !strcmp(import->name, "CoInitializeEx");
+        uint32_t reserved = rd32(cpu->esp + 4u);
+        uint32_t flags = initialize_ex ? rd32(cpu->esp + 8u) : 2u; /* CoInitialize is STA. */
+        uint32_t model = flags & 3u;
+        if (reserved || (model != 0u && model != 2u) || (flags & ~0x0au)) {
+            cpu->eax = 0x80070057u; /* E_INVALIDARG */
+        } else if (com_init_count && com_apartment_model != model) {
+            cpu->eax = 0x80010106u; /* RPC_E_CHANGED_MODE */
+        } else {
+            if (!com_init_count) com_apartment_model = model;
+            ++com_init_count;
+            cpu->eax = com_init_count == 1u ? 0u : 1u; /* S_OK / S_FALSE */
+        }
+        return_stdcall(cpu, initialize_ex ? 8u : 4u);
+        return 1;
+    }
+    if (!strcmp(import->name, "CoUninitialize")) {
+        if (com_init_count && !--com_init_count) com_apartment_model = UINT32_MAX;
+        return_stdcall(cpu, 0u);
+        return 1;
+    }
+    return 0;
+}
+
+static int handle_registry_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "ADVAPI32.dll"))
+        return 0;
+    if (strcmp(import->name, "RegOpenKeyExA")) return 0;
+    uint32_t root = rd32(cpu->esp + 4u);
+    uint32_t subkey = rd32(cpu->esp + 8u);
+    uint32_t options = rd32(cpu->esp + 12u);
+    uint32_t access = rd32(cpu->esp + 16u);
+    uint32_t output = rd32(cpu->esp + 20u);
+    if (root == 0x80000002u && options == 0u && access == 0x00020019u &&
+        guest_string_equal(subkey, "SOFTWARE\\Ubisoft\\Assassin's Creed")) {
+        if (!guest_memory_try_ptr(output, 4u))
+            stop_guest("RegOpenKeyExA output is unmapped", import->token);
+        wr32(output, 0u);
+        cpu->eax = 2u; /* ERROR_FILE_NOT_FOUND: no registry-backed install data on this runtime. */
+        return_stdcall(cpu, 20u);
+        return 1;
+    }
+    stop_guest("unsupported registry key access", import->token);
+    return 1;
+}
+
+#ifdef _WIN32
+static int window_read_guest(void *context, uint32_t address,
+                             void *output, size_t bytes)
+{
+    (void)context;
+    const void *source = guest_memory_try_ptr(address, bytes);
+    if (!source || (!output && bytes)) return 0;
+    if (bytes) memcpy(output, source, bytes);
+    return 1;
+}
+
+static int window_write_guest(void *context, uint32_t address,
+                              const void *input, size_t bytes)
+{
+    (void)context;
+    void *destination = guest_memory_try_ptr(address, bytes);
+    if (!destination || (!input && bytes)) return 0;
+    if (bytes) memcpy(destination, input, bytes);
+    return 1;
+}
+
+static int window_allocate_guest(void *context, size_t bytes,
+                                 uint32_t *guest_address)
+{
+    (void)context;
+    if (!process_heap || !guest_address || !bytes || bytes > UINT32_MAX) return 0;
+    uint32_t address = pcrecomp_heap_alloc(process_heap, (uint32_t)bytes, 0);
+    if (!address) return 0;
+    *guest_address = address;
+    return 1;
+}
+
+static void window_free_guest(void *context, uint32_t guest_address)
+{
+    (void)context;
+    if (process_heap && guest_address) pcrecomp_heap_free(process_heap, guest_address);
+}
+
+static int window_invoke_wndproc(void *context, CPU *cpu, uint32_t procedure,
+    uint32_t guest_hwnd, uint32_t message, uint32_t wparam, uint32_t lparam,
+    uint32_t *result)
+{
+    (void)context;
+    if (!cpu || !procedure || !result || cpu->esp < 5u * sizeof(uint32_t)) return 0;
+    uint32_t frame_address = cpu->esp - 5u * sizeof(uint32_t);
+    uint32_t *frame = (uint32_t *)guest_memory_try_ptr(frame_address,
+                                                       5u * sizeof(uint32_t));
+    if (!frame) return 0;
+
+    CPU saved = *cpu;
+    frame[0] = AC1_RETURN_SENTINEL;
+    frame[1] = guest_hwnd;
+    frame[2] = message;
+    frame[3] = wparam;
+    frame[4] = lparam;
+    cpu->esp = frame_address;
+    dispatch(cpu, procedure);
+    *result = cpu->eax;
+    *cpu = saved;
+    return 1;
+}
+
+static uint32_t window_current_guest_thread_id(void *context)
+{
+    (void)context;
+    return active_guest_thread ? active_guest_thread->id : 0u;
+}
+
+static int ensure_window_bridge(void)
+{
+    if (window_bridge) return 1;
+    ac1_window_win32_callbacks callbacks = {0};
+    callbacks.read_guest = window_read_guest;
+    callbacks.write_guest = window_write_guest;
+    callbacks.allocate_guest = window_allocate_guest;
+    callbacks.free_guest = window_free_guest;
+    callbacks.invoke_wndproc = window_invoke_wndproc;
+    callbacks.current_guest_thread_id = window_current_guest_thread_id;
+    char error[256] = {0};
+    window_bridge = ac1_window_win32_create(&callbacks, error, sizeof(error));
+    if (!window_bridge)
+        stop_guest(error[0] ? error : "cannot initialize Win32 USER32 bridge",
+                   last_guest_target);
+    return 1;
+}
+#endif
+
+static int handle_window_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "USER32.dll"))
+        return 0;
+    if (!strcmp(import->name, "SetWindowsHookExA")) {
+        uint32_t hook_type = rd32(cpu->esp + 4u);
+        uint32_t callback = rd32(cpu->esp + 8u);
+        uint32_t module = rd32(cpu->esp + 12u);
+        uint32_t thread_id = rd32(cpu->esp + 16u);
+        if (hook_type != 13u || callback != 0x00401145u || module != image_base || thread_id)
+            stop_guest("unsupported SetWindowsHookExA hook/callback", import->token);
+        /* WH_KEYBOARD_LL is a system-wide Win32 facility. The callback is a
+         * 32-bit guest VA and cannot be registered with the host OS or Android. */
+        cpu->eax = 0u;
+        last_error = 120u; /* ERROR_CALL_NOT_IMPLEMENTED */
+        return_stdcall(cpu, 16u);
+        return 1;
+    }
+#ifdef _WIN32
+    if (!ensure_window_bridge()) return 0;
+    char error[256] = {0};
+    int status = ac1_window_win32_call(window_bridge, cpu, import->name,
+                                       &last_error, error, sizeof(error));
+    if (status == AC1_WINDOW_WIN32_HANDLED) return 1;
+    if (status == AC1_WINDOW_WIN32_ERROR)
+        stop_guest(error[0] ? error : "Win32 USER32 bridge rejected call state",
+                   import->token);
+#endif
+    return 0;
+}
+
+static int handle_clock_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
+        return 0;
+    uint64_t value;
+    if (!strcmp(import->name, "QueryPerformanceFrequency")) {
+#ifdef _WIN32
+        LARGE_INTEGER frequency;
+        if (!QueryPerformanceFrequency(&frequency)) {
+            cpu->eax = 0;
+            last_error = GetLastError();
+            return_stdcall(cpu, 4u);
+            return 1;
+        }
+        value = (uint64_t)frequency.QuadPart;
+#else
+        value = UINT64_C(1000000000);
+#endif
+    } else if (!strcmp(import->name, "QueryPerformanceCounter")) {
+#ifdef _WIN32
+        LARGE_INTEGER counter;
+        if (!QueryPerformanceCounter(&counter)) {
+            cpu->eax = 0;
+            last_error = GetLastError();
+            return_stdcall(cpu, 4u);
+            return 1;
+        }
+        value = (uint64_t)counter.QuadPart;
+#else
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now))
+            stop_guest("monotonic performance counter failed", import->token);
+        value = (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+#endif
+    } else {
+        return 0;
+    }
+    uint32_t output = rd32(cpu->esp + 4u);
+    if (!guest_memory_try_ptr(output, 8))
+        stop_guest("performance counter output is unmapped", import->token);
+    wr32(output, (uint32_t)value);
+    wr32(output + 4u, (uint32_t)(value >> 32));
+    cpu->eax = 1;
+    return_stdcall(cpu, 4u);
+    return 1;
+}
+
+static int handle_version_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
+        return 0;
+    if (!strcmp(import->name, "GetVersion")) {
+        /* Match the Windows 7 compatibility profile used by GetVersionExA. */
+        cpu->eax = 0x1db10106u; /* 6.1.7601, NT platform */
+        return_stdcall(cpu, 0u);
+        return 1;
+    }
+    if (strcmp(import->name, "GetVersionExA")) return 0;
+    uint32_t output = rd32(cpu->esp + 4u);
+    if (!guest_memory_try_ptr(output, 4u))
+        stop_guest("GetVersionExA output is unmapped", import->token);
+    uint32_t structure_size = rd32(output);
+    if ((structure_size != 148u && structure_size != 156u) ||
+        !guest_memory_try_ptr(output, structure_size)) {
+        cpu->eax = 0;
+        last_error = 87u; /* ERROR_INVALID_PARAMETER */
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    uint8_t *version = (uint8_t *)guest_memory_try_ptr(output, structure_size);
+    memset(version, 0, structure_size);
+    wr32(output, structure_size);
+    wr32(output + 4u, 6u);       /* Windows 7 compatibility profile. */
+    wr32(output + 8u, 1u);
+    wr32(output + 12u, 7601u);
+    wr32(output + 16u, 2u);      /* VER_PLATFORM_WIN32_NT */
+    memcpy(version + 20u, "Service Pack 1", sizeof("Service Pack 1"));
+    if (structure_size == 156u) {
+        version[148] = 1u;       /* wServicePackMajor */
+        version[154] = 1u;       /* VER_NT_WORKSTATION */
+    }
+    cpu->eax = 1;
+    return_stdcall(cpu, 4u);
+    return 1;
+}
+
+static int handle_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
+        return 0;
+
+    if (!strcmp(import->name, "GetStartupInfoA")) {
+        uint32_t output = rd32(cpu->esp + 4u);
+        uint8_t *startup = (uint8_t *)guest_memory_try_ptr(output, 68u);
+        if (!startup) stop_guest("GetStartupInfoA output is unmapped", import->token);
+        memset(startup, 0, 68u);
+        wr32(output, 68u); /* STARTUPINFOA.cb; remaining default fields are zero. */
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "GetSystemInfo")) {
+        uint32_t output = rd32(cpu->esp + 4u);
+        uint8_t *info = (uint8_t *)guest_memory_try_ptr(output, 36u);
+        if (!info) stop_guest("GetSystemInfo output is unmapped", import->token);
+        memset(info, 0, 36u);
+#ifdef _WIN32
+        SYSTEM_INFO host_info;
+        GetSystemInfo(&host_info);
+        uint32_t processor_count = host_info.dwNumberOfProcessors;
+#else
+        long host_count = sysconf(_SC_NPROCESSORS_ONLN);
+        uint32_t processor_count = host_count > 0 ? (uint32_t)host_count : 1u;
+#endif
+        if (!processor_count) processor_count = 1u;
+        if (processor_count > 32u) processor_count = 32u;
+        wr32(output + 4u, 4096u);             /* guest page size */
+        wr32(output + 8u, 0x00010000u);       /* 32-bit Windows user address range */
+        wr32(output + 12u, 0x7ffeffffu);
+        wr32(output + 16u, processor_count == 32u ? UINT32_MAX : ((1u << processor_count) - 1u));
+        wr32(output + 20u, processor_count);
+        wr32(output + 24u, 586u);             /* PROCESSOR_INTEL_PENTIUM */
+        wr32(output + 28u, 65536u);           /* allocation granularity */
+        wr16(output + 32u, 6u);               /* guest x86 processor level */
+        wr16(output + 34u, 0u);
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "RaiseException")) {
+        uint32_t code = rd32(cpu->esp + 4u);
+        uint32_t flags = rd32(cpu->esp + 8u);
+        uint32_t argument_count = rd32(cpu->esp + 12u);
+        uint32_t arguments = rd32(cpu->esp + 16u);
+        if (code != 0x406D1388u || flags != 0u || argument_count != 4u ||
+            !guest_memory_try_ptr(arguments, 4u * sizeof(uint32_t)) ||
+            rd32(arguments) != 0x1000u || !rd32(arguments + 4u) ||
+            rd32(arguments + 12u) != 0u)
+            stop_guest("unsupported RaiseException (only the MSVC thread-name protocol is recognized)",
+                       import->token);
+        if (trace_imports)
+            fprintf(stderr, "AC1 ignored MSVC thread-name debugger exception on guest thread %u\n",
+                    active_guest_thread ? active_guest_thread->id : 0u);
+        /* 0x406D1388 is the debugger-only MSVC thread naming protocol. It has
+         * no guest program effect once no debugger is attached. */
+        return_stdcall(cpu, 16u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "VirtualAlloc")) {
+        uint32_t requested = rd32(cpu->esp + 4u);
+        uint32_t size = rd32(cpu->esp + 8u);
+        uint32_t allocation_type = rd32(cpu->esp + 12u);
+        uint32_t protection = rd32(cpu->esp + 16u);
+        const uint32_t supported_type = 0x1000u | 0x2000u; /* MEM_COMMIT | MEM_RESERVE */
+        if (!size || (allocation_type & supported_type) != supported_type ||
+            (allocation_type & ~(supported_type | 0x100000u)) ||
+            protection != 4u) {
+            cpu->eax = 0u;
+            last_error = 87u; /* ERROR_INVALID_PARAMETER */
+            return_stdcall(cpu, 16u);
+            return 1;
+        }
+        uint64_t rounded = ((uint64_t)size + 0xfffu) & ~UINT64_C(0xfff);
+        uint32_t base = requested;
+        if (base) {
+            base &= ~0xffffu; /* MEM_RESERVE rounds an explicit address to 64 KiB. */
+        } else {
+            if (rounded > UINT32_MAX) {
+                cpu->eax = 0u;
+                last_error = 8u; /* ERROR_NOT_ENOUGH_MEMORY */
+                return_stdcall(cpu, 16u);
+                return 1;
+            }
+            base = guest_memory_find_gap(0x10000000u, (uint32_t)rounded,
+                                         0x10000u, 0x70000000u);
+        }
+        if (!base || !guest_memory_allocate(base, rounded)) {
+            cpu->eax = 0u;
+            last_error = 8u; /* ERROR_NOT_ENOUGH_MEMORY */
+        } else {
+            cpu->eax = base;
+            last_error = 0u;
+        }
+        return_stdcall(cpu, 16u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "VirtualFree")) {
+        uint32_t address = rd32(cpu->esp + 4u);
+        uint32_t size = rd32(cpu->esp + 8u);
+        uint32_t free_type = rd32(cpu->esp + 12u);
+        if (trace_imports)
+            fprintf(stderr, "AC1 VirtualFree: eip=0x%08x address=0x%08x size=0x%08x type=0x%08x\n",
+                    cpu->eip, address, size, free_type);
+        if (free_type == 0x8000u && address && size == 0u &&
+            guest_memory_region_size(address) != 0u) {
+            guest_memory_release(address);
+            cpu->eax = 1u;
+            last_error = 0u;
+        } else if (free_type == 0x4000u) {
+            stop_guest("VirtualFree MEM_DECOMMIT is unsupported by the current guest map model",
+                       import->token);
+        } else {
+            cpu->eax = 0u;
+            last_error = 87u; /* ERROR_INVALID_PARAMETER */
+        }
+        return_stdcall(cpu, 12u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "SetCurrentDirectoryA")) {
+        uint32_t path_address = rd32(cpu->esp + 4u);
+        char path[32768];
+        size_t length = 0u;
+        for (; length + 1u < sizeof(path); ++length) {
+            const char *byte = (const char *)guest_memory_try_ptr(
+                path_address + (uint32_t)length, 1u);
+            if (!byte) stop_guest("SetCurrentDirectoryA path is unmapped", import->token);
+            path[length] = *byte;
+            if (!path[length]) break;
+        }
+        if (length + 1u >= sizeof(path) || path[length])
+            stop_guest("SetCurrentDirectoryA path is unterminated or too long", import->token);
+        while (length > 0u && (path[length - 1u] == '\\' || path[length - 1u] == '/'))
+            path[--length] = '\0';
+#ifdef _WIN32
+        int same_directory = equal_ascii_fold(path, guest_current_directory);
+        DWORD attributes = GetFileAttributesA(path);
+        int exists = attributes != INVALID_FILE_ATTRIBUTES &&
+                     (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+        int same_directory = strcmp(path, guest_current_directory) == 0;
+        struct stat directory_status;
+        int exists = stat(path, &directory_status) == 0 &&
+                     S_ISDIR(directory_status.st_mode);
+#endif
+        if (!exists) {
+            cpu->eax = 0u;
+            last_error = 3u; /* ERROR_PATH_NOT_FOUND */
+        } else if (!same_directory) {
+            stop_guest("SetCurrentDirectoryA requested an unmodeled directory change",
+                       import->token);
+        } else {
+            cpu->eax = 1u;
+            last_error = 0u;
+        }
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "GetLogicalDriveStringsA")) {
+        uint32_t capacity = rd32(cpu->esp + 4u);
+        uint32_t output_address = rd32(cpu->esp + 8u);
+        uint32_t result = 0u;
+#ifdef _WIN32
+        char drives[4096];
+        DWORD native_capacity = capacity < sizeof(drives) ? (DWORD)capacity : (DWORD)sizeof(drives);
+        memset(drives, 0, sizeof(drives));
+        DWORD native_result = GetLogicalDriveStringsA(native_capacity, drives);
+        if (!native_result) {
+            last_error = GetLastError();
+        } else if (capacity && native_result < sizeof(drives)) {
+            size_t bytes = (size_t)native_result + 1u;
+            if (bytes > capacity) bytes = capacity;
+            uint8_t *output = (uint8_t *)guest_memory_try_ptr(output_address, bytes);
+            if (!output) stop_guest("GetLogicalDriveStringsA output is unmapped", import->token);
+            memcpy(output, drives, bytes);
+            result = native_result;
+            last_error = 0u;
+        } else {
+            /* Win32 reports the required character count, including its final
+             * NUL, when the supplied buffer cannot hold the full MULTI_SZ. */
+            result = native_result;
+            last_error = capacity ? 122u : 0u; /* ERROR_INSUFFICIENT_BUFFER */
+        }
+#else
+        /* Android/POSIX has no Win32 logical drives to enumerate. Return the
+         * documented failure shape, rather than claiming a synthetic drive. */
+        if (capacity) {
+            uint8_t *output = (uint8_t *)guest_memory_try_ptr(output_address, capacity);
+            if (!output) stop_guest("GetLogicalDriveStringsA output is unmapped", import->token);
+            output[0] = 0u;
+            if (capacity > 1u) output[1] = 0u;
+        }
+        last_error = 120u; /* ERROR_CALL_NOT_IMPLEMENTED */
+#endif
+        cpu->eax = result;
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "GetACP")) {
+        /* The pinned DX9 runtime's ANSI profile is Windows-1252, also used
+         * for CP_ACP in WideCharToMultiByte above. */
+        cpu->eax = 1252u;
+        return_stdcall(cpu, 0u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "GetCurrentDirectoryA")) {
+        uint32_t capacity = rd32(cpu->esp + 4u);
+        uint32_t output_address = rd32(cpu->esp + 8u);
+        size_t length = strlen(guest_current_directory);
+        if (length > UINT32_MAX - 1u) {
+            cpu->eax = 0u;
+            last_error = 206u; /* ERROR_FILENAME_EXCED_RANGE */
+        } else if (!capacity) {
+            cpu->eax = (uint32_t)length + 1u;
+            last_error = 0u;
+        } else if (capacity <= length) {
+            cpu->eax = (uint32_t)length + 1u;
+            last_error = 122u; /* ERROR_INSUFFICIENT_BUFFER */
+        } else {
+            char *output = (char *)guest_memory_try_ptr(output_address, length + 1u);
+            if (!output) stop_guest("GetCurrentDirectoryA output is unmapped", import->token);
+            memcpy(output, guest_current_directory, length + 1u);
+            cpu->eax = (uint32_t)length;
+            last_error = 0u;
+        }
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "IsValidCodePage")) {
+        uint32_t code_page = rd32(cpu->esp + 4u);
+        cpu->eax = code_page == 1252u || code_page == 65001u;
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "GetCPInfo")) {
+        uint32_t code_page = rd32(cpu->esp + 4u);
+        uint32_t output_address = rd32(cpu->esp + 8u);
+        uint8_t *info = (uint8_t *)guest_memory_try_ptr(output_address, 18u);
+        if (!info) stop_guest("GetCPInfo output is unmapped", import->token);
+        if (code_page != 1252u && code_page != 65001u) {
+            cpu->eax = 0;
+            last_error = 87u;
+        } else {
+            memset(info, 0, 18u);
+            wr32(output_address, code_page == 65001u ? 4u : 1u);
+            info[4] = '?';
+            cpu->eax = 1;
+        }
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "SetUnhandledExceptionFilter")) {
+        uint32_t next_filter = rd32(cpu->esp + 4u);
+        cpu->eax = unhandled_exception_filter;
+        unhandled_exception_filter = next_filter;
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "GetStringTypeW")) {
+        uint32_t type = rd32(cpu->esp + 4u);
+        uint32_t source_address = rd32(cpu->esp + 8u);
+        int32_t requested_units = (int32_t)rd32(cpu->esp + 12u);
+        uint32_t output_address = rd32(cpu->esp + 16u);
+        if (type != 1u)
+            stop_guest("GetStringTypeW classification type is unsupported", import->token);
+        if (!source_address || !output_address || requested_units == 0 || requested_units < -1) {
+            cpu->eax = 0;
+            last_error = 87u;
+            return_stdcall(cpu, 16u);
+            return 1;
+        }
+        size_t units = requested_units > 0 ? (size_t)requested_units : 0u;
+        if (requested_units == -1) {
+            while (units < 0x01000000u) {
+                uint16_t *p = (uint16_t *)guest_memory_try_ptr(source_address + (uint32_t)(units * 2u), 2u);
+                if (!p) stop_guest("GetStringTypeW input string is unmapped", import->token);
+                ++units;
+                if (!*p) break;
+            }
+            if (units == 0x01000000u)
+                stop_guest("GetStringTypeW input string is unterminated", import->token);
+        }
+        const uint16_t *source = (const uint16_t *)guest_memory_try_ptr(source_address, units * 2u);
+        uint16_t *output = (uint16_t *)guest_memory_try_ptr(output_address, units * 2u);
+        if (!source || !output) stop_guest("GetStringTypeW input/output range is unmapped", import->token);
+#ifdef _WIN32
+        cpu->eax = GetStringTypeW(type, (LPCWCH)source, (int)units, (LPWORD)output) != 0;
+#else
+        for (size_t i = 0; i < units; ++i) {
+            uint16_t c = source[i];
+            uint16_t flags = 0;
+            if ((c >= 'A' && c <= 'Z') || (c >= 0x00c0u && c <= 0x00deu && c != 0x00d7u)) flags |= 0x0001u | 0x0100u;
+            else if ((c >= 'a' && c <= 'z') || (c >= 0x00dfu && c <= 0x00ffu && c != 0x00f7u)) flags |= 0x0002u | 0x0100u;
+            if (c >= '0' && c <= '9') flags |= 0x0004u;
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f' || c == 0x00a0u) flags |= 0x0008u;
+            if (c == ' ' || c == '\t' || c == 0x00a0u) flags |= 0x0040u;
+            if ((c >= 0x21u && c <= 0x7eu && !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) ||
+                (c >= 0x00a1u && c <= 0x00bfu)) flags |= 0x0010u;
+            if (c < 0x20u || (c >= 0x7fu && c <= 0x9fu)) flags |= 0x0020u;
+            if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) flags |= 0x0080u;
+            output[i] = flags;
+        }
+        cpu->eax = 1u;
+#endif
+        return_stdcall(cpu, 16u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "MultiByteToWideChar")) {
+        uint32_t code_page = rd32(cpu->esp + 4u);
+        uint32_t flags = rd32(cpu->esp + 8u);
+        uint32_t source_address = rd32(cpu->esp + 12u);
+        int32_t requested_bytes = (int32_t)rd32(cpu->esp + 16u);
+        uint32_t output_address = rd32(cpu->esp + 20u);
+        uint32_t output_capacity = rd32(cpu->esp + 24u);
+        int utf8 = code_page == 65001u;
+        if (code_page != 0u && code_page != 1252u && !utf8)
+            stop_guest("MultiByteToWideChar code page is unsupported", import->token);
+        if ((utf8 && (flags & ~8u)) || (!utf8 && (flags & ~9u)))
+            stop_guest("MultiByteToWideChar flags are unsupported", import->token);
+        if (!source_address || requested_bytes == 0 || requested_bytes < -1) {
+            cpu->eax = 0;
+            last_error = 87u;
+            return_stdcall(cpu, 24u);
+            return 1;
+        }
+        size_t bytes;
+        if (requested_bytes == -1) {
+            bytes = 0;
+            while (bytes < 0x01000000u) {
+                uint8_t *p = (uint8_t *)guest_memory_try_ptr(source_address + (uint32_t)bytes, 1u);
+                if (!p) stop_guest("MultiByteToWideChar input string is unmapped", import->token);
+                ++bytes;
+                if (!*p) break;
+            }
+            if (bytes == 0x01000000u)
+                stop_guest("MultiByteToWideChar input string is unterminated", import->token);
+        } else bytes = (size_t)requested_bytes;
+        const uint8_t *source = (const uint8_t *)guest_memory_try_ptr(source_address, bytes);
+        if (!source) stop_guest("MultiByteToWideChar input range is unmapped", import->token);
+        int valid;
+        int strict = utf8 && (flags & 8u);
+        size_t required = convert_ansi_to_wide(source, bytes, utf8, NULL, strict, &valid);
+        if (!valid && strict) {
+            cpu->eax = 0;
+            last_error = 1113u; /* ERROR_NO_UNICODE_TRANSLATION */
+        } else if (required > INT32_MAX) {
+            stop_guest("MultiByteToWideChar output is too large", import->token);
+        } else if (!output_address && output_capacity == 0u) {
+            cpu->eax = (uint32_t)required;
+        } else {
+            uint16_t *output = (uint16_t *)guest_memory_try_ptr(output_address,
+                                                                (size_t)output_capacity * 2u);
+            if (!output || output_capacity < required) {
+                cpu->eax = 0;
+                last_error = output ? 122u : 87u;
+            } else {
+                convert_ansi_to_wide(source, bytes, utf8, output, 0, &valid);
+                cpu->eax = (uint32_t)required;
+            }
+        }
+        return_stdcall(cpu, 24u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "LCMapStringW")) {
+        uint32_t locale = rd32(cpu->esp + 4u);
+        uint32_t flags = rd32(cpu->esp + 8u);
+        uint32_t source_address = rd32(cpu->esp + 12u);
+        int32_t requested_units = (int32_t)rd32(cpu->esp + 16u);
+        uint32_t output_address = rd32(cpu->esp + 20u);
+        uint32_t output_capacity = rd32(cpu->esp + 24u);
+        uint32_t case_flags = flags & (0x100u | 0x200u);
+        if ((flags & ~0x01000300u) || (case_flags != 0x100u && case_flags != 0x200u))
+            stop_guest("LCMapStringW mapping flags are unsupported", import->token);
+        if (!source_address || requested_units == 0 || requested_units < -1) {
+            cpu->eax = 0;
+            last_error = 87u;
+            return_stdcall(cpu, 24u);
+            return 1;
+        }
+        size_t units;
+        if (requested_units == -1) {
+            units = 0;
+            while (units < 0x01000000u) {
+                uint16_t *p = (uint16_t *)guest_memory_try_ptr(source_address + (uint32_t)(units * 2u), 2u);
+                if (!p) stop_guest("LCMapStringW input string is unmapped", import->token);
+                ++units;
+                if (!*p) break;
+            }
+            if (units == 0x01000000u)
+                stop_guest("LCMapStringW input string is unterminated", import->token);
+        } else units = (size_t)requested_units;
+        const uint16_t *source = (const uint16_t *)guest_memory_try_ptr(source_address, units * 2u);
+        if (!source) stop_guest("LCMapStringW input range is unmapped", import->token);
+#ifdef _WIN32
+        uint16_t *output = output_address ? (uint16_t *)guest_memory_try_ptr(output_address, (size_t)output_capacity * 2u) : NULL;
+        if (output_address && !output) stop_guest("LCMapStringW output range is unmapped", import->token);
+        cpu->eax = (uint32_t)LCMapStringW(locale, flags, (LPCWCH)source, (int)units,
+                                          (LPWSTR)output, (int)output_capacity);
+        if (!cpu->eax && output_address) last_error = 122u;
+#else
+        (void)locale;
+        if (output_address && output_capacity < units) {
+            cpu->eax = 0u;
+            last_error = 122u;
+        } else if (!output_address && output_capacity == 0u) {
+            cpu->eax = (uint32_t)units;
+        } else {
+            uint16_t *output = (uint16_t *)guest_memory_try_ptr(output_address, units * 2u);
+            if (!output) stop_guest("LCMapStringW output range is unmapped", import->token);
+            for (size_t i = 0; i < units; ++i)
+                output[i] = simple_case_map(source[i], case_flags == 0x200u);
+            cpu->eax = (uint32_t)units;
+        }
+#endif
+        return_stdcall(cpu, 24u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "GetCommandLineA")) {
+        if (!process_heap || !exe_path_copy[0])
+            stop_guest("GetCommandLineA called before process initialization", import->token);
+        if (!command_line_guest_address) {
+            size_t path_length = strlen(exe_path_copy);
+            /* The launcher supplies only the executable path. Quote it so paths
+             * containing spaces retain normal Windows command-line parsing. */
+            size_t length = path_length + 3u;
+            command_line_guest_address = pcrecomp_heap_alloc(process_heap, (uint32_t)length, 0);
+            char *command = (char *)guest_ptr(command_line_guest_address, length);
+            if (!command) stop_guest("GetCommandLineA allocation failed", import->token);
+            command[0] = '"';
+            memcpy(command + 1u, exe_path_copy, path_length);
+            command[path_length + 1u] = '"';
+            command[path_length + 2u] = '\0';
+        }
+        cpu->eax = command_line_guest_address;
+        return_stdcall(cpu, 0u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "GetEnvironmentStringsW")) {
+        if (!process_heap) stop_guest("GetEnvironmentStringsW called before process initialization", import->token);
+#ifdef _WIN32
+        char **entries = _environ;
+#else
+        char **entries = environ;
+#endif
+        size_t units = 2u;
+        if (entries) {
+            for (char **entry = entries; *entry; ++entry) {
+                size_t count = utf8_to_utf16_count((const unsigned char *)*entry);
+                if (count > (SIZE_MAX / sizeof(uint16_t)) - units - 1u)
+                    stop_guest("environment block size overflow", import->token);
+                units += count + 1u;
+            }
+        }
+        if (units > UINT32_MAX / sizeof(uint16_t))
+            stop_guest("environment block exceeds guest allocation limit", import->token);
+        uint32_t block = pcrecomp_heap_alloc(process_heap, (uint32_t)(units * sizeof(uint16_t)), 1);
+        uint16_t *destination = (uint16_t *)guest_ptr(block, units * sizeof(uint16_t));
+        if (!destination) stop_guest("environment block allocation failed", import->token);
+        if (entries) {
+            for (char **entry = entries; *entry; ++entry)
+                destination = utf8_to_utf16_write(destination, (const unsigned char *)*entry);
+        }
+        *destination = 0; /* The Windows environment block ends with an extra NUL. */
+        cpu->eax = block;
+        return_stdcall(cpu, 0u);
+        return 1;
+    }
+
+    if (!strcmp(import->name, "WideCharToMultiByte")) {
+        uint32_t code_page = rd32(cpu->esp + 4u);
+        uint32_t flags = rd32(cpu->esp + 8u);
+        uint32_t source_address = rd32(cpu->esp + 12u);
+        int32_t requested_units = (int32_t)rd32(cpu->esp + 16u);
+        uint32_t output_address = rd32(cpu->esp + 20u);
+        uint32_t output_capacity = rd32(cpu->esp + 24u);
+        uint32_t default_address = rd32(cpu->esp + 28u);
+        uint32_t used_default_address = rd32(cpu->esp + 32u);
+        int utf8 = code_page == 65001u;
+        if (code_page != 0u && code_page != 1252u && !utf8)
+            stop_guest("WideCharToMultiByte code page is unsupported", import->token);
+        if ((utf8 && (default_address || used_default_address || (flags & ~0x80u))) ||
+            (!utf8 && flags))
+            stop_guest("WideCharToMultiByte flags/default arguments are unsupported", import->token);
+        if (!source_address || requested_units == 0 || requested_units < -1) {
+            cpu->eax = 0;
+            last_error = 87u;
+            return_stdcall(cpu, 32u);
+            return 1;
+        }
+        size_t units;
+        if (requested_units == -1) {
+            units = 0;
+            while (units < 0x01000000u) {
+                uint16_t *p = (uint16_t *)guest_memory_try_ptr(source_address + (uint32_t)(units * 2u), 2u);
+                if (!p) stop_guest("WideCharToMultiByte input string is unmapped", import->token);
+                ++units;
+                if (!*p) break;
+            }
+            if (units == 0x01000000u)
+                stop_guest("WideCharToMultiByte input string is unterminated", import->token);
+        } else units = (size_t)requested_units;
+        const uint16_t *source = (const uint16_t *)guest_memory_try_ptr(source_address, units * 2u);
+        if (!source) stop_guest("WideCharToMultiByte input range is unmapped", import->token);
+        uint8_t replacement = '?';
+        if (default_address) {
+            uint8_t *value = (uint8_t *)guest_memory_try_ptr(default_address, 1u);
+            if (!value) stop_guest("WideCharToMultiByte default character is unmapped", import->token);
+            replacement = *value;
+        }
+        int used_default = 0;
+        size_t required = convert_wide_to_ansi(source, units, utf8, replacement, NULL, &used_default);
+        if (required > INT32_MAX) stop_guest("WideCharToMultiByte output is too large", import->token);
+        if (used_default_address) {
+            uint8_t *value = (uint8_t *)guest_memory_try_ptr(used_default_address, 4u);
+            if (!value) stop_guest("WideCharToMultiByte used-default output is unmapped", import->token);
+            wr32(used_default_address, (uint32_t)used_default);
+        }
+        if (!output_address && output_capacity == 0u) {
+            cpu->eax = (uint32_t)required;
+        } else {
+            uint8_t *output = (uint8_t *)guest_memory_try_ptr(output_address, output_capacity);
+            if (!output || output_capacity < required) {
+                cpu->eax = 0;
+                last_error = output ? 122u : 87u;
+            } else {
+                convert_wide_to_ansi(source, units, utf8, replacement, output, &used_default);
+                cpu->eax = (uint32_t)required;
+            }
+        }
+        return_stdcall(cpu, 32u);
+        return 1;
+    }
+
+    if (strcmp(import->name, "GetSystemTimeAsFileTime")) return 0;
+
+    uint32_t output = rd32(cpu->esp + 4u);
+    if (!guest_memory_try_ptr(output, 8))
+        stop_guest("GetSystemTimeAsFileTime output is unmapped", import->token);
+
+#ifdef _WIN32
+    FILETIME host_filetime;
+    GetSystemTimeAsFileTime(&host_filetime);
+    uint64_t filetime = ((uint64_t)host_filetime.dwHighDateTime << 32) |
+                        host_filetime.dwLowDateTime;
+#else
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now))
+        stop_guest("host UTC clock query failed", import->token);
+    const uint64_t epoch_delta = UINT64_C(11644473600);
+    if (now.tv_sec < 0 ||
+        (uint64_t)now.tv_sec > UINT64_MAX / UINT64_C(10000000) - epoch_delta)
+        stop_guest("host UTC clock is outside FILETIME range", import->token);
+    uint64_t filetime = ((uint64_t)now.tv_sec + epoch_delta) * UINT64_C(10000000) +
+                        (uint64_t)now.tv_nsec / 100u;
+#endif
+    wr32(output, (uint32_t)filetime);
+    wr32(output + 4u, (uint32_t)(filetime >> 32));
+    return_stdcall(cpu, 4u);
+    return 1;
+}
+
+static void stop_guest(const char *reason, uint32_t target)
+{
+    if (active_guest_thread && active_guest_thread->slot != 0u &&
+        active_guest_thread->scheduler && runtime_stop_ready) {
+        ac1_scheduler *scheduler = active_guest_thread->scheduler;
+        scheduler_lock(scheduler);
+        int already_failed = scheduler->failed;
+        if (!already_failed) {
+            scheduler->failed = 1;
+            scheduler->failure_target = target;
+            scheduler->failure_caller = last_guest_target;
+            scheduler->failure_thread_id = active_guest_thread->id;
+            scheduler->failure_cpu = active_guest_thread->cpu;
+            for (unsigned i = 0; i < 8u; ++i) {
+                uint32_t at = active_guest_thread->cpu.esp + i * 4u;
+                scheduler->failure_stack[i] = guest_memory_try_ptr(at, 4u) ? rd32(at) : 0u;
+            }
+            snprintf(scheduler->failure_reason, sizeof(scheduler->failure_reason),
+                     "guest thread %u: %s", active_guest_thread->id,
+                     reason ? reason : "unsupported guest operation");
+            scheduler->owner = 0u;
+            scheduler_notify(scheduler);
+        }
+        scheduler_unlock(scheduler);
+        if (already_failed) longjmp(active_guest_thread->exit_env, 1);
+    }
+    if (runtime_stop_ready) {
+        snprintf(stop_reason, sizeof(stop_reason), "%s; target=0x%08x",
+                 reason, target);
+        snprintf(last_run_error, sizeof(last_run_error), "%s", stop_reason);
+        longjmp(stop_runtime, 1);
+    }
+    fprintf(stderr, "AC1 native runtime: %s; target=0x%08x\n", reason, target);
+    abort();
+}
+
+static int resolve_import(void *context, const char *dll_name,
+                          const char *name, uint16_t ordinal,
+                          uint32_t *guest_target, char *error,
+                          size_t error_capacity)
+{
+    (void)context;
+    if (!dll_name || !guest_target || import_count >= AC1_IMPORT_LIMIT) {
+        if (error && error_capacity)
+            snprintf(error, error_capacity, "invalid/excessive AC1 import table");
+        return 0;
+    }
+    import_record *record = &imports[import_count];
+    memset(record, 0, sizeof(*record));
+    snprintf(record->dll, sizeof(record->dll), "%s", dll_name);
+    if (name) snprintf(record->name, sizeof(record->name), "%s", name);
+    record->ordinal = ordinal;
+    record->by_ordinal = name == NULL;
+    record->token = AC1_IMPORT_BASE + (uint32_t)import_count * 4u;
+    *guest_target = record->token;
+    ++import_count;
+    return 1;
+}
+
+static const import_record *find_import(uint32_t token)
+{
+    if (token < AC1_IMPORT_BASE || (token - AC1_IMPORT_BASE) % 4u)
+        return NULL;
+    size_t index = (token - AC1_IMPORT_BASE) / 4u;
+    return index < import_count ? &imports[index] : NULL;
+}
+
+static int handle_network_import(CPU *cpu, const import_record *import)
+{
+    if (!import || !equal_ascii_fold(import->dll, "WS2_32.dll")) return 0;
+    uint32_t argument_count = 0u;
+    if ((import->by_ordinal && import->ordinal == 115u) ||
+        (!import->by_ordinal && equal_ascii_fold(import->name, "WSAStartup")))
+        argument_count = 2u;
+    else if ((import->by_ordinal && import->ordinal == 112u) ||
+             (!import->by_ordinal && equal_ascii_fold(import->name, "WSASetLastError")))
+        argument_count = 1u;
+    uint32_t arguments[2] = {0u, 0u};
+    if (argument_count) {
+        uint32_t bytes = argument_count * 4u;
+        if (!guest_memory_try_ptr(cpu->esp + 4u, bytes))
+            stop_guest("Winsock import arguments are unmapped", import->token);
+        for (uint32_t i = 0; i < argument_count; ++i)
+            arguments[i] = rd32(cpu->esp + 4u + i * 4u);
+    }
+    uint32_t result = 0u, stack_bytes = 0u;
+    if (!ac1_network_import(import->dll,
+                            import->by_ordinal ? NULL : import->name,
+                            import->ordinal, import->by_ordinal,
+                            argument_count ? arguments : NULL,
+                            &result, &stack_bytes))
+        return 0;
+    cpu->eax = result;
+    return_stdcall(cpu, stack_bytes);
+    return 1;
+}
+
+/* Called by generated code for direct calls, jumps and returns. Imports are
+ * assigned unique IAT tokens and stop here until a measured implementation is
+ * added; an unknown guest address is equally fatal and includes its caller. */
+void dispatch(CPU *cpu, uint32_t target)
+{
+    if (!cpu) stop_guest("null CPU state", target);
+    ++dispatch_count;
+    if (dispatch_limit && dispatch_count > dispatch_limit) {
+        char reason[128];
+        snprintf(reason, sizeof(reason), "guest dispatch budget exceeded (limit=%llu)",
+                 (unsigned long long)dispatch_limit);
+        stop_guest(reason, target);
+    }
+    if (dispatch_depth >= AC1_DISPATCH_DEPTH)
+        stop_guest("guest call depth exceeded", target);
+
+    if (trace_imports && cpu->eip == 0x00F9FA67u)
+        fprintf(stderr, "AC1 CRT callback: target=0x%08x index=%u table=0x%08x stride=%u context=0x%08x\n",
+                target, rd32(cpu->ebp - 0x1cu), rd32(cpu->ebp + 8u),
+                rd32(cpu->ebp + 12u), rd32(cpu->ebp + 20u));
+
+    if (trace_imports && target == 0x00933370u && cpu->eip == 0x00937546u &&
+        (dispatch_count <= 8u || dispatch_count % 100000u == 0u)) {
+        uint32_t stack[4] = {0};
+        uint32_t node = 0u, node_plus4 = 0u, node_plus7 = 0u, edi_value = 0u;
+        uint32_t header[4] = {0};
+        for (unsigned i = 0; i < 4u; ++i) {
+            uint32_t address = cpu->esp + 4u + i * 4u;
+            if (guest_memory_try_ptr(address, 4u)) stack[i] = rd32(address);
+        }
+        if (guest_memory_try_ptr(cpu->esi, 4u)) node = rd32(cpu->esi);
+        if (guest_memory_try_ptr(cpu->esi + 4u, 4u)) node_plus4 = rd32(cpu->esi + 4u);
+        if (guest_memory_try_ptr(cpu->esi + 7u, 1u)) node_plus7 = rd8(cpu->esi + 7u);
+        if (guest_memory_try_ptr(cpu->edi, 4u)) edi_value = rd32(cpu->edi);
+        uint32_t header_address = node & ~7u;
+        if (guest_memory_try_ptr(header_address, sizeof(header)))
+            for (unsigned i = 0; i < 4u; ++i) header[i] = rd32(header_address + i * 4u);
+        fprintf(stderr, "AC1 parser sample: dispatch=%llu esp=0x%08x eax=0x%08x ebx=0x%08x ecx=0x%08x edx=0x%08x esi=0x%08x edi=0x%08x args=%08x,%08x,%08x,%08x node=%08x,%08x,%08x edi0=%08x header=%08x,%08x,%08x,%08x\n",
+                (unsigned long long)dispatch_count, cpu->esp, cpu->eax,
+                cpu->ebx, cpu->ecx, cpu->edx, cpu->esi, cpu->edi,
+                stack[0], stack[1], stack[2], stack[3], node,
+                node_plus4, node_plus7, edi_value,
+                header[0], header[1], header[2], header[3]);
+    }
+
+    if (trace_imports && cpu->eip == 0x00FD2180u && trace_callback_count < 32u) {
+        uint32_t fields[5] = {0};
+        for (unsigned i = 0; i < 5u; ++i) {
+            uint32_t address = cpu->esi + i * 4u;
+            if (guest_memory_try_ptr(address, 4u)) fields[i] = rd32(address);
+        }
+        fprintf(stderr, "AC1 callback-table sample[%u]: target=0x%08x esi=0x%08x ecx=0x%08x eax=0x%08x edi=0x%08x edx=0x%08x record=%08x,%08x,%08x,%08x,%08x\n",
+                trace_callback_count++, target, cpu->esi, cpu->ecx, cpu->eax,
+                cpu->edi, cpu->edx, fields[0], fields[1], fields[2],
+                fields[3], fields[4]);
+    }
+
+    const import_record *import = find_import(target);
+    if (import) {
+        if (trace_imports && trace_import_count < 128u) {
+            if (import->by_ordinal)
+                fprintf(stderr, "AC1 import[%u] eip=0x%08x target=0x%08x %s!#%u\n",
+                        trace_import_count, cpu->eip, target, import->dll, import->ordinal);
+            else
+                fprintf(stderr, "AC1 import[%u] eip=0x%08x target=0x%08x %s!%s\n",
+                        trace_import_count, cpu->eip, target, import->dll, import->name);
+            ++trace_import_count;
+        }
+#if defined(AC1_HOST_D3D9)
+        int handled = handle_network_import(cpu, import) ||
+                      handle_d3d9_import(cpu, import) ||
+#else
+        int handled = handle_network_import(cpu, import) ||
+#endif
+                      handle_module_import(cpu, import) ||
+                      handle_heap_import(cpu, import) ||
+                      handle_critical_section_import(cpu, import) ||
+                      handle_interlocked_import(cpu, import) ||
+                      handle_stdio_import(cpu, import) ||
+                      handle_thread_import(cpu, import) ||
+                      handle_sync_import(cpu, import) ||
+                      handle_shell_import(cpu, import) ||
+                      handle_ole_import(cpu, import) ||
+                      handle_registry_import(cpu, import) ||
+                      handle_window_import(cpu, import) ||
+                      handle_clock_import(cpu, import) ||
+                      handle_version_import(cpu, import) ||
+                      handle_import(cpu, import);
+        if (handled) {
+            scheduler_checkpoint();
+            return;
+        }
+        char message[320];
+        if (import->by_ordinal && equal_ascii_fold(import->dll, "WS2_32.dll") &&
+            import->ordinal == 115u && guest_memory_try_ptr(cpu->esp + 4u, 8u))
+            snprintf(message, sizeof(message),
+                     "unimplemented import WS2_32.dll!#115 (WSAStartup) version=0x%04x wsadata=0x%08x from 0x%08x",
+                     rd32(cpu->esp + 4u) & 0xffffu, rd32(cpu->esp + 8u), last_guest_target);
+        else if (!import->by_ordinal && !strcmp(import->name, "SetCurrentDirectoryA")) {
+            uint32_t path_address = guest_memory_try_ptr(cpu->esp + 4u, 4u)
+                ? rd32(cpu->esp + 4u) : 0u;
+            char path[192];
+            size_t i = 0u;
+            for (; i + 1u < sizeof(path); ++i) {
+                const char *byte = path_address
+                    ? (const char *)guest_memory_try_ptr(path_address + (uint32_t)i, 1u)
+                    : NULL;
+                if (!byte) break;
+                path[i] = *byte;
+                if (!path[i]) break;
+            }
+            path[i < sizeof(path) ? i : sizeof(path) - 1u] = '\0';
+            snprintf(message, sizeof(message),
+                     "unimplemented import KERNEL32.dll!SetCurrentDirectoryA path=\"%s\" from 0x%08x",
+                     path, last_guest_target);
+        }
+        else if (import->by_ordinal)
+            snprintf(message, sizeof(message), "unimplemented import %s!#%u from 0x%08x",
+                     import->dll, import->ordinal, last_guest_target);
+        else
+            snprintf(message, sizeof(message), "unimplemented import %s!%s from 0x%08x",
+                     import->dll, import->name, last_guest_target);
+        stop_guest(message, target);
+    }
+
+#if defined(AC1_HOST_D3D9)
+    if (dispatch_d3d9_method(cpu, target)) return;
+#endif
+
+    ac1_lifted_fn function = ac1_lifted_lookup(target);
+    if (!function)
+        stop_guest("no generated function for guest target", target);
+
+    if (target == 0x00401375u && !crt_handoff_logged) {
+        crt_handoff_logged = 1;
+        fprintf(stderr,
+                "AC1 CRT handoff: WinMain thunk=0x%08x return=0x%08x hInstance=0x%08x hPrev=0x%08x cmdline=0x%08x show=0x%08x\n",
+                target, rd32(cpu->esp), rd32(cpu->esp + 4u), rd32(cpu->esp + 8u),
+                rd32(cpu->esp + 12u), rd32(cpu->esp + 16u));
+    }
+
+    uint32_t previous_target = last_guest_target;
+    last_guest_target = target;
+    ++dispatch_depth;
+    function(cpu);
+    --dispatch_depth;
+    last_guest_target = previous_target;
+    scheduler_checkpoint();
+}
+
+void dispatch_jmp(CPU *cpu, uint32_t target)
+{
+    dispatch(cpu, target);
+}
+
+static int read_file(const char *path, uint8_t **bytes, size_t *size,
+                     char *error, size_t error_capacity)
+{
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        snprintf(error, error_capacity, "cannot open executable: %s", path);
+        return 0;
+    }
+    if (fseek(file, 0, SEEK_END) || ftell(file) < 0) {
+        snprintf(error, error_capacity, "cannot size executable: %s", path);
+        fclose(file);
+        return 0;
+    }
+    long length = ftell(file);
+    if (length <= 0 || (uint64_t)length > SIZE_MAX || fseek(file, 0, SEEK_SET)) {
+        snprintf(error, error_capacity, "invalid executable size: %s", path);
+        fclose(file);
+        return 0;
+    }
+    uint8_t *data = (uint8_t *)malloc((size_t)length);
+    if (!data) {
+        snprintf(error, error_capacity, "out of memory reading executable");
+        fclose(file);
+        return 0;
+    }
+    if (fread(data, 1, (size_t)length, file) != (size_t)length) {
+        snprintf(error, error_capacity, "short read from executable: %s", path);
+        free(data);
+        fclose(file);
+        return 0;
+    }
+    fclose(file);
+    *bytes = data;
+    *size = (size_t)length;
+    return 1;
+}
+
+static void derive_guest_current_directory(const char *path)
+{
+    size_t length = strlen(path);
+    size_t separator = length;
+    while (separator && path[separator - 1u] != '/' && path[separator - 1u] != '\\')
+        --separator;
+    if (!separator) {
+        memcpy(guest_current_directory, ".", 2u);
+        return;
+    }
+    size_t directory_length = separator - 1u;
+    if (directory_length == 0u ||
+        (directory_length == 2u && path[1] == ':'))
+        directory_length = separator;
+    if (directory_length >= sizeof(guest_current_directory))
+        directory_length = sizeof(guest_current_directory) - 1u;
+    memcpy(guest_current_directory, path, directory_length);
+    guest_current_directory[directory_length] = '\0';
+#ifdef _WIN32
+    for (size_t i = 0; i < directory_length; ++i)
+        if (guest_current_directory[i] == '/') guest_current_directory[i] = '\\';
+#endif
+}
+
+static uint64_t read_dispatch_limit(void)
+{
+    const char *setting = getenv("AC1_DISPATCH_LIMIT");
+    if (!setting || !*setting) return AC1_DISPATCH_LIMIT_DEFAULT;
+    if (setting[0] == '-') return AC1_DISPATCH_LIMIT_DEFAULT;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long value = strtoull(setting, &end, 0);
+    if (errno == ERANGE || end == setting || *end != '\0')
+        return AC1_DISPATCH_LIMIT_DEFAULT;
+    return (uint64_t)value;
+}
+
+int ac1_run(const char *exe_path)
+{
+    char error[512] = {0};
+    uint8_t *file_bytes = NULL;
+    size_t file_size = 0;
+    pe32_module image = {0};
+    guest_address_space *space = NULL;
+    ac1_scheduler *scheduler = NULL;
+    int result = 1;
+    last_run_error[0] = '\0';
+    if (!exe_path || !*exe_path) {
+        snprintf(last_run_error, sizeof(last_run_error), "executable path is empty");
+        fprintf(stderr, "AC1 native runtime: executable path is empty\n");
+        return 2;
+    }
+    if (strlen(exe_path) >= sizeof(exe_path_copy)) {
+        snprintf(last_run_error, sizeof(last_run_error), "executable path is too long");
+        fprintf(stderr, "AC1 native runtime: executable path is too long\n");
+        return 2;
+    }
+    lock_ac1_run();
+    dispatch_limit = read_dispatch_limit();
+#ifdef _WIN32
+    window_bridge = NULL;
+#endif
+    import_count = 0;
+    memset(imports, 0, sizeof(imports));
+    process_heap = NULL;
+    exe_path_copy[0] = '\0';
+    command_line_guest_address = 0;
+    image_base = 0;
+    static_tls_data_base = 0;
+    static_tls_vector_base = 0;
+    static_tls_template = NULL;
+    static_tls_template_size = 0u;
+    static_tls_zero_fill = 0u;
+    static_tls_index_address = 0u;
+    last_error = 0;
+    max_guest_handles = 16u;
+    unhandled_exception_filter = 0u;
+    com_init_count = 0u;
+    com_apartment_model = UINT32_MAX;
+    guest_affinity_mask = 0u;
+    guest_thread_affinity_mask = 0u;
+    memset(tls_used, 0, sizeof(tls_used));
+    memset(tls_values, 0, sizeof(tls_values));
+    memset(private_heaps, 0, sizeof(private_heaps));
+    memset(sync_objects, 0, sizeof(sync_objects));
+    const char *trace_setting = getenv("AC1_TRACE_IMPORTS");
+    trace_imports = trace_setting && *trace_setting && strcmp(trace_setting, "0");
+    if (trace_imports)
+        fprintf(stderr, "AC1 dispatch guard: limit=%llu (0 disables)\n",
+                (unsigned long long)dispatch_limit);
+    trace_import_count = 0;
+    trace_callback_count = 0;
+    crt_handoff_logged = 0;
+    memcpy(exe_path_copy, exe_path, strlen(exe_path) + 1u);
+    derive_guest_current_directory(exe_path_copy);
+    if (!read_file(exe_path, &file_bytes, &file_size, error, sizeof(error))) {
+        snprintf(last_run_error, sizeof(last_run_error), "%s", error);
+        fprintf(stderr, "AC1 native runtime: %s\n", error);
+        unlock_ac1_run();
+        return 2;
+    }
+    uint8_t binary_digest[32];
+    char binary_hash[65];
+    sha256(file_bytes, file_size, binary_digest);
+    digest_hex(binary_digest, binary_hash);
+    if (strcmp(binary_hash, AC1_EXPECTED_EXE_SHA256)) {
+        snprintf(last_run_error, sizeof(last_run_error),
+                 "executable SHA-256 mismatch: expected %s, found %s",
+                 AC1_EXPECTED_EXE_SHA256, binary_hash);
+        fprintf(stderr, "AC1 native runtime: %s\n", last_run_error);
+        free(file_bytes);
+        unlock_ac1_run();
+        return 9;
+    }
+    if (!pe32_load(file_bytes, file_size, 0x00400000u, &image,
+                   error, sizeof(error))) {
+        snprintf(last_run_error, sizeof(last_run_error), "PE load failed: %s", error);
+        fprintf(stderr, "AC1 native runtime: PE load failed: %s\n", error);
+        free(file_bytes);
+        unlock_ac1_run();
+        return 3;
+    }
+    free(file_bytes);
+    if (!pe32_link_imports(&image, resolve_import, NULL, error, sizeof(error))) {
+        snprintf(last_run_error, sizeof(last_run_error), "import linking failed: %s", error);
+        fprintf(stderr, "AC1 native runtime: import linking failed: %s\n", error);
+        pe32_unload(&image);
+        import_count = 0;
+        unlock_ac1_run();
+        return 4;
+    }
+    space = guest_address_space_create();
+    if (!space) {
+        snprintf(last_run_error, sizeof(last_run_error), "guest address-space allocation failed");
+        fprintf(stderr, "AC1 native runtime: guest address-space allocation failed\n");
+        pe32_unload(&image);
+        unlock_ac1_run();
+        return 5;
+    }
+    guest_address_space_select(space);
+    guest_memory_add(image.image, image.load_base, image.image_size);
+    if (!guest_memory_allocate(AC1_STACK_BASE, AC1_STACK_SIZE) ||
+        !guest_memory_allocate(AC1_TIB_BASE, AC1_TIB_SIZE)) {
+        snprintf(last_run_error, sizeof(last_run_error), "guest stack/TIB allocation failed");
+        fprintf(stderr, "AC1 native runtime: guest stack/TIB allocation failed\n");
+        result = 6;
+        goto cleanup;
+    }
+    process_heap = pcrecomp_heap_create(0x100000u);
+    if (!process_heap) {
+        snprintf(last_run_error, sizeof(last_run_error), "process heap initialization failed");
+        fprintf(stderr, "AC1 native runtime: process heap initialization failed\n");
+        result = 6;
+        goto cleanup;
+    }
+
+    /* Minimal x86 process state: stack and TIB are mapped at stable guest VAs;
+     * API services remain strict traps until their real semantics are added. */
+    uint32_t stack_top = AC1_STACK_BASE + AC1_STACK_SIZE - 0x100u;
+    uint32_t tib[7] = {0};
+    tib[0] = UINT32_MAX;                    /* ExceptionList: empty SEH chain. */
+    tib[1] = stack_top;                     /* StackBase. */
+    tib[2] = AC1_STACK_BASE;                /* StackLimit. */
+    tib[6] = AC1_TIB_BASE;                  /* Self pointer at NT_TIB+0x18. */
+    memcpy(guest_ptr(AC1_TIB_BASE, sizeof(tib)), tib, sizeof(tib));
+    if (!initialize_static_tls(&image, error, sizeof(error))) {
+        snprintf(last_run_error, sizeof(last_run_error), "static TLS initialization failed: %s", error);
+        fprintf(stderr, "AC1 native runtime: %s\n", last_run_error);
+        result = 6;
+        goto cleanup;
+    }
+    memset(tls_used, 0, sizeof(tls_used));
+    memset(tls_values, 0, sizeof(tls_values));
+    /* The executable is the first and only loaded module in this profile. */
+    tls_used[0] = 1u;
+    tls_values[0] = static_tls_data_base;
+
+    scheduler = (ac1_scheduler *)calloc(1, sizeof(*scheduler));
+    if (!scheduler) {
+        snprintf(last_run_error, sizeof(last_run_error), "guest scheduler allocation failed");
+        result = 6;
+        goto cleanup;
+    }
+    scheduler_initialize(scheduler, space);
+    active_scheduler = scheduler;
+    ac1_guest_thread *primary = &scheduler->threads[0];
+    primary->scheduler = scheduler;
+    primary->slot = 0u;
+    primary->id = current_host_thread_id();
+    primary->stack_base = AC1_STACK_BASE;
+    primary->stack_size = AC1_STACK_SIZE;
+    primary->tib_base = AC1_TIB_BASE;
+    primary->static_tls_data = static_tls_data_base;
+    primary->static_tls_vector = static_tls_vector_base;
+    primary->image_delta = image.load_base - image.preferred_base;
+    active_guest_thread = primary;
+    wr32(AC1_TIB_BASE + 0x20u, 1u);
+    wr32(AC1_TIB_BASE + 0x24u, primary->id);
+    CPU *cpu = &primary->cpu;
+    memset(cpu, 0, sizeof(*cpu));
+    cpu->eip = image.load_base + image.entry_rva;
+    cpu->esp = stack_top - 4u;
+    cpu->eflags_misc = 2u;
+    cpu->fs_base = AC1_TIB_BASE;
+    image_base = image.load_base;
+    wr32(cpu->esp, AC1_RETURN_SENTINEL);
+    dispatch_count = 0;
+    dispatch_depth = 0;
+    last_guest_target = cpu->eip;
+    g_image_delta = image.load_base - image.preferred_base;
+
+    printf("AC1 native entry: image=0x%08x size=0x%08x entry=0x%08x imports=%zu\n",
+           image.load_base, image.image_size, cpu->eip, import_count);
+    fflush(stdout);
+
+    if (setjmp(stop_runtime) == 0) {
+        runtime_stop_ready = 1;
+        dispatch(cpu, cpu->eip);
+        runtime_stop_ready = 0;
+        if (cpu->esp == stack_top && rd32(stack_top - 4u) == AC1_RETURN_SENTINEL) {
+            printf("AC1 entry returned naturally after %llu guest dispatches\n",
+                   (unsigned long long)dispatch_count);
+            result = 0;
+        } else {
+            snprintf(last_run_error, sizeof(last_run_error),
+                     "entry returned at guest EIP=0x%08x ESP=0x%08x", cpu->eip, cpu->esp);
+            fprintf(stderr, "AC1 entry returned at guest EIP=0x%08x ESP=0x%08x\n",
+                    cpu->eip, cpu->esp);
+            result = 7;
+        }
+    } else {
+        runtime_stop_ready = 0;
+        fprintf(stderr, "AC1 guest stop: %s; caller=0x%08x EIP=0x%08x ESP=0x%08x EAX=0x%08x dispatches=%llu\n",
+                stop_reason, last_guest_target, cpu->eip, cpu->esp, cpu->eax,
+                (unsigned long long)dispatch_count);
+        if (scheduler && scheduler->failed) {
+            const CPU *failed = &scheduler->failure_cpu;
+            fprintf(stderr,
+                    "AC1 worker stop: thread=%u reason=%s caller=0x%08x target=0x%08x EIP=0x%08x ESP=0x%08x EAX=0x%08x ECX=0x%08x EDX=0x%08x EBX=0x%08x EBP=0x%08x ESI=0x%08x EDI=0x%08x stack=[%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x]\n",
+                    scheduler->failure_thread_id, scheduler->failure_reason,
+                    scheduler->failure_caller, scheduler->failure_target,
+                    failed->eip, failed->esp, failed->eax, failed->ecx,
+                    failed->edx, failed->ebx, failed->ebp, failed->esi,
+                    failed->edi,
+                    scheduler->failure_stack[0], scheduler->failure_stack[1],
+                    scheduler->failure_stack[2], scheduler->failure_stack[3],
+                    scheduler->failure_stack[4], scheduler->failure_stack[5],
+                    scheduler->failure_stack[6], scheduler->failure_stack[7]);
+        }
+        result = 8;
+    }
+
+cleanup:
+    runtime_stop_ready = 0;
+    if (scheduler) {
+        scheduler_stop_and_join(scheduler);
+        free(scheduler);
+        scheduler = NULL;
+    }
+    ac1_network_reset();
+#if defined(AC1_HOST_D3D9)
+    if (d3d9_configured) {
+        ac1_d3d9_shutdown();
+        d3d9_configured = 0;
+        memset(d3d9_heap_blocks, 0, sizeof(d3d9_heap_blocks));
+    }
+#endif
+#ifdef _WIN32
+    if (window_bridge) {
+        ac1_window_win32_destroy(window_bridge);
+        window_bridge = NULL;
+    }
+#endif
+    active_guest_thread = NULL;
+    if (process_heap && space) {
+        guest_address_space_select(space);
+        pcrecomp_heap_destroy(process_heap);
+    }
+    for (size_t i = 0; i < AC1_MAX_PRIVATE_HEAPS; ++i) {
+        if (private_heaps[i].heap && space) {
+            guest_address_space_select(space);
+            pcrecomp_heap_destroy(private_heaps[i].heap);
+        }
+        private_heaps[i].heap = NULL;
+        private_heaps[i].handle = 0;
+    }
+    process_heap = NULL;
+    image_base = 0;
+    if (space) {
+        guest_address_space_select(space);
+        if (static_tls_vector_base) guest_memory_release(static_tls_vector_base);
+        if (static_tls_data_base) guest_memory_release(static_tls_data_base);
+        guest_memory_release(AC1_TIB_BASE);
+        guest_memory_release(AC1_STACK_BASE);
+        (void)guest_memory_remove(image.load_base);
+    }
+    static_tls_data_base = 0;
+    static_tls_vector_base = 0;
+    static_tls_template = NULL;
+    static_tls_template_size = 0u;
+    static_tls_zero_fill = 0u;
+    static_tls_index_address = 0u;
+    guest_address_space_select(NULL);
+    guest_address_space_destroy(space);
+    pe32_unload(&image);
+    memset(imports, 0, sizeof(imports));
+    import_count = 0;
+    g_image_delta = 0;
+    unlock_ac1_run();
+    return result;
+}

@@ -1,0 +1,27 @@
+cmake_minimum_required(VERSION 3.22)
+project(ac1_d3d9_bridge LANGUAGES CXX)
+
+if(NOT WIN32)
+  message(FATAL_ERROR "This standalone target validates the Windows native-D3D9 backend")
+endif()
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+add_library(ac1_d3d9_bridge STATIC ac1_d3d9_bridge.cpp)
+target_include_directories(ac1_d3d9_bridge PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(ac1_d3d9_bridge PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+if(MSVC)
+  target_compile_options(ac1_d3d9_bridge PRIVATE /W4 /permissive-)
+else()
+  target_compile_options(ac1_d3d9_bridge PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+option(AC1_D3D9_BUILD_SMOKE "Build a real Direct3DCreate9/GetAdapterCount host smoke test" ON)
+if(AC1_D3D9_BUILD_SMOKE)
+  enable_testing()
+  add_executable(ac1_d3d9_bridge_smoke tests/bridge_smoke.cpp)
+  target_link_libraries(ac1_d3d9_bridge_smoke PRIVATE ac1_d3d9_bridge)
+  add_test(NAME ac1_d3d9_bridge_smoke COMMAND ac1_d3d9_bridge_smoke)
+endif()
