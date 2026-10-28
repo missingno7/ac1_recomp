@@ -1841,6 +1841,519 @@ static int copy_guest_string(uint32_t address, char *output, size_t capacity)
     return 0;
 }
 
+static char *trim_profile_text(char *text)
+{
+    while (*text && (unsigned char)*text <= ' ') ++text;
+    size_t length = strlen(text);
+    while (length && (unsigned char)text[length - 1u] <= ' ')
+        text[--length] = '\0';
+    return text;
+}
+
+static void trim_profile_trailing_blanks(char *text)
+{
+    size_t length = strlen(text);
+    while (length && (unsigned char)text[length - 1u] <= ' ')
+        text[--length] = '\0';
+}
+
+static int profile_component_is_parent(const char *path)
+{
+    const char *component = path;
+    for (const char *cursor = path;; ++cursor) {
+        if (*cursor == '\\' || *cursor == '/' || *cursor == '\0') {
+            if (cursor - component == 2 && component[0] == '.' && component[1] == '.')
+                return 1;
+            if (!*cursor) break;
+            component = cursor + 1;
+        }
+    }
+    return 0;
+}
+
+static int profile_path_is_absolute(const char *path)
+{
+    if (!path || !*path) return 0;
+#ifdef _WIN32
+    size_t length = strlen(path);
+    return (length >= 3u &&
+            ((path[0] >= 'A' && path[0] <= 'Z') ||
+             (path[0] >= 'a' && path[0] <= 'z')) &&
+            path[1] == ':' && (path[2] == '\\' || path[2] == '/')) ||
+           (length >= 2u && path[0] == '\\' && path[1] == '\\');
+#else
+    return path[0] == '/';
+#endif
+}
+
+static int resolve_profile_path(const char *guest_path, char *host_path, size_t capacity)
+{
+    if (!guest_path || !*guest_path || !host_path || !capacity) return 0;
+#ifdef _WIN32
+    size_t length = strlen(guest_path);
+    int absolute = (length >= 3u &&
+                    ((guest_path[0] >= 'A' && guest_path[0] <= 'Z') ||
+                     (guest_path[0] >= 'a' && guest_path[0] <= 'z')) &&
+                    guest_path[1] == ':' &&
+                    (guest_path[2] == '\\' || guest_path[2] == '/')) ||
+                   (length >= 2u && guest_path[0] == '\\' && guest_path[1] == '\\');
+#else
+    int absolute = guest_path[0] == '/';
+#endif
+    if (!absolute && profile_component_is_parent(guest_path)) return 0;
+    int written;
+    if (absolute) {
+        written = snprintf(host_path, capacity, "%s", guest_path);
+    } else {
+#ifdef _WIN32
+        const char *separator = "\\";
+#else
+        const char *separator = "/";
+#endif
+        written = snprintf(host_path, capacity, "%s%s%s",
+                           guest_current_directory, separator, guest_path);
+    }
+    if (written < 0 || (size_t)written >= capacity) return 0;
+#ifndef _WIN32
+    for (char *cursor = host_path; *cursor; ++cursor)
+        if (*cursor == '\\') *cursor = '/';
+#endif
+    return 1;
+}
+
+static int profile_path_is_in_userdata(const char *path)
+{
+    char root[32768];
+    char normalized_path[32768];
+    char normalized_root[32768];
+    if (!get_user_data_root(root, sizeof(root)) ||
+        strlen(path) >= sizeof(normalized_path) ||
+        strlen(root) >= sizeof(normalized_root) ||
+        profile_component_is_parent(path))
+        return 0;
+    memcpy(normalized_path, path, strlen(path) + 1u);
+    memcpy(normalized_root, root, strlen(root) + 1u);
+    for (char *cursor = normalized_path; *cursor; ++cursor)
+        if (*cursor == '\\') *cursor = '/';
+    for (char *cursor = normalized_root; *cursor; ++cursor)
+        if (*cursor == '\\') *cursor = '/';
+    size_t root_length = strlen(normalized_root);
+    while (root_length > 1u && normalized_root[root_length - 1u] == '/')
+        normalized_root[--root_length] = '\0';
+    if (strlen(normalized_path) <= root_length || normalized_path[root_length] != '/')
+        return 0;
+    for (size_t i = 0u; i < root_length; ++i) {
+        unsigned char path_char = (unsigned char)normalized_path[i];
+        unsigned char root_char = (unsigned char)normalized_root[i];
+        if (path_char >= 'A' && path_char <= 'Z') path_char += 'a' - 'A';
+        if (root_char >= 'A' && root_char <= 'Z') root_char += 'a' - 'A';
+        if (path_char != root_char) return 0;
+    }
+    return 1;
+}
+
+static int profile_write_value(const char *path, const char *section,
+                               const char *key, const char *value)
+{
+    enum { PROFILE_FILE_LIMIT = 1024 * 1024 };
+    FILE *input = fopen(path, "rb");
+    char *old_data = NULL;
+    size_t old_length = 0u;
+    if (input) {
+        if (fseek(input, 0, SEEK_END) != 0) { fclose(input); return 0; }
+        long file_length = ftell(input);
+        if (file_length < 0 || file_length > PROFILE_FILE_LIMIT ||
+            fseek(input, 0, SEEK_SET) != 0) {
+            fclose(input);
+            return 0;
+        }
+        old_length = (size_t)file_length;
+        old_data = (char *)malloc(old_length + 1u);
+        if (!old_data) { fclose(input); return 0; }
+        size_t read_length = fread(old_data, 1u, old_length, input);
+        fclose(input);
+        if (read_length != old_length) { free(old_data); return 0; }
+        old_data[old_length] = '\0';
+    } else if (errno != ENOENT) {
+        return 0;
+    }
+
+    size_t section_length = strlen(section);
+    size_t key_length = strlen(key);
+    size_t value_length = value ? strlen(value) : 0u;
+    size_t extra = section_length + key_length + value_length + 16u;
+    if (old_length > PROFILE_FILE_LIMIT - extra) { free(old_data); return 0; }
+    size_t output_capacity = old_length + extra;
+    char *output = (char *)malloc(output_capacity + 1u);
+    if (!output) { free(old_data); return 0; }
+
+    size_t out_length = 0u;
+    size_t offset = 0u;
+    int in_section = 0;
+    int section_seen = 0;
+    int key_written = 0;
+    while (offset < old_length) {
+        size_t line_start = offset;
+        while (offset < old_length && old_data[offset] != '\n') ++offset;
+        size_t line_end = offset;
+        if (offset < old_length) ++offset;
+        size_t content_end = line_end;
+        if (content_end > line_start && old_data[content_end - 1u] == '\r')
+            --content_end;
+        size_t line_length = content_end - line_start;
+        char *line = (char *)malloc(line_length + 1u);
+        if (!line) { free(output); free(old_data); return 0; }
+        memcpy(line, old_data + line_start, line_length);
+        line[line_length] = '\0';
+        char *trimmed = trim_profile_text(line);
+        if (*trimmed == '[') {
+            char *end = strchr(trimmed + 1u, ']');
+            if (end) {
+                if (in_section && !key_written && value) {
+                    int amount = snprintf(output + out_length, output_capacity + 1u - out_length,
+                                          "%s=%s\r\n", key, value);
+                    if (amount < 0 || (size_t)amount >= output_capacity + 1u - out_length) {
+                        free(line); free(output); free(old_data); return 0;
+                    }
+                    out_length += (size_t)amount;
+                    key_written = 1;
+                }
+                *end = '\0';
+                in_section = equal_ascii_fold(trim_profile_text(trimmed + 1u), section);
+                if (in_section) section_seen = 1;
+            } else {
+                in_section = 0;
+            }
+        } else if (in_section) {
+            char *equals = strchr(trimmed, '=');
+            if (equals) {
+                *equals = '\0';
+                if (equal_ascii_fold(trim_profile_text(trimmed), key)) {
+                    if (!key_written && value) {
+                        int amount = snprintf(output + out_length, output_capacity + 1u - out_length,
+                                              "%s=%s\r\n", key, value);
+                        if (amount < 0 || (size_t)amount >= output_capacity + 1u - out_length) {
+                            free(line); free(output); free(old_data); return 0;
+                        }
+                        out_length += (size_t)amount;
+                        key_written = 1;
+                    }
+                    free(line);
+                    continue;
+                }
+            }
+        }
+        free(line);
+        size_t raw_length = offset - line_start;
+        if (raw_length > output_capacity - out_length) {
+            free(output); free(old_data); return 0;
+        }
+        memcpy(output + out_length, old_data + line_start, raw_length);
+        out_length += raw_length;
+    }
+
+    if (in_section && !key_written && value) {
+        if (out_length && output[out_length - 1u] != '\n') {
+            if (out_length + 2u > output_capacity) {
+                free(output); free(old_data); return 0;
+            }
+            output[out_length++] = '\r';
+            output[out_length++] = '\n';
+        }
+        int amount = snprintf(output + out_length, output_capacity + 1u - out_length,
+                              "%s=%s\r\n", key, value);
+        if (amount < 0 || (size_t)amount >= output_capacity + 1u - out_length) {
+            free(output); free(old_data); return 0;
+        }
+        out_length += (size_t)amount;
+        key_written = 1;
+    }
+    if (!section_seen && value) {
+        if (out_length && output[out_length - 1u] != '\n') {
+            if (out_length + 2u > output_capacity) {
+                free(output); free(old_data); return 0;
+            }
+            output[out_length++] = '\r';
+            output[out_length++] = '\n';
+        }
+        int amount = snprintf(output + out_length, output_capacity + 1u - out_length,
+                              "[%s]\r\n%s=%s\r\n", section, key, value);
+        if (amount < 0 || (size_t)amount >= output_capacity + 1u - out_length) {
+            free(output); free(old_data); return 0;
+        }
+        out_length += (size_t)amount;
+    }
+
+    output[out_length] = '\0';
+    FILE *stream = fopen(path, "wb");
+    if (!stream) { free(output); free(old_data); return 0; }
+    int ok = fwrite(output, 1u, out_length, stream) == out_length && fflush(stream) == 0;
+    if (fclose(stream) != 0) ok = 0;
+    free(output);
+    free(old_data);
+    return ok;
+}
+
+static int profile_get_value(const char *path, const char *section,
+                             const char *key, const char *fallback,
+                             char *value, size_t value_capacity, int *file_opened)
+{
+    FILE *stream = fopen(path, "rb");
+    if (file_opened) *file_opened = stream != NULL;
+    if (!stream) {
+        size_t length = strlen(fallback);
+        if (length >= value_capacity) length = value_capacity - 1u;
+        memcpy(value, fallback, length);
+        value[length] = '\0';
+        return 0;
+    }
+
+    char line[4096];
+    int in_section = 0;
+    int found = 0;
+    while (fgets(line, sizeof(line), stream)) {
+        char *entry = trim_profile_text(line);
+        if (!*entry || *entry == ';' || *entry == '#') continue;
+        if (*entry == '[') {
+            char *end = strchr(entry + 1, ']');
+            if (!end) {
+                in_section = 0;
+                continue;
+            }
+            *end = '\0';
+            in_section = equal_ascii_fold(trim_profile_text(entry + 1), section);
+            continue;
+        }
+        if (!in_section) continue;
+        char *equals = strchr(entry, '=');
+        if (!equals) continue;
+        *equals = '\0';
+        char *entry_key = trim_profile_text(entry);
+        if (!equal_ascii_fold(entry_key, key)) continue;
+        char *entry_value = trim_profile_text(equals + 1);
+        size_t length = strlen(entry_value);
+        if (length >= value_capacity) length = value_capacity - 1u;
+        memcpy(value, entry_value, length);
+        value[length] = '\0';
+        found = 1;
+        break;
+    }
+    fclose(stream);
+    if (!found) {
+        size_t length = strlen(fallback);
+        if (length >= value_capacity) length = value_capacity - 1u;
+        memcpy(value, fallback, length);
+        value[length] = '\0';
+    }
+    return found;
+}
+
+static int profile_enumerate_sections(const char *path, char *output,
+                                      size_t capacity, int *file_opened)
+{
+    if (file_opened) *file_opened = 0;
+    if (!capacity) return 0;
+    output[0] = '\0';
+    if (capacity == 1u) return 0;
+    output[1] = '\0';
+
+    FILE *stream = fopen(path, "rb");
+    if (!stream) return 0;
+    if (file_opened) *file_opened = 1;
+    size_t used = 0u;
+    char line[4096];
+    while (fgets(line, sizeof(line), stream)) {
+        char *entry = trim_profile_text(line);
+        if (*entry != '[') continue;
+        char *end = strchr(entry + 1u, ']');
+        if (!end) continue;
+        *end = '\0';
+        char *name = trim_profile_text(entry + 1u);
+        size_t length = strlen(name);
+        if (!length) continue;
+
+        int duplicate = 0;
+        for (size_t offset = 0u; offset < used;) {
+            size_t existing_length = strlen(output + offset);
+            if (equal_ascii_fold(output + offset, name)) {
+                duplicate = 1;
+                break;
+            }
+            offset += existing_length + 1u;
+        }
+        if (duplicate) continue;
+
+        if (capacity < 2u || used + length + 2u > capacity) {
+            fclose(stream);
+            if (capacity >= 2u) {
+                size_t available = capacity - used - 2u;
+                size_t copied = length < available ? length : available;
+                if (copied) memcpy(output + used, name, copied);
+                size_t terminator = used + copied;
+                output[terminator] = '\0';
+                output[terminator + 1u] = '\0';
+            }
+            return capacity > 2u ? (int)(capacity - 2u) : 0;
+        }
+        memcpy(output + used, name, length);
+        used += length;
+        output[used++] = '\0';
+        output[used] = '\0';
+    }
+    fclose(stream);
+    return used;
+}
+
+static int handle_profile_import(CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal ||
+        !equal_ascii_fold(import->dll, "KERNEL32.dll") ||
+        (strcmp(import->name, "GetPrivateProfileStringA") &&
+         strcmp(import->name, "WritePrivateProfileStringA")))
+        return 0;
+
+    if (!strcmp(import->name, "WritePrivateProfileStringA")) {
+        const uint32_t *arguments = (const uint32_t *)guest_memory_try_ptr(cpu->esp + 4u, 16u);
+        if (!arguments)
+            stop_guest("WritePrivateProfileStringA arguments are unmapped", import->token);
+        char section[512] = "";
+        char key[512] = "";
+        char value[4096] = "";
+        char guest_path[32768] = "";
+        if ((arguments[0] && !copy_guest_string(arguments[0], section, sizeof(section))) ||
+            (arguments[1] && !copy_guest_string(arguments[1], key, sizeof(key))) ||
+            (arguments[2] && !copy_guest_string(arguments[2], value, sizeof(value))) ||
+            (arguments[3] && !copy_guest_string(arguments[3], guest_path, sizeof(guest_path))))
+            stop_guest("WritePrivateProfileStringA string argument is unmapped or too long", import->token);
+        if (trace_imports)
+            fprintf(stderr, "AC1 profile write args: section=%s key=%s value=\"%s\" file=%s\n",
+                    arguments[0] ? section : "<null>", arguments[1] ? key : "<null>",
+                    arguments[2] ? value : "<null>", arguments[3] ? guest_path : "<null>");
+        if (!arguments[0] || !arguments[1] || !arguments[3])
+            stop_guest("WritePrivateProfileStringA section/key/file form is unsupported", import->token);
+        if (!profile_path_is_absolute(guest_path))
+            stop_guest("WritePrivateProfileStringA relative paths require Windows-directory lookup",
+                       import->token);
+        char host_path[32768];
+        if (!resolve_profile_path(guest_path, host_path, sizeof(host_path)) ||
+            !profile_path_is_in_userdata(host_path))
+            stop_guest("WritePrivateProfileStringA path is outside the userdata root", import->token);
+        char parent_path[32768];
+        size_t path_length = strlen(host_path);
+        if (path_length >= sizeof(parent_path))
+            stop_guest("WritePrivateProfileStringA path is too long", import->token);
+        memcpy(parent_path, host_path, path_length + 1u);
+        char *slash = strrchr(parent_path, '/');
+        char *backslash = strrchr(parent_path, '\\');
+        if (backslash && (!slash || backslash > slash)) slash = backslash;
+        if (!slash) stop_guest("WritePrivateProfileStringA path has no parent directory", import->token);
+        *slash = '\0';
+        if (!ensure_directory_tree(parent_path)) {
+            cpu->eax = 0u;
+            last_error = 5u;
+        } else {
+            cpu->eax = profile_write_value(host_path, section, key,
+                                           arguments[2] ? value : NULL) ? 1u : 0u;
+            last_error = cpu->eax ? 0u : 5u;
+        }
+        return_stdcall(cpu, 16u);
+        return 1;
+    }
+
+    uint32_t argument_address = cpu->esp + 4u;
+    const uint32_t *arguments = (const uint32_t *)guest_memory_try_ptr(argument_address, 24u);
+    if (!arguments) stop_guest("GetPrivateProfileStringA arguments are unmapped", import->token);
+    uint32_t app_address = arguments[0];
+    uint32_t key_address = arguments[1];
+    uint32_t fallback_address = arguments[2];
+    uint32_t output_address = arguments[3];
+    uint32_t capacity = arguments[4];
+    uint32_t file_address = arguments[5];
+    char section[512] = "";
+    char key[512] = "";
+    char fallback[4096] = "";
+    char guest_path[32768] = "";
+    if ((app_address && !copy_guest_string(app_address, section, sizeof(section))) ||
+        (key_address && !copy_guest_string(key_address, key, sizeof(key))) ||
+        (fallback_address && !copy_guest_string(fallback_address, fallback, sizeof(fallback))) ||
+        (file_address && !copy_guest_string(file_address, guest_path, sizeof(guest_path))))
+        stop_guest("GetPrivateProfileStringA string argument is unmapped or too long", import->token);
+    trim_profile_trailing_blanks(fallback);
+    if (trace_imports)
+        fprintf(stderr, "AC1 profile args: section=%s key=%s default=\"%s\" file=%s output=0x%08x size=%u\n",
+                app_address ? section : "<null>", key_address ? key : "<null>",
+                fallback, file_address ? guest_path : "<null>", output_address, capacity);
+    if (!file_address)
+        stop_guest("GetPrivateProfileStringA null filename is unsupported", import->token);
+    if (!profile_path_is_absolute(guest_path))
+        stop_guest("GetPrivateProfileStringA relative paths require Windows-directory lookup",
+                   import->token);
+
+    char host_path[32768];
+    if (!resolve_profile_path(guest_path, host_path, sizeof(host_path))) {
+        cpu->eax = 0u;
+        last_error = 87u; /* ERROR_INVALID_PARAMETER */
+        if (capacity && guest_memory_try_ptr(output_address, capacity))
+            ((char *)guest_memory_try_ptr(output_address, capacity))[0] = '\0';
+        return_stdcall(cpu, 24u);
+        return 1;
+    }
+    if (trace_imports)
+        fprintf(stderr, "AC1 profile read: section=\"%s\" key=\"%s\" default=\"%s\" file=\"%s\" host=\"%s\"\n",
+                app_address ? section : "<null>", key_address ? key : "<null>",
+                fallback, guest_path, host_path);
+
+    if (!app_address && !key_address) {
+        char *output = capacity
+            ? (char *)guest_memory_try_ptr(output_address, capacity) : NULL;
+        if (capacity && !output)
+            stop_guest("GetPrivateProfileStringA section-list output is unmapped", import->token);
+        int file_opened = 0;
+        cpu->eax = capacity
+            ? (uint32_t)profile_enumerate_sections(host_path, output, capacity, &file_opened)
+            : 0u;
+        if (!file_opened) last_error = (errno == ENOENT) ? 2u : 5u;
+        else last_error = 0u;
+        if (trace_imports)
+            fprintf(stderr, "AC1 profile section enumeration: chars=%u file_opened=%d\n",
+                    cpu->eax, file_opened);
+        return_stdcall(cpu, 24u);
+        return 1;
+    }
+    if (!app_address || !key_address)
+        stop_guest("GetPrivateProfileStringA key enumeration form is unsupported", import->token);
+
+    char value[4096];
+    int file_opened = 0;
+    int value_found = profile_get_value(host_path, section, key, fallback,
+                                        value, sizeof(value), &file_opened);
+    if (!file_opened) last_error = (errno == ENOENT) ? 2u : 5u;
+    else last_error = 0u;
+    size_t value_length = strlen(value);
+    if (value_found && value_length >= 2u &&
+        ((value[0] == '"' && value[value_length - 1u] == '"') ||
+         (value[0] == '\'' && value[value_length - 1u] == '\''))) {
+        memmove(value, value + 1u, value_length - 2u);
+        value[value_length - 2u] = '\0';
+    }
+    if (capacity) {
+        char *output = (char *)guest_memory_try_ptr(output_address, capacity);
+        if (!output) stop_guest("GetPrivateProfileStringA output is unmapped", import->token);
+        size_t length = strlen(value);
+        if (length >= capacity) length = (size_t)capacity - 1u;
+        memcpy(output, value, length);
+        output[length] = '\0';
+        cpu->eax = (uint32_t)length;
+    } else {
+        cpu->eax = 0u;
+    }
+    if (trace_imports)
+        fprintf(stderr, "AC1 profile result: chars=%u file_opened=%d\n",
+                cpu->eax, file_opened);
+    return_stdcall(cpu, 24u);
+    return 1;
+}
+
 static sync_object *sync_object_named(const char *name)
 {
     if (!name || !*name) return NULL;
@@ -3196,6 +3709,7 @@ void dispatch(CPU *cpu, uint32_t target)
         int handled = handle_network_import(cpu, import) ||
 #endif
                       handle_module_import(cpu, import) ||
+                      handle_profile_import(cpu, import) ||
                       handle_heap_import(cpu, import) ||
                       handle_critical_section_import(cpu, import) ||
                       handle_interlocked_import(cpu, import) ||

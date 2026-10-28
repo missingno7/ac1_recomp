@@ -167,13 +167,14 @@ def run_ac1_switch_selftest(binary: Path, pcrecomp: Path) -> None:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     from pe_analyze import analyze_pe, build_iat_map
     from disasm32 import Disassembler
-    from capstone.x86 import X86_OP_IMM, X86_OP_MEM
+    from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
     from lift32_cpu import Lifter as BaseLifter
     import pefile
 
     info = analyze_pe(str(binary))
     code = binary.read_bytes()
     dis = Disassembler(code, info.image_base, info.sections)
+    install_ac1_jump_table_bounds(dis)
     function = dis.disassemble_function(0x0079F910, build_iat_map(info))
     if function is None or not function.blocks:
         raise AssertionError("AC1 jump-table regression function did not disassemble")
@@ -216,7 +217,193 @@ def run_ac1_switch_selftest(binary: Path, pcrecomp: Path) -> None:
         assert "L_0079FC38:" in body
     finally:
         pe.close()
+
+    # This switch has four dword targets followed immediately by an
+    # eleven-byte index remap. Without the guard/remap bound, the first four
+    # map bytes form the bogus in-image target 0x01010300.
+    remapped = dis.disassemble_function(0x0099CBF0, build_iat_map(info))
+    real_targets = {0x0099C9D3, 0x0099CA83, 0x0099CA35, 0x0099CA9A}
+    if remapped is None or not remapped.blocks:
+        raise AssertionError("AC1 remapped-switch regression function did not disassemble")
+    assert 0x01010300 not in remapped.blocks
+    switch_insn = next(
+        ins for block in remapped.blocks.values() for ins in block.instructions
+        if ins.address == 0x0099C9CC)
+    inferred = infer_remapped_switch_limit(
+        dis.md, dis.read_bytes, switch_insn, X86_OP_REG, X86_OP_MEM, X86_OP_IMM)
+    assert inferred == (4, 11), inferred
+    assert set(dis.jump_table_targets(switch_insn)) == real_targets
+    assert real_targets <= remapped.jump_targets
+    # A second switch in this function reads the byte map with EAX, writes
+    # ECX, then dispatches through [ECX*4]. Keep this distinct-register form
+    # covered while retaining the same guarded bound checks.
+    remap2_insn = next(
+        ins for block in remapped.blocks.values() for ins in block.instructions
+        if ins.address == 0x0099CC04)
+    remap2_bound = infer_remapped_switch_limit(
+        dis.md, dis.read_bytes, remap2_insn, X86_OP_REG, X86_OP_MEM, X86_OP_IMM)
+    remap2_targets = set(dis.jump_table_targets(remap2_insn))
+    assert remap2_bound == (17, 30), remap2_bound
+    assert len(remap2_targets) == 17
+    assert remap2_targets <= remapped.jump_targets
+    remapped_spec = {
+        "address": 0x0099CBF0,
+        "size": remapped.size,
+        "blocks": [{
+            "start": block.start,
+            "end": block.end,
+            "successors": sorted(set(block.successors)),
+            "is_exit": block.is_exit,
+            "instructions": [[ins.address, ins.size] for ins in block.instructions],
+        } for block in remapped.blocks.values()],
+    }
+    pe = pefile.PE(str(binary), fast_load=True)
+    try:
+        remap_lifter = BaseLifter(str(binary), image_size,
+                                  lambda va, count: pe.get_data((va - image_base) & 0xFFFFFFFF, count))
+        remap_lifter.image_lo = image_base
+        remap_lifter.image_hi = image_base + image_size
+        remapped_body = lift_exact_function(
+            remap_lifter, remapped_spec,
+            lambda va, count: pe.get_data((va - image_base) & 0xFFFFFFFF, count),
+            X86_OP_IMM, X86_OP_MEM)
+        for target in sorted(real_targets):
+            assert f"_jt == GVA(0x{target:08X})" in remapped_body
+        for target in sorted(remap2_targets):
+            assert f"_jt == GVA(0x{target:08X})" in remapped_body
+        assert "0x01010300" not in remapped_body
+    finally:
+        pe.close()
     print("AC1 actual-base jump-table self-test: both indirect switches recovered")
+
+
+def infer_remapped_switch_limit(md, read_va, jump_insn, reg_type: int,
+                                mem_type: int, imm_type: int) -> tuple[int, int] | None:
+    """Recognize a guarded byte-index remap feeding an indirect dword jump.
+
+    Some MSVC switches first apply `movzx reg, byte [reg + map]` and then use
+    that value as the dword-table index. A generic image-bounded table scan
+    mistakes the adjacent byte map for more dword pointers. Recover the
+    original input bound from the preceding CMP and cap the jump table using
+    the largest remapped index actually present in that guarded map.
+    """
+    if (jump_insn.mnemonic != "jmp" or not jump_insn.operands or
+            jump_insn.operands[0].type != mem_type):
+        return None
+    jump_mem = jump_insn.operands[0].mem
+    if not jump_mem.index or jump_mem.scale != 4:
+        return None
+    jump_index_reg = jump_mem.index
+
+    # Try short contiguous decodes ending exactly at the dispatch. Starting at
+    # several nearby byte offsets is safe only when the complete sequence ends
+    # at the known instruction boundary and contains the distinctive MOVZX.
+    begin = max(0, jump_insn.address - 24)
+    candidates = []
+    for start in range(begin, jump_insn.address):
+        try:
+            raw = read_va(start, jump_insn.address - start)
+            stream = list(md.disasm(raw, start))
+        except Exception:
+            continue
+        if stream and stream[-1].address + stream[-1].size == jump_insn.address:
+            candidates.append(stream)
+
+    # Prefer the shortest contiguous decode; it is least likely to begin in
+    # the middle of an unrelated instruction.
+    candidates.sort(key=len)
+    for stream in candidates:
+        for remap_at, remap in enumerate(stream):
+            if remap.mnemonic != "movzx" or len(remap.operands) != 2:
+                continue
+            dst, src = remap.operands
+            if (dst.type != reg_type or dst.reg != jump_index_reg or
+                    src.type != mem_type or src.size != 1):
+                continue
+            map_mem = src.mem
+            # The source index may differ from the destination/jump index
+            # (AC1's 0x0099CBFD uses EAX for the byte map and ECX for dispatch).
+            # Restrict this adapter to a single register plus an absolute map
+            # displacement; more complex addressing needs separate evidence.
+            if bool(map_mem.base) == bool(map_mem.index):
+                continue
+            map_source_reg = map_mem.base or map_mem.index
+            map_base = map_mem.disp & 0xFFFFFFFF
+            if not map_base:
+                continue
+
+            # Only accept the proven guarded form: CMP source-index, imm;
+            # unsigned JA/JAE default branch; then MOVZX. No intervening
+            # instruction can mutate the index or replace the condition.
+            input_count = None
+            for cmp_at in range(remap_at - 1, -1, -1):
+                cmp = stream[cmp_at]
+                if cmp.mnemonic != "cmp" or len(cmp.operands) != 2:
+                    continue
+                lhs, rhs = cmp.operands
+                if lhs.type != reg_type or lhs.reg != map_source_reg or rhs.type != imm_type:
+                    continue
+                between = stream[cmp_at + 1:remap_at]
+                guards = [item.mnemonic for item in between if item.mnemonic in ("ja", "jae")]
+                if (not guards or len(set(guards)) != 1 or
+                        any(item.mnemonic not in ("ja", "jae", "nop") for item in between)):
+                    continue
+                bound = int(rhs.imm)
+                input_count = bound + (1 if guards[0] == "ja" else 0)
+                break
+            if input_count is None or not 1 <= input_count <= 256:
+                continue
+            try:
+                remap_bytes = read_va(map_base, input_count)
+            except Exception:
+                continue
+            if not remap_bytes or len(remap_bytes) != input_count:
+                continue
+            # The selected dword table must end exactly where the byte remap
+            # begins, and every guarded map output must select one of its arms.
+            table_base = jump_mem.disp & 0xFFFFFFFF
+            delta = (map_base - table_base) & 0xFFFFFFFF
+            if not delta or delta % 4:
+                continue
+            table_count = delta // 4
+            max_index = max(remap_bytes)
+            if not 1 <= table_count <= 256 or max_index >= table_count:
+                continue
+            return table_count, input_count
+    return None
+
+
+def install_ac1_jump_table_bounds(disassembler) -> None:
+    """Apply AC1-local bounds for guarded byte-remapped switch tables."""
+    from types import MethodType
+    from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
+
+    original = disassembler.jump_table_targets
+
+    def bounded(self, insn, limit=256):
+        inferred = infer_remapped_switch_limit(
+            self.md, self.read_bytes, insn, X86_OP_REG, X86_OP_MEM, X86_OP_IMM)
+        if inferred is not None:
+            limit = min(limit, inferred[0])
+        return original(insn, limit)
+
+    disassembler.jump_table_targets = MethodType(bounded, disassembler)
+
+
+def resolve_jump_table_with_limit(lifter, table_va: int, limit: int) -> list[int]:
+    """Bound the donor resolver without changing its shared source."""
+    targets = []
+    if not lifter.read_va:
+        return targets
+    for index in range(limit):
+        raw = lifter.read_va(table_va + 4 * index, 4)
+        if not raw or len(raw) < 4:
+            break
+        target = int.from_bytes(raw, "little")
+        if not lifter.in_image(target):
+            break
+        targets.append(target)
+    return targets
 
 
 def resolve_tooling(config: dict, args) -> tuple[Path, Path]:
@@ -245,6 +432,7 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
     code = binary.read_bytes()
     iat = build_iat_map(info)
     dis = Disassembler(code, info.image_base, info.sections)
+    install_ac1_jump_table_bounds(dis)
     entry = info.image_base + info.entry_point_rva
     initial_seeds = sorted({entry, *extra_seeds})
     queue = collections.deque((seed, 0) for seed in initial_seeds)
@@ -299,7 +487,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
               functions_per_tu: int) -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
-    from capstone.x86 import X86_OP_IMM, X86_OP_MEM
+    from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
     from lift32_cpu import Lifter as BaseLifter
 
     class AC1Lifter(BaseLifter):
@@ -503,6 +691,8 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
     block instruction set here preserves the upstream translator while keeping
     those gaps out of generated code.
     """
+    from capstone.x86 import X86_OP_REG
+
     address = spec["address"]
     blocks = spec.get("blocks", [])
     decoded = {}
@@ -535,7 +725,11 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
             if operand.mem.index and operand.mem.scale == 4:
                 table_va = operand.mem.disp & 0xFFFFFFFF
                 if lifter.in_image(table_va):
-                    targets = lifter.resolve_jumptable(table_va)
+                    inferred = infer_remapped_switch_limit(
+                        lifter.md, read_va, insn, X86_OP_REG, X86_OP_MEM, X86_OP_IMM)
+                    targets = (resolve_jump_table_with_limit(lifter, table_va, inferred[0])
+                               if inferred is not None
+                               else lifter.resolve_jumptable(table_va))
                     if targets:
                         lifter.jumptables[insn.address] = targets
                         labels.update(target for target in targets if target in decoded)

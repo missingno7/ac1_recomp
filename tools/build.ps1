@@ -63,7 +63,16 @@ try {
     }
     if ($Run) {
         if ($Target -ne 'Host') { throw '-Run applies to Host; use the Android packaging script for APKs' }
-        & (Join-Path $ProjectRoot "$BuildDir/ac1_startup.exe") $GameExe
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $RunErrorPreference = $ErrorActionPreference
+        try {
+            # Windows PowerShell represents redirected native stderr as error
+            # records. The guest diagnostics use stderr even on normal startup.
+            $ErrorActionPreference = 'Continue'
+            & (Join-Path $ProjectRoot "$BuildDir/ac1_startup.exe") $GameExe 2>&1 |
+                ForEach-Object { "$_" } |
+                Tee-Object -FilePath (Join-Path $ProjectRoot 'work/startup.log')
+            $RunExitCode = $LASTEXITCODE
+        } finally { $ErrorActionPreference = $RunErrorPreference }
+        if ($RunExitCode -ne 0) { exit $RunExitCode }
     }
 } finally { Pop-Location }
