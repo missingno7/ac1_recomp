@@ -7,13 +7,15 @@ android {
 
     defaultConfig {
         applicationId 'org.ac1.recomp'
-        minSdk 26
+        minSdk 29
         targetSdk 35
         versionCode 1
         versionName '0.1.0'
-        ndk { abiFilters 'arm64-v8a' }
+        // -Pac1Abi=x86_64 builds the emulator APK; phones use arm64-v8a.
+        ndk { abiFilters(project.findProperty('ac1Abi') ?: 'arm64-v8a') }
         externalNativeBuild {
-            cmake { arguments '-DANDROID_STL=c++_static' }
+            cmake { arguments '-DANDROID_STL=c++_static', '-DAC1_NATIVE_BINK=ON',
+                    '-DAC1_DIRECT_MEMORY=ON', '-DAC1_FORCE_INLINE_ACCESSORS=ON' }
         }
     }
 

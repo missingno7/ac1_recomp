@@ -1,7 +1,7 @@
 # AC1 native Bink prototype
 
 The provider is integrated into the Windows host runtime behind
-`AC1_NATIVE_BINK` (default ON on Windows, OFF on Android). The adaptation of recomp-kit `dx/bink.cpp` retains its MIT notice in
+`AC1_NATIVE_BINK` (default ON on Windows; the Android app now explicitly selects ON). The adaptation of recomp-kit `dx/bink.cpp` retains its MIT notice in
 `src/platform/ac1_bink_native.cpp`. FFmpeg remains a separate LGPL dependency.
 All executable-derived disassembly, media, decoder libraries, executables and
 test logs are private under ignored `work/bink_native/`.
@@ -205,6 +205,17 @@ results and per-frame checksums are in `work/bink_native/verification.json` and
 `*.stdout.log`/`*.stderr.log`. Raw reference BGRA and PCM stay under work.
 
 ## Android and remaining limits
+
+The android-prep update to `build.sh android-arm64` emits static PIC archives
+using direct NDK clang `--target=aarch64-linux-android29`, verifies the n8.1
+commit and defaults to one compile job. Android app CMake enables native Bink
+at `work/bink_native/ffmpeg-android-arm64/install`. Archives were not built in
+this pass: MSYS GNU make is absent. See the [exact remaining commands](../../docs/android.md#remaining-dependency-build-after-the-benchmark).
+Provider syntax compilation is not an ARM64 FFmpeg link/playback test. Bink
+audio and the portable guest DS8 backend remain explicitly silent.
+
+The API26/shared recipe discussion below records the earlier checkpoint;
+the current recipe and app select API29/static libraries.
 
 `build.sh android-arm64` documents the later upstream NDK 28.2.13676358 build:
 `--target-os=android --arch=aarch64 --enable-cross-compile --enable-pic`, API 26
