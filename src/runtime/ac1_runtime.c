@@ -307,6 +307,13 @@ static int invoke_guest_stdcall_callback(CPU *cpu, uint32_t procedure,
                                          uint32_t argument_count,
                                          uint32_t *result);
 
+/* Direct address spaces commit whole pages, so small guest blocks must start
+ * on page boundaries there; checked spaces keep the original 16-byte packing. */
+static uint32_t guest_block_alignment(void)
+{
+    return guest_memory_is_direct() ? 4096u : 16u;
+}
+
 static int prepare_guest_thread(ac1_guest_thread *thread)
 {
     thread->stack_base = guest_memory_find_gap(0x60000000u, thread->stack_size,
@@ -335,10 +342,10 @@ static int prepare_guest_thread(ac1_guest_thread *thread)
     if (static_tls_index_address) {
         uint32_t total = static_tls_template_size + static_tls_zero_fill;
         if (!total) total = 1u;
-        thread->static_tls_data = guest_memory_find_gap(0x70000000u, total, 16u,
+        thread->static_tls_data = guest_memory_find_gap(0x70000000u, total, guest_block_alignment(),
                                                          AC1_STACK_BASE);
         thread->static_tls_vector = guest_memory_find_gap(0x7FC00000u,
-                                                          64u * 4u, 16u,
+                                                          64u * 4u, guest_block_alignment(),
                                                           AC1_TIB_BASE);
         if (!thread->static_tls_data || !thread->static_tls_vector ||
             !guest_memory_allocate(thread->static_tls_data, total) ||
@@ -1280,8 +1287,8 @@ static int initialize_static_tls(pe32_module *image, char *error, size_t error_c
     static_tls_template_size = template_size;
     static_tls_zero_fill = zero_fill;
     static_tls_index_address = index_va;
-    static_tls_data_base = guest_memory_find_gap(0x70000000u, total_size, 16u, AC1_STACK_BASE);
-    static_tls_vector_base = guest_memory_find_gap(0x7FC00000u, 64u * 4u, 16u, AC1_TIB_BASE);
+    static_tls_data_base = guest_memory_find_gap(0x70000000u, total_size, guest_block_alignment(), AC1_STACK_BASE);
+    static_tls_vector_base = guest_memory_find_gap(0x7FC00000u, 64u * 4u, guest_block_alignment(), AC1_TIB_BASE);
     if (!static_tls_data_base || !static_tls_vector_base) {
         snprintf(error, error_capacity, "no guest range for static TLS block/vector");
         return 0;
@@ -6623,6 +6630,49 @@ static uint64_t read_dispatch_limit(void)
     return (uint64_t)value;
 }
 
+#ifdef AC1_DIRECT_MEMORY
+uint8_t *ac1_direct_arena;
+
+#ifdef _WIN32
+/* Direct accesses to unmapped guest pages fault in host code. Report the
+ * guest address and instruction before the default crash handling runs. */
+static LONG CALLBACK ac1_direct_fault_handler(EXCEPTION_POINTERS *info)
+{
+    const EXCEPTION_RECORD *record = info->ExceptionRecord;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || !ac1_direct_arena ||
+        record->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t address = (uintptr_t)record->ExceptionInformation[1];
+    const uintptr_t arena = (uintptr_t)ac1_direct_arena;
+    if (address < arena || address - arena >= UINT64_C(0x100001000))
+        return EXCEPTION_CONTINUE_SEARCH;
+    const ULONG_PTR kind = record->ExceptionInformation[0];
+    fprintf(stderr,
+            "AC1 direct guest memory fault: %s guest=0x%08llx guest-eip=0x%08x guest-thread=%u\n",
+            kind == 1 ? "write" : kind == 8 ? "execute" : "read",
+            (unsigned long long)(address - arena),
+            active_guest_thread ? active_guest_thread->cpu.eip : 0u,
+            active_guest_thread ? active_guest_thread->id : 0u);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+#endif
+
+/* Map a loaded PE image at its guest base. A direct address space owns its
+ * arena pages, so the bound host image is copied there; export lookups keep
+ * reading the host copy, whose metadata does not change after binding. */
+static int map_module_image(const pe32_module *module)
+{
+    if (guest_memory_is_direct()) {
+        void *arena = guest_memory_allocate(module->load_base, module->image_size);
+        if (!arena) return 0;
+        memcpy(arena, module->image, module->image_size);
+        return 1;
+    }
+    guest_memory_add(module->image, module->load_base, module->image_size);
+    return 1;
+}
+
 int ac1_run(const char *exe_path)
 {
     char error[512] = {0};
@@ -6767,7 +6817,11 @@ int ac1_run(const char *exe_path)
         unlock_ac1_run();
         return 4;
     }
+#ifdef AC1_DIRECT_MEMORY
+    space = guest_address_space_create_direct();
+#else
     space = guest_address_space_create();
+#endif
     if (!space) {
         snprintf(last_run_error, sizeof(last_run_error), "guest address-space allocation failed");
         fprintf(stderr, "AC1 native runtime: guest address-space allocation failed\n");
@@ -6778,8 +6832,28 @@ int ac1_run(const char *exe_path)
         return 5;
     }
     guest_address_space_select(space);
-    guest_memory_add(image.image, image.load_base, image.image_size);
-    guest_memory_add(bink_image.image, bink_image.load_base, bink_image.image_size);
+    if (!map_module_image(&image) || !map_module_image(&bink_image)) {
+        snprintf(last_run_error, sizeof(last_run_error), "guest image mapping failed");
+        fprintf(stderr, "AC1 native runtime: guest image mapping failed\n");
+        guest_address_space_select(NULL);
+        guest_address_space_destroy(space);
+        pe32_unload(&bink_image);
+        bink_module_path[0] = '\0';
+        pe32_unload(&image);
+        unlock_ac1_run();
+        return 5;
+    }
+#ifdef AC1_DIRECT_MEMORY
+    ac1_direct_arena = guest_execution_base;
+    fprintf(stderr, "AC1 direct guest memory: arena=%p\n", (void *)ac1_direct_arena);
+#ifdef _WIN32
+    {
+        static void *fault_handler;
+        if (!fault_handler)
+            fault_handler = AddVectoredExceptionHandler(1, ac1_direct_fault_handler);
+    }
+#endif
+#endif
     bink_image_mapped = 1;
 #ifdef __ANDROID__
     guest_files = ac1_files_create_with_guest_root(host_game_directory,
@@ -7023,6 +7097,9 @@ cleanup:
         if (bink_image_mapped) (void)guest_memory_remove(bink_image.load_base);
         (void)guest_memory_remove(image.load_base);
     }
+#ifdef AC1_DIRECT_MEMORY
+    ac1_direct_arena = NULL;
+#endif
     bink_image_mapped = 0;
     bink_module_path[0] = '\0';
     static_tls_data_base = 0;

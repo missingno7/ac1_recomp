@@ -56,6 +56,31 @@ static inline void ac1_x87_set_tag(CPU *c, unsigned reg, unsigned tag) {
 }
 '''
 
+DIRECT_ACCESS_HELPERS = r'''/* AC1 direct memory: one process-wide 4 GiB arena maps guest VA a at
+ * ac1_direct_arena + a, so lifted fixed-width accesses become plain loads and
+ * stores. A plain global (not _Thread_local, which MinGW lowers to emutls
+ * calls) is safe because every AC1 guest thread shares one address space.
+ * Unmapped arena pages fault instead of producing the checked diagnostic.
+ * Without an arena the parenthesized calls reach the checked implementation. */
+#ifdef AC1_DIRECT_MEMORY
+#include <string.h>
+extern uint8_t *ac1_direct_arena;
+static inline void ac1_direct_read(uint32_t a, void *o, size_t w)
+{
+    if (__builtin_expect(ac1_direct_arena != NULL, 1)) memcpy(o, ac1_direct_arena + a, w);
+    else (guest_execution_read)(a, o, w);
+}
+static inline void ac1_direct_write(uint32_t a, const void *i, size_t w)
+{
+    if (__builtin_expect(ac1_direct_arena != NULL, 1)) memcpy(ac1_direct_arena + a, i, w);
+    else (guest_execution_write)(a, i, w);
+}
+#define guest_execution_read(a, o, w) ac1_direct_read((a), (o), (w))
+#define guest_execution_write(a, i, w) ac1_direct_write((a), (i), (w))
+#endif
+
+'''
+
 FP_STATE_HELPERS = r'''
 /* Portable MMX integer lanes. Unsigned extraction/assembly avoids signed
  * overflow, signed left shifts and host vector/rounding-mode dependencies. */
@@ -368,6 +393,13 @@ def main() -> None:
             content = text.replace("\r\n", "\n").encode("utf-8")
         if destination == "src/runtime/guest_memory.c":
             text = content.decode("utf-8").replace("\r\n", "\n")
+            # Reserve the direct arena top-down: a bottom-up 4 GiB reservation
+            # landed at 0x7FFF0000 and took the address space below 4 GiB that
+            # native DirectSound needs (3D CreateSoundBuffer never completed).
+            reserve = "MEM_RESERVE, PAGE_NOACCESS);"
+            if text.count(reserve) != 1:
+                raise SystemExit(f"unexpected direct-arena reservation in {source}")
+            text = text.replace(reserve, "MEM_RESERVE | MEM_TOP_DOWN, PAGE_NOACCESS);")
             checkpoint = (
                 "    if (current_memory.count==65) {\n"
                 '        printf("guest-memory mapping checkpoint: count=65 base=0x%08x size=%llu\\n",\n'
@@ -576,6 +608,10 @@ void guest_execution_write(uint32_t address, const void *input, size_t width)
             if text.count(closing) != 1 or not text.rstrip().endswith(closing):
                 raise SystemExit("unexpected CPU header closing include guard")
             text = text.replace(closing, FP_STATE_HELPERS + "\n" + closing)
+            access = "/* ---- memory access: checked uint32 guest VA to native pointer ---- */"
+            if text.count(access) != 1:
+                raise SystemExit("unexpected CPU header memory-access marker")
+            text = text.replace(access, DIRECT_ACCESS_HELPERS + access)
             content = text.replace("\r\n", "\n").encode("utf-8")
         if not output.exists() or output.read_bytes() != content:
             output.write_bytes(content)

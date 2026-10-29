@@ -92,6 +92,18 @@ set_source_files_properties(src/runtime/ac1_runtime.c PROPERTIES
 if(AC1_TRACE_EIP)
   target_compile_definitions(ac1_runtime PRIVATE AC1_TRACE_EIP)
 endif()
+# Direct mode measured 1.7x faster loading and ~2-4x faster menu frames than
+# checked per-access region lookup. OFF restores checked accesses that report
+# unmapped guest addresses as guest stops (useful when debugging bad pointers).
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+  set(ac1_direct_default ON)
+else()
+  set(ac1_direct_default OFF)
+endif()
+option(AC1_DIRECT_MEMORY "Inline guest accesses into one reserved 4 GiB arena (64-bit hosts)" ${ac1_direct_default})
+if(AC1_DIRECT_MEMORY)
+  target_compile_definitions(ac1_runtime PRIVATE AC1_DIRECT_MEMORY)
+endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(ac1_runtime PRIVATE -fwrapv -fno-strict-aliasing -ffp-contract=off)
   set_source_files_properties(src/runtime/ac1_runtime.c PROPERTIES

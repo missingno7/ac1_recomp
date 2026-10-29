@@ -46,7 +46,7 @@ guest_address_space *guest_address_space_create_direct(void)
     if (!s) return NULL;
 #ifdef _WIN32
     SYSTEM_INFO info; GetSystemInfo(&info); s->page_size = info.dwPageSize;
-    s->arena = VirtualAlloc(NULL, (SIZE_T)(ARENA_BYTES+s->page_size), MEM_RESERVE, PAGE_NOACCESS);
+    s->arena = VirtualAlloc(NULL, (SIZE_T)(ARENA_BYTES+s->page_size), MEM_RESERVE | MEM_TOP_DOWN, PAGE_NOACCESS);
 #else
     s->page_size = (size_t)sysconf(_SC_PAGESIZE);
     void *p = mmap(NULL, (size_t)(ARENA_BYTES+s->page_size), PROT_NONE,

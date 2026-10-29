@@ -138,6 +138,29 @@ static inline void ac1_x87_set_tag(CPU *c, unsigned reg, unsigned tag) {
 #define SET8H(r, v)   ((r) = ((r) & 0xFFFF00FFu) | ((uint32_t)(uint8_t)(v) << 8))
 #define SET16(r, v)   ((r) = ((r) & 0xFFFF0000u) | (uint16_t)(v))
 
+/* AC1 direct memory: one process-wide 4 GiB arena maps guest VA a at
+ * ac1_direct_arena + a, so lifted fixed-width accesses become plain loads and
+ * stores. A plain global (not _Thread_local, which MinGW lowers to emutls
+ * calls) is safe because every AC1 guest thread shares one address space.
+ * Unmapped arena pages fault instead of producing the checked diagnostic.
+ * Without an arena the parenthesized calls reach the checked implementation. */
+#ifdef AC1_DIRECT_MEMORY
+#include <string.h>
+extern uint8_t *ac1_direct_arena;
+static inline void ac1_direct_read(uint32_t a, void *o, size_t w)
+{
+    if (__builtin_expect(ac1_direct_arena != NULL, 1)) memcpy(o, ac1_direct_arena + a, w);
+    else (guest_execution_read)(a, o, w);
+}
+static inline void ac1_direct_write(uint32_t a, const void *i, size_t w)
+{
+    if (__builtin_expect(ac1_direct_arena != NULL, 1)) memcpy(ac1_direct_arena + a, i, w);
+    else (guest_execution_write)(a, i, w);
+}
+#define guest_execution_read(a, o, w) ac1_direct_read((a), (o), (w))
+#define guest_execution_write(a, i, w) ac1_direct_write((a), (i), (w))
+#endif
+
 /* ---- memory access: checked uint32 guest VA to native pointer ---- */
 static inline uint8_t rd8(uint32_t a) { uint8_t v; guest_execution_read(a, &v, 1); return v; }
 static inline uint16_t rd16(uint32_t a) { uint16_t v; guest_execution_read(a, &v, 2); return v; }
