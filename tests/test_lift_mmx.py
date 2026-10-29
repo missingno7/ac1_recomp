@@ -51,6 +51,19 @@ class GeneralMMXTests(unittest.TestCase):
         self.assertNotIn("ac1_mmx[8]",body)
         self.assertNotIn("RECOMP_TODO",body)
 
+    def test_register_fstp_keeps_straight_line_fallthrough(self):
+        # fstp st(1); fstp st(0); ret -- regression: the x87 tag prefix once
+        # reused the loop index and emitted dispatch() to the next instruction.
+        raw=bytes.fromhex("ddd9ddd8c3")
+        instructions=list(self.lifter.md.disasm(raw,0x00401100))
+        spec={"address":0x00401100,"size":len(raw),"blocks":[{
+            "start":0x00401100,"end":0x00401100+len(raw),
+            "instructions":[(ins.address,ins.size) for ins in instructions]}]}
+        body=lift.lift_exact_function(self.lifter,spec,
+            lambda va,n:raw[va-0x00401100:va-0x00401100+n],X86_OP_IMM,X86_OP_MEM)
+        self.assertIn("ac1_x87_set_tag(c,(unsigned)(c->fpu_top+1)&7u,0);",body)
+        self.assertNotIn("dispatch(c, 0x",body)
+
 
 if __name__ == "__main__":
     unittest.main()

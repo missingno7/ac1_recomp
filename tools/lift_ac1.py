@@ -3354,8 +3354,8 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
                     prefix.append(f"c->fpu_dp={lifter.addr_expr(insn,operand)}; c->fpu_ds=c->{segment};")
                     break
             if insn.mnemonic in ("fst", "fstp") and insn.operands[0].type == X86_OP_REG:
-                index = lifter._st_idx(insn.operands[0])
-                prefix.append(f"ac1_x87_set_tag(c,(unsigned)(c->fpu_top+{index})&7u,0);")
+                st_index = lifter._st_idx(insn.operands[0])  # not `index`: the loop uses it below
+                prefix.append(f"ac1_x87_set_tag(c,(unsigned)(c->fpu_top+{st_index})&7u,0);")
             translated = prefix + translated
         for line in translated:
             output.append(f"    {line:<60} /* {insn.address:08X}: {insn.mnemonic} {insn.op_str} */")

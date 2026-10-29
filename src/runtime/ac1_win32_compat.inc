@@ -525,8 +525,15 @@ static int wc_file_import(CPU *cpu, const import_record *import, wc_state *s)
         if (!get_user_data_root(root, sizeof(root)) || !profile_path_is_in_userdata(path))
             return 0;
         uint32_t handle = UINT32_MAX;
-        if (A(4) || A(7))
-            stop_guest("userdata CreateFileA security/template unsupported", import->token);
+        /* The CRT's _sopen passes SECURITY_ATTRIBUTES {12, NULL descriptor,
+         * bInheritHandle}; inheritance is meaningless without child processes,
+         * so only that form is accepted. Real descriptors and templates stop. */
+        if (A(4)) {
+            if (!guest_memory_try_ptr(A(4), 12u) || rd32(A(4)) != 12u || rd32(A(4) + 4u))
+                stop_guest("userdata CreateFileA security descriptor unsupported", import->token);
+        }
+        if (A(7))
+            stop_guest("userdata CreateFileA template unsupported", import->token);
         uint32_t error;
         int ok = ac1_files_open_userdata(guest_files, root, path, A(2), A(3), A(5), A(6), &handle,
                                          &error);
