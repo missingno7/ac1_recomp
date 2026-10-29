@@ -1,0 +1,9 @@
+#include <windows.h>
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+STRINGTABLE
+BEGIN
+17 "Assassin's fixture"
+18 "Caf\351"
+19 ""
+20 "Long string for truncation checks"
+END

@@ -114,6 +114,59 @@ The same build also translates the required Bink DLL functions using `tools/lift
 
 ## Evidence and scope
 
+The Win32 import compatibility work has a separate focused check that does not
+regenerate or execute translated game functions:
+
+```powershell
+& 'D:\Prog\dukemp_recomp\.venv\Scripts\python.exe' -B tests\run_win32_compat.py
+```
+
+On 2026-10-29 this passed 280 adapter calls and 1,427 assertions, including
+native Windows comparisons, wildcard enumeration, PE string resources,
+userdata-only mutations, symlink/hard-link rejection, guest thread aliases,
+and suppression of accessibility setting changes. Existing file and profile
+contracts also passed. The complete runtime passed host syntax checking with
+the graphics/native Bink options enabled and Android ARM64 API 28 syntax
+checking with NDK 28.2. Empty lookup-header stubs are confined to
+`work/win32_compat/stubs`; these checks do not establish a runtime link, game
+execution, menu/save behavior, rendering, or Android hardware verification.
+Commands, output and the per-import disposition audit are preserved in
+`work/win32_compat/`.
+
+Against committed source, the installed PE has 114 imports absent from the
+string-literal scan: KERNEL32 68, USER32 7, ADVAPI32 3, OLEAUT32 1, WS2_32 26,
+EAX 1, DSOUND 2, XINPUT1_3 3, WINMM 1, WININET 2. The 14 Bink imports are
+already named; EAX #6 and DSOUND #2/#11 already have ordinal handlers.
+New coverage is KERNEL32 65 (including three controlled process stops),
+USER32 7, ADVAPI32 3, OLEAUT32 1, WS2_32 5 pure helpers, XINPUT1_3 3 and
+WINMM 1. Both installed XInput export tables confirm ordinals 2/3/4.
+
+The 21 remaining WS2_32 names and both WININET cookie functions stop with
+explicit offline diagnostics because their caller fallbacks are unverified;
+the audit lists each name. EAX retains its previously verified optional
+provider failure. `DebugBreak`, `RtlUnwind` and `UnhandledExceptionFilter`
+also stop explicitly. The runtime starts with an empty `FS:[0]` exception
+chain, stores but does not dispatch the unhandled filter, and recognizes
+only the debugger thread-name form of `RaiseException`. Full SEH needs
+guest exception/context structures, checked frame traversal, guest handler
+callbacks and dispositions, nested exceptions, target-frame unwind and
+nonlocal transfer across translated C frames. Native host unwinding cannot
+substitute for that work. Process termination drains through the existing
+stop/cleanup path with exit code and caller logged; the public host result
+remains 8. A distinct normal guest-exit result requires an outer run-loop
+change beyond the two-line import integration.
+
+Portable branches provide bounded filesystem and time operations plus an
+en-US/ASCII locale subset. Unsupported collation, custom date/time formats
+and keyboard translation diagnose their exact boundary. POSIX creation-time
+setting returns `ERROR_NOT_SUPPORTED`; timezone information describes the
+current host offset without transition rules. Android XInput returns
+`ERROR_DEVICE_NOT_CONNECTED`, wave output reports no device, and keyboard
+state/system-setting GET services return documented unavailability. Windows
+forwards those platform queries and NLS operations natively. Console control
+handlers are registered in guest state; host signal delivery is not routed
+into guest callbacks.
+
 The exact DX9 SHA-256 is `2fa8d50c60398cc249c6d908de46b15f48e445dd0c605b5956e94fa2f445a713`. The PE entry is `0x00F9F445`. Reports and generated C live under ignored `work/`; the latest preserved host boundary is fingerprinted above. The configured direct-call closure compiles, links and executes the startup path; it is not a whole-program port. Discovery now allows depth 32: the isolated closure audit reached actual depth 24 with no missing executable direct-call targets, and the broader build has passed host startup through the earlier parser callbacks. Validated virtual-method families are added as original execution reaches them, including the distinct `BlendCamera` and `BlendCameraSettings` tables. The discovered `RCPPS`, `RSQRTSS`, `RSQRTPS`, XMM `PMULUDQ` and XMM `PMAXSW` gaps now have portable lowerings and focused checks. The broader registered-type closure still contains two explicit instruction stops: `FNSAVE` at `0x00FA0EAD` and `FRSTOR` at `0x00FA0EB9`, a paired x87 context save/restore around a math helper. They have not been reached by the verified startup path and are not silently skipped. The diagnostic dispatch guard defaults to two hundred million calls per guest thread; `AC1_DISPATCH_LIMIT` overrides it and `0` disables it. Lower limits of ten million and fifty million interrupted finite multi-precision arithmetic during original crypto initialization. An earlier retry with a 200-million limit passed that bounded multiply path; runtime costs vary between starts.
 
 The host trace confirms original entry execution, C/C++ initialization, and the CRT's handoff to the game's WinMain thunk at `0x00401375` (original return address `0x00F9F3DC`). The original worker entry at `0x00FA3B17` also executes on a native host thread with a separate guest CPU, stack, TIB and TLS. Guest execution is currently serialized for correctness; this is not yet parallel execution across CPU cores. A same-process repeat-run check passes through worker cleanup and runtime reinitialization. Game startup remains incomplete. The APK's library is ELF64 AArch64; no Android device execution has been verified.

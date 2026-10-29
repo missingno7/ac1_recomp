@@ -6079,6 +6079,7 @@ static int handle_bink_import(CPU *cpu, const import_record *import)
 /* Called by generated code for direct calls, jumps and returns. Imports are
  * assigned unique IAT tokens and stop here until a measured implementation is
  * added; an unknown guest address is equally fatal and includes its caller. */
+#include "ac1_win32_compat.inc"
 void dispatch(CPU *cpu, uint32_t target)
 {
     if (!cpu) stop_guest("null CPU state", target);
@@ -6222,6 +6223,7 @@ void dispatch(CPU *cpu, uint32_t target)
             ++trace_import_count;
         }
         int handled = handle_network_import(cpu, import) ||
+                      handle_win32_compat_import(cpu, import) ||
                       handle_crypto_import(cpu, import) ||
                       handle_audio_import(cpu, import) ||
                       handle_optional_eax_import(cpu, import) ||

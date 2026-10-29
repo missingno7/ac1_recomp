@@ -9,6 +9,21 @@ extern "C" {
 
 typedef struct ac1_files ac1_files;
 
+/* Checked metadata/mutation seam for the Win32 compatibility adapter. A
+ * resolved path is beneath the asset root (read only) or userdata root.
+ * Traversal, device names and links are rejected, including existing parents.
+ * missing_leaf permits creation of the final component only. */
+int ac1_files_resolve(ac1_files *files, const char *userdata_root,
+    const char *guest_path, int writing, int missing_leaf,
+    char *host_path, uint32_t capacity, uint32_t *error_out);
+int ac1_files_open_userdata(ac1_files *files, const char *userdata_root,
+    const char *guest_path, uint32_t access, uint32_t share,
+    uint32_t disposition, uint32_t flags, uint32_t *handle, uint32_t *error);
+int ac1_files_native(ac1_files *files, uint32_t handle, int writing,
+    intptr_t *native, uint32_t *error);
+/* State and destructor are owned by this service, hence reset on each run. */
+void **ac1_files_compat_state(ac1_files *files, void (*destroy)(void *));
+
 typedef struct ac1_files_overlapped_snapshot {
     uint32_t internal;
     uint32_t internal_high;
