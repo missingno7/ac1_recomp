@@ -2,7 +2,7 @@
 
 ## Current host checkpoint
 
-The latest DXVK-backed Windows run is `work/startup_slice_1000.log` (SHA-256 `E45E3C1FC0F5DDCEDFC8999D333DD6836FFC36CB68009380D2CA07118A70B45B`). It initializes shaders and textures; all 460 original `D3DXGetShaderConstantTable` calls return `S_OK` after the dynamic-ledger fix, and the `EnumDisplayMonitors` guest callback is delivered once with result 1 and error 0. It passes the earlier video-event stop and stops at `IDirect3DDevice9::TestCooperativeLevel` slot 3 (`0x7E002030`), called from `0x00A10CC0` at `0x00A10CCD`. Five workers are joined. No draw, `Present`, rendered frame, or menu is verified.
+The current host trace, exact stop, and fingerprint are maintained in the [README checkpoint](../README.md). The host graphics path has passed native device creation, shader and texture initialization, all 460 D3DX constant-table calls, monitor enumeration, and `TestCooperativeLevel`. No draw, `Present`, rendered frame, or menu is verified.
 
 AC1 now has a reproducible ARM64 DXVK Native build under `ports/dxvk_android/`. It pins DXVK Native `native-1.9.2b` to `c8dc91fabd00cac11d697ccf07426e798393cd40`, applies the Android patch recipe into ignored `work/dxvk/prepared/`, and uses NDK `glslc` plus `spirv-val` to generate and validate all 54 built-in shaders for Vulkan 1.1. Run `ports/dxvk_android/build.ps1` to repeat the build; downloaded source, prepared source and compiler output stay under ignored `work/`.
 

@@ -73,11 +73,8 @@ the Android DXVK factory because ordinary USER32 calls such as `LoadCursorA`,
 implementation. Windows-only audio and input providers and portable Android
 D3DX services also remain unresolved.
 
-The latest host-only evidence is `work/startup_slice_1000.log` (SHA-256
-`E45E3C1FC0F5DDCEDFC8999D333DD6836FFC36CB68009380D2CA07118A70B45B`): the
-host completed 460 shader constant-table calls and one monitor callback, joined
-five workers, and stopped at D3D9 `TestCooperativeLevel` slot 3. This does not
-establish Android startup or rendering.
+The current host trace and stop are tracked in the [README checkpoint](../README.md).
+Host progress does not establish Android startup or rendering.
 
 ## Isolated ARM64 package checkpoint
 
