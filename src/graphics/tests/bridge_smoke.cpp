@@ -887,6 +887,36 @@ int main(int argc, char **argv)
     }
 
     const uint32_t surface = guest_word(render_output);
+    const uint32_t color_fill_args[] = {device, surface, 0u, 0xff204060u};
+    const uint32_t fill_rect_address = allocate_guest(nullptr, sizeof(RECT), 4);
+    const RECT fill_rect{0, 0, 16, 16};
+    std::memcpy(resolve_guest(nullptr, fill_rect_address, sizeof(fill_rect),
+                              AC1_D3D9_GUEST_WRITE), &fill_rect, sizeof(fill_rect));
+    const uint32_t color_fill_rect_args[] = {
+        device, surface, fill_rect_address, 0xff102030u
+    };
+    const uint32_t bad_color_fill_args[] = {device, device, 0u, 0u};
+    if (ac1_d3d9_argument_count(object_slot(device, 35)) != 4 ||
+        ac1_d3d9_dispatch(object_slot(device, 35), color_fill_args, 4,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result)) ||
+        ac1_d3d9_dispatch(object_slot(device, 35), color_fill_rect_args, 4,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "native ColorFill smoke failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 26;
+    }
+    if (ac1_d3d9_dispatch(object_slot(device, 35), bad_color_fill_args, 4,
+                          &getter_result) != 1 ||
+        getter_result != static_cast<uint32_t>(D3DERR_INVALIDCALL)) {
+        std::fprintf(stderr, "ColorFill did not reject a non-surface guest proxy\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 27;
+    }
     const uint32_t surface_desc_token = object_slot(surface, 12);
     const uint32_t desc_address = allocate_guest(nullptr, 32, 4);
     const uint32_t desc_args[] = {surface, desc_address};

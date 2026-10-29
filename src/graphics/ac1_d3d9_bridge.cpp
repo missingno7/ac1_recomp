@@ -310,6 +310,7 @@ int token_argument_count(uint32_t token)
 
     if (kind == kDeviceKind) {
         if (method < 3) return method == 0 ? 3 : 1;
+        if (method == 35) return 4;
         if (method == 26 || method == 27) return 7;
         if (method == 65 || method == 92 || method == 107) return method == 65 ? 3 : 2;
         if (method == 67 || method == 69) return 4;
@@ -1018,6 +1019,27 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
             return hresult(D3DERR_INVALIDCALL);
         return hresult(get_device_surface(static_cast<IDirect3DDevice9 *>(object.native),
                                           args, true));
+    }
+    if (method == 35) {
+        if (!require_count(argc, 4, "IDirect3DDevice9::ColorFill"))
+            return hresult(D3DERR_INVALIDCALL);
+        GuestObject *surface = find_object(args[1], ObjectKind::Surface);
+        if (!surface) {
+            set_error("IDirect3DDevice9::ColorFill requires a registered surface proxy");
+            return hresult(D3DERR_INVALIDCALL);
+        }
+        RECT rect{};
+        const RECT *rect_pointer = nullptr;
+        if (args[2]) {
+            static_assert(sizeof(RECT) == 16, "guest RECT must remain 16 bytes");
+            if (!guest_read(args[2], &rect, sizeof(rect))) {
+                set_error("IDirect3DDevice9::ColorFill RECT is unmapped");
+                return hresult(D3DERR_INVALIDCALL);
+            }
+            rect_pointer = &rect;
+        }
+        return hresult(static_cast<IDirect3DDevice9 *>(object.native)->ColorFill(
+            static_cast<IDirect3DSurface9 *>(surface->native), rect_pointer, args[3]));
     }
     if (method == 26 || method == 27) {
         if (!require_count(argc, 7, method == 26
