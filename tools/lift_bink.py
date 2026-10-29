@@ -309,8 +309,10 @@ def main() -> int:
     for seed in extra_roots:
         if not executable_va(seed, base, pe.sections):
             parser.error(f"configured Bink seed is not in executable image code: 0x{seed:08X}")
-    info, dis, catalog, failures, queued, entry, iat, _callback_edges = lift_ac1.discover_entry_cone(
-        binary, pcrecomp, max_functions, max_depth, sorted(set(extra_roots)))
+    (info, dis, catalog, failures, queued, entry, iat, _callback_edges,
+     _immediate_summary) = lift_ac1.discover_entry_cone(
+        binary, pcrecomp, max_functions, max_depth, sorted(set(extra_roots)),
+        code_immediates=False)
     catalog_functions = sorted(catalog.values(), key=lambda item: item["address"])
     call_returns = call_return_sites(binary, pcrecomp, catalog_functions)
 

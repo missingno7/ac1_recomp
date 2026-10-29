@@ -2239,6 +2239,11 @@ class InstructionSpanIndex:
         return any(start < target < end
                    for start, end in self._pages.get(target >> self.PAGE_SHIFT, ()))
 
+    def contains(self, target: int) -> bool:
+        """Include exact instruction starts when rejecting interior labels."""
+        return any(start <= target < end
+                   for start, end in self._pages.get(target >> self.PAGE_SHIFT, ()))
+
 
 def linear_instruction_span_overlap(target: int, discovered: dict) -> bool:
     """Reference implementation retained for exact-equivalence tests."""
@@ -2266,6 +2271,10 @@ def run_instruction_span_index_selftest() -> None:
         assert index.overlaps(target) == linear_instruction_span_overlap(target, discovered), (
             f"instruction-span index mismatch at 0x{target:08X}"
         )
+        assert index.contains(target) == any(
+            start <= target < start + size
+            for function in discovered.values() for block in function["blocks"]
+            for start, size in block["instructions"])
 
 
 def validate_callback_code_entry(target: int, disassembler, info, iat,
@@ -2288,8 +2297,81 @@ def validate_callback_code_entry(target: int, disassembler, info, iat,
     return bool(candidate and candidate.blocks and target in candidate.blocks)
 
 
+def constant_code_immediate_edges(function) -> list[dict]:
+    """Read pointer-sized literals only from recovered MOV/PUSH instructions.
+
+    Use address adjacency across block boundaries too: PUSH return; JMP callee
+    is a manual call, not evidence that the pushed continuation is a callback.
+    No alignment is imposed; function-boundary evidence is checked separately.
+    """
+    from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
+
+    instructions = {ins.address: ins for block in function.blocks.values()
+                    for ins in block.instructions}
+    edges = []
+    for ins in sorted(instructions.values(), key=lambda item: item.address):
+        ops = ins.operands
+        if (ins.mnemonic == "mov" and len(ops) == 2 and
+                ops[0].type in (X86_OP_REG, X86_OP_MEM) and ops[0].size == 4 and
+                ops[1].type == X86_OP_IMM and ops[1].size == 4):
+            operand = ops[1]
+        elif (ins.mnemonic == "push" and len(ops) == 1 and
+              ops[0].type == X86_OP_IMM and ops[0].size == 4 and
+              # PUSH imm8 is sign extended by Capstone to size 4.
+              len(ins.bytes) >= 5 and ins.bytes[-5] == 0x68):
+            operand = ops[0]
+        else:
+            continue
+        following = instructions.get(ins.address + ins.size)
+        edges.append({
+            "callsite": ins.address,
+            "target": operand.imm & 0xFFFFFFFF,
+            "instruction": f"{ins.mnemonic} {ins.op_str}",
+            "manual_call": (ins.mnemonic == "push" and following is not None and
+                            following.mnemonic in ("jmp", "ljmp")),
+        })
+    return edges
+
+
+def code_immediate_has_function_boundary(target, dis, recovered) -> bool:
+    """Require an existing entry or padding/RET/JMP ending at the target.
+
+    These local byte suffixes corroborate an immediate pointer; they never
+    discover roots themselves and do not relax the shared entry/span checks.
+    Keep this requirement scoped to the generic code-immediate rule.
+    """
+    if target in recovered:
+        return True
+    for size, opcodes in ((1, (0xCC, 0x90, 0xC3)), (3, (0xC2,)),
+                          (5, (0xE9,)), (2, (0xEB,))):
+        start = target - size
+        if not dis.is_code_address(start):
+            continue
+        preceding = dis.read_bytes(start, size)
+        if preceding and len(preceding) == size and preceding[0] in opcodes:
+            return True
+    return False
+
+
+def code_immediate_rejection(target, dis, info, iat, spans, results) -> str | None:
+    """Keep entry validation shared with the ABI-specific callback rules."""
+    if not (info.code_start <= target < info.code_end and dis.is_code_address(target)):
+        return "non_executable"
+    if spans.overlaps(target):
+        return "mid_instruction"
+    # An instruction boundary inside a known body can be a return address or
+    # switch label. It needs independent entry evidence, not just a MOV/PUSH.
+    if target not in results and spans.contains(target):
+        return "interior_instruction"
+    if not code_immediate_has_function_boundary(target, dis, results):
+        return "not_function_boundary"
+    if not validate_callback_code_entry(target, dis, info, iat, spans):
+        return "invalid_entry"
+    return None
+
+
 def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_depth: int,
-                        extra_seeds: list[int]):
+                        extra_seeds: list[int], code_immediates: bool = True):
     sys.path[:0] = [str(pcrecomp / "tools/pe"), str(pcrecomp / "tools/disasm")]
     from pe_analyze import analyze_pe, build_iat_map
     from disasm32 import Disassembler
@@ -2307,10 +2389,43 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
     instruction_spans = InstructionSpanIndex()
     failures = []
     callback_edges = []
-    while queue and len(results) < max_functions:
+    immediate_pending = collections.defaultdict(list)
+    immediate_edges = collections.defaultdict(list)
+    immediate_queued = set()
+    immediate_rejected = collections.Counter()
+    immediate_waves = 0
+    while (queue or immediate_pending) and len(results) < max_functions:
+        if not queue:
+            # First exhaust the direct/ABI-specific cone, so instruction spans
+            # can reject continuations and mid-instruction literals. Repeat
+            # after every new wave, scanning newly recovered bodies to closure.
+            immediate_waves += 1
+            for target, edges in sorted(immediate_pending.items()):
+                reason = code_immediate_rejection(target, dis, info, iat,
+                                                 instruction_spans, results)
+                if reason:
+                    immediate_rejected[reason] += len(edges)
+                    continue
+                immediate_edges[target].extend(edges)
+                if target not in results and target not in queued:
+                    queued.add(target)
+                    immediate_queued.add(target)
+                    queue.append((target, min(edge["depth"] for edge in edges)))
+            immediate_pending.clear()
+            if not queue:
+                break
         address, depth = queue.popleft()
         if address in results:
             continue
+        if address in immediate_queued:
+            # Earlier roots in this wave may have recovered the instruction
+            # containing this target since the batch was validated.
+            if instruction_spans.overlaps(address) or instruction_spans.contains(address):
+                reason = ("mid_instruction" if instruction_spans.overlaps(address)
+                          else "interior_instruction")
+                immediate_rejected[reason] += len(immediate_edges.pop(address, []))
+                queued.discard(address)
+                continue
         try:
             function = dis.disassemble_function(address, iat)
         except Exception as exc:  # report concrete decoder limits per function
@@ -2343,6 +2458,19 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
             ],
         }
         instruction_spans.add_function(results[address])
+        if code_immediates:
+            for edge in constant_code_immediate_edges(function):
+                target = edge["target"]
+                if not (info.code_start <= target < info.code_end and dis.is_code_address(target)):
+                    immediate_rejected["non_executable"] += 1
+                elif edge.pop("manual_call"):
+                    immediate_rejected["manual_call"] += 1
+                elif depth >= max_depth:
+                    immediate_rejected["depth_limit"] += 1
+                else:
+                    immediate_pending[target].append({
+                        **edge, "caller": address, "role": "code_immediate", "depth": depth + 1,
+                    })
         tail_target = direct_tail_thunk_target(function)
         if (tail_target is not None and
                 validate_callback_code_entry(tail_target, dis, info, iat, instruction_spans)):
@@ -2398,7 +2526,17 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
                 if target not in results and target not in queued:
                     queued.add(target)
                     queue.append((target, depth + 1))
-    return info, dis, results, failures, len(queue), entry, iat, callback_edges
+    for edges in immediate_edges.values():
+        callback_edges.extend(edges)
+    immediate_summary = {
+        "enabled": code_immediates,
+        "waves": immediate_waves,
+        "accepted_edges": sum(map(len, immediate_edges.values())),
+        "rejected_candidates": dict(sorted(immediate_rejected.items())),
+        "pending_targets": len(immediate_pending),
+    }
+    return (info, dis, results, failures, len(queue), entry, iat, callback_edges,
+            immediate_summary)
 
 
 def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: Path,
@@ -2751,6 +2889,8 @@ def main() -> int:
                         help="fixed address-hash partition count; overrides functions-per-tu grouping")
     parser.add_argument("--no-emission-cache", action="store_true",
                         help="disable the persistent generated-body cache")
+    parser.add_argument("--no-code-immediates", action="store_true",
+                        help="disable callback discovery from decoded MOV/PUSH imm32 operands")
     args = parser.parse_args()
     if args.selftest:
         config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -2850,9 +2990,10 @@ def main() -> int:
     invalidate_success_report(report_path)
     start_time = time.perf_counter()
     discovery_start = time.perf_counter()
-    info, dis, catalog, discovery_failures, queued, entry, iat, callback_edges = discover_entry_cone(
-        binary, pcrecomp, max_functions, max_depth, extra_seeds
-    )
+    (info, dis, catalog, discovery_failures, queued, entry, iat, callback_edges,
+     immediate_summary) = discover_entry_cone(
+        binary, pcrecomp, max_functions, max_depth, extra_seeds,
+        code_immediates=not args.no_code_immediates)
     discovery_seconds = time.perf_counter() - discovery_start
     catalog_doc = {
         "binary_sha256": binary_hash,
@@ -2881,6 +3022,7 @@ def main() -> int:
         "discovered_count": len(catalog),
         "discovery_failures": discovery_failures,
         "discovered_callback_edges": callback_edges,
+        "code_immediate_discovery": immediate_summary,
         "functions": sorted(catalog.values(), key=lambda item: item["address"]),
     }
     catalog_path = output_dir / "functions.json"
@@ -2961,7 +3103,7 @@ def main() -> int:
         "limitations": [
             "Discovery follows bounded direct calls and validated direct tail thunks from the PE entry point and explicit --seed targets; arbitrary indirect calls, exports, and generic data-pointer targets remain uncovered.",
             "No menu, graphics, or gameplay has been verified through this generated slice.",
-            "Callback discovery is limited to validated AC1 F9FA43 constructor/cleanup, 438EF0 schema-helper arg2, and 9312F0 reader-helper arg2 ABIs; it does not cover arbitrary virtual calls, callback records, or exports.",
+            "Callback discovery follows validated AC1 F9FA43 constructor/cleanup, 438EF0 schema-helper arg2, and 9312F0 reader-helper arg2 ABIs, plus decoded MOV/PUSH imm32 code pointers unless --no-code-immediates is set; arbitrary virtual calls, data-only callback records, and exports remain uncovered.",
             "Any RECOMP_TODO emitted by the upstream lifter remains a concrete translation gap.",
             "The inspected DX9 image has no base-relocation directory, so the first runtime must preserve its preferred image base 0x00400000 unless relocation evidence changes.",
         ],

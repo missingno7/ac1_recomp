@@ -1021,6 +1021,20 @@ HRESULT create_device(IDirect3D9 *d3d, const uint32_t *args)
     if (!present_ok) return D3DERR_INVALIDCALL;
 
     D3DPRESENT_PARAMETERS host = host_present_parameters(guest, present_window);
+    /* Explicit presentation mapping: present an exclusive-fullscreen request in
+       the game's own window without a display-mode change. The guest still
+       sees the fullscreen parameters it requested. */
+    const bool force_windowed = !guest.windowed &&
+        std::getenv("AC1_D3D9_FORCE_WINDOWED") != nullptr &&
+        std::strcmp(std::getenv("AC1_D3D9_FORCE_WINDOWED"), "0") != 0;
+    if (force_windowed) {
+        host.Windowed = TRUE;
+        host.FullScreen_RefreshRateInHz = 0;
+        std::fprintf(stderr, "AC1 D3D9 presentation mapping: fullscreen %ux%u@%u "
+                     "presented windowed (AC1_D3D9_FORCE_WINDOWED)\n",
+                     guest.back_buffer_width, guest.back_buffer_height,
+                     guest.fullscreen_refresh_rate);
+    }
     IDirect3DDevice9 *device = nullptr;
 #if defined(_WIN32)
     const bool trace_create_device =
@@ -1094,6 +1108,10 @@ HRESULT create_device(IDirect3D9 *d3d, const uint32_t *args)
     }
 #endif
     GuestPresentParameters updated = guest_present_parameters(host, guest.device_window);
+    if (force_windowed) {
+        updated.windowed = guest.windowed;
+        updated.fullscreen_refresh_rate = guest.fullscreen_refresh_rate;
+    }
     if (!guest_write(args[5], &updated, sizeof(updated))) {
         if (device) device->Release();
         set_error("CreateDevice could not write back presentation parameters");
