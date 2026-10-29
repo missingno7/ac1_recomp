@@ -3727,6 +3727,22 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
         set_error("COM token called with an unknown guest object or interface kind");
         return -1;
     }
+    {
+        /* AC1_D3D9_TRACE_CALLS_AT=N: log every COM call of the frame that ends
+         * with the N-th device Present (1-based), then the Present itself. */
+        static long long trace_at = -1, frame = 1;
+        if (trace_at < 0) {
+            const char *value = std::getenv("AC1_D3D9_TRACE_CALLS_AT");
+            trace_at = value ? std::atoll(value) : 0;
+        }
+        if (trace_at > 0 && frame == trace_at) {
+            std::fprintf(stderr, "AC1 D3D9 call frame=%lld kind=%u slot=%u args=", frame, kind, method);
+            for (uint32_t i = 1; i < arg_count; ++i)
+                std::fprintf(stderr, "%s%08x", i > 1 ? "," : "", args[i]);
+            std::fprintf(stderr, "\n");
+        }
+        if (kind == kDeviceKind && method == 17) ++frame;
+    }
     if ((object->kind == ObjectKind::VertexBuffer ||
          object->kind == ObjectKind::IndexBuffer) && method == 11) {
         if (object->buffer_lock_guest_address || object->buffer_lock_native_pointer) {
