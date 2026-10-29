@@ -492,6 +492,7 @@ int token_argument_count(uint32_t token)
 
     if (kind == kDeviceKind) {
         if (method < 3) return method == 0 ? 3 : 1;
+        if (method == 3) return 1;
         if (method == 35) return 4;
         if (method == 47) return 2;
         if (method == 86) return 3;
@@ -1877,6 +1878,11 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
             free_guest_object(guest_address, retired);
         }
         return guest_count;
+    }
+    if (method == 3) {
+        if (!require_count(argc, 1, "IDirect3DDevice9::TestCooperativeLevel"))
+            return hresult(D3DERR_INVALIDCALL);
+        return hresult(static_cast<IDirect3DDevice9 *>(object.native)->TestCooperativeLevel());
     }
     if (method == 38) {
         if (!require_count(argc, 3, "IDirect3DDevice9::GetRenderTarget"))

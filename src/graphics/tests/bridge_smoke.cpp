@@ -311,6 +311,11 @@ HRESULT STDMETHODCALLTYPE fake_create_device(
     return S_OK;
 }
 
+uintptr_t fake_translate_window(void *, uint32_t guest_hwnd)
+{
+    return guest_hwnd == 0x1234u ? 1u : 0u;
+}
+
 HRESULT STDMETHODCALLTYPE fake_get_render_target(
     IDirect3DDevice9 *, DWORD index, IDirect3DSurface9 **output)
 {
@@ -338,6 +343,11 @@ HRESULT STDMETHODCALLTYPE fake_set_render_state(IDirect3DDevice9 *,
     fake_render_state_type = static_cast<uint32_t>(state);
     fake_render_state_value = value;
     return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE fake_test_cooperative_level(IDirect3DDevice9 *)
+{
+    return D3DERR_DEVICELOST;
 }
 
 HRESULT STDMETHODCALLTYPE fake_get_device_caps(IDirect3DDevice9 *, D3DCAPS9 *output)
@@ -503,6 +513,7 @@ void initialize_fake_com()
     fake_device_vtable[0] = reinterpret_cast<void *>(&fake_query_interface);
     fake_device_vtable[1] = reinterpret_cast<void *>(&fake_add_ref);
     fake_device_vtable[2] = reinterpret_cast<void *>(&fake_release);
+    fake_device_vtable[3] = reinterpret_cast<void *>(&fake_test_cooperative_level);
     fake_pixel_shader_vtable[0] = reinterpret_cast<void *>(&fake_query_interface);
     fake_pixel_shader_vtable[1] = reinterpret_cast<void *>(&fake_add_ref);
     fake_pixel_shader_vtable[2] = reinterpret_cast<void *>(&fake_release);
@@ -564,6 +575,7 @@ bool run_fake_surface_smoke(ac1_d3d9_callbacks callbacks)
 {
     initialize_fake_com();
     callbacks.factory = fake_factory;
+    callbacks.guest_hwnd_to_host = fake_translate_window;
     if (!ac1_d3d9_configure(&callbacks, nullptr)) {
         std::fprintf(stderr, "fake bridge configure failed: %s\n", ac1_d3d9_last_error());
         return false;
@@ -596,6 +608,15 @@ bool run_fake_surface_smoke(ac1_d3d9_callbacks callbacks)
         return false;
     }
     const uint32_t device = guest_word(device_output);
+    const uint32_t cooperative_args[] = {device};
+    if (ac1_d3d9_argument_count(object_slot(device, 3)) != 1 ||
+        ac1_d3d9_dispatch(object_slot(device, 3), cooperative_args, 1, &result) != 1 ||
+        static_cast<HRESULT>(result) != D3DERR_DEVICELOST) {
+        std::fprintf(stderr, "fake TestCooperativeLevel HRESULT forwarding failed: 0x%08x %s\n",
+                     result, ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
     const uint32_t render_state_args[] = {device, 7u, 1u};
     if (ac1_d3d9_argument_count(object_slot(device, 57)) != 3 ||
         ac1_d3d9_dispatch(object_slot(device, 57), render_state_args, 3, &result) != 1 ||
@@ -1074,6 +1095,8 @@ int main(int argc, char **argv)
     callbacks.guest_free = free_guest;
     callbacks.guest_hwnd_to_host = translate_window;
     callbacks.log = log_message;
+    if (argc == 2 && !std::strcmp(argv[1], "--fake-com"))
+        return run_fake_surface_smoke(callbacks) ? 0 : 19;
     if (!ac1_d3d9_configure(&callbacks, nullptr)) {
         std::fprintf(stderr, "configure failed: %s\n", ac1_d3d9_last_error());
         return 1;
@@ -1097,7 +1120,7 @@ int main(int argc, char **argv)
                 resolve_guest(nullptr, vtable + 4 * 4, sizeof(get_adapter_count), AC1_D3D9_GUEST_READ),
                 sizeof(get_adapter_count));
     if (ac1_d3d9_argument_count(get_adapter_count) != 1 ||
-        ac1_d3d9_argument_count(0x7e002030u) != -2 ||
+        ac1_d3d9_argument_count(0x7e002030u) != 1 ||
         ac1_d3d9_argument_count(0x7e002260u) != 3 ||
         ac1_d3d9_argument_count(0x7e002390u) != 3 ||
         ac1_d3d9_argument_count(0x7e002280u) != 2 ||
@@ -1112,7 +1135,6 @@ int main(int argc, char **argv)
         ac1_d3d9_argument_count(0x7e007000u) != 3 ||
         ac1_d3d9_argument_count(0x7e002560u) != 3 ||
         ac1_d3d9_argument_count(0x7e002170u) != 9 ||
-        ac1_d3d9_dispatch(0x7e002030u, nullptr, 0, nullptr) != -2 ||
         ac1_d3d9_dispatch(0x7e0030b0u, nullptr, 0, nullptr) != -2 ||
         ac1_d3d9_dispatch(0x7e00b000u, nullptr, 0, nullptr) != 0) {
         std::fprintf(stderr, "COM method-arity classification failed\n");
@@ -1593,7 +1615,7 @@ int main(int argc, char **argv)
     const uint32_t depth_args[] = {device, depth_output};
     if (ac1_d3d9_argument_count(get_render_target) != 3 ||
         ac1_d3d9_argument_count(get_depth_stencil) != 2 ||
-        ac1_d3d9_argument_count(object_slot(device, 3)) != -2 ||
+        ac1_d3d9_argument_count(object_slot(device, 3)) != 1 ||
         ac1_d3d9_dispatch(get_render_target, render_args, 3, &getter_result) != 1 ||
         FAILED(static_cast<HRESULT>(getter_result)) || !guest_word(render_output) ||
         ac1_d3d9_dispatch(get_depth_stencil, depth_args, 2, &getter_result) != 1 ||
