@@ -1220,6 +1220,25 @@ def run_ac1_switch_selftest(binary: Path, pcrecomp: Path) -> None:
                                   lambda va, count: pe.get_data((va - image_base) & 0xFFFFFFFF, count))
         remap_lifter.image_lo = image_base
         remap_lifter.image_hi = image_base + image_size
+        register_switch = dis.disassemble_function(0x010D730C, thunk_iat)
+        sites = {site["load"]: site for site in register_switch.register_switches}
+        assert sites[0x010D731C]["count"] == 15
+        assert len(set(sites[0x010D731C]["targets"])) == 15
+        assert 0x010D74C6 in register_switch.blocks
+        register_spec = {
+            "address": register_switch.address, "size": register_switch.size,
+            "register_switches": register_switch.register_switches,
+            "blocks": [{"start": b.start, "end": b.end,
+                        "instructions": [[ins.address, ins.size] for ins in b.instructions]}
+                       for b in register_switch.blocks.values()],
+        }
+        register_body = lift_exact_function(remap_lifter, register_spec, remap_lifter.read_va,
+                                            X86_OP_IMM, X86_OP_MEM)
+        for target in sites[0x010D731C]["targets"]:
+            assert f"if (_jt == GVA(0x{target:08X})) goto L_{target:08X};" in register_body
+        assert "uint32_t _jt = c->edx;" in register_body
+        assert (0x01732544, 0x01732544 + 15 * 4) in dis.ac1_switch_table_ranges
+        print("AC1 register-switch self-test: 15 internal cases, RET 8, and indexed-table exclusion")
         remapped_body = lift_exact_function(
             remap_lifter, remapped_spec,
             lambda va, count: pe.get_data((va - image_base) & 0xFFFFFFFF, count),
@@ -1699,6 +1718,23 @@ def run_ac1_reader_callback_selftest(dis, info, iat) -> None:
     print("AC1 9312F0 reader-callback self-test: RET 16 / arg2 / ECX / saved-reader ABI, producer, self edges, and dynamic rejection validated")
 
 
+def unsigned_switch_count(bound: int, branch: str, taken: bool) -> int | None:
+    """Size of the unsigned upper range selected by a CMP/branch edge."""
+    inclusive = ((branch == "ja" and not taken) or (branch == "jbe" and taken))
+    exclusive = ((branch == "jae" and not taken) or (branch == "jb" and taken))
+    count = bound + (1 if inclusive else 0)
+    return count if (inclusive or exclusive) and 1 <= count <= 256 else None
+
+
+def remapped_switch_count(table_base: int, map_base: int, remap_bytes: bytes) -> int | None:
+    """Share the adjacent DWORD-table/byte-map proof with register switches."""
+    delta = (map_base - table_base) & 0xFFFFFFFF
+    if not delta or delta % 4 or not remap_bytes:
+        return None
+    count = delta // 4
+    return count if 1 <= count <= 256 and max(remap_bytes) < count else None
+
+
 def infer_remapped_switch_limit(md, read_va, jump_insn, reg_type: int,
                                 mem_type: int, imm_type: int) -> tuple[int, int] | None:
     """Recognize a guarded byte-index remap feeding an indirect dword jump.
@@ -1771,7 +1807,7 @@ def infer_remapped_switch_limit(md, read_va, jump_insn, reg_type: int,
                         any(item.mnemonic not in ("ja", "jae", "nop") for item in between)):
                     continue
                 bound = int(rhs.imm)
-                input_count = bound + (1 if guards[0] == "ja" else 0)
+                input_count = unsigned_switch_count(bound, guards[0], False)
                 break
             if input_count is None or not 1 <= input_count <= 256:
                 continue
@@ -1784,14 +1820,9 @@ def infer_remapped_switch_limit(md, read_va, jump_insn, reg_type: int,
             # The selected dword table must end exactly where the byte remap
             # begins, and every guarded map output must select one of its arms.
             table_base = jump_mem.disp & 0xFFFFFFFF
-            delta = (map_base - table_base) & 0xFFFFFFFF
-            if not delta or delta % 4:
-                continue
-            table_count = delta // 4
-            max_index = max(remap_bytes)
-            if not 1 <= table_count <= 256 or max_index >= table_count:
-                continue
-            return table_count, input_count
+            table_count = remapped_switch_count(table_base, map_base, remap_bytes)
+            if table_count is not None:
+                return table_count, input_count
     return None
 
 
@@ -1810,15 +1841,169 @@ def ac1_pinned_switch_limit(insn) -> int | None:
     return None
 
 
-def install_ac1_jump_table_bounds(disassembler) -> None:
+def register_family(md, reg) -> str:
+    name = md.reg_name(reg)
+    for names in (("eax", "ax", "al", "ah"), ("ebx", "bx", "bl", "bh"),
+                  ("ecx", "cx", "cl", "ch"), ("edx", "dx", "dl", "dh"),
+                  ("esi", "si"), ("edi", "di"), ("esp", "sp"), ("ebp", "bp")):
+        if name in names:
+            return names[0]
+    return name
+
+
+def register_switch_sites(function, md, read_va, is_code, known=None) -> dict:
+    """Prove last-definition table loads and unsigned guards on decoded CFG paths."""
+    from capstone.x86 import X86_OP_REG, X86_OP_MEM, X86_OP_IMM, X86_REG_EFLAGS
+    known = known or {}
+    candidates = [block for block in function.blocks.values() if block.instructions
+                  and block.instructions[-1].mnemonic == "jmp"
+                  and block.instructions[-1].operands
+                  and block.instructions[-1].operands[0].type == X86_OP_REG]
+    if not candidates:
+        return {}
+    predecessors = collections.defaultdict(set)
+    for block in function.blocks.values():
+        successors = set(block.successors)
+        last = block.instructions[-1] if block.instructions else None
+        if last and last.address in known:
+            successors.update(known[last.address]["targets"])
+        elif (last and last.mnemonic == "jmp" and last.operands and
+              last.operands[0].type == X86_OP_MEM):
+            # The donor omits indirect successors in pass 2. Conservatively
+            # include its recovered switch arms when proving uniqueness.
+            successors.update(function.jump_targets)
+        for target in successors:
+            predecessors[target].add(block.start)
+    detail = {}
+
+    def decoded(ins):
+        if ins.address not in detail:
+            detail[ins.address] = next(md.disasm(bytes(ins.bytes), ins.address, count=1))
+        return detail[ins.address]
+
+    def writes(ins, reg):
+        return (ins.mnemonic in ("call", "lcall") or
+                any(register_family(md, written) == register_family(md, reg)
+                    for written in decoded(ins).regs_access()[1]))
+
+    def guard(path, reg, before):
+        # The path records which successor was actually selected, including
+        # taken JBE/JB edges over an intervening default-return block.
+        for at in range(before - 1, -1, -1):
+            branch = path[at]
+            if writes(branch, reg):
+                return None
+            if branch.mnemonic not in ("ja", "jae", "jb", "jbe") or at + 1 >= len(path):
+                continue
+            if not branch.operands or branch.operands[0].type != X86_OP_IMM:
+                continue
+            taken = path[at + 1].address == (branch.operands[0].imm & 0xFFFFFFFF)
+            if not taken and path[at + 1].address != branch.address + branch.size:
+                continue
+            for cmp_at in range(at - 1, -1, -1):
+                cmp = path[cmp_at]
+                if writes(cmp, reg):
+                    return None
+                if (cmp.mnemonic == "cmp" and len(cmp.operands) == 2 and
+                        cmp.operands[0].type == X86_OP_REG and cmp.operands[0].reg == reg and
+                        cmp.operands[1].type == X86_OP_IMM):
+                    count = unsigned_switch_count(cmp.operands[1].imm, branch.mnemonic, taken)
+                    if count is not None:
+                        return count, branch.address
+                if X86_REG_EFLAGS in decoded(cmp).regs_access()[1]:
+                    break
+        return None
+
+    sites = {}
+    instruction_spans = None
+    for block in candidates:
+        chain, seen = [block], {block.start}
+        while len(chain) < 32 and sum(len(b.instructions) for b in chain) < 128:
+            preds = predecessors[chain[0].start]
+            if len(preds) != 1:
+                break
+            previous = next(iter(preds))
+            if previous in seen or previous not in function.blocks:
+                break
+            seen.add(previous)
+            chain.insert(0, function.blocks[previous])
+        path = [decoded(ins) for part in chain for ins in part.instructions]
+        jump = path[-1]
+        reg = jump.operands[0].reg
+        load_at = next((at for at in range(len(path) - 2, -1, -1) if writes(path[at], reg)), None)
+        if load_at is None:
+            continue
+        load = path[load_at]
+        ops = load.operands
+        if not (load.mnemonic == "mov" and len(ops) == 2 and
+                ops[0].type == X86_OP_REG and ops[0].reg == reg and ops[0].size == 4 and
+                ops[1].type == X86_OP_MEM and ops[1].size == 4):
+            continue
+        mem = ops[1].mem
+        if mem.base or not mem.index or mem.scale != 4 or mem.segment:
+            continue
+        if any(writes(ins, mem.index) for ins in path[load_at + 1:-1]):
+            continue
+        table = mem.disp & 0xFFFFFFFF
+        bound = guard(path, mem.index, load_at)
+        input_count = None
+        if bound is None:
+            remap_at = next((at for at in range(load_at - 1, -1, -1)
+                             if writes(path[at], mem.index)), None)
+            if remap_at is None:
+                continue
+            remap = path[remap_at]
+            if not (remap.mnemonic == "movzx" and len(remap.operands) == 2 and
+                    remap.operands[0].type == X86_OP_REG and remap.operands[0].reg == mem.index and
+                    remap.operands[1].type == X86_OP_MEM and remap.operands[1].size == 1):
+                continue
+            mapping = remap.operands[1].mem
+            if bool(mapping.base) == bool(mapping.index) or mapping.scale != 1 or mapping.segment:
+                continue
+            input_bound = guard(path, mapping.base or mapping.index, remap_at)
+            if input_bound is None:
+                continue
+            input_count, guard_address = input_bound
+            raw_map = read_va(mapping.disp & 0xFFFFFFFF, input_count)
+            if raw_map is None or len(raw_map) != input_count:
+                continue
+            count = remapped_switch_count(table, mapping.disp & 0xFFFFFFFF, raw_map)
+            if count is None:
+                continue
+        else:
+            count, guard_address = bound
+        raw = read_va(table, count * 4)
+        if raw is None or len(raw) != count * 4:
+            continue
+        targets = [int.from_bytes(raw[at:at + 4], "little") for at in range(0, len(raw), 4)]
+        if instruction_spans is None:
+            instruction_spans = InstructionSpanIndex()
+            instruction_spans.add_function({"blocks": [
+                {"instructions": [(ins.address, ins.size) for ins in part.instructions]}
+                for part in function.blocks.values()]})
+        if any(not is_code(target) or instruction_spans.overlaps(target) for target in targets):
+            continue
+        sites[jump.address] = {
+            "jump": jump.address, "load": load.address, "table": table, "count": count,
+            "guard": guard_address, "input_count": input_count,
+            "register": md.reg_name(reg), "index_register": md.reg_name(mem.index), "targets": targets,
+        }
+    return sites
+
+
+def install_ac1_jump_table_bounds(disassembler, register_switches: bool = True) -> None:
     """Apply AC1-local bounds and discover negatively biased switch tables."""
     from types import MethodType
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
 
     original = disassembler.jump_table_targets
     disassembler.ac1_switch_table_ranges = set()
+    disassembler.ac1_active_register_switches = {}
 
     def bounded(self, insn, limit=256):
+        if insn.mnemonic == "jmp" and insn.operands and insn.operands[0].type == X86_OP_REG:
+            site = self.ac1_active_register_switches.get(insn.address)
+            return list(site["targets"]) if site else []
         pinned_limit = ac1_pinned_switch_limit(insn)
         proven_limit = pinned_limit
         if pinned_limit is not None:
@@ -1867,6 +2052,43 @@ def install_ac1_jump_table_bounds(disassembler) -> None:
         return targets
 
     disassembler.jump_table_targets = MethodType(bounded, disassembler)
+    if not register_switches:
+        return
+    original_function = disassembler.disassemble_function
+
+    def recover(self, address, iat=None):
+        previous = self.ac1_active_register_switches
+        self.ac1_active_register_switches = {}
+        try:
+            function = original_function(address, iat)
+            if function is None or not function.blocks:
+                return function
+            initial_blocks = len(function.blocks)
+            current, rejected = {}, set()
+            for _ in range(64):
+                sites = register_switch_sites(function, self.md, self.read_bytes,
+                                              self.is_code_address, current)
+                # New case edges can invalidate a formerly unique predecessor.
+                # Never oscillate back to that provisional proof after removal.
+                rejected.update(jump for jump, site in current.items() if sites.get(jump) != site)
+                sites = {jump: site for jump, site in sites.items() if jump not in rejected}
+                if sites == current:
+                    for jump, site in sites.items():
+                        self.ac1_switch_table_ranges.add((site["table"], site["table"] + 4 * site["count"]))
+                        for block in function.blocks.values():
+                            if block.instructions and block.instructions[-1].address == jump:
+                                block.successors = sorted(set(block.successors) | set(site["targets"]))
+                    function.register_switches = list(sites.values())
+                    function.register_switch_added_blocks = len(function.blocks) - initial_blocks
+                    return function
+                current = sites
+                self.ac1_active_register_switches = sites
+                function = original_function(address, iat)
+            raise ValueError(f"register-switch CFG did not converge at 0x{address:08X} after 64 passes")
+        finally:
+            self.ac1_active_register_switches = previous
+
+    disassembler.disassemble_function = MethodType(recover, disassembler)
 
 
 def infer_negated_switch_bound(md, read_va, jump_insn, reg_type: int,
@@ -2565,7 +2787,7 @@ class IndexedTableDiscovery:
 
 def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_depth: int,
                         extra_seeds: list[int], code_immediates: bool = True,
-                        indexed_tables: bool = True):
+                        indexed_tables: bool = True, register_switches: bool = True):
     sys.path[:0] = [str(pcrecomp / "tools/pe"), str(pcrecomp / "tools/disasm")]
     from pe_analyze import analyze_pe, build_iat_map
     from disasm32 import Disassembler
@@ -2574,7 +2796,7 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
     code = binary.read_bytes()
     iat = build_iat_map(info)
     dis = Disassembler(code, info.image_base, info.sections)
-    install_ac1_jump_table_bounds(dis)
+    install_ac1_jump_table_bounds(dis, register_switches=register_switches)
     entry = info.image_base + info.entry_point_rva
     initial_seeds = sorted({entry, *extra_seeds})
     queue = collections.deque((seed, 0) for seed in initial_seeds)
@@ -2656,6 +2878,9 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
                 for block in sorted(function.blocks.values(), key=lambda item: item.start)
             ],
         }
+        if getattr(function, "register_switches", None):
+            results[address]["register_switches"] = function.register_switches
+            results[address]["register_switch_added_blocks"] = function.register_switch_added_blocks
         instruction_spans.add_function(results[address])
         indexed.collect(function, address, depth, max_depth)
         if code_immediates:
@@ -3019,6 +3244,16 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
     validate_ac1_mmx_interval(address, spec, decoded)
     labels = set()
     block_starts = {block["start"] for block in blocks}
+    register_switches = {site["jump"]: site for site in spec.get("register_switches", [])}
+    for jump, site in register_switches.items():
+        if (jump not in decoded or decoded[jump].mnemonic != "jmp" or
+                decoded[jump].operands[0].type != X86_OP_REG or
+                lifter.md.reg_name(decoded[jump].operands[0].reg) != site["register"]):
+            raise ValueError(f"register-switch jump changed at 0x{jump:08X}")
+        for target in site["targets"]:
+            if target not in decoded:
+                raise ValueError(f"register-switch 0x{jump:08X} missing internal case 0x{target:08X}")
+            labels.add(target)
     for insn in insns:
         if insn.mnemonic.startswith("j") or insn.mnemonic.startswith("loop"):
             for operand in insn.operands:
@@ -3054,7 +3289,15 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
         if insn.address in labels or (entry_jump and insn.address == address):
             output.append(f"L_{insn.address:08X}:")
         output.append(f"    AC1_SET_GUEST_EIP(c, 0x{insn.address:08X}u);")
-        translated = translate_directional_string_instruction(insn)
+        if insn.address in register_switches:
+            # Read the architectural register, not the table a second time:
+            # intervening instructions may have changed memory since the MOV.
+            translated = [f"{{ uint32_t _jt = {lifter._target(insn, insn.operands[0])};"]
+            for target in sorted(set(register_switches[insn.address]["targets"])):
+                translated.append(f"  if (_jt == GVA(0x{target:08X})) goto L_{target:08X};")
+            translated.append("  dispatch_jmp(c, _jt); return; }")
+        else:
+            translated = translate_directional_string_instruction(insn)
         if translated is None:
             translated = lifter.translate(insn, labels)
         for line in translated:
@@ -3097,6 +3340,8 @@ def main() -> int:
                         help="disable callback discovery from decoded MOV/PUSH imm32 operands")
     parser.add_argument("--no-indexed-tables", action="store_true",
                         help="disable initialized-data function-table discovery")
+    parser.add_argument("--no-register-switches", action="store_true",
+                        help="disable guarded register-loaded switch recovery for A/B comparison")
     args = parser.parse_args()
     config_path = args.config.resolve()
     if args.selftest:
@@ -3200,7 +3445,8 @@ def main() -> int:
     (info, dis, catalog, discovery_failures, queued, entry, iat, callback_edges,
      immediate_summary, indexed_summary) = discover_entry_cone(
         binary, pcrecomp, max_functions, max_depth, extra_seeds,
-        code_immediates=not args.no_code_immediates, indexed_tables=not args.no_indexed_tables)
+        code_immediates=not args.no_code_immediates, indexed_tables=not args.no_indexed_tables,
+        register_switches=not args.no_register_switches)
     discovery_seconds = time.perf_counter() - discovery_start
     catalog_doc = {
         "binary_sha256": binary_hash,
@@ -3231,6 +3477,14 @@ def main() -> int:
         "discovered_callback_edges": callback_edges,
         "code_immediate_discovery": immediate_summary,
         "indexed_table_discovery": indexed_summary,
+        "register_switch_discovery": {
+            "enabled": not args.no_register_switches,
+            "site_count": len({site["jump"] for spec in catalog.values()
+                               for site in spec.get("register_switches", [])}),
+            "added_blocks": sum(spec.get("register_switch_added_blocks", 0) for spec in catalog.values()),
+            "sites": [{"caller": spec["address"], **site} for spec in catalog.values()
+                      for site in spec.get("register_switches", [])],
+        },
         "functions": sorted(catalog.values(), key=lambda item: item["address"]),
     }
     catalog_path = output_dir / "functions.json"
