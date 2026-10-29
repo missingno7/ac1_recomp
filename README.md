@@ -2,7 +2,31 @@
 
 This repository builds and executes a statically translated portion of the original GOG DX9 executable on a 64-bit Windows host. The host runtime uses native code generated from the original x86 program; Android remains a compile-only port with an older frozen diagnostic APK.
 
-## Saved host checkpoint (64,409 main + 65 Bink functions; paused)
+## Current host checkpoint: first original image (loading screen)
+
+Original code now renders AC1's loading screen on Windows. The translated Bink DLL decodes `videos\LoadingScreen.bik`, and the game draws its progress bar over it through the D3D9 bridge on DXVK. Back-buffer captures show loading progress from 4% at present 4 to 81% at present 64, with 81 original draw calls by then. Evidence: `work/startup_first_image_loading.log` (SHA-256 `77EBD97228EEF25CD839F887B44240EFFD52C690A353E51DF7CCE4D3A6BE0412`) and `work/captures/present_000064.bmp`. This verifies sustained original rendering of the loading screen. Menu, input, audio playback and gameplay are not yet verified.
+
+The catalog grew to about 83,900 main-executable functions and 292 Bink functions, from these systematic discovery sources:
+- decoded `MOV`/`PUSH` imm32 code pointers at function boundaries (`code_immediate` edges);
+- every RTTI-located vtable slot, primary and secondary, including `.?AU` struct bases and single-slot tables (`work/scan_all_rtti_vtables.py`);
+- Bink's relocation-proven function tables.
+
+The D3D9 bridge covers every `IDirect3DDevice9` slot and the resource interfaces. The DirectSound bridge covers every slot of the DS8, buffer, 3D buffer, 3D listener and notify interfaces. The newly covered but not yet reached MMX code produces 13 main-executable lift failures and 71 explicit `RECOMP_TODO`s. Bink has 165 MMX sites that its loading-screen decode has not reached so far. A native FFmpeg Bink provider adapted from recomp-kit is being integrated (see [architecture](docs/architecture.md)).
+
+Development run, windowed and skipping the intro videos as players do by deleting them:
+
+```powershell
+$env:AC1_D3D9_LIBRARY = (Resolve-Path work\d3d9_dxvk_probe\d3d9.dll).Path
+$env:AC1_D3D9_FORCE_WINDOWED = '1'   # fullscreen request presented windowed; no mode switch
+$env:AC1_D3D9_TRACE_FRAME = '1'      # present/draw counts at power-of-two presents
+$env:AC1_D3D9_CAPTURE_DIR = (Resolve-Path work\captures).Path   # BMP back buffers
+$env:AC1_HIDE_FILES = 'videos\UBI_LOGO.bik;videos\Ubisoft_Presents.bik;videos\Warning_Disclaimer.bik;videos\DemoIntro.bik'
+.\tools\build.ps1 -BuildType RelWithDebInfo -Jobs 16 -Run
+```
+
+Without `AC1_HIDE_FILES`, the game plays all four intro videos in real time (about eight minutes) before loading.
+
+## Earlier saved host checkpoint (64,409 main + 65 Bink functions; historical)
 
 The generated catalog contains 64,409 main-executable functions and 65 Bink functions, with zero generation failures and an empty queue. Two `RECOMP_TODO` instructions remain: `FNSAVE` and `FRSTOR`. Work stopped at the user's request after the current callback change and one final verification run.
 
