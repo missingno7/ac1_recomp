@@ -89,6 +89,9 @@ if(NOT ANDROID)
   add_executable(ac1_profile_int_contract EXCLUDE_FROM_ALL
     tests/ac1_profile_int_fixture.c)
   target_include_directories(ac1_profile_int_contract PRIVATE src/runtime)
+  add_executable(ac1_lookup_cache_contract EXCLUDE_FROM_ALL
+    tests/lifted_lookup_cache_fixture.c)
+  target_include_directories(ac1_lookup_cache_contract PRIVATE src/runtime)
   if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ac1_guest_memory_contract PRIVATE
       -fwrapv -fno-strict-aliasing -ffp-contract=off)

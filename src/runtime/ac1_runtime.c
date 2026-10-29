@@ -11,6 +11,7 @@
 #include "ac1_crypto.h"
 #include "ac1_files.h"
 #include "initial_dispatch.h"
+#include "ac1_lookup_cache.h"
 #include "bink_dispatch.h"
 #include "bink_module.h"
 #include "ac1_fingerprint.h"
@@ -70,6 +71,19 @@ extern uintptr_t ac1_android_d3d9_guest_hwnd(void *context, uint32_t guest_hwnd)
 #define AC1_WAIT_TIMEOUT 258u
 #define AC1_STILL_ACTIVE 259u
 #define AC1_WAIT_CRITICAL_SECTION 3
+
+static ac1_lifted_lookup_cache_slot
+    ac1_main_lifted_lookup_cache[AC1_LIFTED_LOOKUP_CACHE_SLOTS];
+static int ac1_main_lifted_lookup_cache_enabled = 1;
+
+static void reset_main_lifted_lookup_cache(void)
+{
+    const char *setting = getenv("AC1_LIFTED_LOOKUP_CACHE");
+    memset(ac1_main_lifted_lookup_cache, 0,
+           sizeof(ac1_main_lifted_lookup_cache));
+    ac1_main_lifted_lookup_cache_enabled =
+        !(setting && strcmp(setting, "0") == 0);
+}
 
 _Thread_local uint32_t g_image_delta;
 
@@ -5813,7 +5827,9 @@ void dispatch(CPU *cpu, uint32_t target)
     if (dispatch_ds8_method(cpu, target)) return;
 #endif
 
-    ac1_lifted_fn function = ac1_lifted_lookup(target);
+    ac1_lifted_fn function = ac1_lifted_lookup_cached(
+        target, ac1_main_lifted_lookup_cache_enabled,
+        ac1_main_lifted_lookup_cache, ac1_lifted_lookup);
     if (!function && bink_image_mapped && target >= bink_image.load_base &&
         (uint64_t)target < (uint64_t)bink_image.load_base + bink_image.image_size) {
         bink_lifted_fn bink_function = bink_lifted_lookup(target);
@@ -6124,6 +6140,7 @@ int ac1_run(const char *exe_path)
         return 2;
     }
     lock_ac1_run();
+    reset_main_lifted_lookup_cache();
     dispatch_limit = read_dispatch_limit();
     scheduler_return_slice_ns = read_scheduler_return_slice_ns();
 #ifdef _WIN32
