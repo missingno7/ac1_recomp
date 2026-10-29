@@ -127,7 +127,7 @@ class IndexedTableTests(unittest.TestCase):
                           (0x2100, 0x2100, 0x1300)})
         self.assertTrue(all(edge["role"] == "indexed_table" for edge in edges))
         self.assertEqual(result[9]["table_count"], 2)
-        self.assertEqual(result[9]["rejected_candidates"], {"non_executable": 2})
+        self.assertEqual(result[9]["rejected_candidates"], {"null_run": 2})
         self.assertNotIn(0x1FFC, reads)  # forward from the displacement itself
 
     def test_disable_and_bounded_switch_exclusion(self):
@@ -140,13 +140,22 @@ class IndexedTableTests(unittest.TestCase):
         self.assertEqual(result[9]["rejected_candidates"], {"bounded_switch": 1})
 
     def test_stop_at_first_bad_entry_without_skipping_it(self):
-        for bad, boundary, reason in ((0, True, "non_executable"),
+        for bad, boundary, reason in ((0x5000, True, "non_executable"),
                                       (0x1400, True, "invalid_entry"),
                                       (0x1100, False, "not_function_boundary")):
             result, reads = self.discover(values={0x2000: [bad, 0x1200]}, boundary=boundary)
             self.assertEqual(set(result[2]), {0x1000})
             self.assertEqual(result[9]["rejected_candidates"], {reason: 1})
             self.assertNotIn(0x2004, reads)
+
+    def test_null_slots_are_skipped_until_a_long_zero_run(self):
+        result, _ = self.discover(values={0x2000: [0, 0, 0, 0x1200]})
+        self.assertIn(0x1200, result[2])
+        table = next(t for t in result[9]["tables"] if t["table"] == 0x2000)
+        self.assertEqual((table["entry_count"], table["null_entries"]), (1, 3))
+        result, _ = self.discover(values={0x2000: [0] * 9 + [0x1200]})
+        self.assertNotIn(0x1200, result[2])
+        self.assertEqual(result[9]["rejected_candidates"], {"null_run": 1})
 
     def test_instruction_overlap_and_recovered_entry_exception(self):
         for target, reason in ((0x1001, "mid_instruction"), (0x1007, "interior_instruction")):

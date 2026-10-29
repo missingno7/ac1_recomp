@@ -2732,6 +2732,10 @@ class IndexedTableDiscovery:
             end = next(end for start, end, _ in self.ranges if start <= table < end)
             report = {"table": table, "kind": kind, "reference_count": len(refs), "entry_count": 0}
             cap = 1 if kind == "absolute" else self.entry_cap
+            # NULL slots are common in function tables (e.g. 0x0191B8C0 starts
+            # with three); skip them, but a long zero run ends the table.
+            null_run = 0
+            report["null_entries"] = 0
             for index in range(cap):
                 slot = table + 4 * index
                 report["stop_slot"] = slot
@@ -2748,6 +2752,13 @@ class IndexedTableDiscovery:
                     break
                 target = int.from_bytes(raw, "little")
                 report["stop_target"] = target
+                if target == 0 and kind != "absolute":
+                    null_run += 1
+                    if null_run > 8:
+                        report["stop_reason"] = "null_run"
+                        break
+                    continue
+                pending_nulls, null_run = null_run, 0
                 if target not in validation:
                     validation[target] = code_immediate_rejection(
                         target, self.dis, self.info, iat, spans, results)
@@ -2755,6 +2766,7 @@ class IndexedTableDiscovery:
                     report["stop_reason"] = validation[target]
                     break
                 report["entry_count"] += 1
+                report["null_entries"] += pending_nulls
                 self.edges[target].extend({**ref, "slot": slot, "index": index, "target": target}
                                           for ref in refs.values())
                 if target not in results and target not in queued:

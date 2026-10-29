@@ -1079,10 +1079,14 @@ extern "C" int ac1_ds8_dispatch(uint32_t token, const uint32_t *args,
     if(kind==ObjectKind::Buffer8 && method==22u){
         if(args[2]>4096u){set_error("AcquireResources effects count exceeds bridge limit");return AC1_DS8_ERROR;}
         const uint32_t bytes=args[2]*static_cast<uint32_t>(sizeof(DWORD));
-        auto *guest_codes=static_cast<DWORD *>(guest_memory(args[3],bytes?bytes:sizeof(DWORD),AC1_DS8_GUEST_WRITE));
-        if(!guest_codes){set_error("AcquireResources result codes are not writable in guest memory");return AC1_DS8_ERROR;}
+        /* With no effects (count 0) the result array may be NULL. */
+        DWORD *guest_codes=nullptr;
+        if(bytes){
+            guest_codes=static_cast<DWORD *>(guest_memory(args[3],bytes,AC1_DS8_GUEST_WRITE));
+            if(!guest_codes){set_error("AcquireResources result codes are not writable in guest memory");return AC1_DS8_ERROR;}
+        }
         std::vector<DWORD> codes(args[2]);
-        HRESULT hr=reinterpret_cast<IDirectSoundBuffer8 *>(object.native)->AcquireResources(args[1],args[2],codes.data());
+        HRESULT hr=reinterpret_cast<IDirectSoundBuffer8 *>(object.native)->AcquireResources(args[1],args[2],bytes?codes.data():nullptr);
         if(SUCCEEDED(hr)&&bytes)std::memcpy(guest_codes,codes.data(),bytes);
         *result_out=static_cast<uint32_t>(hr);return AC1_DS8_HANDLED;
     }
