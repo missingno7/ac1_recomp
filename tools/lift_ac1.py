@@ -2008,13 +2008,12 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
                 queued.add(tail_target)
                 queue.append((tail_target, depth + 1))
         for target in terminal_external_direct_jump_targets(function):
-            if target == tail_target:
+            if target == tail_target or target in results or target in queued:
                 continue
             if not validate_callback_code_entry(target, dis, info, iat, instruction_spans):
                 continue
-            if target not in results and target not in queued:
-                queued.add(target)
-                queue.append((target, depth + 1))
+            queued.add(target)
+            queue.append((target, depth + 1))
         for call_edge in ac1_array_constructor_call_edges(function):
             for role in ("constructor", "cleanup"):
                 target = call_edge[role]
