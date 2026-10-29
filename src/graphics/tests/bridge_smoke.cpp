@@ -100,6 +100,134 @@ bool run_native_shader_smoke(uint32_t device, const char *source,
     return true;
 }
 
+std::string guest_string(uint32_t address, uint32_t maximum)
+{
+    std::string result;
+    for (uint32_t i = 0; i < maximum; ++i) {
+        const auto *character = static_cast<const char *>(resolve_guest(
+            nullptr, address + i, 1, AC1_D3D9_GUEST_READ));
+        if (!character) return std::string();
+        if (!*character) return result;
+        result.push_back(*character);
+    }
+    return std::string();
+}
+
+bool run_constant_table_smoke()
+{
+    static const char source[] =
+        "float4 g_ElapsedTime : register(c0);\n"
+        "sampler2D s0 : register(s0);\n"
+        "sampler2D s1 : register(s1);\n"
+        "float4 main(float2 uv : TEXCOORD0) : COLOR0 {\n"
+        " return g_ElapsedTime + tex2D(s0, uv) + tex2D(s1, uv);\n"
+        "}";
+    std::vector<uint8_t> bytecode;
+    if (!compile_native_smoke_shader(source, "ps_3_0", &bytecode)) return false;
+    const uint32_t code_address = allocate_guest(
+        nullptr, static_cast<uint32_t>(bytecode.size()), 4);
+    const uint32_t table_output = allocate_guest(nullptr, sizeof(uint32_t), 4);
+    std::memcpy(resolve_guest(nullptr, code_address,
+        static_cast<uint32_t>(bytecode.size()), AC1_D3D9_GUEST_WRITE),
+        bytecode.data(), bytecode.size());
+    uint32_t native_result = 0;
+    if (ac1_d3d9_get_shader_constant_table(code_address, table_output,
+                                            &native_result) != 1 ||
+        FAILED(static_cast<HRESULT>(native_result)) || !guest_word(table_output)) {
+        std::fprintf(stderr, "D3DXGetShaderConstantTable smoke failed: 0x%08x %s\n",
+                     native_result, ac1_d3d9_last_error());
+        return false;
+    }
+    const uint32_t table = guest_word(table_output);
+    const uint32_t table_desc_output = allocate_guest(nullptr, 12, 4);
+    const uint32_t get_desc_args[] = {table, table_desc_output};
+    if (ac1_d3d9_argument_count(object_slot(table, 5)) != 2 ||
+        ac1_d3d9_dispatch(object_slot(table, 5), get_desc_args, 2,
+                          &native_result) != 1 ||
+        FAILED(static_cast<HRESULT>(native_result))) {
+        std::fprintf(stderr, "ID3DXConstantTable::GetDesc smoke failed: %s\n",
+                     ac1_d3d9_last_error());
+        return false;
+    }
+    uint32_t creator_address = 0, constant_count = 0;
+    std::memcpy(&creator_address,
+        resolve_guest(nullptr, table_desc_output, 4, AC1_D3D9_GUEST_READ), 4);
+    std::memcpy(&constant_count,
+        resolve_guest(nullptr, table_desc_output + 8, 4, AC1_D3D9_GUEST_READ), 4);
+    if (!creator_address || constant_count != 3 || guest_string(creator_address, 256).empty()) {
+        std::fprintf(stderr, "D3DX constant-table descriptor fields mismatch\n");
+        return false;
+    }
+
+    const uint32_t handle_tokens[] = {object_slot(table, 8), object_slot(table, 8),
+                                      object_slot(table, 8)};
+    const uint32_t descriptor_address = allocate_guest(nullptr, 48, 4);
+    const uint32_t count_address = allocate_guest(nullptr, 4, 4);
+    bool saw_elapsed = false, saw_sampler0 = false, saw_sampler1 = false;
+    for (uint32_t i = 0; i < constant_count; ++i) {
+        const uint32_t get_handle_args[] = {table, 0, i};
+        uint32_t handle = 0;
+        if (ac1_d3d9_argument_count(handle_tokens[i]) != 3 ||
+            ac1_d3d9_dispatch(handle_tokens[i], get_handle_args, 3, &handle) != 1 ||
+            !handle) {
+            std::fprintf(stderr, "ID3DXConstantTable::GetConstant[%u] failed: %s\n",
+                         i, ac1_d3d9_last_error());
+            return false;
+        }
+        if (i == 0) {
+            const uint32_t sentinel = 0xdeadbeefu;
+            std::memcpy(resolve_guest(nullptr, descriptor_address, 4,
+                                      AC1_D3D9_GUEST_WRITE), &sentinel, 4);
+            const uint32_t invalid_count_args[] = {
+                table, handle, descriptor_address, kGuestLimit - 2
+            };
+            if (ac1_d3d9_dispatch(object_slot(table, 6), invalid_count_args, 4,
+                                  &native_result) != 1 ||
+                native_result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
+                guest_word(descriptor_address) != sentinel) {
+                std::fprintf(stderr, "unmapped constant-desc count output was not rejected before write\n");
+                return false;
+            }
+        }
+        const uint32_t capacity = 1;
+        std::memcpy(resolve_guest(nullptr, count_address, 4, AC1_D3D9_GUEST_WRITE),
+                    &capacity, 4);
+        const uint32_t get_constant_desc_args[] = {
+            table, handle, descriptor_address, count_address
+        };
+        if (ac1_d3d9_argument_count(object_slot(table, 6)) != 4 ||
+            ac1_d3d9_dispatch(object_slot(table, 6), get_constant_desc_args, 4,
+                              &native_result) != 1 ||
+            FAILED(static_cast<HRESULT>(native_result)) || guest_word(count_address) != 1) {
+            std::fprintf(stderr, "ID3DXConstantTable::GetConstantDesc[%u] failed: %s\n",
+                         i, ac1_d3d9_last_error());
+            return false;
+        }
+        uint32_t name_address = 0, register_index = 0;
+        uint32_t register_set = 0;
+        std::memcpy(&name_address,
+            resolve_guest(nullptr, descriptor_address, 4, AC1_D3D9_GUEST_READ), 4);
+        std::memcpy(&register_set,
+            resolve_guest(nullptr, descriptor_address + 4, 4, AC1_D3D9_GUEST_READ), 4);
+        std::memcpy(&register_index,
+            resolve_guest(nullptr, descriptor_address + 8, 4, AC1_D3D9_GUEST_READ), 4);
+        const std::string name = guest_string(name_address, 256);
+        saw_elapsed |= name == "g_ElapsedTime" && register_set == 2 && register_index == 0;
+        saw_sampler0 |= name == "s0" && register_set == 3 && register_index == 0;
+        saw_sampler1 |= name == "s1" && register_set == 3 && register_index == 1;
+    }
+    const uint32_t release_args[] = {table};
+    if (!saw_elapsed || !saw_sampler0 || !saw_sampler1 ||
+        ac1_d3d9_dispatch(object_slot(table, 2), release_args, 1,
+                          &native_result) != 1 || native_result != 0) {
+        std::fprintf(stderr, "D3DX constant metadata or table release mismatch: %s\n",
+                     ac1_d3d9_last_error());
+        return false;
+    }
+    std::printf("D3DX constant-table GetDesc/GetConstant/GetConstantDesc passed\n");
+    return true;
+}
+
 struct GuestPresentParameters {
     uint32_t back_buffer_width;
     uint32_t back_buffer_height;
@@ -956,6 +1084,11 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "Direct3DCreate9 failed: %s\n", ac1_d3d9_last_error());
         return 2;
     }
+    if (!run_constant_table_smoke()) {
+        std::fprintf(stderr, "D3DX constant-table bridge smoke failed\n");
+        ac1_d3d9_shutdown();
+        return 48;
+    }
     uint32_t vtable = 0;
     std::memcpy(&vtable, resolve_guest(nullptr, d3d9, sizeof(vtable), AC1_D3D9_GUEST_READ),
                 sizeof(vtable));
@@ -981,7 +1114,7 @@ int main(int argc, char **argv)
         ac1_d3d9_argument_count(0x7e002170u) != 9 ||
         ac1_d3d9_dispatch(0x7e002030u, nullptr, 0, nullptr) != -2 ||
         ac1_d3d9_dispatch(0x7e0030b0u, nullptr, 0, nullptr) != -2 ||
-        ac1_d3d9_dispatch(0x7e00a000u, nullptr, 0, nullptr) != 0) {
+        ac1_d3d9_dispatch(0x7e00b000u, nullptr, 0, nullptr) != 0) {
         std::fprintf(stderr, "COM method-arity classification failed\n");
         ac1_d3d9_shutdown();
         return 3;

@@ -67,6 +67,15 @@ AC1_D3D9_API int ac1_d3d9_check_texture_requirements(
     uint32_t guest_mip_levels, uint32_t usage, uint32_t guest_format,
     uint32_t pool, uint32_t *native_hresult_out);
 
+/* Windows native D3DXGetShaderConstantTable import bridge. Validates and
+ * stages a bounded SM3 guest token stream, wraps the native table pointer, and
+ * writes only its synthetic guest proxy to guest_output. Returns 1 when native
+ * D3DX ran (native_hresult_out is valid), -1 for invalid guest ABI/memory, and
+ * -2 when the platform/export/profile is unsupported. */
+AC1_D3D9_API int ac1_d3d9_get_shader_constant_table(
+    uint32_t guest_bytecode, uint32_t guest_output,
+    uint32_t *native_hresult_out);
+
 /* Return the exact number of x86 stack words, including guest `this`, for a
  * supported token. Returns 0 for a foreign token, -1 for a malformed owned
  * token/slot, and -2 for an owned but unsupported COM method. */

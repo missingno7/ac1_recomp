@@ -66,19 +66,20 @@ Android now has the surface and DXVK factory wiring, but it cannot yet reach
 that factory from the original startup path. `handle_window_import` only routes
 ordinary USER32 calls through the Win32 window bridge under `_WIN32`; Android
 currently handles the special `SetWindowsHookExA` fallback but not normal
-window calls. The recorded host startup order begins `LoadCursorA`, then
-`RegisterClassExA`, `AdjustWindowRect`, and `CreateWindowExA`. `LoadCursorA` is
-the first unsupported call in this window sequence, before D3D9 initialization;
-without an Android run, this does not establish the earliest overall startup
-failure. Other Windows-only services, including audio providers, remain. The
-portable Android implementation of `D3DXCheckTextureRequirements` is also still
-missing; building the DXVK provider does not resolve either game-side service.
+window calls. The recorded window-creation sequence uses `LoadCursorA`,
+`RegisterClassExA`, `AdjustWindowRect`, and `CreateWindowExA` before D3D9.
+The host trace also contains an earlier `PeekMessageA` call, with DirectSound
+initialization before it. Without an Android run, this does not establish the
+earliest overall startup failure. Windows-only audio and input providers also
+remain. Portable implementations of the D3DX texture-requirements and shader
+constant-table helpers are missing; linking DXVK does not resolve these
+game-side services.
 
-The latest recorded host trace in `work/startup.log` is later progress on
-Windows: `IDirect3D9::CreateDevice` succeeded and
-`D3DXCheckTextureRequirements` returned `HRESULT=0`; a worker then stopped at
-missing generated guest target `0x00aa9e90`. This is host-only evidence and does
-not imply the Android USER32 path or rendering has run.
+The preserved host trace `work/startup_dxvk_texturelock.log` confirms native
+device creation, D3DX texture validation, and the original texture upload,
+followed by a resource-callback stop that later host builds have passed.
+`work/startup.log` records the current host boundary. Host progress does not
+imply the Android USER32 path or rendering has run.
 
 ## Isolated ARM64 package checkpoint
 
