@@ -322,6 +322,7 @@ int token_argument_count(uint32_t token)
     }
     if (kind == kSurfaceKind) {
         if (method < 3) return method == 0 ? 3 : 1;
+        if (method == 3) return 2;
         return method == 12 ? 2 : -2;
     }
     if (kind == kVertexBufferKind || kind == kIndexBufferKind) {
@@ -1130,6 +1131,30 @@ uint32_t invoke_surface(GuestObject &object, uint32_t method,
             return hresult(D3DERR_INVALIDCALL);
         uint32_t output = 0;
         return hresult(do_query_interface(object, args, &output));
+    }
+    if (method == 3) {
+        if (!require_count(argc, 2, "IDirect3DSurface9::GetDevice"))
+            return hresult(D3DERR_INVALIDCALL);
+        auto *output = static_cast<uint32_t *>(guest_memory(
+            args[1], sizeof(uint32_t), AC1_D3D9_GUEST_WRITE));
+        if (!output) {
+            set_error("IDirect3DSurface9::GetDevice output pointer is unmapped");
+            return hresult(D3DERR_INVALIDCALL);
+        }
+        *output = 0;
+        IDirect3DDevice9 *native_device = nullptr;
+        const HRESULT status = static_cast<IDirect3DSurface9 *>(object.native)->GetDevice(
+            &native_device);
+        if (FAILED(status)) return hresult(status);
+        if (!native_device) {
+            set_error("IDirect3DSurface9::GetDevice succeeded without returning a device");
+            return hresult(E_FAIL);
+        }
+        const uint32_t guest_device = wrap_native(
+            static_cast<IUnknown *>(native_device), ObjectKind::Device, true);
+        if (!guest_device) return hresult(E_OUTOFMEMORY);
+        *output = guest_device;
+        return hresult(status);
     }
     if (method == 1) {
         if (!require_count(argc, 1, "IDirect3DSurface9::AddRef")) return 0;

@@ -874,6 +874,7 @@ int main(int argc, char **argv)
     const uint32_t depth_args[] = {device, depth_output};
     if (ac1_d3d9_argument_count(get_render_target) != 3 ||
         ac1_d3d9_argument_count(get_depth_stencil) != 2 ||
+        ac1_d3d9_argument_count(object_slot(device, 3)) != -2 ||
         ac1_d3d9_dispatch(get_render_target, render_args, 3, &getter_result) != 1 ||
         FAILED(static_cast<HRESULT>(getter_result)) || !guest_word(render_output) ||
         ac1_d3d9_dispatch(get_depth_stencil, depth_args, 2, &getter_result) != 1 ||
@@ -890,6 +891,7 @@ int main(int argc, char **argv)
     const uint32_t desc_address = allocate_guest(nullptr, 32, 4);
     const uint32_t desc_args[] = {surface, desc_address};
     if (ac1_d3d9_argument_count(surface_desc_token) != 2 ||
+        ac1_d3d9_argument_count(object_slot(surface, 3)) != 2 ||
         ac1_d3d9_dispatch(surface_desc_token, desc_args, 2, &getter_result) != 1 ||
         FAILED(static_cast<HRESULT>(getter_result))) {
         std::fprintf(stderr, "surface GetDesc smoke failed: %s (HRESULT=0x%08x)\n",
@@ -911,6 +913,29 @@ int main(int argc, char **argv)
         DestroyWindow(hidden_window);
         ac1_d3d9_shutdown();
         return 13;
+    }
+
+    const uint32_t surface_device_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t get_surface_device_args[] = {surface, surface_device_output};
+    if (ac1_d3d9_dispatch(object_slot(surface, 3), get_surface_device_args, 2,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result)) ||
+        guest_word(surface_device_output) != device) {
+        std::fprintf(stderr, "surface GetDevice did not return the existing device proxy: %s "
+                             "(HRESULT=0x%08x, guest=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result,
+                     guest_word(surface_device_output));
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 24;
+    }
+    const uint32_t device_this_for_getdevice[] = {device};
+    if (ac1_d3d9_dispatch(object_slot(device, 2), device_this_for_getdevice, 1,
+                          &references) != 1 || references != 1) {
+        std::fprintf(stderr, "surface GetDevice reference balance failed\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 25;
     }
 
     const uint8_t iid_unknown[16] = {
