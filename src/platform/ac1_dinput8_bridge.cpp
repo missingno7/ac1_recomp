@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include "ac1_dinput8_bridge.h"
+#include "ac1_input_script.h"
 
 #include <windows.h>
 #include <dinput.h>
@@ -41,6 +42,7 @@ const GUID kIidDeviceW =
 
 struct GuestObject {
     IUnknown *native = nullptr;
+    int input_kind = 0; /* 1: system keyboard, 2: system mouse */
     ObjectKind kind = ObjectKind::Unknown;
     uint32_t guest_vtable = 0;
     uint32_t guest_references = 1;
@@ -564,8 +566,27 @@ int invoke_get_device_state(GuestObject &object, const uint32_t *args,
         set_error(message.str());
         return AC1_DINPUT8_ERROR;
     }
+    char input_error[1024];
+    if (!ac1_input_session_init(input_error, sizeof(input_error))) {
+        set_error(input_error);
+        return AC1_DINPUT8_ERROR;
+    }
+    if (object.input_kind) {
+        const int replay = ac1_input_replace_state(object.input_kind == 1, output, args[1]);
+        if (replay < 0) {
+            set_error("input replay: unsupported system keyboard/mouse GetDeviceState byte count " + std::to_string(args[1]));
+            return AC1_DINPUT8_METHOD_UNSUPPORTED;
+        }
+        if (replay) {
+            ac1_input_record_state(object.input_kind == 1, output, args[1]);
+            *result_out = DI_OK;
+            return AC1_DINPUT8_HANDLED;
+        }
+    }
     const HRESULT result = reinterpret_cast<IDirectInputDevice8W *>(object.native)
         ->GetDeviceState(args[1], output);
+    if (SUCCEEDED(result) && object.input_kind)
+        ac1_input_record_state(object.input_kind == 1, output, args[1]);
     *result_out = static_cast<uint32_t>(result);
     return AC1_DINPUT8_HANDLED;
 }
@@ -633,6 +654,7 @@ int invoke_query_interface(GuestObject &object, const uint32_t *args,
     }
     const uint32_t guest_object = wrap_native(
         static_cast<IUnknown *>(native_result), result_kind);
+    if (guest_object) g_objects.at(guest_object).input_kind = object.input_kind;
     if (!guest_object) return AC1_DINPUT8_ERROR;
     *output = guest_object;
     *result_out = static_cast<uint32_t>(result);
@@ -683,6 +705,10 @@ int invoke_create_device(GuestObject &object, const uint32_t *args,
     const ObjectKind device_kind = object.kind == ObjectKind::InputA
         ? ObjectKind::DeviceA : ObjectKind::DeviceW;
     const uint32_t guest_object = wrap_native(native, device_kind);
+    const GUID keyboard_guid = {0x6f1d2b61,0xd5a0,0x11cf,{0xbf,0xc7,0x44,0x45,0x53,0x54,0,0}};
+    const GUID mouse_guid = {0x6f1d2b60,0xd5a0,0x11cf,{0xbf,0xc7,0x44,0x45,0x53,0x54,0,0}};
+    if (guest_object) g_objects.at(guest_object).input_kind =
+        IsEqualGUID(device_guid, keyboard_guid) ? 1 : IsEqualGUID(device_guid, mouse_guid) ? 2 : 0;
     if (!guest_object) return AC1_DINPUT8_ERROR;
     *output = guest_object;
     *result_out = static_cast<uint32_t>(result);
@@ -906,6 +932,7 @@ extern "C" void ac1_dinput8_shutdown(void)
     }
     g_objects.clear();
     g_pending_enum_batches.clear();
+    ac1_input_session_shutdown();
     if (g_dinput_module) {
         FreeLibrary(g_dinput_module);
         g_dinput_module = nullptr;

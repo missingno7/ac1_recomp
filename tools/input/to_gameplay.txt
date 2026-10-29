@@ -1,0 +1,17 @@
+# AC1 title -> selected profile (or create Replay) -> main menu -> Continue/New Game.
+# Timing is in successful presents. DI state and WM key messages are generated together.
+# Keep the cursor away from menu rows so keyboard selection remains stable.
+at 0 mouse move 30 30
+at 200 tap RETURN 3
+at 400 tap RETURN 3
+# If Create New Profile was selected, enter its name. Existing-profile menus ignore text.
+at 500 tap R 2
++8 tap E 2
++8 tap P 2
++8 tap L 2
++8 tap A 2
++8 tap Y 2
+at 650 tap RETURN 3
+at 900 tap RETURN 3
+at 1200 tap RETURN 3
+at 1500 tap RETURN 3

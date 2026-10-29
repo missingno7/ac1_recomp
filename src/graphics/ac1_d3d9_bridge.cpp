@@ -16,6 +16,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -255,7 +256,7 @@ std::map<uint32_t, GuestConstantHandle> g_constant_handles;
 std::map<std::pair<uint32_t, uintptr_t>, uint32_t> g_guest_handle_by_native;
 std::mutex g_mutex;
 uint64_t g_successful_draw_calls = 0;
-uint64_t g_successful_present_calls = 0;
+std::atomic<uint64_t> g_successful_present_calls{0};
 bool g_frame_trace_enabled = false;
 bool g_frame_trace_initialized = false;
 bool g_first_draw_reported = false;
@@ -284,7 +285,9 @@ void capture_back_buffer(IDirect3DDevice9 *device)
     const char *dir = std::getenv("AC1_D3D9_CAPTURE_DIR");
     if (!dir || !*dir || !device) return;
     const uint64_t n = ++g_capture_present_index;
-    if (n & (n - 1u)) return;
+    const char *every = std::getenv("AC1_D3D9_CAPTURE_EVERY");
+    const uint64_t interval = every ? std::strtoull(every, nullptr, 10) : 0;
+    if ((n & (n - 1u)) && (!interval || n % interval)) return;
     IDirect3DSurface9 *back = nullptr, *copy = nullptr;
     D3DSURFACE_DESC desc{};
     D3DLOCKED_RECT locked{};
@@ -339,9 +342,9 @@ void trace_frame_success(bool is_present, const char *method)
             "AC1_D3D9_TRACE_FRAME", value, static_cast<DWORD>(sizeof(value))) != 0;
         g_frame_trace_initialized = true;
     }
+    if (is_present) g_successful_present_calls.fetch_add(1, std::memory_order_relaxed);
     if (!g_frame_trace_enabled) return;
     if (is_present) {
-        ++g_successful_present_calls;
         const uint64_t n = g_successful_present_calls;
         if (n >= 2u && !(n & (n - 1u)))
             std::fprintf(stderr, "AC1 D3D9 trace: present_calls=%llu draw_calls=%llu t_ms=%lu\n",
@@ -3939,4 +3942,9 @@ extern "C" AC1_D3D9_API void ac1_d3d9_shutdown(void)
 extern "C" AC1_D3D9_API const char *ac1_d3d9_last_error(void)
 {
     return g_last_error;
+}
+
+extern "C" AC1_D3D9_API uint64_t ac1_d3d9_present_count(void)
+{
+    return g_successful_present_calls.load(std::memory_order_relaxed);
 }
