@@ -29687,9 +29687,14 @@
       "0x00CC4530",
       "0x00CC4540",
       "0x00CC4550",
-      "0x00CC4560"
+      "0x00CC4560",
+      "0x008D7DE0",
+      "0x008D7E10",
+      "0x008D7E40",
+      "0x008D7E70",
+      "0x004CD940"
     ]
   },
   "functions_per_translation_unit": 100,
-  "translation_unit_buckets": 100
+  "translation_unit_buckets": 1000
 }

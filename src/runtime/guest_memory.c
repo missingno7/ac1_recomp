@@ -266,6 +266,113 @@ int guest_memory_read(uint32_t address, void *output, size_t width)
     memcpy(output,source,width);return 1;
 }
 
+/* CPU scalar accesses can cross adjacent guest mappings whose host backing
+ * allocations are unrelated. Validate the full guest span first, then copy
+ * it in per-region chunks. Raw guest_ptr intentionally remains one-region. */
+static guest_memory_region_t *scalar_region_at(uint64_t address)
+{
+    if (!selected_memory || address >= UINT64_C(0x100000000)) return NULL;
+    for (size_t i = 0; i < current_memory.count; ++i) {
+        guest_memory_region_t *region = &current_memory.regions[i];
+        uint64_t end = (uint64_t)region->base + region->size;
+        if (address >= region->base && address < end) return region;
+    }
+    return NULL;
+}
+
+static int scalar_span_mapped(uint64_t begin, uint64_t end)
+{
+    uint64_t at = begin;
+    while (at < end) {
+        guest_memory_region_t *region = scalar_region_at(at);
+        if (!region) return 0;
+        uint64_t region_end = (uint64_t)region->base + region->size;
+        if (region_end <= at) return 0;
+        at = region_end < end ? region_end : end;
+    }
+    return 1;
+}
+
+static void scalar_copy_from(uint64_t begin, uint64_t end, uint8_t *output)
+{
+    uint64_t at = begin;
+    while (at < end) {
+        guest_memory_region_t *region = scalar_region_at(at);
+        uint64_t region_end = (uint64_t)region->base + region->size;
+        size_t chunk = (size_t)((region_end < end ? region_end : end) - at);
+        memcpy(output, region->data + (size_t)(at - region->base), chunk);
+        output += chunk;
+        at += chunk;
+    }
+}
+
+static void scalar_copy_to(uint64_t begin, uint64_t end, const uint8_t *input)
+{
+    uint64_t at = begin;
+    while (at < end) {
+        guest_memory_region_t *region = scalar_region_at(at);
+        uint64_t region_end = (uint64_t)region->base + region->size;
+        size_t chunk = (size_t)((region_end < end ? region_end : end) - at);
+        memcpy(region->data + (size_t)(at - region->base), input, chunk);
+        input += chunk;
+        at += chunk;
+    }
+}
+
+int guest_memory_read_scalar(uint32_t address, void *output, size_t width)
+{
+    if (!output || !width || width > 16u) return 0;
+    uint64_t end = (uint64_t)address + width;
+    if (end > UINT64_C(0x100000000)) return 0;
+    void *single = guest_memory_try_ptr(address, width);
+    if (single) {
+        memcpy(output, single, width);
+        return 1;
+    }
+    if (!scalar_span_mapped(address, end)) return 0;
+    scalar_copy_from(address, end, (uint8_t *)output);
+    return 1;
+}
+
+int guest_memory_write_scalar(uint32_t address, const void *input, size_t width)
+{
+    if (!input || !width || width > 16u) return 0;
+    uint64_t end = (uint64_t)address + width;
+    if (end > UINT64_C(0x100000000)) return 0;
+    void *single = guest_memory_try_ptr(address, width);
+    if (single) {
+        memcpy(single, input, width);
+        return 1;
+    }
+    if (!scalar_span_mapped(address, end)) return 0;
+    scalar_copy_to(address, end, (const uint8_t *)input);
+    return 1;
+}
+
+void guest_execution_read(uint32_t address, void *output, size_t width)
+{
+#ifdef DUKEMP_DIRECT_MEMORY
+    if (guest_execution_base) {
+        memcpy(output, guest_execution_base + address, width);
+        return;
+    }
+#endif
+    if (!guest_memory_read_scalar(address, output, width))
+        fail("unmapped scalar read", address, width);
+}
+
+void guest_execution_write(uint32_t address, const void *input, size_t width)
+{
+#ifdef DUKEMP_DIRECT_MEMORY
+    if (guest_execution_base) {
+        memcpy(guest_execution_base + address, input, width);
+        return;
+    }
+#endif
+    if (!guest_memory_write_scalar(address, input, width))
+        fail("unmapped scalar write", address, width);
+}
+
 void *guest_ptr(uint32_t address, size_t width)
 {
     uint64_t end, region_end, offset;

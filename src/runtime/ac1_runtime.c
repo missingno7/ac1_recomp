@@ -5551,6 +5551,10 @@ int ac1_run(const char *exe_path)
     trace_file_read_count = 0;
     crt_handoff_logged = 0;
     memcpy(exe_path_copy, exe_path, strlen(exe_path) + 1u);
+#ifdef _WIN32
+    for (size_t i = 0; exe_path_copy[i]; ++i)
+        if (exe_path_copy[i] == '/') exe_path_copy[i] = '\\';
+#endif
     derive_guest_current_directory(exe_path_copy);
     if (!read_file(exe_path, &file_bytes, &file_size, error, sizeof(error))) {
         snprintf(last_run_error, sizeof(last_run_error), "%s", error);

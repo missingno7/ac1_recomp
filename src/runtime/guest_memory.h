@@ -42,6 +42,11 @@ void *guest_ptr(uint32_t address, size_t width);
 /* Optional observers: bounded read under the serialized guest owner; no abort. */
 void *guest_memory_try_ptr(uint32_t address, size_t width);
 int guest_memory_read(uint32_t address, void *output, size_t width);
+/* Checked fixed-width CPU accesses may cross adjacent mappings. */
+int guest_memory_read_scalar(uint32_t address, void *output, size_t width);
+int guest_memory_write_scalar(uint32_t address, const void *input, size_t width);
+void guest_execution_read(uint32_t address, void *output, size_t width);
+void guest_execution_write(uint32_t address, const void *input, size_t width);
 static inline void *guest_execution_ptr(uint32_t address, size_t width) {
 #ifdef DUKEMP_DIRECT_MEMORY
     /* Only lifted fixed-width accesses use this path. The extra inaccessible

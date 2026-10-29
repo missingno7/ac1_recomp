@@ -69,6 +69,18 @@ def main() -> None:
             if text.count(marker) != 1:
                 raise SystemExit(f"unexpected guest-memory header shape: {source}")
             text = text.replace(marker, marker + "\nuint64_t guest_memory_region_size(uint32_t base);")
+            marker = "int guest_memory_read(uint32_t address, void *output, size_t width);"
+            if text.count(marker) != 1:
+                raise SystemExit(f"unexpected guest-memory read declaration: {source}")
+            text = text.replace(
+                marker,
+                marker + "\n"
+                "/* Checked fixed-width CPU accesses may cross adjacent mappings. */\n"
+                "int guest_memory_read_scalar(uint32_t address, void *output, size_t width);\n"
+                "int guest_memory_write_scalar(uint32_t address, const void *input, size_t width);\n"
+                "void guest_execution_read(uint32_t address, void *output, size_t width);\n"
+                "void guest_execution_write(uint32_t address, const void *input, size_t width);",
+            )
             content = text.replace("\r\n", "\n").encode("utf-8")
         if destination == "src/runtime/guest_memory.c":
             text = content.decode("utf-8").replace("\r\n", "\n")
@@ -97,6 +109,118 @@ def main() -> None:
                 "}\n\n"
                 + marker,
             )
+            marker = "void *guest_ptr(uint32_t address, size_t width)\n"
+            if text.count(marker) != 1:
+                raise SystemExit(f"unexpected guest-memory pointer implementation: {source}")
+            scalar_helpers = r'''/* CPU scalar accesses can cross adjacent guest mappings whose host backing
+ * allocations are unrelated. Validate the full guest span first, then copy
+ * it in per-region chunks. Raw guest_ptr intentionally remains one-region. */
+static guest_memory_region_t *scalar_region_at(uint64_t address)
+{
+    if (!selected_memory || address >= UINT64_C(0x100000000)) return NULL;
+    for (size_t i = 0; i < current_memory.count; ++i) {
+        guest_memory_region_t *region = &current_memory.regions[i];
+        uint64_t end = (uint64_t)region->base + region->size;
+        if (address >= region->base && address < end) return region;
+    }
+    return NULL;
+}
+
+static int scalar_span_mapped(uint64_t begin, uint64_t end)
+{
+    uint64_t at = begin;
+    while (at < end) {
+        guest_memory_region_t *region = scalar_region_at(at);
+        if (!region) return 0;
+        uint64_t region_end = (uint64_t)region->base + region->size;
+        if (region_end <= at) return 0;
+        at = region_end < end ? region_end : end;
+    }
+    return 1;
+}
+
+static void scalar_copy_from(uint64_t begin, uint64_t end, uint8_t *output)
+{
+    uint64_t at = begin;
+    while (at < end) {
+        guest_memory_region_t *region = scalar_region_at(at);
+        uint64_t region_end = (uint64_t)region->base + region->size;
+        size_t chunk = (size_t)((region_end < end ? region_end : end) - at);
+        memcpy(output, region->data + (size_t)(at - region->base), chunk);
+        output += chunk;
+        at += chunk;
+    }
+}
+
+static void scalar_copy_to(uint64_t begin, uint64_t end, const uint8_t *input)
+{
+    uint64_t at = begin;
+    while (at < end) {
+        guest_memory_region_t *region = scalar_region_at(at);
+        uint64_t region_end = (uint64_t)region->base + region->size;
+        size_t chunk = (size_t)((region_end < end ? region_end : end) - at);
+        memcpy(region->data + (size_t)(at - region->base), input, chunk);
+        input += chunk;
+        at += chunk;
+    }
+}
+
+int guest_memory_read_scalar(uint32_t address, void *output, size_t width)
+{
+    if (!output || !width || width > 16u) return 0;
+    uint64_t end = (uint64_t)address + width;
+    if (end > UINT64_C(0x100000000)) return 0;
+    void *single = guest_memory_try_ptr(address, width);
+    if (single) {
+        memcpy(output, single, width);
+        return 1;
+    }
+    if (!scalar_span_mapped(address, end)) return 0;
+    scalar_copy_from(address, end, (uint8_t *)output);
+    return 1;
+}
+
+int guest_memory_write_scalar(uint32_t address, const void *input, size_t width)
+{
+    if (!input || !width || width > 16u) return 0;
+    uint64_t end = (uint64_t)address + width;
+    if (end > UINT64_C(0x100000000)) return 0;
+    void *single = guest_memory_try_ptr(address, width);
+    if (single) {
+        memcpy(single, input, width);
+        return 1;
+    }
+    if (!scalar_span_mapped(address, end)) return 0;
+    scalar_copy_to(address, end, (const uint8_t *)input);
+    return 1;
+}
+
+void guest_execution_read(uint32_t address, void *output, size_t width)
+{
+#ifdef DUKEMP_DIRECT_MEMORY
+    if (guest_execution_base) {
+        memcpy(output, guest_execution_base + address, width);
+        return;
+    }
+#endif
+    if (!guest_memory_read_scalar(address, output, width))
+        fail("unmapped scalar read", address, width);
+}
+
+void guest_execution_write(uint32_t address, const void *input, size_t width)
+{
+#ifdef DUKEMP_DIRECT_MEMORY
+    if (guest_execution_base) {
+        memcpy(guest_execution_base + address, input, width);
+        return;
+    }
+#endif
+    if (!guest_memory_write_scalar(address, input, width))
+        fail("unmapped scalar write", address, width);
+}
+
+'''
+            text = text.replace(marker, scalar_helpers + marker)
             content = text.replace("\r\n", "\n").encode("utf-8")
         if destination == "src/runtime/cpu.h":
             text = content.decode("utf-8")
@@ -114,6 +238,35 @@ def main() -> None:
             if text.count(todo) != 1:
                 raise SystemExit(f"unexpected pcrecomp RECOMP_TODO hook in {source}")
             text = text.replace(todo, "#define RECOMP_TODO(va, text) ac1_unsupported_instruction((va), (text))")
+            access_replacements = {
+                "memcpy(&v, guest_execution_ptr(a, 1), 1);": "guest_execution_read(a, &v, 1);",
+                "memcpy(&v, guest_execution_ptr(a, 2), 2);": "guest_execution_read(a, &v, 2);",
+                "memcpy(&v, guest_execution_ptr(a, 4), 4);": "guest_execution_read(a, &v, 4);",
+                "memcpy(&v, guest_execution_ptr(a, 8), 8);": "guest_execution_read(a, &v, 8);",
+                "memcpy(guest_execution_ptr(a, 1), &v, 1);": "guest_execution_write(a, &v, 1);",
+                "memcpy(guest_execution_ptr(a, 2), &v, 2);": "guest_execution_write(a, &v, 2);",
+                "memcpy(guest_execution_ptr(a, 4), &v, 4);": "guest_execution_write(a, &v, 4);",
+                "memcpy(guest_execution_ptr(a, 8), &v, 8);": "guest_execution_write(a, &v, 8);",
+                "memcpy(&f, guest_execution_ptr(a, 4), 4);": "guest_execution_read(a, &f, 4);",
+                "memcpy(&d, guest_execution_ptr(a, 8), 8);": "guest_execution_read(a, &d, 8);",
+                "memcpy(&i, guest_execution_ptr(a, 2), 2);": "guest_execution_read(a, &i, 2);",
+                "memcpy(&i, guest_execution_ptr(a, 4), 4);": "guest_execution_read(a, &i, 4);",
+                "memcpy(&i, guest_execution_ptr(a, 8), 8);": "guest_execution_read(a, &i, 8);",
+                "memcpy(guest_execution_ptr(a, 4), &f, 4);": "guest_execution_write(a, &f, 4);",
+                "memcpy(guest_execution_ptr(a, 4), &i, 4);": "guest_execution_write(a, &i, 4);",
+                "memcpy(guest_execution_ptr(a, 2), &i, 2);": "guest_execution_write(a, &i, 2);",
+                "memcpy(guest_execution_ptr(a, 8), &i, 8);": "guest_execution_write(a, &i, 8);",
+                "memcpy(&x, guest_execution_ptr(a, 16), 16);": "guest_execution_read(a, &x, 16);",
+                "memcpy(guest_execution_ptr(a, 16), &v, 16);": "guest_execution_write(a, &v, 16);",
+                "memcpy(b, guest_execution_ptr(a, 10), 10);": "guest_execution_read(a, b, 10);",
+                "memcpy(guest_execution_ptr(a, 10), b, 10);": "guest_execution_write(a, b, 10);",
+            }
+            for old, new in access_replacements.items():
+                if text.count(old) == 0:
+                    raise SystemExit(f"expected CPU guest-memory operand not found: {old}")
+                text = text.replace(old, new)
+            if "guest_execution_ptr(a," in text:
+                raise SystemExit("CPU header still has an unconverted fixed-width memory operand")
             content = text.replace("\r\n", "\n").encode("utf-8")
         if not output.exists() or output.read_bytes() != content:
             output.write_bytes(content)

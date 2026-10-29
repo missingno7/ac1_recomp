@@ -111,12 +111,12 @@ void ac1_unsupported_instruction(uint32_t guest_va, const char *reason);
 #define SET16(r, v)   ((r) = ((r) & 0xFFFF0000u) | (uint16_t)(v))
 
 /* ---- memory access: checked uint32 guest VA to native pointer ---- */
-static inline uint8_t rd8(uint32_t a) { uint8_t v; memcpy(&v, guest_execution_ptr(a, 1), 1); return v; }
-static inline uint16_t rd16(uint32_t a) { uint16_t v; memcpy(&v, guest_execution_ptr(a, 2), 2); return v; }
-static inline uint32_t rd32(uint32_t a) { uint32_t v; memcpy(&v, guest_execution_ptr(a, 4), 4); return v; }
-static inline void wr8(uint32_t a, uint8_t v) { memcpy(guest_execution_ptr(a, 1), &v, 1); }
-static inline void wr16(uint32_t a, uint16_t v) { memcpy(guest_execution_ptr(a, 2), &v, 2); }
-static inline void wr32(uint32_t a, uint32_t v) { memcpy(guest_execution_ptr(a, 4), &v, 4); }
+static inline uint8_t rd8(uint32_t a) { uint8_t v; guest_execution_read(a, &v, 1); return v; }
+static inline uint16_t rd16(uint32_t a) { uint16_t v; guest_execution_read(a, &v, 2); return v; }
+static inline uint32_t rd32(uint32_t a) { uint32_t v; guest_execution_read(a, &v, 4); return v; }
+static inline void wr8(uint32_t a, uint8_t v) { guest_execution_write(a, &v, 1); }
+static inline void wr16(uint32_t a, uint16_t v) { guest_execution_write(a, &v, 2); }
+static inline void wr32(uint32_t a, uint32_t v) { guest_execution_write(a, &v, 4); }
 
 /* ---- fs:-relative access (TIB / SEH chain) ----
  *
@@ -153,8 +153,8 @@ static inline void wr32(uint32_t a, uint32_t v) { memcpy(guest_execution_ptr(a, 
  * round-trip would be exact for every value except the signalling NaNs a
  * mask-producing compare leaves behind. memcpy, because the address need
  * not be aligned. */
-static inline uint64_t rd64(uint32_t a) { uint64_t v; memcpy(&v, guest_execution_ptr(a, 8), 8); return v; }
-static inline void wr64(uint32_t a, uint64_t v) { memcpy(guest_execution_ptr(a, 8), &v, 8); }
+static inline uint64_t rd64(uint32_t a) { uint64_t v; guest_execution_read(a, &v, 8); return v; }
+static inline void wr64(uint32_t a, uint64_t v) { guest_execution_write(a, &v, 8); }
 
 /* ---- EFLAGS pack/unpack (modelled bits only) ---- */
 /* `lock`-prefixed read-modify-write.
@@ -468,16 +468,16 @@ static inline double fpop(CPU *c) { double v = c->st[c->fpu_top]; c->fpu_top = (
 static inline double *fst(CPU *c, int i) { return &c->st[(c->fpu_top + i) & 7]; }
 
 /* float/double/int memory operands (memcpy avoids alignment/aliasing issues) */
-static inline double rdf32(uint32_t a) { float  f; memcpy(&f, guest_execution_ptr(a, 4), 4); return (double)f; }
-static inline double rdf64(uint32_t a) { double d; memcpy(&d, guest_execution_ptr(a, 8), 8); return d; }
-static inline double rdi16(uint32_t a) { int16_t i; memcpy(&i, guest_execution_ptr(a, 2), 2); return (double)i; }
-static inline double rdi32(uint32_t a) { int32_t i; memcpy(&i, guest_execution_ptr(a, 4), 4); return (double)i; }
-static inline double rdi64(uint32_t a) { int64_t i; memcpy(&i, guest_execution_ptr(a, 8), 8); return (double)i; }
-static inline void   wrf32(uint32_t a, double v) { float  f = (float)v; memcpy(guest_execution_ptr(a, 4), &f, 4); }
-static inline void   wrf64(uint32_t a, double v) { memcpy(guest_execution_ptr(a, 8), &v, 8); }
-static inline void   wri32(uint32_t a, double v) { int32_t i = (int32_t)nearbyint(v); memcpy(guest_execution_ptr(a, 4), &i, 4); }
-static inline void   wri16(uint32_t a, double v) { int16_t i = (int16_t)nearbyint(v); memcpy(guest_execution_ptr(a, 2), &i, 2); }
-static inline void   wri64(uint32_t a, double v) { int64_t i = (int64_t)nearbyint(v); memcpy(guest_execution_ptr(a, 8), &i, 8); }
+static inline double rdf32(uint32_t a) { float  f; guest_execution_read(a, &f, 4); return (double)f; }
+static inline double rdf64(uint32_t a) { double d; guest_execution_read(a, &d, 8); return d; }
+static inline double rdi16(uint32_t a) { int16_t i; guest_execution_read(a, &i, 2); return (double)i; }
+static inline double rdi32(uint32_t a) { int32_t i; guest_execution_read(a, &i, 4); return (double)i; }
+static inline double rdi64(uint32_t a) { int64_t i; guest_execution_read(a, &i, 8); return (double)i; }
+static inline void   wrf32(uint32_t a, double v) { float  f = (float)v; guest_execution_write(a, &f, 4); }
+static inline void   wrf64(uint32_t a, double v) { guest_execution_write(a, &v, 8); }
+static inline void   wri32(uint32_t a, double v) { int32_t i = (int32_t)nearbyint(v); guest_execution_write(a, &i, 4); }
+static inline void   wri16(uint32_t a, double v) { int16_t i = (int16_t)nearbyint(v); guest_execution_write(a, &i, 2); }
+static inline void   wri64(uint32_t a, double v) { int64_t i = (int64_t)nearbyint(v); guest_execution_write(a, &i, 8); }
 
 
 /* fcom/fcomp: set C3/C2/C0 (st0 vs v). Cleared C1. */
@@ -517,12 +517,12 @@ static inline void do_sahf(CPU *c, uint8_t ah) {
 /* Memory operands. Separate from the x87 rdf32/rdf64 above because those
  * widen to double for the 80-bit stack, and these must not. memcpy because an
  * SSE memory operand is frequently unaligned (movups exists for a reason). */
-static inline float  rdss(uint32_t a) { float  f; memcpy(&f, guest_execution_ptr(a, 4), 4); return f; }
-static inline double rdsd(uint32_t a) { double d; memcpy(&d, guest_execution_ptr(a, 8), 8); return d; }
-static inline XMM    rdxm(uint32_t a) { XMM x;    memcpy(&x, guest_execution_ptr(a, 16), 16); return x; }
-static inline void   wrss(uint32_t a, float  v) { memcpy(guest_execution_ptr(a, 4), &v, 4); }
-static inline void   wrsd(uint32_t a, double v) { memcpy(guest_execution_ptr(a, 8), &v, 8); }
-static inline void   wrxm(uint32_t a, XMM    v) { memcpy(guest_execution_ptr(a, 16), &v, 16); }
+static inline float  rdss(uint32_t a) { float  f; guest_execution_read(a, &f, 4); return f; }
+static inline double rdsd(uint32_t a) { double d; guest_execution_read(a, &d, 8); return d; }
+static inline XMM    rdxm(uint32_t a) { XMM x;    guest_execution_read(a, &x, 16); return x; }
+static inline void   wrss(uint32_t a, float  v) { guest_execution_write(a, &v, 4); }
+static inline void   wrsd(uint32_t a, double v) { guest_execution_write(a, &v, 8); }
+static inline void   wrxm(uint32_t a, XMM    v) { guest_execution_write(a, &v, 16); }
 
 /* MOVSS/MOVSD loading from memory zero the rest of the register; the
  * register-to-register forms leave the high lanes alone. Getting that
@@ -611,7 +611,7 @@ static inline uint32_t bit_reg_op(CPU *c, uint32_t *r, uint32_t idx, int op)
 static inline double rdf80(uint32_t a)
 {
     unsigned char b[10];
-    memcpy(b, guest_execution_ptr(a, 10), 10);
+    guest_execution_read(a, b, 10);
 
     uint64_t mant;
     uint16_t se;
@@ -653,7 +653,7 @@ static inline void wrf80(uint32_t a, double v)
     }
     memcpy(b, &mant, 8);
     memcpy(b + 8, &se, 2);
-    memcpy(guest_execution_ptr(a, 10), b, 10);
+    guest_execution_write(a, b, 10);
 }
 
 /* FPREM: the remainder of st0/st1 with the quotient truncated toward zero,

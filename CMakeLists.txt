@@ -83,6 +83,13 @@ if(NOT ANDROID)
   add_executable(ac1_files_contract EXCLUDE_FROM_ALL
     tests/files_contract.c src/runtime/ac1_files.c)
   target_include_directories(ac1_files_contract PRIVATE src/runtime)
+  add_executable(ac1_guest_memory_contract EXCLUDE_FROM_ALL
+    tests/guest_memory_scalar_fixture.c src/runtime/guest_memory.c)
+  target_include_directories(ac1_guest_memory_contract PRIVATE src/runtime)
+  if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(ac1_guest_memory_contract PRIVATE
+      -fwrapv -fno-strict-aliasing -ffp-contract=off)
+  endif()
   if(WIN32)
     target_link_libraries(ac1_crypto_contract PRIVATE advapi32)
   endif()
