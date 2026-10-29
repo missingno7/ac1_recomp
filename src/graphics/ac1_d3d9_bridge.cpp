@@ -40,9 +40,13 @@ constexpr uint32_t kVertexBufferKind = 4u;
 constexpr uint32_t kIndexBufferKind = 5u;
 constexpr uint32_t kVertexDeclarationKind = 6u;
 constexpr uint32_t kTextureKind = 7u;
+constexpr uint32_t kPixelShaderKind = 8u;
+constexpr uint32_t kVertexShaderKind = 9u;
 constexpr uint32_t kD3D9VtableSlots = 17u;
 constexpr uint32_t kDeviceVtableSlots = 119u;
 constexpr uint32_t kSurfaceVtableSlots = 17u;
+constexpr uint32_t kPixelShaderVtableSlots = 5u;
+constexpr uint32_t kVertexShaderVtableSlots = 5u;
 
 constexpr GUID kIidIUnknown =
     {0x00000000u, 0x0000u, 0x0000u, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
@@ -62,6 +66,10 @@ constexpr GUID kIidIDirect3DBaseTexture9 =
     {0x580ca87eu, 0x1d3cu, 0x4d54u, {0x99, 0x1d, 0xb7, 0xd3, 0xe3, 0xc2, 0x98, 0xce}};
 constexpr GUID kIidIDirect3DTexture9 =
     {0x85c31227u, 0x3de5u, 0x4f00u, {0x9b, 0x3a, 0xf1, 0x1a, 0xc3, 0x8c, 0x18, 0xb5}};
+constexpr GUID kIidIDirect3DPixelShader9 =
+    {0x6d3bdbdcu, 0x5b02u, 0x4415u, {0xb8, 0x52, 0xce, 0x5e, 0x8b, 0xcc, 0xb2, 0x89}};
+constexpr GUID kIidIDirect3DVertexShader9 =
+    {0xefc5557eu, 0x6265u, 0x4613u, {0x8a, 0x94, 0x43, 0x85, 0x78, 0x89, 0xeb, 0x36}};
 
 enum class ObjectKind : uint32_t {
     D3D9 = kD3D9Kind,
@@ -70,7 +78,9 @@ enum class ObjectKind : uint32_t {
     VertexBuffer = kVertexBufferKind,
     IndexBuffer = kIndexBufferKind,
     VertexDeclaration = kVertexDeclarationKind,
-    Texture = kTextureKind
+    Texture = kTextureKind,
+    PixelShader = kPixelShaderKind,
+    VertexShader = kVertexShaderKind
 };
 
 struct GuestObject {
@@ -401,17 +411,19 @@ uint32_t slot_count(ObjectKind kind)
     case ObjectKind::IndexBuffer: return 14u;
     case ObjectKind::VertexDeclaration: return 5u;
     case ObjectKind::Texture: return 22u;
+    case ObjectKind::PixelShader: return kPixelShaderVtableSlots;
+    case ObjectKind::VertexShader: return kVertexShaderVtableSlots;
     }
     return 0;
 }
 
 int token_argument_count(uint32_t token)
 {
-    if (token < kTokenBase || token >= kTokenBase + 8 * kKindStride) return 0;
+    if (token < kTokenBase || token >= kTokenBase + 10 * kKindStride) return 0;
     const uint32_t offset = token - kTokenBase;
     const uint32_t kind = offset / kKindStride;
     const uint32_t within_kind = offset % kKindStride;
-    if (kind < kD3D9Kind || kind > kTextureKind) return 0;
+    if (kind < kD3D9Kind || kind > kVertexShaderKind) return 0;
     if (within_kind % kSlotStride) return -1;
     const uint32_t method = within_kind / kSlotStride;
     if (method >= slot_count(static_cast<ObjectKind>(kind))) return -1;
@@ -421,6 +433,8 @@ int token_argument_count(uint32_t token)
         if (method == 35) return 4;
         if (method == 47) return 2;
         if (method == 86) return 3;
+        if (method == 106) return 3;
+        if (method == 91) return 3;
         if (method == 23) return 9;
         if (method == 26 || method == 27) return 7;
         if (method == 65 || method == 92 || method == 107) return method == 65 ? 3 : 2;
@@ -450,6 +464,10 @@ int token_argument_count(uint32_t token)
         if (method < 3) return method == 0 ? 3 : 1;
         if (method == 19) return 5;
         if (method == 20) return 2;
+        return -2;
+    }
+    if (kind == kPixelShaderKind || kind == kVertexShaderKind) {
+        if (method < 3) return method == 0 ? 3 : 1;
         return -2;
     }
 
@@ -642,6 +660,8 @@ bool bridge_supports_iid(ObjectKind kind, const GUID &iid)
     case ObjectKind::IndexBuffer: supported = &kIidIDirect3DIndexBuffer9; break;
     case ObjectKind::VertexDeclaration: supported = &kIidIDirect3DVertexDeclaration9; break;
     case ObjectKind::Texture: supported = &kIidIDirect3DTexture9; break;
+    case ObjectKind::PixelShader: supported = &kIidIDirect3DPixelShader9; break;
+    case ObjectKind::VertexShader: supported = &kIidIDirect3DVertexShader9; break;
     }
     return std::memcmp(&iid, &kIidIUnknown, sizeof(iid)) == 0 ||
            std::memcmp(&iid, supported, sizeof(iid)) == 0 ||
@@ -659,6 +679,8 @@ const char *interface_name(ObjectKind kind)
     case ObjectKind::IndexBuffer: return "IDirect3DIndexBuffer9";
     case ObjectKind::VertexDeclaration: return "IDirect3DVertexDeclaration9";
     case ObjectKind::Texture: return "IDirect3DTexture9";
+    case ObjectKind::PixelShader: return "IDirect3DPixelShader9";
+    case ObjectKind::VertexShader: return "IDirect3DVertexShader9";
     }
     return "IUnknown";
 }
@@ -1175,6 +1197,125 @@ HRESULT create_vertex_declaration(IDirect3DDevice9 *device, const uint32_t *args
     return status;
 }
 
+bool read_shader_model_3(uint32_t guest_bytecode, DWORD expected_version,
+                         const char *shader_kind, std::vector<DWORD> *staged)
+{
+    constexpr uint32_t kMaxShaderWords = 1u << 20; /* 4 MiB hard guest-read cap. */
+    if (!guest_bytecode || !staged) {
+        set_error("D3D shader bytecode pointer is null");
+        return false;
+    }
+
+    uint32_t token = 0;
+    if (!guest_read(guest_bytecode, &token, sizeof(token))) {
+        set_error("D3D shader version token is unmapped");
+        return false;
+    }
+    /* The observed asset is pixel shader 3.0. Reject other profiles until a
+     * parser for their different instruction-length rules is evidenced. */
+    if (token != expected_version) {
+        std::ostringstream message;
+        message << "Create" << shader_kind
+                << " only supports the observed shader model 3.0 token format";
+        set_error(message.str());
+        return false;
+    }
+    staged->clear();
+    staged->reserve(256);
+    staged->push_back(token);
+
+    uint32_t cursor = 1;
+    while (cursor < kMaxShaderWords) {
+        const uint64_t address = static_cast<uint64_t>(guest_bytecode) +
+                                 static_cast<uint64_t>(cursor) * sizeof(DWORD);
+        if (address > UINT32_MAX) {
+            set_error("D3D shader bytecode address overflows the guest ABI");
+            return false;
+        }
+        if (!guest_read(static_cast<uint32_t>(address), &token, sizeof(token))) {
+            set_error("D3D shader token stream has no mapped terminator");
+            return false;
+        }
+        staged->push_back(token);
+        ++cursor;
+
+        if (token == D3DSIO_END) return true;
+
+        const DWORD opcode = token & D3DSI_OPCODE_MASK;
+        uint32_t payload_words = 0;
+        if (opcode == D3DSIO_COMMENT) {
+            payload_words = (token & D3DSI_COMMENTSIZE_MASK) >> D3DSI_COMMENTSIZE_SHIFT;
+        } else {
+            payload_words = (token & D3DSI_INSTLENGTH_MASK) >> D3DSI_INSTLENGTH_SHIFT;
+        }
+        if (payload_words > kMaxShaderWords - cursor) {
+            set_error("D3D shader instruction length exceeds the bounded token stream");
+            return false;
+        }
+        for (uint32_t i = 0; i < payload_words; ++i) {
+            const uint64_t payload_address = static_cast<uint64_t>(guest_bytecode) +
+                static_cast<uint64_t>(cursor) * sizeof(DWORD);
+            if (payload_address > UINT32_MAX ||
+                !guest_read(static_cast<uint32_t>(payload_address), &token, sizeof(token))) {
+                set_error("D3D shader instruction payload is unmapped");
+                return false;
+            }
+            staged->push_back(token);
+            ++cursor;
+        }
+    }
+    set_error("D3D shader token stream exceeds the 4 MiB safety bound without END");
+    return false;
+}
+
+HRESULT create_guest_shader(IDirect3DDevice9 *device, const uint32_t *args,
+                            ObjectKind kind)
+{
+    const bool pixel_shader = kind == ObjectKind::PixelShader;
+    const char *shader_kind = pixel_shader ? "PixelShader" : "VertexShader";
+    if (!args[2]) {
+        set_error(std::string("IDirect3DDevice9::Create") + shader_kind +
+                  " output pointer is null");
+        return D3DERR_INVALIDCALL;
+    }
+    auto *output = static_cast<uint32_t *>(guest_memory(
+        args[2], sizeof(uint32_t), AC1_D3D9_GUEST_WRITE));
+    if (!output) {
+        set_error(std::string("IDirect3DDevice9::Create") + shader_kind +
+                  " output pointer is unmapped");
+        return D3DERR_INVALIDCALL;
+    }
+    *output = 0;
+
+    std::vector<DWORD> bytecode;
+    const DWORD expected_version = pixel_shader ? D3DPS_VERSION(3, 0)
+                                                : D3DVS_VERSION(3, 0);
+    if (!read_shader_model_3(args[1], expected_version, shader_kind, &bytecode))
+        return D3DERR_INVALIDCALL;
+
+    IUnknown *native_shader = nullptr;
+    HRESULT status = S_OK;
+    if (pixel_shader) {
+        IDirect3DPixelShader9 *shader = nullptr;
+        status = device->CreatePixelShader(bytecode.data(), &shader);
+        native_shader = static_cast<IUnknown *>(shader);
+    } else {
+        IDirect3DVertexShader9 *shader = nullptr;
+        status = device->CreateVertexShader(bytecode.data(), &shader);
+        native_shader = static_cast<IUnknown *>(shader);
+    }
+    if (FAILED(status)) return status;
+    if (!native_shader) {
+        set_error(std::string("native Create") + shader_kind +
+                  " succeeded without returning an object");
+        return E_FAIL;
+    }
+    const uint32_t guest_shader = wrap_native(native_shader, kind, true);
+    if (!guest_shader) return E_OUTOFMEMORY;
+    *output = guest_shader;
+    return status;
+}
+
 HRESULT get_vertex_declaration(IDirect3DVertexDeclaration9 *declaration,
                                const uint32_t *args)
 {
@@ -1446,6 +1587,20 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
         return hresult(create_vertex_declaration(
             static_cast<IDirect3DDevice9 *>(object.native), args));
     }
+    if (method == 106) {
+        if (!require_count(argc, 3, "IDirect3DDevice9::CreatePixelShader"))
+            return hresult(D3DERR_INVALIDCALL);
+        return hresult(create_guest_shader(
+            static_cast<IDirect3DDevice9 *>(object.native), args,
+            ObjectKind::PixelShader));
+    }
+    if (method == 91) {
+        if (!require_count(argc, 3, "IDirect3DDevice9::CreateVertexShader"))
+            return hresult(D3DERR_INVALIDCALL);
+        return hresult(create_guest_shader(
+            static_cast<IDirect3DDevice9 *>(object.native), args,
+            ObjectKind::VertexShader));
+    }
     if (method == 26 || method == 27) {
         if (!require_count(argc, 7, method == 26
                 ? "IDirect3DDevice9::CreateVertexBuffer"
@@ -1491,14 +1646,30 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
     if (method == 92) {
         if (!require_count(argc, 2, "IDirect3DDevice9::SetVertexShader"))
             return hresult(D3DERR_INVALIDCALL);
-        /* Non-null shader handles are rejected as unsupported before dispatch. */
-        return hresult(device->SetVertexShader(nullptr));
+        IDirect3DVertexShader9 *shader = nullptr;
+        if (args[1]) {
+            GuestObject *shader_object = find_object(args[1], ObjectKind::VertexShader);
+            if (!shader_object) {
+                set_error("SetVertexShader received an unknown guest vertex-shader proxy");
+                return hresult(D3DERR_INVALIDCALL);
+            }
+            shader = static_cast<IDirect3DVertexShader9 *>(shader_object->native);
+        }
+        return hresult(device->SetVertexShader(shader));
     }
     if (method == 107) {
         if (!require_count(argc, 2, "IDirect3DDevice9::SetPixelShader"))
             return hresult(D3DERR_INVALIDCALL);
-        /* Non-null shader handles are rejected as unsupported before dispatch. */
-        return hresult(device->SetPixelShader(nullptr));
+        IDirect3DPixelShader9 *shader = nullptr;
+        if (args[1]) {
+            GuestObject *shader_object = find_object(args[1], ObjectKind::PixelShader);
+            if (!shader_object) {
+                set_error("SetPixelShader received an unknown guest pixel-shader proxy");
+                return hresult(D3DERR_INVALIDCALL);
+            }
+            shader = static_cast<IDirect3DPixelShader9 *>(shader_object->native);
+        }
+        return hresult(device->SetPixelShader(shader));
     }
     if (method == 94 || method == 96 || method == 98 ||
         method == 109 || method == 111 || method == 113) {
@@ -1553,6 +1724,44 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
     message << "IDirect3DDevice9 method " << method
             << " is not implemented; no guest device/frame success is implied";
     set_error(message.str());
+    return hresult(D3DERR_NOTAVAILABLE);
+}
+
+uint32_t invoke_pixel_shader(GuestObject &object, uint32_t method,
+                             const uint32_t *args, uint32_t argc)
+{
+    const std::string prefix = interface_name(object.kind);
+    if (method == 0) {
+        if (!require_count(argc, 3, (prefix + "::QueryInterface").c_str()))
+            return hresult(D3DERR_INVALIDCALL);
+        uint32_t output = 0;
+        return hresult(do_query_interface(object, args, &output));
+    }
+    if (method == 1) {
+        if (!require_count(argc, 1, (prefix + "::AddRef").c_str())) return 0;
+        ++object.guest_references;
+        object.native->AddRef();
+        return object.guest_references;
+    }
+    if (method == 2) {
+        if (!require_count(argc, 1, (prefix + "::Release").c_str())) return 0;
+        if (!object.guest_references) {
+            set_error(prefix + "::Release called with zero guest references");
+            return 0;
+        }
+        IUnknown *native = object.native;
+        const uint32_t guest_address = args[0];
+        native->Release();
+        const uint32_t guest_count = --object.guest_references;
+        if (!guest_count) {
+            GuestObject retired = object;
+            g_guest_by_native.erase(native);
+            g_objects.erase(guest_address);
+            free_guest_object(guest_address, retired);
+        }
+        return guest_count;
+    }
+    set_error(prefix + " method is not implemented");
     return hresult(D3DERR_NOTAVAILABLE);
 }
 
@@ -1953,10 +2162,18 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
         set_error("COM token called with an unknown guest object or interface kind");
         return -1;
     }
-    if (object->kind == ObjectKind::Device &&
-        ((method == 65 && args[2] != 0u) ||
-         ((method == 92 || method == 107) && args[1] != 0u))) {
-        set_error("non-null texture/shader guest object has no registered AC1 proxy kind");
+    if (object->kind == ObjectKind::Device && method == 65 && args[2] != 0u) {
+        set_error("non-null texture guest object has no registered AC1 proxy kind");
+        return -2;
+    }
+    if (object->kind == ObjectKind::Device && method == 92 && args[1] != 0u &&
+        !find_object(args[1], ObjectKind::VertexShader)) {
+        set_error("SetVertexShader received an unregistered guest shader object");
+        return -2;
+    }
+    if (object->kind == ObjectKind::Device && method == 107 && args[1] != 0u &&
+        !find_object(args[1], ObjectKind::PixelShader)) {
+        set_error("SetPixelShader received an unregistered guest shader object");
         return -2;
     }
     if (object->kind == ObjectKind::Device &&
@@ -1967,6 +2184,19 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
     if (object->kind == ObjectKind::Device && method == 23 && args[8] != 0u) {
         set_error("D3D9 shared texture handles are unsupported by the guest bridge");
         return -2;
+    }
+    if (object->kind == ObjectKind::Device && (method == 91 || method == 106)) {
+        uint32_t version = 0;
+        if (guest_read(args[1], &version, sizeof(version))) {
+            const uint32_t expected = method == 106 ? D3DPS_VERSION(3, 0)
+                                                   : D3DVS_VERSION(3, 0);
+            if (version != expected) {
+                set_error(method == 106
+                    ? "CreatePixelShader only supports the observed pixel shader 3.0 profile"
+                    : "CreateVertexShader only supports the observed vertex shader 3.0 profile");
+                return -2;
+            }
+        }
     }
     if (object->kind == ObjectKind::Texture && method == 19) {
         if (args[3] != 0u || args[4] != 0u) {
@@ -2008,6 +2238,12 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
         break;
     case ObjectKind::Texture:
         *result_out = invoke_texture(*object, method, args, arg_count);
+        break;
+    case ObjectKind::PixelShader:
+        *result_out = invoke_pixel_shader(*object, method, args, arg_count);
+        break;
+    case ObjectKind::VertexShader:
+        *result_out = invoke_pixel_shader(*object, method, args, arg_count);
         break;
     }
     return 1;

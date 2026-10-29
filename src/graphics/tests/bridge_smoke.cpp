@@ -5,8 +5,10 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <windows.h>
 #include <d3d9.h>
+#include <d3dcompiler.h>
 
 namespace {
 constexpr uint32_t kGuestBase = 0x00010000u;
@@ -18,11 +20,43 @@ HWND hidden_window = nullptr;
 std::array<void *, 17> fake_d3d_vtable{};
 std::array<void *, 119> fake_device_vtable{};
 std::array<void *, 17> fake_surface_vtable{};
+std::array<void *, 5> fake_pixel_shader_vtable{};
+std::array<void *, 5> fake_vertex_shader_vtable{};
 
 void *resolve_guest(void *context, uint32_t address, uint32_t size, uint32_t access);
 uint32_t allocate_guest(void *context, uint32_t size, uint32_t alignment);
 uint32_t guest_word(uint32_t address);
 uint32_t object_slot(uint32_t object, uint32_t slot);
+
+bool compile_native_smoke_shader(std::vector<uint8_t> *bytecode)
+{
+    if (!bytecode) return false;
+    HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
+    if (!compiler) return false;
+    auto compile = reinterpret_cast<pD3DCompile>(GetProcAddress(compiler, "D3DCompile"));
+    if (!compile) {
+        FreeLibrary(compiler);
+        return false;
+    }
+    static const char source[] =
+        "float4 main() : COLOR0 { return float4(1.0, 0.0, 0.0, 1.0); }";
+    ID3DBlob *shader = nullptr;
+    ID3DBlob *errors = nullptr;
+    const HRESULT status = compile(source, sizeof(source) - 1, "ac1-d3d9-smoke",
+        nullptr, nullptr, "main", "ps_3_0", 0, 0, &shader, &errors);
+    if (FAILED(status) && errors)
+        std::fprintf(stderr, "D3DCompile diagnostic: %s\n",
+                     static_cast<const char *>(errors->GetBufferPointer()));
+    bool ok = SUCCEEDED(status) && shader && shader->GetBufferSize() >= sizeof(DWORD);
+    if (ok) {
+        const auto *begin = static_cast<const uint8_t *>(shader->GetBufferPointer());
+        bytecode->assign(begin, begin + shader->GetBufferSize());
+    }
+    if (shader) shader->Release();
+    if (errors) errors->Release();
+    FreeLibrary(compiler);
+    return ok;
+}
 
 struct GuestPresentParameters {
     uint32_t back_buffer_width;
@@ -51,6 +85,8 @@ FakeComObject fake_d3d{};
 FakeComObject fake_device{};
 FakeComObject fake_render_target{};
 FakeComObject fake_depth_surface{};
+FakeComObject fake_pixel_shader{};
+FakeComObject fake_vertex_shader{};
 uint32_t fake_query_calls = 0;
 uint32_t fake_render_state_type = UINT32_MAX;
 uint32_t fake_render_state_value = UINT32_MAX;
@@ -62,6 +98,10 @@ uint32_t fake_sampler = UINT32_MAX;
 uint32_t fake_sampler_type = UINT32_MAX;
 uint32_t fake_sampler_value = UINT32_MAX;
 uint32_t fake_null_shader_calls = 0;
+bool fake_pixel_shader_stream_ok = false;
+uint32_t fake_pixel_shader_create_calls = 0;
+bool fake_vertex_shader_stream_ok = false;
+uint32_t fake_vertex_shader_create_calls = 0;
 uint32_t fake_constant_kind = 0;
 uint32_t fake_constant_start = UINT32_MAX;
 uint32_t fake_constant_count = UINT32_MAX;
@@ -168,7 +208,8 @@ HRESULT STDMETHODCALLTYPE fake_set_sampler_state(IDirect3DDevice9 *, DWORD sampl
 HRESULT STDMETHODCALLTYPE fake_set_vertex_shader(IDirect3DDevice9 *,
                                                   IDirect3DVertexShader9 *shader)
 {
-    if (shader) return E_INVALIDARG;
+    if (shader && shader != reinterpret_cast<IDirect3DVertexShader9 *>(
+            &fake_vertex_shader)) return E_INVALIDARG;
     ++fake_null_shader_calls;
     return S_OK;
 }
@@ -176,8 +217,37 @@ HRESULT STDMETHODCALLTYPE fake_set_vertex_shader(IDirect3DDevice9 *,
 HRESULT STDMETHODCALLTYPE fake_set_pixel_shader(IDirect3DDevice9 *,
                                                  IDirect3DPixelShader9 *shader)
 {
-    if (shader) return E_INVALIDARG;
+    if (shader && shader != reinterpret_cast<IDirect3DPixelShader9 *>(
+            &fake_pixel_shader)) return E_INVALIDARG;
     ++fake_null_shader_calls;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE fake_create_pixel_shader(IDirect3DDevice9 *,
+    const DWORD *bytecode, IDirect3DPixelShader9 **output)
+{
+    ++fake_pixel_shader_create_calls;
+    fake_pixel_shader_stream_ok = bytecode && output &&
+        bytecode[0] == D3DPS_VERSION(3, 0) &&
+        bytecode[1] == (51u << D3DSI_COMMENTSIZE_SHIFT | D3DSIO_COMMENT) &&
+        bytecode[2] == D3DSIO_END && bytecode[53] == (3u << 24 | 1u) &&
+        bytecode[54] == D3DSIO_END && bytecode[109] == D3DSIO_END;
+    if (!output) return E_POINTER;
+    fake_pixel_shader.references = 1;
+    *output = reinterpret_cast<IDirect3DPixelShader9 *>(&fake_pixel_shader);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE fake_create_vertex_shader(IDirect3DDevice9 *,
+    const DWORD *bytecode, IDirect3DVertexShader9 **output)
+{
+    ++fake_vertex_shader_create_calls;
+    fake_vertex_shader_stream_ok = bytecode && output &&
+        bytecode[0] == D3DVS_VERSION(3, 0) &&
+        bytecode[1] == D3DSIO_NOP && bytecode[2] == D3DSIO_END;
+    if (!output) return E_POINTER;
+    fake_vertex_shader.references = 1;
+    *output = reinterpret_cast<IDirect3DVertexShader9 *>(&fake_vertex_shader);
     return S_OK;
 }
 
@@ -253,6 +323,8 @@ void initialize_fake_com()
     fake_d3d_vtable.fill(nullptr);
     fake_device_vtable.fill(nullptr);
     fake_surface_vtable.fill(nullptr);
+    fake_pixel_shader_vtable.fill(nullptr);
+    fake_vertex_shader_vtable.fill(nullptr);
     for (auto *table : {&fake_d3d_vtable, &fake_surface_vtable}) {
         (*table)[0] = reinterpret_cast<void *>(&fake_query_interface);
         (*table)[1] = reinterpret_cast<void *>(&fake_add_ref);
@@ -261,6 +333,12 @@ void initialize_fake_com()
     fake_device_vtable[0] = reinterpret_cast<void *>(&fake_query_interface);
     fake_device_vtable[1] = reinterpret_cast<void *>(&fake_add_ref);
     fake_device_vtable[2] = reinterpret_cast<void *>(&fake_release);
+    fake_pixel_shader_vtable[0] = reinterpret_cast<void *>(&fake_query_interface);
+    fake_pixel_shader_vtable[1] = reinterpret_cast<void *>(&fake_add_ref);
+    fake_pixel_shader_vtable[2] = reinterpret_cast<void *>(&fake_release);
+    fake_vertex_shader_vtable[0] = reinterpret_cast<void *>(&fake_query_interface);
+    fake_vertex_shader_vtable[1] = reinterpret_cast<void *>(&fake_add_ref);
+    fake_vertex_shader_vtable[2] = reinterpret_cast<void *>(&fake_release);
     fake_d3d_vtable[16] = reinterpret_cast<void *>(&fake_create_device);
     fake_device_vtable[38] = reinterpret_cast<void *>(&fake_get_render_target);
     fake_device_vtable[40] = reinterpret_cast<void *>(&fake_get_depth_surface);
@@ -270,10 +348,12 @@ void initialize_fake_com()
     fake_device_vtable[67] = reinterpret_cast<void *>(&fake_set_texture_stage_state);
     fake_device_vtable[69] = reinterpret_cast<void *>(&fake_set_sampler_state);
     fake_device_vtable[92] = reinterpret_cast<void *>(&fake_set_vertex_shader);
+    fake_device_vtable[91] = reinterpret_cast<void *>(&fake_create_vertex_shader);
     fake_device_vtable[94] = reinterpret_cast<void *>(&fake_set_vertex_constant_f);
     fake_device_vtable[96] = reinterpret_cast<void *>(&fake_set_vertex_constant_i);
     fake_device_vtable[98] = reinterpret_cast<void *>(&fake_set_vertex_constant_b);
     fake_device_vtable[107] = reinterpret_cast<void *>(&fake_set_pixel_shader);
+    fake_device_vtable[106] = reinterpret_cast<void *>(&fake_create_pixel_shader);
     fake_device_vtable[109] = reinterpret_cast<void *>(&fake_set_pixel_constant_f);
     fake_device_vtable[111] = reinterpret_cast<void *>(&fake_set_pixel_constant_i);
     fake_device_vtable[113] = reinterpret_cast<void *>(&fake_set_pixel_constant_b);
@@ -281,6 +361,8 @@ void initialize_fake_com()
 
     fake_d3d = {fake_d3d_vtable.data(), 1, {}};
     fake_device = {fake_device_vtable.data(), 0, {}};
+    fake_pixel_shader = {fake_pixel_shader_vtable.data(), 0, {}};
+    fake_vertex_shader = {fake_vertex_shader_vtable.data(), 0, {}};
     fake_query_calls = 0;
     fake_render_state_type = UINT32_MAX;
     fake_render_state_value = UINT32_MAX;
@@ -292,6 +374,10 @@ void initialize_fake_com()
     fake_sampler_type = UINT32_MAX;
     fake_sampler_value = UINT32_MAX;
     fake_null_shader_calls = 0;
+    fake_pixel_shader_stream_ok = false;
+    fake_pixel_shader_create_calls = 0;
+    fake_vertex_shader_stream_ok = false;
+    fake_vertex_shader_create_calls = 0;
     fake_constant_kind = 0;
     fake_constant_start = UINT32_MAX;
     fake_constant_count = UINT32_MAX;
@@ -374,6 +460,112 @@ bool run_fake_surface_smoke(ac1_d3d9_callbacks callbacks)
         ac1_d3d9_dispatch(object_slot(device, 107), pixel_shader_args, 2, &result) != 1 ||
         FAILED(static_cast<HRESULT>(result)) || fake_null_shader_calls != 2u) {
         std::fprintf(stderr, "fake D3D9 state/null-resource ABI forwarding failed: %s\n",
+                     ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    std::array<uint32_t, 110> shader_words{};
+    shader_words[0] = D3DPS_VERSION(3, 0);
+    shader_words[1] = (51u << D3DSI_COMMENTSIZE_SHIFT) | D3DSIO_COMMENT;
+    shader_words[2] = D3DSIO_END; /* End-like data inside the CTAB comment. */
+    for (uint32_t instruction = 0; instruction < 14; ++instruction)
+        shader_words[53 + instruction * 4] = (3u << 24) | 1u;
+    shader_words[54] = D3DSIO_END; /* End-like immediate inside an instruction. */
+    shader_words[109] = D3DSIO_END;
+    const uint32_t shader_code = allocate_guest(nullptr, sizeof(shader_words), 4);
+    const uint32_t shader_output = allocate_guest(nullptr, sizeof(uint32_t), 4);
+    std::memcpy(resolve_guest(nullptr, shader_code, sizeof(shader_words), AC1_D3D9_GUEST_WRITE),
+                shader_words.data(), sizeof(shader_words));
+    const uint32_t create_pixel_shader_args[] = {device, shader_code, shader_output};
+    if (ac1_d3d9_argument_count(object_slot(device, 106)) != 3 ||
+        ac1_d3d9_dispatch(object_slot(device, 106), create_pixel_shader_args, 3,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result)) ||
+        !fake_pixel_shader_stream_ok || fake_pixel_shader_create_calls != 1) {
+        std::fprintf(stderr, "fake CreatePixelShader token-boundary/proxy setup failed: %s\n",
+                     ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    const uint32_t guest_shader = guest_word(shader_output);
+    const uint32_t bind_shader_args[] = {device, guest_shader};
+    const uint32_t release_shader_args[] = {guest_shader};
+    if (!guest_shader ||
+        ac1_d3d9_dispatch(object_slot(device, 107), bind_shader_args, 2, &result) != 1 ||
+        FAILED(static_cast<HRESULT>(result)) ||
+        ac1_d3d9_dispatch(object_slot(guest_shader, 2), release_shader_args, 1,
+                          &result) != 1 || result != 0 || fake_pixel_shader.references != 0) {
+        std::fprintf(stderr, "fake pixel-shader bind/lifetime failed: %s\n",
+                     ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    uint32_t bad_shader_output = 0xdeadbeefu;
+    const uint32_t bad_shader_output_address = allocate_guest(
+        nullptr, sizeof(bad_shader_output), 4);
+    const uint32_t shader_version = D3DPS_VERSION(3, 0);
+    std::memcpy(resolve_guest(nullptr, kGuestLimit - sizeof(shader_version),
+                              sizeof(shader_version), AC1_D3D9_GUEST_WRITE),
+                &shader_version, sizeof(shader_version));
+    std::memcpy(resolve_guest(nullptr, bad_shader_output_address, sizeof(bad_shader_output),
+                              AC1_D3D9_GUEST_WRITE),
+                &bad_shader_output, sizeof(bad_shader_output));
+    const uint32_t unterminated_shader_args[] = {
+        device, kGuestLimit - sizeof(uint32_t), bad_shader_output_address
+    };
+    if (ac1_d3d9_dispatch(object_slot(device, 106), unterminated_shader_args, 3,
+                          &result) != 1 ||
+        result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
+        guest_word(bad_shader_output_address) != 0 || fake_pixel_shader_create_calls != 1) {
+        std::fprintf(stderr, "unterminated pixel-shader token stream was not rejected safely\n");
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    const uint32_t unsupported_shader_version = D3DPS_VERSION(2, 0);
+    std::memcpy(resolve_guest(nullptr, shader_code, sizeof(unsupported_shader_version),
+                              AC1_D3D9_GUEST_WRITE),
+                &unsupported_shader_version, sizeof(unsupported_shader_version));
+    const uint32_t unsupported_profile_args[] = {
+        device, shader_code, bad_shader_output_address
+    };
+    result = 0xdeadbeefu;
+    if (ac1_d3d9_dispatch(object_slot(device, 106), unsupported_profile_args, 3,
+                          &result) != -2 || result != 0xdeadbeefu ||
+        fake_pixel_shader_create_calls != 1) {
+        std::fprintf(stderr, "unsupported shader profile was not explicitly classified\n");
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    const std::array<uint32_t, 3> vertex_shader_words{{
+        D3DVS_VERSION(3, 0), D3DSIO_NOP, D3DSIO_END
+    }};
+    const uint32_t vertex_shader_code = allocate_guest(
+        nullptr, static_cast<uint32_t>(sizeof(vertex_shader_words)), 4);
+    const uint32_t vertex_shader_output = allocate_guest(nullptr, sizeof(uint32_t), 4);
+    std::memcpy(resolve_guest(nullptr, vertex_shader_code,
+        static_cast<uint32_t>(sizeof(vertex_shader_words)), AC1_D3D9_GUEST_WRITE),
+        vertex_shader_words.data(), sizeof(vertex_shader_words));
+    const uint32_t create_vertex_shader_args[] = {
+        device, vertex_shader_code, vertex_shader_output
+    };
+    if (ac1_d3d9_argument_count(object_slot(device, 91)) != 3 ||
+        ac1_d3d9_dispatch(object_slot(device, 91), create_vertex_shader_args, 3,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result)) ||
+        !fake_vertex_shader_stream_ok || fake_vertex_shader_create_calls != 1) {
+        std::fprintf(stderr, "fake CreateVertexShader token/proxy setup failed: %s\n",
+                     ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    const uint32_t guest_vertex_shader = guest_word(vertex_shader_output);
+    const uint32_t bind_vertex_shader_args[] = {device, guest_vertex_shader};
+    const uint32_t release_vertex_shader_args[] = {guest_vertex_shader};
+    if (!guest_vertex_shader ||
+        ac1_d3d9_dispatch(object_slot(device, 92), bind_vertex_shader_args, 2,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result)) ||
+        ac1_d3d9_dispatch(object_slot(guest_vertex_shader, 2),
+                          release_vertex_shader_args, 1, &result) != 1 ||
+        result != 0 || fake_vertex_shader.references != 0) {
+        std::fprintf(stderr, "fake vertex-shader bind/lifetime failed: %s\n",
                      ac1_d3d9_last_error());
         ac1_d3d9_shutdown();
         return false;
@@ -747,7 +939,7 @@ int main(int argc, char **argv)
         ac1_d3d9_argument_count(0x7e002170u) != 9 ||
         ac1_d3d9_dispatch(0x7e002030u, nullptr, 0, nullptr) != -2 ||
         ac1_d3d9_dispatch(0x7e0030b0u, nullptr, 0, nullptr) != -2 ||
-        ac1_d3d9_dispatch(0x7e008000u, nullptr, 0, nullptr) != 0) {
+        ac1_d3d9_dispatch(0x7e00a000u, nullptr, 0, nullptr) != 0) {
         std::fprintf(stderr, "COM method-arity classification failed\n");
         ac1_d3d9_shutdown();
         return 3;
@@ -828,6 +1020,49 @@ int main(int argc, char **argv)
         DestroyWindow(hidden_window);
         return fake_passed ? 0 : 19;
     }
+
+    std::vector<uint8_t> native_pixel_shader_code;
+    if (!compile_native_smoke_shader(&native_pixel_shader_code)) {
+        std::fprintf(stderr, "could not compile synthetic ps_3_0 smoke shader\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 46;
+    }
+    const uint32_t native_shader_code_address = allocate_guest(
+        nullptr, static_cast<uint32_t>(native_pixel_shader_code.size()), 4);
+    const uint32_t native_shader_output = allocate_guest(nullptr, sizeof(uint32_t), 4);
+    std::memcpy(resolve_guest(nullptr, native_shader_code_address,
+        static_cast<uint32_t>(native_pixel_shader_code.size()), AC1_D3D9_GUEST_WRITE),
+        native_pixel_shader_code.data(), native_pixel_shader_code.size());
+    const uint32_t native_create_shader_args[] = {
+        device, native_shader_code_address, native_shader_output
+    };
+    if (ac1_d3d9_dispatch(object_slot(device, 106), native_create_shader_args, 3,
+                          &create_result) != 1 ||
+        FAILED(static_cast<HRESULT>(create_result)) || !guest_word(native_shader_output)) {
+        std::fprintf(stderr, "native DXVK CreatePixelShader smoke failed: 0x%08x %s\n",
+                     create_result, ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 46;
+    }
+    const uint32_t native_shader = guest_word(native_shader_output);
+    const uint32_t native_bind_shader_args[] = {device, native_shader};
+    const uint32_t native_clear_shader_args[] = {device, 0};
+    const uint32_t native_shader_release_args[] = {native_shader};
+    if (ac1_d3d9_dispatch(object_slot(device, 107), native_bind_shader_args, 2,
+                          &create_result) != 1 || FAILED(static_cast<HRESULT>(create_result)) ||
+        ac1_d3d9_dispatch(object_slot(device, 107), native_clear_shader_args, 2,
+                          &create_result) != 1 || FAILED(static_cast<HRESULT>(create_result)) ||
+        ac1_d3d9_dispatch(object_slot(native_shader, 2), native_shader_release_args, 1,
+                          &create_result) != 1 || create_result != 0) {
+        std::fprintf(stderr, "native DXVK pixel-shader bind/release smoke failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 47;
+    }
+    std::printf("native DXVK pixel-shader create/bind/unbind/release passed\n");
 
     uint32_t getter_result = 0;
     const uint32_t width_address = allocate_guest(nullptr, 4, 4);
