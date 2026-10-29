@@ -8,6 +8,8 @@ param(
     [switch]$PrepareOnly,
     [switch]$CheckRepeat,
     [switch]$Run,
+    # Checked per-access guest memory (diagnosable bad pointers) instead of the direct arena.
+    [switch]$CheckedMemory,
     [string]$GameExe = 'C:\Program Files (x86)\GOG.com\Assassins Creed\AssassinsCreed_Dx9.exe'
 )
 $ErrorActionPreference = 'Stop'
@@ -54,6 +56,8 @@ try {
     $BuildDir = "build/$($Target.ToLower())"
     if ($BuildType -ne 'Debug') { $BuildDir += "-$($BuildType.ToLower())" }
     $ConfigureArgs = @('-S', '.', '-B', $BuildDir, '-G', 'Ninja', "-DCMAKE_MAKE_PROGRAM=$Ninja", "-DCMAKE_BUILD_TYPE=$BuildType")
+    # Explicit, because an option default never overrides an existing CMake cache entry.
+    $ConfigureArgs += "-DAC1_DIRECT_MEMORY=$(if ($CheckedMemory) { 'OFF' } else { 'ON' })"
     if ($Target -eq 'Host') {
         $ConfigureArgs += '-DCMAKE_C_COMPILER=C:/msys64/mingw64/bin/gcc.exe'
         $ConfigureArgs += '-DCMAKE_CXX_COMPILER=C:/msys64/mingw64/bin/g++.exe'
