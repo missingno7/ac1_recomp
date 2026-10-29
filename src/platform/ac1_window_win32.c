@@ -814,6 +814,78 @@ int ac1_window_win32_call(ac1_window_win32 *ui, CPU *cpu,
         return AC1_WINDOW_WIN32_HANDLED;
     }
 
+    if (!strcmp(name, "GetCursorPos")) {
+        uint32_t point_address;
+        POINT old_point;
+        POINT point;
+        if (!guest_read(ui, cpu->esp + 4u, &point_address, 4u))
+            goto invalid_one;
+        /* Probe guest writability before calling the host API, so a failed
+         * guest output mapping cannot leave a successful native result that
+         * the guest never receives. Writing the existing bytes back is
+         * observationally neutral and uses the bridge's checked callback. */
+        if (!point_address ||
+            !guest_read(ui, point_address, &old_point, sizeof(old_point)) ||
+            !guest_write(ui, point_address, &old_point, sizeof(old_point))) {
+            cpu->eax = FALSE;
+            return_api(cpu, 4u);
+            if (last_error) *last_error = ERROR_NOACCESS;
+            set_error(error, error_capacity, "GetCursorPos guest POINT is not writable");
+            return AC1_WINDOW_WIN32_HANDLED;
+        }
+        BOOL result = GetCursorPos(&point);
+        if (result && !guest_write(ui, point_address, &point, sizeof(point))) {
+            cpu->eax = FALSE;
+            return_api(cpu, 4u);
+            if (last_error) *last_error = ERROR_NOACCESS;
+            set_error(error, error_capacity, "GetCursorPos guest POINT became unwritable");
+            return AC1_WINDOW_WIN32_HANDLED;
+        }
+        cpu->eax = (uint32_t)result;
+        return_api(cpu, 4u);
+        if (!result && last_error) *last_error = GetLastError();
+        set_error(error, error_capacity, "");
+        return AC1_WINDOW_WIN32_HANDLED;
+    }
+
+    if (!strcmp(name, "ScreenToClient")) {
+        uint32_t args[2];
+        POINT point;
+        if (!guest_read(ui, cpu->esp + 4u, args, sizeof(args)))
+            goto invalid_two;
+        if (!args[1] || !guest_read(ui, args[1], &point, sizeof(point)) ||
+            !guest_write(ui, args[1], &point, sizeof(point))) {
+            cpu->eax = FALSE;
+            return_api(cpu, 8u);
+            if (last_error) *last_error = ERROR_NOACCESS;
+            set_error(error, error_capacity, "ScreenToClient guest POINT is not readable/writable");
+            return AC1_WINDOW_WIN32_HANDLED;
+        }
+        HWND hwnd = args[0] == AC1_DESKTOP_TOKEN ? GetDesktopWindow() : NULL;
+        ac1_window_record *record = record_from_guest(ui, args[0]);
+        if (record && record->native) hwnd = record->native;
+        if (!hwnd) {
+            cpu->eax = FALSE;
+            return_api(cpu, 8u);
+            if (last_error) *last_error = ERROR_INVALID_WINDOW_HANDLE;
+            set_error(error, error_capacity, "");
+            return AC1_WINDOW_WIN32_HANDLED;
+        }
+        BOOL result = ScreenToClient(hwnd, &point);
+        if (result && !guest_write(ui, args[1], &point, sizeof(point))) {
+            cpu->eax = FALSE;
+            return_api(cpu, 8u);
+            if (last_error) *last_error = ERROR_NOACCESS;
+            set_error(error, error_capacity, "ScreenToClient guest POINT became unwritable");
+            return AC1_WINDOW_WIN32_HANDLED;
+        }
+        cpu->eax = (uint32_t)result;
+        return_api(cpu, 8u);
+        if (!result && last_error) *last_error = GetLastError();
+        set_error(error, error_capacity, "");
+        return AC1_WINDOW_WIN32_HANDLED;
+    }
+
     if (!strcmp(name, "AdjustWindowRect")) {
         uint32_t args[3];
         RECT rect;

@@ -252,6 +252,25 @@ static int run_one_lifecycle(smoke_context *context, CPU *cpu, int exercise_clos
     if (client.right - client.left != 640 || client.bottom - client.top != 480)
         return 0;
 
+    uint32_t cursor_arg = GUEST_MSG;
+    if (!call_api(context, cpu, "GetCursorPos", 4, &cursor_arg, 1, 0) ||
+        cpu->eax != TRUE) return 0;
+    POINT screen_point, expected_client_point;
+    memcpy(&screen_point, guest_ptr(GUEST_MSG, sizeof(screen_point)),
+           sizeof(screen_point));
+    expected_client_point = screen_point;
+    if (!ScreenToClient(native, &expected_client_point)) return 0;
+    uint32_t screen_to_client_args[] = {guest_hwnd, GUEST_MSG};
+    if (!call_api(context, cpu, "ScreenToClient", 8,
+                  screen_to_client_args, 2, 0) || cpu->eax != TRUE)
+        return 0;
+    POINT actual_client_point;
+    memcpy(&actual_client_point, guest_ptr(GUEST_MSG, sizeof(actual_client_point)),
+           sizeof(actual_client_point));
+    if (actual_client_point.x != expected_client_point.x ||
+        actual_client_point.y != expected_client_point.y)
+        return 0;
+
     if (exercise_close) return dispatch_close_and_quit(context, cpu, guest_hwnd);
 
     uint32_t destroy_arg = guest_hwnd;
