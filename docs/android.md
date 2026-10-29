@@ -68,7 +68,9 @@ ordinary USER32 calls through the Win32 window bridge under `_WIN32`; Android
 currently handles the special `SetWindowsHookExA` fallback but not normal
 window calls. The recorded host startup order begins `LoadCursorA`, then
 `RegisterClassExA`, `AdjustWindowRect`, and `CreateWindowExA`. `LoadCursorA` is
-therefore the first known Android blocker, before D3D9 initialization. The
+the first unsupported call in this window sequence, before D3D9 initialization;
+without an Android run, this does not establish the earliest overall startup
+failure. Other Windows-only services, including audio providers, remain. The
 portable Android implementation of `D3DXCheckTextureRequirements` is also still
 missing; building the DXVK provider does not resolve either game-side service.
 
