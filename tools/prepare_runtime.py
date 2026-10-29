@@ -505,6 +505,35 @@ void guest_execution_write(uint32_t address, const void *input, size_t width)
 
 '''
             text = text.replace(marker, scalar_helpers + marker)
+            # Profile only cache-miss scans, including the try_ptr path used by
+            # fixed-width CPU operands. Preserve donor hashes and record the
+            # transformed output hash in runtime-provenance.json as usual.
+            text = text.replace('#include "guest_memory.h"', '''#include "guest_memory.h"
+#ifdef AC1_PROFILE_HOOKS
+#include "ac1_profile.h"
+#else
+#define AC1_PROFILE_COUNT(field) ((void)0)
+#define AC1_PROFILE_SCAN(n) ((void)0)
+#endif''', 1)
+            for name, following, loop, success, failure in (
+                ("void *guest_ptr(", "uint32_t guest_atomic_xadd32(",
+                 "    for (i = 0; i < current_memory.count; ++i) {",
+                 "            return region->data + (size_t)offset;",
+                 "    if (width == 0 && one_past)"),
+                ("void *guest_memory_try_ptr(", "int guest_memory_read(",
+                 "    for (size_t i=0;i<current_memory.count;++i) {",
+                 "            return r->data+(address-r->base);",
+                 "    return NULL;"),
+            ):
+                begin, end = text.index(name), text.index(following, text.index(name))
+                body = text[begin:end]
+                for needle in (loop, success, failure):
+                    if body.count(needle) != 1:
+                        raise SystemExit(f"unexpected profiling scan shape: {name}: {needle}")
+                body = body.replace(loop, "    AC1_PROFILE_COUNT(slow);\n" + loop)
+                body = body.replace(success, "            AC1_PROFILE_SCAN(i + 1);\n" + success)
+                body = body.replace(failure, "    AC1_PROFILE_SCAN(current_memory.count);\n" + failure)
+                text = text[:begin] + body + text[end:]
             content = text.replace("\r\n", "\n").encode("utf-8")
         if destination == "src/runtime/cpu.h":
             text = content.decode("utf-8")

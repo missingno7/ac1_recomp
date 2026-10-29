@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include "ac1_runtime.h"
+#include "ac1_profile.h"
 #include "ac1_virtual_query.h"
 #include "ac1_profile_int.h"
 #include "cpu.h"
@@ -359,6 +360,7 @@ static int prepare_guest_thread(ac1_guest_thread *thread)
 static void run_guest_thread(ac1_guest_thread *thread)
 {
     ac1_scheduler *scheduler = thread->scheduler;
+    ac1_profile_guest(thread->slot, thread->id, &thread->cpu.eip, &scheduler->owner);
     scheduler_lock(scheduler);
     while (!scheduler->stopping && !scheduler->failed && scheduler->owner != thread->slot)
         scheduler_wait_condition(scheduler, 0u);
@@ -408,9 +410,13 @@ static void run_guest_thread(ac1_guest_thread *thread)
     scheduler_lock(scheduler);
     thread->guest_dispatches = dispatch_count;
     thread->finished = 1;
-    if (scheduler->failed) scheduler->owner = 0u;
+    if (scheduler->failed) {
+        if (scheduler->owner != 0u) AC1_PROFILE_COUNT(handoffs);
+        scheduler->owner = 0u;
+    }
     else if (scheduler->owner == thread->slot) {
         unsigned next = scheduler_next_runnable(scheduler, thread->slot);
+        AC1_PROFILE_COUNT(handoffs);
         scheduler->owner = next < scheduler->count ? next : 0u;
     }
     int worker_failed = scheduler->failed;
@@ -420,6 +426,7 @@ static void run_guest_thread(ac1_guest_thread *thread)
         fprintf(stderr, "AC1 guest worker end id=%u exit=0x%08x failed=%d\n",
                 thread->id, thread->exit_code, worker_failed);
     active_guest_thread = NULL;
+    ac1_profile_guest_done();
     guest_address_space_select(NULL);
 }
 
@@ -714,6 +721,7 @@ static void scheduler_notify(ac1_scheduler *scheduler)
 
 static void scheduler_wait_condition(ac1_scheduler *scheduler, uint32_t milliseconds)
 {
+    uint64_t profile_wait = ac1_profile_enabled ? ac1_profile_wait_begin() : 0;
 #ifdef _WIN32
     SleepConditionVariableCS(&scheduler->condition, &scheduler->mutex,
                              milliseconds ? milliseconds : INFINITE);
@@ -729,6 +737,7 @@ static void scheduler_wait_condition(ac1_scheduler *scheduler, uint32_t millisec
         (void)pthread_cond_timedwait(&scheduler->condition, &scheduler->mutex, &until);
     }
 #endif
+    if (profile_wait) ac1_profile_wait_end(profile_wait);
 }
 
 static void scheduler_initialize(ac1_scheduler *scheduler, guest_address_space *space)
@@ -797,6 +806,7 @@ static void scheduler_checkpoint(void)
         unsigned next = scheduler_next_runnable(scheduler, thread->slot);
         if (next == thread->slot) break;
         if (next < scheduler->count) {
+            AC1_PROFILE_COUNT(handoffs);
             scheduler->owner = next;
             scheduler_notify(scheduler);
             while (!scheduler->stopping && !scheduler->failed &&
@@ -5433,6 +5443,7 @@ static void stop_guest(const char *reason, uint32_t target)
             snprintf(scheduler->failure_reason, sizeof(scheduler->failure_reason),
                      "guest thread %u: %s", active_guest_thread->id,
                      reason ? reason : "unsupported guest operation");
+            if (scheduler->owner != 0u) AC1_PROFILE_COUNT(handoffs);
             scheduler->owner = 0u;
             scheduler_notify(scheduler);
         }
@@ -6080,8 +6091,15 @@ static int handle_bink_import(CPU *cpu, const import_record *import)
  * assigned unique IAT tokens and stop here until a measured implementation is
  * added; an unknown guest address is equally fatal and includes its caller. */
 #include "ac1_win32_compat.inc"
+static ac1_lifted_fn profile_lifted_lookup(uint32_t target)
+{
+    AC1_PROFILE_COUNT(misses);
+    return ac1_lifted_lookup(target);
+}
+
 void dispatch(CPU *cpu, uint32_t target)
 {
+    AC1_PROFILE_COUNT(dispatches);
     if (!cpu) stop_guest("null CPU state", target);
     const uint32_t guest_callsite = cpu->eip;
     ++dispatch_count;
@@ -6333,7 +6351,7 @@ void dispatch(CPU *cpu, uint32_t target)
 
     ac1_lifted_fn function = ac1_lifted_lookup_cached(
         target, ac1_main_lifted_lookup_cache_enabled,
-        ac1_main_lifted_lookup_cache, ac1_lifted_lookup);
+        ac1_main_lifted_lookup_cache, profile_lifted_lookup);
     if (!function && bink_image_mapped && target >= bink_image.load_base &&
         (uint64_t)target < (uint64_t)bink_image.load_base + bink_image.image_size) {
         bink_lifted_fn bink_function = bink_lifted_lookup(target);
@@ -6849,6 +6867,8 @@ int ac1_run(const char *exe_path)
     primary->static_tls_vector = static_tls_vector_base;
     primary->image_delta = image.load_base - image.preferred_base;
     active_guest_thread = primary;
+    ac1_profile_init();
+    ac1_profile_guest(0, primary->id, &primary->cpu.eip, &scheduler->owner);
     primary->return_slice_deadline = scheduler_return_slice_ns
         ? guest_monotonic_ns() + scheduler_return_slice_ns : 0u;
     primary->return_slice_checks = 0u;
@@ -6951,6 +6971,7 @@ int ac1_run(const char *exe_path)
 
 cleanup:
     runtime_stop_ready = 0;
+    ac1_profile_shutdown();
     if (scheduler) {
         scheduler_stop_and_join(scheduler);
         free(scheduler);

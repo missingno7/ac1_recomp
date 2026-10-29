@@ -26,6 +26,7 @@ endif()
 
 add_library(ac1_runtime STATIC
   src/runtime/ac1_runtime.c
+  src/runtime/ac1_profile.c
   src/runtime/ac1_network.c
   src/runtime/ac1_files.c
   src/runtime/ac1_crypto.c
@@ -37,6 +38,7 @@ add_library(ac1_runtime STATIC
   ${AC1_BINK_GENERATED})
 set_target_properties(ac1_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(ac1_runtime PUBLIC Threads::Threads)
+target_compile_definitions(ac1_runtime PRIVATE AC1_PROFILE_HOOKS=1)
 if(AC1_NATIVE_BINK)
   enable_language(CXX)
   target_sources(ac1_runtime PRIVATE src/platform/ac1_bink_native.cpp)
@@ -83,6 +85,7 @@ if(AC1_HOST_D3D9)
   endif()
   set(AC1_D3D9_BUILD_SMOKE OFF)
   add_subdirectory(src/graphics)
+  target_compile_definitions(ac1_d3d9_bridge PRIVATE AC1_PROFILE_HOOKS=1)
   target_compile_definitions(ac1_runtime PRIVATE AC1_HOST_D3D9=1)
   target_link_libraries(ac1_runtime PRIVATE ac1_d3d9_bridge)
 endif()
