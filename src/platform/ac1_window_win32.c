@@ -195,8 +195,11 @@ static int queue_message(ac1_window_win32 *ui, ac1_window_record *record,
 
 static int guest_visible_message(UINT message)
 {
-    return message == WM_ACTIVATE || message == WM_CLOSE ||
-           message == WM_SYSCOMMAND || message == WM_KEYUP ||
+    /* WM_KEYDOWN feeds text input (0x0077FF50) and WM_ACTIVATEAPP the
+     * activation helper (0x00404CA6); both are handled by the original WndProc. */
+    return message == WM_ACTIVATE || message == WM_ACTIVATEAPP ||
+           message == WM_CLOSE || message == WM_SYSCOMMAND ||
+           message == WM_KEYDOWN || message == WM_KEYUP ||
            message == WM_CHAR || message == WM_SYSCHAR ||
            message == WM_MOUSEMOVE || message == WM_LBUTTONDBLCLK ||
            message == WM_PAINT;
