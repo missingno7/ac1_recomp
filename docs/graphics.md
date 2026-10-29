@@ -2,7 +2,7 @@
 
 ## Current host checkpoint
 
-The current host trace, exact stop, and fingerprint are maintained in the [README checkpoint](../README.md). The host graphics path has passed native device creation, shader and texture initialization, all 460 D3DX constant-table calls, monitor enumeration, and `TestCooperativeLevel`. No draw, `Present`, rendered frame, or menu is verified.
+The current host trace, exact stop, and fingerprint are maintained in the [README checkpoint](../README.md). The host graphics path has passed native device creation, shader and texture initialization, all 460 D3DX constant-table calls, monitor enumeration, and `TestCooperativeLevel`. Original code has made a successful native `Present` with zero recorded draws. No rendered game image or menu is verified; the latest verification run failed earlier at device creation, as recorded in the README.
 
 AC1 now has a reproducible ARM64 DXVK Native build under `ports/dxvk_android/`. It pins DXVK Native `native-1.9.2b` to `c8dc91fabd00cac11d697ccf07426e798393cd40`, applies the Android patch recipe into ignored `work/dxvk/prepared/`, and uses NDK `glslc` plus `spirv-val` to generate and validate all 54 built-in shaders for Vulkan 1.1. Run `ports/dxvk_android/build.ps1` to repeat the build; downloaded source, prepared source and compiler output stay under ignored `work/`.
 
