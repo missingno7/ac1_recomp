@@ -1,6 +1,7 @@
 param(
     [string]$AndroidSdk = $(if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { Join-Path $env:LOCALAPPDATA 'Android\Sdk' }),
-    [string]$AndroidNdk = '28.2.13676358'
+    [string]$AndroidNdk = '28.2.13676358',
+    [ValidateSet('arm64-v8a', 'x86_64')][string]$Abi = 'arm64-v8a'
 )
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -12,7 +13,8 @@ $SpirvVal = Join-Path $NdkRoot 'shader-tools\windows-x86_64\spirv-val.exe'
 $Python = (Get-Command python.exe -ErrorAction Stop).Source
 $Dependency = Join-Path $Root 'work\deps\dxvk-native'
 $Prepared = Join-Path $Root 'work\dxvk\prepared'
-$Build = Join-Path $Root 'work\build\dxvk-android-arm64'
+$AbiTag = if ($Abi -eq 'arm64-v8a') { 'arm64' } else { 'x86_64' }
+$Build = Join-Path $Root "work\build\dxvk-android-$AbiTag"
 
 foreach ($Required in @($Cmake, $Ninja, $Glslc, $SpirvVal)) {
     if (!(Test-Path -LiteralPath $Required)) { throw "Required build tool not found: $Required" }
@@ -39,9 +41,9 @@ if ($LASTEXITCODE -ne 0) { throw 'DXVK shader generation failed' }
 & $Cmake -S $PSScriptRoot -B $Build -G Ninja `
     "-DCMAKE_MAKE_PROGRAM=$Ninja" `
     "-DCMAKE_TOOLCHAIN_FILE=$NdkRoot\build\cmake\android.toolchain.cmake" `
-    '-DANDROID_ABI=arm64-v8a' '-DANDROID_PLATFORM=29' `
+    "-DANDROID_ABI=$Abi" '-DANDROID_PLATFORM=29' `
     "-DDXVK_SOURCE=$Prepared" '-DCMAKE_BUILD_TYPE=Release'
 if ($LASTEXITCODE -ne 0) { throw 'DXVK CMake configure failed' }
 & $Cmake --build $Build --parallel
-if ($LASTEXITCODE -ne 0) { throw 'DXVK ARM64 build failed' }
-Write-Host "Built ARM64 DXVK dependency: $(Join-Path $Build 'libac1_dxvk_android.so')"
+if ($LASTEXITCODE -ne 0) { throw "DXVK $Abi build failed" }
+Write-Host "Built $Abi DXVK dependency: $(Join-Path $Build 'libac1_dxvk_android.so')"

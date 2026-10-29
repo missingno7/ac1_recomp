@@ -22,7 +22,7 @@ case "$mode" in
   make_cmd=${MAKE:-make}
   platform=(--target-os=mingw32 --arch=x86_64 --cc=gcc --cxx=g++ --disable-x86asm --enable-shared --disable-static)
   ;;
- android-arm64)
+ android-arm64|android-x86_64)
   : "${ANDROID_NDK_HOME:?Set ANDROID_NDK_HOME to NDK 28.2.13676358}"
   if command -v cygpath >/dev/null; then ANDROID_NDK_HOME=$(cygpath -u "$ANDROID_NDK_HOME"); fi
   host=${NDK_HOST_TAG:-windows-x86_64}
@@ -31,13 +31,16 @@ case "$mode" in
   make_cmd=${MAKE:-make}
   # Direct clang avoids executing Windows .cmd compiler wrappers from MSYS.
   # -j1 by default below; this dependency build never compiles lifted game code.
-  platform=(--target-os=android --arch=aarch64 --enable-cross-compile
-    --cc=clang --cxx=clang++ --extra-cflags=--target=aarch64-linux-android29
-    --extra-ldflags="--target=aarch64-linux-android29 -Wl,-z,max-page-size=16384"
+  # x86_64 is the emulator build: no asm (no nasm; avoids PIC text relocations).
+  if [ "$mode" = android-arm64 ]; then arch=aarch64; asm=(); else arch=x86_64; asm=(--disable-asm); fi
+  triple=$arch-linux-android29
+  platform=(--target-os=android --arch=$arch --enable-cross-compile
+    --cc=clang --cxx=clang++ --extra-cflags=--target=$triple
+    --extra-ldflags="--target=$triple -Wl,-z,max-page-size=16384" "${asm[@]}"
     --ar=llvm-ar --nm=llvm-nm --ranlib=llvm-ranlib --strip=llvm-strip
     --disable-symver --enable-pic --enable-static --disable-shared)
   ;;
- *) echo "usage: $0 [mingw64|android-arm64]" >&2;exit 2;;
+ *) echo "usage: $0 [mingw64|android-arm64|android-x86_64]" >&2;exit 2;;
 esac
 command -v "$make_cmd" >/dev/null || {
  echo "MSYS/POSIX GNU make is required; see build_mingw_probe.py for the native test fallback" >&2
