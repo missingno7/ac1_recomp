@@ -20,23 +20,21 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = struct.Struct("<QQQIIIIII")
+HANDOFF_CAUSES = ("return-slice", "import", "sleep", "yield/Sleep(0)", "wait/block",
+                  "critical-section", "event/semaphore/mutex", "I/O", "thread-start", "thread-exit")
 GUEST = re.compile(r"(?:^|\b)(?:L|ac1|bink)_([0-9A-Fa-f]{8})(?:\b|\.)")
 
 
 @lru_cache(maxsize=16)
-def wait_exports(path: str):
-    """Resolve syscall wait stubs from the local PE export table (no PDB needed).
-
-    This also classifies older captures whose wait-stub flags predate win32u.
-    RVAs are matched against the module base recorded in each capture.
-    """
+def pe_exports(path: str):
+    """Export starts, excluding forwarded exports. Nearest export is approximate."""
     try:
         data = Path(path).read_bytes()
         pe = struct.unpack_from("<I", data, 0x3c)[0]
         sections, optional_size = struct.unpack_from("<H", data, pe+6)[0], struct.unpack_from("<H", data, pe+20)[0]
         optional = pe+24
         magic = struct.unpack_from("<H", data, optional)[0]
-        export = struct.unpack_from("<I", data, optional+(112 if magic == 0x20b else 96))[0]
+        export, export_size = struct.unpack_from("<II", data, optional+(112 if magic == 0x20b else 96))
         def offset(rva):
             for n in range(sections):
                 size, va, raw_size, raw = struct.unpack_from("<IIII", data, optional+optional_size+40*n+8)
@@ -49,12 +47,28 @@ def wait_exports(path: str):
             name_rva = struct.unpack_from("<I", data, offset(names)+4*i)[0]
             begin = offset(name_rva)
             name = data[begin:data.index(b"\0", begin)].decode("ascii", errors="replace")
-            if not name.startswith(("Nt", "Zw")) or not re.search(r"Wait|DelayExecution|GetMessage|RemoveIoCompletion|ListenPort", name): continue
             ordinal = struct.unpack_from("<H", data, offset(ordinals)+2*i)[0]
-            found.append(struct.unpack_from("<I", data, offset(functions)+4*ordinal)[0])
-        return tuple(sorted(set(found)))
+            rva = struct.unpack_from("<I", data, offset(functions)+4*ordinal)[0]
+            if rva and not export <= rva < export+export_size: found.append((rva, name))
+        return tuple(sorted(found))
     except (OSError, ValueError, struct.error, IndexError):
         return ()
+
+
+@lru_cache(maxsize=16)
+def wait_exports(path: str):
+    return tuple(sorted({rva for rva, name in pe_exports(path)
+                         if name.startswith(("Nt", "Zw")) and
+                         re.search(r"Wait|DelayExecution|GetMessage|RemoveIoCompletion|ListenPort", name)}))
+
+
+def nearest_export(module, rip):
+    exports = pe_exports(module["path"])
+    rva = rip-module["base"]
+    index = bisect.bisect_right(exports, (rva, "\uffff"))-1
+    if index < 0: return "[no export]"
+    start, name = exports[index]
+    return f"{name}+0x{rva-start:x}"
 
 
 def syscall_parked(module, rip):
@@ -141,6 +155,7 @@ def main():
     rvas, names = load_symbols(args.exe, args.nm)
     guest_entries = sorted({int(m.group(1), 16) for n in names if (m := GUEST.search(n))})
     modules, symbols, categories, guest_functions = Counter(), Counter(), Counter(), Counter()
+    external_exports = Counter()
     by_thread = defaultdict(Counter)
     module_threads, symbol_threads, category_threads, guest_threads = (defaultdict(Counter) for _ in range(4))
     all_frames, ticks = [], set()
@@ -196,6 +211,7 @@ def main():
             else:
                 categories["external: "+modname] += 1
                 category_threads[tid]["external: "+modname] += 1
+                if mod: external_exports[modname+"!"+nearest_export(mod, rip)] += 1
             if guest:
                 match = GUEST.search(name)
                 if match:
@@ -237,6 +253,7 @@ def main():
         lines.append(f"  {tid:6d}: {t['running']:7,d}/{t['total']:7,d} {100*t['running']/max(total,1):6.2f}% {cpu:10.2f}ms parked={100*t['parked']/t['total']:6.2f}% baton={100*t['baton']/t['total']:6.2f}% {t['total']/elapsed:.1f}/s guest={t['guest']:#x}")
     add_top("Host modules (% of all CPU-active samples)", modules, total)
     add_top("Host categories (% of all CPU-active samples)", categories, total, count=30)
+    add_top("External RIPs by nearest local PE export (approximate, no call stack; % of all active samples)", external_exports, total, count=25)
     if bounds and total:
         all_cpu = sum(max(0, cpu_after.get(tid, 0)-cpu_before.get(tid, 0)) for tid in cpu_after)/10000
         add_cpu_top("Host modules (OS CPU-time weighted sample mix; compensates for different thread sampling rates)", module_threads, all_cpu)
@@ -268,13 +285,27 @@ def main():
     if bounds and latest["mode"] == "sampling":
         duration = (bounds[-1][1]-bounds[0][0])/hz
         totals = Counter()
+        causes = Counter()
         lines.append(f"Counters: complete intervals {(bounds[0][0]-origin)/hz:.3f}..{(bounds[-1][1]-origin)/hz:.3f}s ({duration:.3f}s)")
         for tid, g in after.items():
             delta = {k: g[k]-before.get(tid, {}).get(k, 0) for k in ("dispatches", "misses", "slow", "scanned", "handoffs", "wait_ticks")}
             totals.update(delta)
+            for key in ("transfer_count", "transfer_ns", "io_wait_completions"):
+                totals[key] += g.get(key, 0)-before.get(tid, {}).get(key, 0)
+            old_causes = before.get(tid, {}).get("handoff_causes", [0]*len(HANDOFF_CAUSES))
+            for label, value, old in zip(HANDOFF_CAUSES, g.get("handoff_causes", []), old_causes):
+                causes[label] += value-old
             lines.append(f"  guest {g['guest']:#x} tid={tid}: baton wait {delta['wait_ticks']/hz:.3f}s ({100*delta['wait_ticks']/hz/duration:.2f}% of wall interval), handoffs={delta['handoffs']:,}")
         lines.append(f"  dispatches={totals['dispatches']:,} ({totals['dispatches']/duration:,.1f}/s), lookup misses={totals['misses']:,} ({100*totals['misses']/max(totals['dispatches'],1):.2f}% of dispatches)")
         lines.append(f"  guest_ptr/try_ptr slow scans={totals['slow']:,} ({totals['slow']/duration:,.1f}/s), regions scanned={totals['scanned']:,}, average scan={totals['scanned']/max(totals['slow'],1):.2f}")
+        lines.append(f"  handoffs={totals['handoffs']:,} ({totals['handoffs']/duration:,.1f}/s); causes: "+", ".join(f"{k}={v:,}" for k,v in causes.items()))
+        if totals['transfer_count']:
+            lines.append(f"  baton transfer (publish owner -> recipient holding lock; excludes peer guest execution): mean {totals['transfer_ns']/totals['transfer_count']/1000:.3f} us over {totals['transfer_count']:,} transfers")
+        else:
+            lines.append("  baton transfer latency: unavailable in this capture")
+        lines.append(f"  waits granted on I/O-backed completion events: {totals['io_wait_completions']:,} (not a count of ReadFile submissions)")
+        all_cpu = sum(max(0, cpu_after.get(tid, 0)-cpu_before.get(tid, 0)) for tid in cpu_after)/1e7
+        lines.append(f"  process CPU excluding sampler: {all_cpu:.3f}s, {100*all_cpu/duration:.2f}% of one core")
     elif latest["mode"] == "frames": lines.append("Counters: disabled in frame-only baseline.")
     else: lines.append("Counters: no complete intervals in selected window; widen window to interval boundaries.")
     lines.append("Notes: sampler threads exclude themselves. CPU-active means nonzero QueryThreadCycleTime delta and RIP outside known syscall wait stubs (capture flags plus local ntdll/win32u PE exports); raw deltas are retained. Suspension can itself charge sleeping threads kernel cycles. This is not exact scheduled CPU residency. OS CPU times cover complete counter intervals. Inlined helpers remain charged to generated code. Helper guest-entry attribution via EIP is approximate where discovery entries overlap. Baton wait counts condition sleeps entered without ownership, including guest API blocking after relinquishing ownership. Enumeration is every 250ms; short-lived threads can be missed. Guest/native samplers are separate so a slow graphics GetThreadContext cannot stall guest observations.")

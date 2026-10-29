@@ -238,7 +238,9 @@ static void flush(uint64_t end)
         ac1_profile_counts c=InterlockedCompareExchange(&g->finished,0,0) ? g->counts : g->snapshot;
         uint64_t wait=c.wait_ticks+(c.wait_start && end>c.wait_start ? end-c.wait_start : 0);
         if(comma++) fputc(',',f);
-        fprintf(f,"{\"tid\":%ld,\"guest\":%u,\"snapshot_tick\":%llu,\"dispatches\":%llu,\"misses\":%llu,\"slow\":%llu,\"scanned\":%llu,\"handoffs\":%llu,\"wait_ticks\":%llu}",g->tid,g->id,(unsigned long long)g->snapshot_tick,(unsigned long long)c.dispatches,(unsigned long long)c.misses,(unsigned long long)c.slow,(unsigned long long)c.scanned,(unsigned long long)c.handoffs,(unsigned long long)wait);
+        fprintf(f,"{\"tid\":%ld,\"guest\":%u,\"snapshot_tick\":%llu,\"dispatches\":%llu,\"misses\":%llu,\"slow\":%llu,\"scanned\":%llu,\"handoffs\":%llu,\"wait_ticks\":%llu,\"transfer_count\":%llu,\"transfer_ns\":%llu,\"transfer_max_ns\":%llu,\"handoff_causes\":[",g->tid,g->id,(unsigned long long)g->snapshot_tick,(unsigned long long)c.dispatches,(unsigned long long)c.misses,(unsigned long long)c.slow,(unsigned long long)c.scanned,(unsigned long long)c.handoffs,(unsigned long long)wait,(unsigned long long)c.transfer_count,(unsigned long long)c.transfer_ns,(unsigned long long)c.transfer_max_ns);
+        for(unsigned h=0;h<AC1_HANDOFF_CAUSES;++h) fprintf(f,"%s%llu",h?",":"",(unsigned long long)c.handoff_causes[h]);
+        fprintf(f,"],\"io_wait_completions\":%llu}",(unsigned long long)c.io_wait_completions);
     }
     fprintf(f,"],\"frames\":["); comma=0;
     uint64_t written=(uint64_t)InterlockedCompareExchange64(&frame_write,0,0);
@@ -311,6 +313,8 @@ void ac1_profile_init(void)
     p=strrchr(output_dir,'\\'); if(!p) return; *p=0;
     p=strrchr(output_dir,'\\'); if(!p) return; *p=0;
     strncat(output_dir,"\\work\\profile",sizeof(output_dir)-strlen(output_dir)-1);
+    const char *directory=getenv("AC1_PROFILE_DIR");
+    if(directory && *directory) snprintf(output_dir,sizeof(output_dir),"%s",directory);
     CreateDirectoryA(output_dir,NULL);
     /* Append captures across runs; an interrupted run must not leave old
      * higher-numbered files masquerading as part of a subsequent run. */
@@ -352,6 +356,19 @@ uint64_t ac1_profile_wait_begin(void)
     return ac1_profile_local.wait_start=now();
 }
 void ac1_profile_wait_end(uint64_t start) { if(start) { ac1_profile_local.wait_ticks+=now()-start; ac1_profile_local.wait_start=0; } }
+void ac1_profile_handoff(ac1_handoff_cause cause)
+{
+    if (!ac1_profile_enabled || !ac1_profile_current) return;
+    ++ac1_profile_local.handoffs;
+    ++ac1_profile_local.handoff_causes[cause];
+}
+void ac1_profile_transfer(uint64_t ns)
+{
+    if (!ac1_profile_enabled || !ac1_profile_current) return;
+    ++ac1_profile_local.transfer_count;
+    ac1_profile_local.transfer_ns += ns;
+    if (ns > ac1_profile_local.transfer_max_ns) ac1_profile_local.transfer_max_ns = ns;
+}
 void ac1_profile_present(void)
 {
     /* Guest Present calls are serialized by the baton. Publish after writing. */
@@ -373,5 +390,7 @@ void ac1_profile_guest(unsigned s,uint32_t id,const uint32_t *e,const unsigned *
 void ac1_profile_guest_done(void) {}
 uint64_t ac1_profile_wait_begin(void) { return 0; }
 void ac1_profile_wait_end(uint64_t s) { (void)s; }
+void ac1_profile_handoff(ac1_handoff_cause c) { (void)c; }
+void ac1_profile_transfer(uint64_t ns) { (void)ns; }
 void ac1_profile_present(void) {}
 #endif

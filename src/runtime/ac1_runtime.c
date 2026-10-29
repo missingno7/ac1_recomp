@@ -121,6 +121,9 @@ struct ac1_guest_thread {
     uint64_t wait_deadline;
     uint64_t return_slice_deadline;
     unsigned return_slice_checks;
+    uint64_t checkpoints, wait_completions;
+    ac1_handoff_cause checkpoint_cause;
+    int checkpoint_force;
 };
 
 struct ac1_scheduler {
@@ -136,6 +139,8 @@ struct ac1_scheduler {
     unsigned count, owner;
     uint32_t next_thread_id;
     int stopping, failed;
+    uint64_t trace_wait_deadline;
+    uint64_t transfer_start_ns;
     uint32_t failure_target;
     uint32_t failure_caller, failure_thread_id;
     CPU failure_cpu;
@@ -173,6 +178,8 @@ uint64_t ac1_dispatch_limit = AC1_DISPATCH_LIMIT_DEFAULT;
 #define dispatch_limit ac1_dispatch_limit
 int ac1_direct_slow_mode;
 static uint64_t scheduler_return_slice_ns = UINT64_C(1000000);
+static uint64_t trace_wait_interval_ns;
+static int scheduler_batch_imports = 1;
 static pcrecomp_heap *process_heap;
 static ac1_files *guest_files;
 static char exe_path_copy[32768];
@@ -259,6 +266,14 @@ static void scheduler_notify(ac1_scheduler *scheduler);
 static void scheduler_wait_condition(ac1_scheduler *scheduler, uint32_t milliseconds);
 static void scheduler_destroy_primitives(ac1_scheduler *scheduler);
 static unsigned scheduler_next_runnable(ac1_scheduler *scheduler, unsigned after);
+static void scheduler_refresh_waits(ac1_scheduler *scheduler);
+static void scheduler_transfer_received(ac1_scheduler *scheduler)
+{
+    if (ac1_profile_enabled && scheduler->transfer_start_ns) {
+        ac1_profile_transfer(guest_monotonic_ns() - scheduler->transfer_start_ns);
+        scheduler->transfer_start_ns = 0u;
+    }
+}
 static ac1_guest_thread *thread_for_handle(uint32_t handle);
 static int equal_ascii_fold(const char *a, const char *b);
 static void return_stdcall(CPU *cpu, uint32_t argument_bytes);
@@ -297,6 +312,7 @@ typedef struct {
     uint8_t manual_reset;
     uint8_t signaled;
     uint8_t io_backed;
+    uint64_t signals, acquisitions;
 #ifdef _WIN32
     HANDLE host_event;
 #endif
@@ -378,6 +394,7 @@ static void run_guest_thread(ac1_guest_thread *thread)
     while (!scheduler->stopping && !scheduler->failed && scheduler->owner != thread->slot)
         scheduler_wait_condition(scheduler, 0u);
     int can_run = !scheduler->stopping && !scheduler->failed;
+    if (can_run) scheduler_transfer_received(scheduler);
     thread->started = can_run;
     scheduler_unlock(scheduler);
 
@@ -424,12 +441,13 @@ static void run_guest_thread(ac1_guest_thread *thread)
     thread->guest_dispatches = dispatch_count;
     thread->finished = 1;
     if (scheduler->failed) {
-        if (scheduler->owner != 0u) AC1_PROFILE_COUNT(handoffs);
+        if (scheduler->owner != 0u) ac1_profile_handoff(AC1_HANDOFF_EXIT);
         scheduler->owner = 0u;
     }
     else if (scheduler->owner == thread->slot) {
         unsigned next = scheduler_next_runnable(scheduler, thread->slot);
-        AC1_PROFILE_COUNT(handoffs);
+        ac1_profile_handoff(AC1_HANDOFF_EXIT);
+        if (ac1_profile_enabled) scheduler->transfer_start_ns = guest_monotonic_ns();
         scheduler->owner = next < scheduler->count ? next : 0u;
     }
     int worker_failed = scheduler->failed;
@@ -587,6 +605,7 @@ static int create_guest_thread(CPU *cpu, const import_record *import)
         return 1;
     }
     if (thread_id_output) wr32(thread_id_output, thread->id);
+    if (active_guest_thread) active_guest_thread->checkpoint_cause = AC1_HANDOFF_START;
     cpu->eax = thread->handle;
     last_error = 0u;
     return_stdcall(cpu, 24u);
@@ -600,6 +619,8 @@ static int handle_thread_import(CPU *cpu, const import_record *import)
     if (!strcmp(import->name, "CreateThread")) return create_guest_thread(cpu, import);
     if (!strcmp(import->name, "Sleep")) {
         uint32_t milliseconds = rd32(cpu->esp + 4u);
+        if (active_guest_thread) active_guest_thread->checkpoint_cause =
+            milliseconds ? AC1_HANDOFF_SLEEP : AC1_HANDOFF_YIELD;
         if (active_guest_thread && active_scheduler && milliseconds) {
             active_guest_thread->blocked = 1;
             active_guest_thread->wait_kind = 2;
@@ -610,7 +631,14 @@ static int handle_thread_import(CPU *cpu, const import_record *import)
         return 1;
     }
     if (!strcmp(import->name, "SwitchToThread")) {
-        int another = active_scheduler && active_scheduler->count > 1u;
+        if (active_guest_thread) active_guest_thread->checkpoint_cause = AC1_HANDOFF_YIELD;
+        int another = 0;
+        if (active_scheduler && active_guest_thread) {
+            scheduler_lock(active_scheduler);
+            unsigned next=scheduler_next_runnable(active_scheduler, active_guest_thread->slot);
+            another=next<active_scheduler->count && next!=active_guest_thread->slot;
+            scheduler_unlock(active_scheduler);
+        }
         cpu->eax = another ? 1u : 0u;
         return_stdcall(cpu, 0u);
         return 1;
@@ -788,7 +816,6 @@ static ac1_guest_thread *thread_for_handle(uint32_t handle)
     return thread->handle == handle && !thread->closed ? thread : NULL;
 }
 
-static void scheduler_refresh_waits(ac1_scheduler *scheduler);
 static uint32_t scheduler_next_timeout(ac1_scheduler *scheduler);
 
 static unsigned scheduler_next_runnable(ac1_scheduler *scheduler, unsigned after)
@@ -819,18 +846,39 @@ static void scheduler_checkpoint_for_thread(ac1_guest_thread *thread)
 {
     ac1_scheduler *scheduler = thread ? thread->scheduler : NULL;
     if (!scheduler || !thread || scheduler->count < 2u) return;
+    ++thread->checkpoints;
+    ac1_handoff_cause cause = thread->checkpoint_cause;
+    thread->checkpoint_cause = AC1_HANDOFF_RETURN;
+    if (thread->blocked) {
+        cause = thread->wait_kind == AC1_WAIT_CRITICAL_SECTION ? AC1_HANDOFF_CS :
+                thread->wait_kind == 2 ? AC1_HANDOFF_SLEEP : AC1_HANDOFF_WAIT;
+    }
+    int force = thread->checkpoint_force;
+    thread->checkpoint_force = 0;
+    /* Keep the existing quantum; ordinary imports are yield opportunities,
+     * not mandatory context switches. Blocking, explicit yield, thread start
+     * and a newly readied higher-priority peer remain immediate boundaries.
+     * Only the baton owner reads/writes these fields during guest execution. */
+    if (scheduler_batch_imports && scheduler_return_slice_ns && !force &&
+        !thread->blocked && !thread->suspended && !scheduler->failed &&
+        !scheduler->stopping && cause != AC1_HANDOFF_YIELD &&
+        cause != AC1_HANDOFF_START &&
+        guest_monotonic_ns() < thread->return_slice_deadline)
+        return;
     scheduler_lock(scheduler);
     for (;;) {
         if (scheduler->failed || scheduler->stopping) break;
         unsigned next = scheduler_next_runnable(scheduler, thread->slot);
         if (next == thread->slot) break;
         if (next < scheduler->count) {
-            AC1_PROFILE_COUNT(handoffs);
+            ac1_profile_handoff(cause);
+            if (ac1_profile_enabled) scheduler->transfer_start_ns = guest_monotonic_ns();
             scheduler->owner = next;
             scheduler_notify(scheduler);
             while (!scheduler->stopping && !scheduler->failed &&
                    scheduler->owner != thread->slot)
                 scheduler_wait_condition(scheduler, 0u);
+            if (scheduler->owner == thread->slot) scheduler_transfer_received(scheduler);
             /* Once this thread gets the baton back, let it execute. A regular
              * checkpoint must not immediately hand it to the same peer again. */
             scheduler_refresh_waits(scheduler);
@@ -1359,6 +1407,10 @@ static int equal_ascii_fold(const char *a, const char *b)
 
 static void return_stdcall(CPU *cpu, uint32_t argument_bytes)
 {
+    /* Import adapters all finish here, including bridge service tokens. Keep
+     * the caller hint outside dispatch and the generated-return hot path. */
+    if (active_guest_thread && active_guest_thread->checkpoint_cause == AC1_HANDOFF_RETURN)
+        active_guest_thread->checkpoint_cause = AC1_HANDOFF_IMPORT;
     cpu->eip = rd32(cpu->esp);
     cpu->esp += 4u + argument_bytes;
 }
@@ -2472,6 +2524,7 @@ static int handle_critical_section_import(CPU *cpu, const import_record *import)
     int leave = !strcmp(name, "LeaveCriticalSection");
     int try_enter = !strcmp(name, "TryEnterCriticalSection");
     if (!init_spin && !init && !destroy && !enter && !leave && !try_enter) return 0;
+    if (active_guest_thread) active_guest_thread->checkpoint_cause = AC1_HANDOFF_CS;
 
     uint32_t address = rd32(cpu->esp + 4u);
     uint8_t *section = (uint8_t *)guest_memory_try_ptr(address, 24u);
@@ -2567,13 +2620,15 @@ static int handle_critical_section_import(CPU *cpu, const import_record *import)
                 wr32(address + 8u, 1u);
                 wr32(address + 12u, waiter->id);
                 waiter->blocked = 0;
+                ++waiter->wait_completions;
                 waiter->wait_result = 0u;
                 if (trace_imports)
                     fprintf(stderr,
                             "AC1 CS handoff: section=0x%08x waiter=%u lockcount=%u recursion=%u\n",
                             address, waiter->id, rd32(address + 4u),
                             rd32(address + 8u));
-                scheduler_notify(active_scheduler);
+                if (active_guest_thread && waiter->priority > active_guest_thread->priority)
+                    active_guest_thread->checkpoint_force = 1;
                 break;
             }
             scheduler_unlock(active_scheduler);
@@ -3397,9 +3452,32 @@ static sync_object *sync_object_named(const char *name)
     return NULL;
 }
 
+/* Grant existing waits at the signal boundary, even if the signaler retains
+ * its slice. A subsequent ResetEvent must not revoke an already granted wait.
+ * Native resets temporarily latch their atomic previous signal for this scan. */
+static void scheduler_signal_changed(void)
+{
+    ac1_scheduler *scheduler = active_scheduler;
+    if (!scheduler) return;
+    scheduler_lock(scheduler);
+    scheduler_refresh_waits(scheduler);
+    if (active_guest_thread) {
+        for (unsigned i=0; i<scheduler->count; ++i) {
+            ac1_guest_thread *peer=&scheduler->threads[i];
+            if (!peer->blocked && !peer->finished && !peer->suspended &&
+                peer->priority > active_guest_thread->priority) {
+                active_guest_thread->checkpoint_force=1;
+                break;
+            }
+        }
+    }
+    scheduler_unlock(scheduler);
+}
+
 static int sync_object_is_signaled(sync_object *object)
 {
     if (!object) return 0;
+    if (object->signaled) return 1;
 #ifdef _WIN32
     if (object->kind == 1u && object->host_event)
         return WaitForSingleObject(object->host_event, 0u) == WAIT_OBJECT_0;
@@ -3410,11 +3488,44 @@ static int sync_object_is_signaled(sync_object *object)
 static void sync_object_consume_event(sync_object *object)
 {
     if (!object || object->kind != 1u || object->manual_reset) return;
-#ifdef _WIN32
-    if (object->host_event) return; /* The zero-time native wait consumed it. */
-#endif
+    /* A reset can temporarily latch the previous native signal for an already
+     * registered guest wait. Otherwise the zero-time native wait consumed it. */
     object->signaled = 0u;
 }
+
+#ifdef _WIN32
+typedef LONG (NTAPI *ac1_native_reset_event_fn)(HANDLE, LONG *);
+static ac1_native_reset_event_fn sync_native_reset_event;
+
+static int sync_object_reset_native(sync_object *object, uint32_t token)
+{
+    if (!sync_native_reset_event) {
+        union { FARPROC procedure; ac1_native_reset_event_fn reset; } proc;
+        proc.procedure=GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtResetEvent");
+        sync_native_reset_event=proc.reset;
+    }
+    if (!sync_native_reset_event)
+        stop_guest("native NtResetEvent export is unavailable",token);
+    LONG previous=0;
+    LONG status=sync_native_reset_event(object->host_event,&previous);
+    if (status<0) {
+        typedef ULONG (NTAPI *status_error_fn)(LONG);
+        union { FARPROC procedure; status_error_fn convert; } proc;
+        proc.procedure=GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"RtlNtStatusToDosError");
+        if (!proc.convert) stop_guest("native RtlNtStatusToDosError export is unavailable",token);
+        last_error=proc.convert(status);
+        return 0;
+    }
+    /* Poll-then-ResetEvent loses a completion arriving between those calls.
+     * NtResetEvent returns the previous signal atomically with the reset. Grant
+     * that signal to existing guest waiters; a later native completion remains
+     * in the native event and is not erased by clearing this temporary latch. */
+    object->signaled=previous!=0;
+    scheduler_signal_changed();
+    object->signaled=0;
+    return 1;
+}
+#endif
 
 /* Acquire a waitable object for one satisfied wait on behalf of thread_id. */
 static int sync_object_try_acquire(sync_object *object, uint32_t thread_id)
@@ -3422,17 +3533,20 @@ static int sync_object_try_acquire(sync_object *object, uint32_t thread_id)
     if (object->kind == 1u) {
         if (!sync_object_is_signaled(object)) return 0;
         sync_object_consume_event(object);
+        ++object->acquisitions;
         return 1;
     }
     if (object->kind == 2u) {
         if (!object->count) return 0;
         --object->count;
+        ++object->acquisitions;
         return 1;
     }
     if (object->kind == 3u) {
         if (object->count && object->owner != thread_id) return 0;
         object->owner = thread_id;
         ++object->count;
+        ++object->acquisitions;
         return 1;
     }
     return 0;
@@ -3451,15 +3565,72 @@ static int wait_handle_try_acquire(uint32_t handle, uint32_t thread_id, int *inv
     return sync_object_try_acquire(object, thread_id);
 }
 
+/* Called only by the baton owner under the scheduler lock. Never probe a
+ * native event with a wait here: that would consume auto-reset signals. */
+static void scheduler_trace_waits(ac1_scheduler *scheduler, uint64_t now)
+{
+    if (!trace_wait_interval_ns || now < scheduler->trace_wait_deadline) return;
+    scheduler->trace_wait_deadline = now + trace_wait_interval_ns;
+    fprintf(stderr, "AC1 waits: ns=%llu owner=%u pending_io=%d threads=%u\n",
+            (unsigned long long)now, scheduler->owner,
+            guest_files && ac1_files_has_pending(guest_files), scheduler->count);
+    /* Observed writes in the pinned image's WM_ACTIVATEAPP helper at
+     * 0x00404820..0x00404A4C; observation only, never change guest state. */
+    if (guest_memory_try_ptr(0x01A0EC04u, 2u))
+        fprintf(stderr, "AC1 waits activation: flags@01a0ec04=%u,%u\n",
+                rd8(0x01A0EC04u), rd8(0x01A0EC05u));
+    for (unsigned i = 0; i < scheduler->count; ++i) {
+        ac1_guest_thread *t = &scheduler->threads[i];
+        fprintf(stderr, "AC1 waits thread: slot=%u id=%u eip=0x%08x esp=0x%08x start=0x%08x blocked=%d kind=%d suspended=%d finished=%d priority=%d deadline=%llu checkpoints=%llu completed=%llu handles=",
+                i, t->id, t->cpu.eip, t->cpu.esp, t->start, t->blocked,
+                t->wait_kind, t->suspended, t->finished, t->priority,
+                (unsigned long long)t->wait_deadline,
+                (unsigned long long)t->checkpoints, (unsigned long long)t->wait_completions);
+        uint32_t count = t->wait_count ? t->wait_count : 1u;
+        for (uint32_t h = 0; h < count; ++h)
+            fprintf(stderr, "0x%08x,", t->wait_count ? t->wait_handles[h] : t->wait_handle);
+        if (t->wait_kind == AC1_WAIT_CRITICAL_SECTION && guest_memory_try_ptr(t->wait_handle, 24u))
+            fprintf(stderr, " CS(owner=%u,count=%d,recursion=%u)",
+                    rd32(t->wait_handle + 12u), (int32_t)rd32(t->wait_handle + 4u), rd32(t->wait_handle + 8u));
+        fprintf(stderr, " stack=");
+        for (unsigned s = 0; s < 6u && guest_memory_try_ptr(t->cpu.esp + s*4u, 4u); ++s)
+            fprintf(stderr, "%08x,", rd32(t->cpu.esp + s*4u));
+        fputc('\n', stderr);
+    }
+    for (unsigned i = 0; i < AC1_MAX_SYNC_OBJECTS; ++i) {
+        sync_object *o = &sync_objects[i];
+        if (!o->handle) continue;
+        int native_signal = -1;
+#ifdef _WIN32
+        /* EventBasicInformation is a read-only NT query (type, signal state).
+         * Resolve only for opt-in diagnostics; -1 means unavailable. */
+        typedef LONG (NTAPI *query_event_fn)(HANDLE, int, void *, ULONG, ULONG *);
+        union { FARPROC procedure; query_event_fn query; } query;
+        query.procedure = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryEvent");
+        struct { int type; LONG state; } info;
+        if (o->host_event && query.query &&
+            query.query(o->host_event, 0, &info, sizeof(info), NULL) >= 0)
+            native_signal = info.state;
+#endif
+        fprintf(stderr, "AC1 waits object: handle=0x%08x kind=%u manual=%u portable_signal=%u native_signal=%d io=%u count=%u owner=%u signals=%llu acquired=%llu name=%s\n",
+                o->handle, o->kind, o->manual_reset, o->signaled, native_signal,
+                o->io_backed, o->count, o->owner, (unsigned long long)o->signals,
+                (unsigned long long)o->acquisitions, o->name);
+    }
+    fflush(stderr);
+}
+
 static void scheduler_refresh_waits(ac1_scheduler *scheduler)
 {
     uint64_t now = guest_monotonic_ns();
+    scheduler_trace_waits(scheduler, now);
     for (unsigned i = 0; i < scheduler->count; ++i) {
         ac1_guest_thread *thread = &scheduler->threads[i];
         if (!thread->blocked) continue;
         if (thread->wait_kind == 2) {
             if (thread->wait_deadline && now >= thread->wait_deadline) {
                 thread->blocked = 0;
+                ++thread->wait_completions;
                 thread->wait_result = AC1_WAIT_TIMEOUT;
                 thread->wait_kind = 0;
             }
@@ -3472,7 +3643,10 @@ static void scheduler_refresh_waits(ac1_scheduler *scheduler)
                    !wait_handle_try_acquire(thread->wait_handles[index], thread->id, NULL))
                 ++index;
             if (index < thread->wait_count) {
+                sync_object *completed = sync_object_for_handle(thread->wait_handles[index]);
+                if (completed && completed->io_backed) AC1_PROFILE_COUNT(io_wait_completions);
                 thread->blocked = 0;
+                ++thread->wait_completions;
                 thread->wait_result = AC1_WAIT_OBJECT_0 + index;
                 thread->cpu.eax = AC1_WAIT_OBJECT_0 + index;
                 thread->wait_kind = 0;
@@ -3481,6 +3655,7 @@ static void scheduler_refresh_waits(ac1_scheduler *scheduler)
             }
             if (thread->wait_deadline && now >= thread->wait_deadline) {
                 thread->blocked = 0;
+                ++thread->wait_completions;
                 thread->wait_result = AC1_WAIT_TIMEOUT;
                 thread->cpu.eax = AC1_WAIT_TIMEOUT;
                 thread->wait_kind = 0;
@@ -3491,6 +3666,7 @@ static void scheduler_refresh_waits(ac1_scheduler *scheduler)
         ac1_guest_thread *waited_thread = thread_for_handle(thread->wait_handle);
         if (waited_thread && waited_thread->finished) {
             thread->blocked = 0;
+            ++thread->wait_completions;
             thread->wait_result = AC1_WAIT_OBJECT_0;
             thread->cpu.eax = AC1_WAIT_OBJECT_0;
             thread->wait_kind = 0;
@@ -3499,7 +3675,9 @@ static void scheduler_refresh_waits(ac1_scheduler *scheduler)
         sync_object *object = sync_object_for_handle(thread->wait_handle);
         if (object) {
             if (sync_object_try_acquire(object, thread->id)) {
+                if (object->io_backed) AC1_PROFILE_COUNT(io_wait_completions);
                 thread->blocked = 0;
+                ++thread->wait_completions;
                 thread->wait_result = AC1_WAIT_OBJECT_0;
                 thread->cpu.eax = AC1_WAIT_OBJECT_0;
                 thread->wait_kind = 0;
@@ -3508,6 +3686,7 @@ static void scheduler_refresh_waits(ac1_scheduler *scheduler)
         }
         if (thread->wait_deadline && now >= thread->wait_deadline) {
             thread->blocked = 0;
+            ++thread->wait_completions;
             thread->wait_result = AC1_WAIT_TIMEOUT;
             thread->cpu.eax = AC1_WAIT_TIMEOUT;
             thread->wait_kind = 0;
@@ -3542,6 +3721,10 @@ static uint32_t scheduler_next_timeout(ac1_scheduler *scheduler)
         if (thread->blocked && thread->wait_deadline && thread->wait_deadline < nearest)
             nearest = thread->wait_deadline;
     }
+    /* Let the baton holder print periodic diagnostics even if every guest is
+     * in an infinite wait. No observer thread or event-consuming probe. */
+    if (trace_wait_interval_ns && scheduler->trace_wait_deadline < nearest)
+        nearest = scheduler->trace_wait_deadline;
     if (nearest == UINT64_MAX) {
 #ifdef _WIN32
         return poll_native_events ? 10u : 0u;
@@ -3588,6 +3771,9 @@ static int handle_sync_import(CPU *cpu, const import_record *import)
     if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
         return 0;
     const char *name = import->name;
+    if (active_guest_thread && (!strcmp(name, "SetEvent") || !strcmp(name, "ResetEvent") ||
+        !strcmp(name, "ReleaseSemaphore") || !strcmp(name, "ReleaseMutex")))
+        active_guest_thread->checkpoint_cause = AC1_HANDOFF_SYNC;
     if (!strcmp(name, "CreateEventA")) {
         uint32_t attributes = rd32(cpu->esp + 4u);
         uint32_t manual_reset = rd32(cpu->esp + 8u);
@@ -3684,7 +3870,10 @@ static int handle_sync_import(CPU *cpu, const import_record *import)
         } else if (!object->count || object->owner != current_host_thread_id()) {
             cpu->eax = 0u; last_error = 288u; /* ERROR_NOT_OWNER */
         } else {
-            if (!--object->count) object->owner = 0u;
+            if (!--object->count) {
+                object->owner = 0u;
+                scheduler_signal_changed();
+            }
             cpu->eax = 1u;
         }
         return_stdcall(cpu, 4u);
@@ -3701,12 +3890,14 @@ static int handle_sync_import(CPU *cpu, const import_record *import)
             if (object->host_event)
                 native_success = !strcmp(name, "SetEvent")
                     ? SetEvent(object->host_event)
-                    : ResetEvent(object->host_event);
+                    : sync_object_reset_native(object, import->token);
+#else
+            if (!strcmp(name,"ResetEvent")) scheduler_signal_changed();
 #endif
             if (!native_success) {
                 cpu->eax = 0u;
 #ifdef _WIN32
-                last_error = (uint32_t)GetLastError();
+                if (!strcmp(name,"SetEvent")) last_error = (uint32_t)GetLastError();
 #else
                 last_error = 6u;
 #endif
@@ -3714,6 +3905,8 @@ static int handle_sync_import(CPU *cpu, const import_record *import)
 #ifndef _WIN32
                 object->signaled = !strcmp(name, "SetEvent");
 #endif
+                if (!strcmp(name, "SetEvent")) ++object->signals;
+                if (!strcmp(name, "SetEvent")) scheduler_signal_changed();
                 cpu->eax = 1u;
             }
         }
@@ -3736,6 +3929,7 @@ static int handle_sync_import(CPU *cpu, const import_record *import)
                 wr32(previous_address, object->count);
             }
             object->count += release_count;
+            scheduler_signal_changed();
             cpu->eax = 1u;
         }
         return_stdcall(cpu, 12u);
@@ -4505,6 +4699,7 @@ static int handle_file_import(CPU *cpu, const import_record *import)
     }
 
     if (!strcmp(import->name, "ReadFile")) {
+        if (active_guest_thread) active_guest_thread->checkpoint_cause = AC1_HANDOFF_IO;
         if (!guest_files) return 0;
         if (!guest_memory_try_ptr(cpu->esp + 4u, 20u))
             stop_guest("ReadFile arguments are unmapped", import->token);
@@ -6773,6 +6968,15 @@ int ac1_run(const char *exe_path)
     reset_main_lifted_lookup_cache();
     dispatch_limit = read_dispatch_limit();
     scheduler_return_slice_ns = read_scheduler_return_slice_ns();
+    {
+        const char *setting = getenv("AC1_SCHEDULER_BATCH_IMPORTS");
+        scheduler_batch_imports = !setting || strcmp(setting, "0");
+    }
+    {
+        const char *setting = getenv("AC1_TRACE_WAITS");
+        unsigned seconds = setting ? (unsigned)strtoul(setting, NULL, 10) : 0u;
+        trace_wait_interval_ns = (uint64_t)seconds * UINT64_C(1000000000);
+    }
 #ifdef _WIN32
     window_bridge = NULL;
     ds8_configured = 0;
