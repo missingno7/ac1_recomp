@@ -1,5 +1,6 @@
 #include "ac1_d3d9_bridge.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -16,10 +17,12 @@ constexpr uint32_t kGuestLimit = 0x00050000u;
 constexpr uint32_t kGuestObjectPool = 0x00020000u;
 std::array<uint8_t, kGuestLimit - kGuestBase> guest_memory{};
 uint32_t next_guest_address = kGuestObjectPool;
+bool fail_next_guest_allocation = false;
 HWND hidden_window = nullptr;
 std::array<void *, 17> fake_d3d_vtable{};
 std::array<void *, 119> fake_device_vtable{};
 std::array<void *, 17> fake_surface_vtable{};
+std::array<void *, 22> fake_cube_texture_vtable{};
 std::array<void *, 5> fake_pixel_shader_vtable{};
 std::array<void *, 5> fake_vertex_shader_vtable{};
 
@@ -246,6 +249,12 @@ struct GuestPresentParameters {
 };
 static_assert(sizeof(GuestPresentParameters) == 56, "guest D3D9 ABI test layout");
 
+struct GuestLockedRect {
+    int32_t pitch;
+    uint32_t bits;
+};
+static_assert(sizeof(GuestLockedRect) == 8, "guest D3DLOCKED_RECT test layout");
+
 struct FakeComObject {
     void **vtable;
     ULONG references;
@@ -255,6 +264,7 @@ FakeComObject fake_d3d{};
 FakeComObject fake_device{};
 FakeComObject fake_render_target{};
 FakeComObject fake_depth_surface{};
+FakeComObject fake_cube_texture{};
 FakeComObject fake_pixel_shader{};
 FakeComObject fake_vertex_shader{};
 uint32_t fake_query_calls = 0;
@@ -276,6 +286,10 @@ uint32_t fake_constant_kind = 0;
 uint32_t fake_constant_start = UINT32_MAX;
 uint32_t fake_constant_count = UINT32_MAX;
 std::array<uint32_t, 16> fake_constant_words{};
+HRESULT fake_cube_create_result = S_OK;
+uint32_t fake_cube_create_calls = 0;
+std::array<uint32_t, 6> fake_cube_create_args{};
+std::vector<uint32_t> freed_guest_allocations;
 
 HRESULT STDMETHODCALLTYPE fake_query_interface(IUnknown *self, REFIID iid, void **output)
 {
@@ -309,6 +323,22 @@ HRESULT STDMETHODCALLTYPE fake_create_device(
     fake_device.references = 1;
     *output = reinterpret_cast<IDirect3DDevice9 *>(&fake_device);
     return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE fake_create_cube_texture(
+    IDirect3DDevice9 *, UINT edge_length, UINT levels, DWORD usage,
+    D3DFORMAT format, D3DPOOL pool, IDirect3DCubeTexture9 **output,
+    HANDLE *shared_handle)
+{
+    ++fake_cube_create_calls;
+    fake_cube_create_args = {edge_length, levels, usage,
+        static_cast<uint32_t>(format), static_cast<uint32_t>(pool),
+        shared_handle ? 1u : 0u};
+    if (FAILED(fake_cube_create_result)) return fake_cube_create_result;
+    if (!output) return D3DERR_INVALIDCALL;
+    fake_cube_texture.references = 1;
+    *output = reinterpret_cast<IDirect3DCubeTexture9 *>(&fake_cube_texture);
+    return fake_cube_create_result;
 }
 
 uintptr_t fake_translate_window(void *, uint32_t guest_hwnd)
@@ -503,6 +533,7 @@ void initialize_fake_com()
     fake_d3d_vtable.fill(nullptr);
     fake_device_vtable.fill(nullptr);
     fake_surface_vtable.fill(nullptr);
+    fake_cube_texture_vtable.fill(nullptr);
     fake_pixel_shader_vtable.fill(nullptr);
     fake_vertex_shader_vtable.fill(nullptr);
     for (auto *table : {&fake_d3d_vtable, &fake_surface_vtable}) {
@@ -510,6 +541,9 @@ void initialize_fake_com()
         (*table)[1] = reinterpret_cast<void *>(&fake_add_ref);
         (*table)[2] = reinterpret_cast<void *>(&fake_release);
     }
+    fake_cube_texture_vtable[0] = reinterpret_cast<void *>(&fake_query_interface);
+    fake_cube_texture_vtable[1] = reinterpret_cast<void *>(&fake_add_ref);
+    fake_cube_texture_vtable[2] = reinterpret_cast<void *>(&fake_release);
     fake_device_vtable[0] = reinterpret_cast<void *>(&fake_query_interface);
     fake_device_vtable[1] = reinterpret_cast<void *>(&fake_add_ref);
     fake_device_vtable[2] = reinterpret_cast<void *>(&fake_release);
@@ -521,6 +555,7 @@ void initialize_fake_com()
     fake_vertex_shader_vtable[1] = reinterpret_cast<void *>(&fake_add_ref);
     fake_vertex_shader_vtable[2] = reinterpret_cast<void *>(&fake_release);
     fake_d3d_vtable[16] = reinterpret_cast<void *>(&fake_create_device);
+    fake_device_vtable[25] = reinterpret_cast<void *>(&fake_create_cube_texture);
     fake_device_vtable[38] = reinterpret_cast<void *>(&fake_get_render_target);
     fake_device_vtable[40] = reinterpret_cast<void *>(&fake_get_depth_surface);
     fake_device_vtable[57] = reinterpret_cast<void *>(&fake_set_render_state);
@@ -569,6 +604,10 @@ void initialize_fake_com()
     fake_depth_surface = {fake_surface_vtable.data(), 0,
         {D3DFMT_D24S8, D3DRTYPE_SURFACE, D3DUSAGE_DEPTHSTENCIL,
          D3DPOOL_DEFAULT, D3DMULTISAMPLE_NONE, 0, 640, 480}};
+    fake_cube_texture = {fake_cube_texture_vtable.data(), 0, {}};
+    fake_cube_create_result = S_OK;
+    fake_cube_create_calls = 0;
+    fake_cube_create_args.fill(UINT32_MAX);
 }
 
 bool run_fake_surface_smoke(ac1_d3d9_callbacks callbacks)
@@ -614,6 +653,82 @@ bool run_fake_surface_smoke(ac1_d3d9_callbacks callbacks)
         static_cast<HRESULT>(result) != D3DERR_DEVICELOST) {
         std::fprintf(stderr, "fake TestCooperativeLevel HRESULT forwarding failed: 0x%08x %s\n",
                      result, ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    const uint32_t cube_output = allocate_guest(nullptr, sizeof(uint32_t), 4);
+    const uint32_t cube_create_args[] = {
+        device, 4u, 1u, 0u, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+        cube_output, 0u
+    };
+    const uint32_t cube_unmapped_output_args[] = {
+        device, 4u, 1u, 0u, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+        0xfffffffcu, 0u
+    };
+    const uint32_t cube_shared_handle_args[] = {
+        device, 4u, 1u, 0u, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+        cube_output, 0x1234u
+    };
+    if (ac1_d3d9_argument_count(0x7e002190u) != 8 ||
+        ac1_d3d9_dispatch(object_slot(device, 25), cube_unmapped_output_args, 8,
+                          &result) != 1 ||
+        result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
+        fake_cube_create_calls != 0 ||
+        ac1_d3d9_dispatch(object_slot(device, 25), cube_shared_handle_args, 8,
+                          &result) != -2 || fake_cube_create_calls != 0) {
+        std::fprintf(stderr, "fake CreateCubeTexture output/shared-handle validation failed: %s\n",
+                     ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    fake_cube_create_result = D3DERR_OUTOFVIDEOMEMORY;
+    if (ac1_d3d9_dispatch(object_slot(device, 25), cube_create_args, 8,
+                          &result) != 1 ||
+        result != static_cast<uint32_t>(D3DERR_OUTOFVIDEOMEMORY) ||
+        guest_word(cube_output) != 0 || fake_cube_create_calls != 1) {
+        std::fprintf(stderr, "fake CreateCubeTexture HRESULT/output handling failed\n");
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    fake_cube_create_result = S_OK;
+    fail_next_guest_allocation = true;
+    if (ac1_d3d9_dispatch(object_slot(device, 25), cube_create_args, 8,
+                          &result) != 1 ||
+        result != static_cast<uint32_t>(E_OUTOFMEMORY) ||
+        guest_word(cube_output) != 0 || fake_cube_create_calls != 2 ||
+        fake_cube_texture.references != 0) {
+        std::fprintf(stderr, "fake CreateCubeTexture guest allocation failure cleanup failed: %s\n",
+                     ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    if (ac1_d3d9_dispatch(object_slot(device, 25), cube_create_args, 8,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result)) ||
+        fake_cube_create_calls != 3 ||
+        fake_cube_create_args != std::array<uint32_t, 6>{
+            4u, 1u, 0u, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, 0u}) {
+        std::fprintf(stderr, "fake CreateCubeTexture native ABI forwarding failed: %s\n",
+                     ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    const uint32_t cube_texture = guest_word(cube_output);
+    const uint32_t cube_release_args[] = {cube_texture};
+    const uint32_t fake_cube_lock_args[] = {
+        cube_texture, D3DCUBEMAP_FACE_POSITIVE_X, 0u, cube_output, 1u, 0u
+    };
+    if (!cube_texture || object_slot(cube_texture, 0) != 0x7e00b000u ||
+        ac1_d3d9_argument_count(object_slot(cube_texture, 3)) != -2 ||
+        ac1_d3d9_argument_count(object_slot(cube_texture, 19)) != 6 ||
+        ac1_d3d9_argument_count(object_slot(cube_texture, 20)) != 3 ||
+        ac1_d3d9_argument_count(0x7e00b160u) != -1 ||
+        ac1_d3d9_dispatch(object_slot(cube_texture, 19), fake_cube_lock_args, 6,
+                          &result) != -2 ||
+        ac1_d3d9_dispatch(object_slot(cube_texture, 2), cube_release_args, 1,
+                          &result) != 1 || result != 0 ||
+        fake_cube_texture.references != 0) {
+        std::fprintf(stderr, "fake cube-texture proxy/lifetime validation failed: %s\n",
+                     ac1_d3d9_last_error());
         ac1_d3d9_shutdown();
         return false;
     }
@@ -981,6 +1096,10 @@ void *resolve_guest(void *, uint32_t address, uint32_t size, uint32_t)
 
 uint32_t allocate_guest(void *, uint32_t size, uint32_t alignment)
 {
+    if (fail_next_guest_allocation) {
+        fail_next_guest_allocation = false;
+        return 0;
+    }
     const uint32_t mask = alignment - 1;
     next_guest_address = (next_guest_address + mask) & ~mask;
     if (!size || next_guest_address > kGuestLimit || size > kGuestLimit - next_guest_address)
@@ -990,7 +1109,10 @@ uint32_t allocate_guest(void *, uint32_t size, uint32_t alignment)
     return result;
 }
 
-void free_guest(void *, uint32_t) {}
+void free_guest(void *, uint32_t address)
+{
+    freed_guest_allocations.push_back(address);
+}
 
 uintptr_t translate_window(void *, uint32_t guest_hwnd)
 {
@@ -1135,8 +1257,14 @@ int main(int argc, char **argv)
         ac1_d3d9_argument_count(0x7e007000u) != 3 ||
         ac1_d3d9_argument_count(0x7e002560u) != 3 ||
         ac1_d3d9_argument_count(0x7e002170u) != 9 ||
+        ac1_d3d9_argument_count(0x7e002190u) != 8 ||
+        ac1_d3d9_argument_count(0x7e00b000u) != 3 ||
+        ac1_d3d9_argument_count(0x7e00b130u) != 6 ||
+        ac1_d3d9_argument_count(0x7e00b140u) != 3 ||
+        ac1_d3d9_argument_count(0x7e00b030u) != -2 ||
+        ac1_d3d9_argument_count(0x7e00b160u) != -1 ||
         ac1_d3d9_dispatch(0x7e0030b0u, nullptr, 0, nullptr) != -2 ||
-        ac1_d3d9_dispatch(0x7e00b000u, nullptr, 0, nullptr) != 0) {
+        ac1_d3d9_dispatch(0x7e00c000u, nullptr, 0, nullptr) != 0) {
         std::fprintf(stderr, "COM method-arity classification failed\n");
         ac1_d3d9_shutdown();
         return 3;
@@ -1217,6 +1345,235 @@ int main(int argc, char **argv)
         DestroyWindow(hidden_window);
         return fake_passed ? 0 : 19;
     }
+
+    const uint32_t cube_output = allocate_guest(nullptr, sizeof(uint32_t), 4);
+    const uint32_t cube_create_args[] = {
+        device, 4u, 1u, 0u, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+        cube_output, 0u
+    };
+    uint32_t cube_result = 0;
+    if (ac1_d3d9_argument_count(object_slot(device, 25)) != 8 ||
+        ac1_d3d9_dispatch(object_slot(device, 25), cube_create_args, 8,
+                          &cube_result) != 1 ||
+        FAILED(static_cast<HRESULT>(cube_result))) {
+        std::fprintf(stderr, "native DXVK CreateCubeTexture failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), cube_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 58;
+    }
+    const uint32_t cube_texture = guest_word(cube_output);
+    const uint32_t cube_lock = object_slot(cube_texture, 19);
+    const uint32_t cube_unlock = object_slot(cube_texture, 20);
+    const uint32_t cube_locked_output = allocate_guest(nullptr, sizeof(GuestLockedRect), 4);
+    const uint32_t cube_bad_output_args[] = {
+        cube_texture, D3DCUBEMAP_FACE_POSITIVE_X, 0u, 0xfffffffcu, 0u, 0u
+    };
+    const uint32_t cube_bad_face_args[] = {
+        cube_texture, 6u, 0u, cube_locked_output, 0u, 0u
+    };
+    const uint32_t cube_bad_rect_args[] = {
+        cube_texture, D3DCUBEMAP_FACE_POSITIVE_X, 0u, cube_locked_output, 1u, 0u
+    };
+    const uint32_t cube_bad_flags_args[] = {
+        cube_texture, D3DCUBEMAP_FACE_POSITIVE_X, 0u, cube_locked_output, 0u,
+        D3DLOCK_READONLY
+    };
+    if (!cube_texture || object_slot(cube_texture, 0) != 0x7e00b000u ||
+        ac1_d3d9_argument_count(cube_lock) != 6 ||
+        ac1_d3d9_argument_count(cube_unlock) != 3 ||
+        ac1_d3d9_dispatch(cube_lock, cube_bad_output_args, 6, &cube_result) != 1 ||
+        cube_result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
+        ac1_d3d9_dispatch(cube_lock, cube_bad_face_args, 6, &cube_result) != 1 ||
+        cube_result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
+        ac1_d3d9_dispatch(cube_lock, cube_bad_rect_args, 6, &cube_result) != -2 ||
+        ac1_d3d9_dispatch(cube_lock, cube_bad_flags_args, 6, &cube_result) != -2) {
+        std::fprintf(stderr, "native cube LockRect ABI/profile validation failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 60;
+    }
+
+    std::array<GuestLockedRect, 6> face_locks{};
+    for (uint32_t face = 0; face < face_locks.size(); ++face) {
+        const uint32_t lock_args[] = {cube_texture, face, 0u,
+                                      cube_locked_output, 0u, 0u};
+        if (ac1_d3d9_dispatch(cube_lock, lock_args, 6, &cube_result) != 1 ||
+            FAILED(static_cast<HRESULT>(cube_result))) {
+            std::fprintf(stderr, "native cube face %u LockRect failed: %s (HRESULT=0x%08x)\n",
+                         face, ac1_d3d9_last_error(), cube_result);
+            DestroyWindow(hidden_window);
+            ac1_d3d9_shutdown();
+            return 61;
+        }
+        std::memcpy(&face_locks[face],
+                    resolve_guest(nullptr, cube_locked_output,
+                                  sizeof(GuestLockedRect), AC1_D3D9_GUEST_READ),
+                    sizeof(GuestLockedRect));
+        if (face_locks[face].pitch < 16 || !face_locks[face].bits ||
+            face_locks[face].bits < kGuestBase ||
+            static_cast<uint64_t>(face_locks[face].bits) +
+                static_cast<uint64_t>(face_locks[face].pitch) * 4u > kGuestLimit) {
+            std::fprintf(stderr, "native cube face %u returned invalid guest pitch/bits\n", face);
+            DestroyWindow(hidden_window);
+            ac1_d3d9_shutdown();
+            return 62;
+        }
+        auto *pixels = static_cast<uint32_t *>(resolve_guest(
+            nullptr, face_locks[face].bits,
+            static_cast<uint32_t>(face_locks[face].pitch) * 4u,
+            AC1_D3D9_GUEST_WRITE));
+        if (!pixels) {
+            std::fprintf(stderr, "native cube face %u staging pointer is not guest memory\n", face);
+            DestroyWindow(hidden_window);
+            ac1_d3d9_shutdown();
+            return 63;
+        }
+        for (uint32_t y = 0; y < 4; ++y) {
+            for (uint32_t x = 0; x < 4; ++x) {
+                pixels[static_cast<size_t>(y) * face_locks[face].pitch / 4u + x] =
+                    0xff000000u | ((face + 1u) << 16u) | (y << 8u) | x;
+            }
+        }
+    }
+    const uint32_t cube_duplicate_lock_args[] = {
+        cube_texture, D3DCUBEMAP_FACE_POSITIVE_X, 0u, cube_locked_output, 0u, 0u
+    };
+    const uint32_t cube_unmatched_unlock_args[] = {
+        cube_texture, D3DCUBEMAP_FACE_POSITIVE_X, 1u
+    };
+    if (ac1_d3d9_dispatch(cube_lock, cube_duplicate_lock_args, 6, &cube_result) != 1 ||
+        cube_result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
+        ac1_d3d9_dispatch(cube_unlock, cube_unmatched_unlock_args, 3,
+                          &cube_result) != 1 ||
+        cube_result != static_cast<uint32_t>(D3DERR_INVALIDCALL)) {
+        std::fprintf(stderr, "cube face/level lock identity validation failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 64;
+    }
+    for (uint32_t face = 0; face < face_locks.size(); ++face) {
+        const uint32_t unlock_args[] = {cube_texture, face, 0u};
+        if (ac1_d3d9_dispatch(cube_unlock, unlock_args, 3, &cube_result) != 1 ||
+            FAILED(static_cast<HRESULT>(cube_result))) {
+            std::fprintf(stderr, "native cube face %u UnlockRect failed: %s (HRESULT=0x%08x)\n",
+                         face, ac1_d3d9_last_error(), cube_result);
+            DestroyWindow(hidden_window);
+            ac1_d3d9_shutdown();
+            return 65;
+        }
+    }
+    for (uint32_t face = 0; face < face_locks.size(); ++face) {
+        const uint32_t lock_args[] = {cube_texture, face, 0u,
+                                      cube_locked_output, 0u, 0u};
+        if (ac1_d3d9_dispatch(cube_lock, lock_args, 6, &cube_result) != 1 ||
+            FAILED(static_cast<HRESULT>(cube_result))) {
+            std::fprintf(stderr, "native cube face %u readback LockRect failed\n", face);
+            DestroyWindow(hidden_window);
+            ac1_d3d9_shutdown();
+            return 66;
+        }
+        GuestLockedRect readback{};
+        std::memcpy(&readback,
+                    resolve_guest(nullptr, cube_locked_output,
+                                  sizeof(GuestLockedRect), AC1_D3D9_GUEST_READ),
+                    sizeof(readback));
+        auto *pixels = static_cast<const uint32_t *>(resolve_guest(
+            nullptr, readback.bits, static_cast<uint32_t>(readback.pitch) * 4u,
+            AC1_D3D9_GUEST_READ));
+        bool face_matches = pixels != nullptr && readback.pitch == face_locks[face].pitch;
+        for (uint32_t y = 0; y < 4 && face_matches; ++y) {
+            for (uint32_t x = 0; x < 4; ++x) {
+                const uint32_t expected = 0xff000000u |
+                    ((face + 1u) << 16u) | (y << 8u) | x;
+                if (pixels[static_cast<size_t>(y) * readback.pitch / 4u + x] != expected) {
+                    face_matches = false;
+                    break;
+                }
+            }
+        }
+        const uint32_t unlock_args[] = {cube_texture, face, 0u};
+        if (!face_matches ||
+            ac1_d3d9_dispatch(cube_unlock, unlock_args, 3, &cube_result) != 1 ||
+            FAILED(static_cast<HRESULT>(cube_result))) {
+            std::fprintf(stderr, "native cube face %u row-pitch readback mismatch\n", face);
+            DestroyWindow(hidden_window);
+            ac1_d3d9_shutdown();
+            return 67;
+        }
+    }
+    const uint32_t cube_outstanding_lock_args[] = {
+        cube_texture, D3DCUBEMAP_FACE_POSITIVE_X, 0u, cube_locked_output, 0u, 0u
+    };
+    if (ac1_d3d9_dispatch(cube_lock, cube_outstanding_lock_args, 6,
+                          &cube_result) != 1 ||
+        FAILED(static_cast<HRESULT>(cube_result))) {
+        std::fprintf(stderr, "cube final-release cleanup LockRect failed\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 68;
+    }
+    GuestLockedRect release_locked{};
+    std::memcpy(&release_locked,
+                resolve_guest(nullptr, cube_locked_output,
+                              sizeof(GuestLockedRect), AC1_D3D9_GUEST_READ),
+                sizeof(release_locked));
+    const uint32_t cube_release_args[] = {cube_texture};
+    if (!cube_texture || object_slot(cube_texture, 0) != 0x7e00b000u ||
+        ac1_d3d9_argument_count(object_slot(cube_texture, 3)) != -2 ||
+        ac1_d3d9_dispatch(object_slot(cube_texture, 2), cube_release_args, 1,
+                          &cube_result) != 1 || cube_result != 0) {
+        std::fprintf(stderr, "native DXVK cube-texture proxy release failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 59;
+    }
+    if (std::find(freed_guest_allocations.begin(), freed_guest_allocations.end(),
+                  release_locked.bits) == freed_guest_allocations.end()) {
+        std::fprintf(stderr, "cube final Release did not free locked guest staging\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 69;
+    }
+
+    const uint32_t shutdown_cube_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t shutdown_cube_create_args[] = {
+        device, 4u, 1u, 0u, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+        shutdown_cube_output, 0u
+    };
+    if (ac1_d3d9_dispatch(object_slot(device, 25), shutdown_cube_create_args, 8,
+                          &cube_result) != 1 ||
+        FAILED(static_cast<HRESULT>(cube_result))) {
+        std::fprintf(stderr, "shutdown-cleanup cube creation failed\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 70;
+    }
+    const uint32_t shutdown_cube = guest_word(shutdown_cube_output);
+    const uint32_t shutdown_cube_locked_output = allocate_guest(
+        nullptr, sizeof(GuestLockedRect), 4);
+    const uint32_t shutdown_cube_lock_args[] = {
+        shutdown_cube, D3DCUBEMAP_FACE_NEGATIVE_Z, 0u,
+        shutdown_cube_locked_output, 0u, 0u
+    };
+    if (ac1_d3d9_dispatch(object_slot(shutdown_cube, 19),
+                          shutdown_cube_lock_args, 6, &cube_result) != 1 ||
+        FAILED(static_cast<HRESULT>(cube_result))) {
+        std::fprintf(stderr, "shutdown-cleanup cube LockRect failed\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 71;
+    }
+    GuestLockedRect shutdown_cube_locked{};
+    std::memcpy(&shutdown_cube_locked,
+                resolve_guest(nullptr, shutdown_cube_locked_output,
+                              sizeof(GuestLockedRect), AC1_D3D9_GUEST_READ),
+                sizeof(shutdown_cube_locked));
+
+    std::printf("native DXVK cube six-face LockRect round-trip plus Release cleanup passed\n");
 
     static const char pixel_source[] =
         "float4 main() : COLOR0 { return float4(1.0, 0.0, 0.0, 1.0); }";
@@ -1825,6 +2182,11 @@ int main(int argc, char **argv)
     }
     DestroyWindow(hidden_window);
     ac1_d3d9_shutdown();
+    if (std::find(freed_guest_allocations.begin(), freed_guest_allocations.end(),
+                  shutdown_cube_locked.bits) == freed_guest_allocations.end()) {
+        std::fprintf(stderr, "bridge shutdown did not free locked cube staging\n");
+        return 72;
+    }
     std::printf("native D3D9 bridge smoke passed; adapters=%u, windowed device surface=%ux%u\n",
                 adapter_count, surface_width, surface_height);
     return run_fake_surface_smoke(callbacks) ? 0 : 19;
