@@ -344,9 +344,10 @@ void trace_frame_success(bool is_present, const char *method)
         ++g_successful_present_calls;
         const uint64_t n = g_successful_present_calls;
         if (n >= 2u && !(n & (n - 1u)))
-            std::fprintf(stderr, "AC1 D3D9 trace: present_calls=%llu draw_calls=%llu\n",
+            std::fprintf(stderr, "AC1 D3D9 trace: present_calls=%llu draw_calls=%llu t_ms=%lu\n",
                          static_cast<unsigned long long>(n),
-                         static_cast<unsigned long long>(g_successful_draw_calls));
+                         static_cast<unsigned long long>(g_successful_draw_calls),
+                         static_cast<unsigned long>(GetTickCount()));
         if (!g_first_present_reported) {
             std::fprintf(stderr,
                 "AC1 D3D9 trace: first successful Present via %s (present_calls=%llu, draw_calls=%llu)\n",
