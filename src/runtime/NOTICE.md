@@ -9,3 +9,5 @@ The ordinary-return scheduler slice in `ac1_runtime.c` follows the per-thread co
 `cpu.h` and `pcrecomp_heap.inc` derive from pcrecomp, copyright 2026 sp00nz, MIT; see `LICENSE.pcrecomp.txt`. The CPU header also contains helper fragments from recomp-kit, copyright 2026 veritr1x, MIT; see `LICENSE.recomp-kit.txt`. This applies to those reusable runtime implementations, not the original Assassin's Creed executable or its generated translations.
 
 Generated game functions are private local build products under ignored `work/`. APKs and host executables that include those translations are likewise local build products. No game executable, assets, or translated game functions belong in the source repository.
+
+`tools/lift_ac1.py` has a bounded MMX lowering for the two validated Havok record routines at `0x01023410` and `0x01023520`. It uses function-local MMX registers because both intervals are call-free, initialize every MMX read on all paths, and execute `EMMS` before every exit. This does not model general MMX/x87 register aliasing or x87 tag state; MMX instructions outside these pinned intervals remain unsupported diagnostics.

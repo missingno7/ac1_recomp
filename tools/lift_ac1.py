@@ -34,6 +34,89 @@ AC1_ARG2_CALLBACK_HELPERS = {
     AC1_READER_CALLBACK_HELPER: "reader_callback",
 }
 
+# These are the only MMX intervals in the current observed AC1 catalog. Each
+# begins with a MOVQ from memory, contains no calls or x87 operations, and ends
+# with EMMS before returning. Keep MMX lowering scoped to these closed paths
+# until the CPU model grows full x87/MMX physical-register alias semantics.
+AC1_MMX_FUNCTION_COUNTS = {
+    0x01023410: 30,
+    0x01023520: 29,
+}
+AC1_MMX_MNEMONICS = {"movq", "pcmpgtw", "paddw", "psubw", "pand"}
+
+AC1_MMX_LOCAL_HELPERS = r"""
+static inline void ac1_mmx_enter(CPU *c, int *active)
+{
+    if (!*active) { c->fpu_top = 0; *active = 1; }
+}
+static inline uint64_t ac1_mmx_read(CPU *c, uint64_t regs[8], uint8_t *valid,
+                                    int *active, unsigned reg)
+{
+    ac1_mmx_enter(c, active);
+    if (reg >= 8u || !(*valid & (uint8_t)(1u << reg))) {
+        ac1_unsupported_instruction(c->eip, "uninitialized register in bounded MMX interval");
+        return 0u;
+    }
+    return regs[reg];
+}
+static inline void ac1_mmx_write(CPU *c, uint64_t regs[8], uint8_t *valid,
+                                 int *active, unsigned reg, uint64_t value)
+{
+    ac1_mmx_enter(c, active);
+    if (reg >= 8u) {
+        ac1_unsupported_instruction(c->eip, "invalid register in bounded MMX interval");
+        return;
+    }
+    regs[reg] = value;
+    *valid |= (uint8_t)(1u << reg);
+}
+static inline void ac1_mmx_pcmpgtw(CPU *c, uint64_t regs[8], uint8_t *valid,
+                                   int *active, unsigned dst, uint64_t src)
+{
+    uint64_t left = ac1_mmx_read(c, regs, valid, active, dst), result = 0u;
+    for (unsigned lane = 0; lane < 4u; ++lane) {
+        unsigned shift = lane * 16u;
+        uint16_t a = (uint16_t)(left >> shift), b = (uint16_t)(src >> shift);
+        if ((uint16_t)(a ^ 0x8000u) > (uint16_t)(b ^ 0x8000u))
+            result |= UINT64_C(0xffff) << shift;
+    }
+    ac1_mmx_write(c, regs, valid, active, dst, result);
+}
+static inline void ac1_mmx_paddw(CPU *c, uint64_t regs[8], uint8_t *valid,
+                                 int *active, unsigned dst, uint64_t src)
+{
+    uint64_t left = ac1_mmx_read(c, regs, valid, active, dst), result = 0u;
+    for (unsigned lane = 0; lane < 4u; ++lane) {
+        unsigned shift = lane * 16u;
+        uint16_t sum = (uint16_t)((uint16_t)(left >> shift) + (uint16_t)(src >> shift));
+        result |= (uint64_t)sum << shift;
+    }
+    ac1_mmx_write(c, regs, valid, active, dst, result);
+}
+static inline void ac1_mmx_psubw(CPU *c, uint64_t regs[8], uint8_t *valid,
+                                 int *active, unsigned dst, uint64_t src)
+{
+    uint64_t left = ac1_mmx_read(c, regs, valid, active, dst), result = 0u;
+    for (unsigned lane = 0; lane < 4u; ++lane) {
+        unsigned shift = lane * 16u;
+        uint16_t difference = (uint16_t)((uint16_t)(left >> shift) - (uint16_t)(src >> shift));
+        result |= (uint64_t)difference << shift;
+    }
+    ac1_mmx_write(c, regs, valid, active, dst, result);
+}
+static inline void ac1_mmx_pand(CPU *c, uint64_t regs[8], uint8_t *valid,
+                                int *active, unsigned dst, uint64_t src)
+{
+    uint64_t left = ac1_mmx_read(c, regs, valid, active, dst);
+    ac1_mmx_write(c, regs, valid, active, dst, left & src);
+}
+static inline void ac1_mmx_emms(CPU *c, int *active)
+{
+    *active = 0;
+    c->fpu_top = 0;
+}
+""".strip()
+
 
 FP_ADAPTER_HELPERS = r"""
 /* The legacy SSE reciprocal instructions have implementation-defined low
@@ -159,6 +242,208 @@ def ac1_sse_width_translation(lifter, insn) -> list[str] | None:
             f"c->xmm[{dst}].f64[1] = (double)_hi; }}"
         ]
     return None
+
+
+def ac1_mmx_translation(lifter, insn) -> list[str] | None:
+    """Lower the observed MOVQ/word-arithmetic MMX forms with exact m64 widths."""
+    from capstone.x86 import X86_OP_MEM, X86_OP_REG
+
+    if insn.mnemonic == "emms":
+        return ["ac1_mmx_emms(c, &ac1_mmx_active);"]
+    if insn.mnemonic not in AC1_MMX_MNEMONICS or len(insn.operands) != 2:
+        return None
+
+    destination, source = insn.operands
+
+    def mm_register(operand) -> int | None:
+        if operand.type != X86_OP_REG or operand.size != 8:
+            return None
+        name = insn.reg_name(operand.reg)
+        if len(name) == 3 and name.startswith("mm") and name[2] in "01234567":
+            return int(name[2])
+        return None
+
+    def source_expression(operand) -> str | None:
+        register = mm_register(operand)
+        if register is not None:
+            return ("ac1_mmx_read(c, ac1_mmx, &ac1_mmx_valid, "
+                    f"&ac1_mmx_active, {register}u)")
+        if operand.type == X86_OP_MEM and operand.size == 8:
+            return f"rd64({lifter.addr_expr(insn, operand)})"
+        return None
+
+    destination_register = mm_register(destination)
+    source_register = mm_register(source)
+    source_value = source_expression(source)
+    if insn.mnemonic == "movq":
+        if destination_register is not None and source_value is not None:
+            return [f"ac1_mmx_write(c, ac1_mmx, &ac1_mmx_valid, &ac1_mmx_active, "
+                    f"{destination_register}u, {source_value});"]
+        if (destination.type == X86_OP_MEM and destination.size == 8 and
+                source_register is not None):
+            return [f"wr64({lifter.addr_expr(insn, destination)}, "
+                    f"ac1_mmx_read(c, ac1_mmx, &ac1_mmx_valid, &ac1_mmx_active, "
+                    f"{source_register}u));"]
+        return None
+
+    if destination_register is None or source_value is None:
+        return None
+    helper = {
+        "pcmpgtw": "ac1_mmx_pcmpgtw",
+        "paddw": "ac1_mmx_paddw",
+        "psubw": "ac1_mmx_psubw",
+        "pand": "ac1_mmx_pand",
+    }.get(insn.mnemonic)
+    if helper is None:
+        return None
+    return [f"{helper}(c, ac1_mmx, &ac1_mmx_valid, &ac1_mmx_active, "
+            f"{destination_register}u, {source_value});"]
+
+
+def validate_ac1_mmx_interval(function_address: int, spec: dict, decoded: dict) -> None:
+    """Pin the two closed MMX intervals and prove every CFG path initializes reads."""
+    expected_count = AC1_MMX_FUNCTION_COUNTS.get(function_address)
+    if expected_count is None:
+        return
+    insns = [decoded[va] for va in sorted(decoded)]
+    mmx_count = sum(insn.mnemonic in AC1_MMX_MNEMONICS or insn.mnemonic == "emms"
+                    for insn in insns)
+    if mmx_count != expected_count:
+        raise RuntimeError(
+            f"AC1 MMX interval at 0x{function_address:08X} changed: "
+            f"expected {expected_count} instructions, found {mmx_count}")
+    first = next(i for i, insn in enumerate(insns)
+                 if insn.mnemonic in AC1_MMX_MNEMONICS)
+    endings = [i for i, insn in enumerate(insns) if insn.mnemonic == "emms"]
+    if len(endings) != 1:
+        raise RuntimeError(f"AC1 MMX interval at 0x{function_address:08X} needs one EMMS")
+    last = endings[0]
+    if last <= first:
+        raise RuntimeError(f"AC1 MMX interval at 0x{function_address:08X} ends before it starts")
+    from capstone.x86 import X86_OP_MEM, X86_OP_REG
+
+    def mm_register(insn, operand) -> int | None:
+        if operand.type != X86_OP_REG or operand.size != 8:
+            return None
+        name = insn.reg_name(operand.reg)
+        if len(name) == 3 and name.startswith("mm") and name[2] in "01234567":
+            return int(name[2])
+        return None
+
+    for insn in insns[first:last + 1]:
+        if insn.mnemonic.startswith("f") or insn.mnemonic in {"call", "lcall"}:
+            raise RuntimeError(
+                f"AC1 MMX/x87 mixed interval at 0x{function_address:08X}: "
+                f"{insn.mnemonic} at 0x{insn.address:08X}")
+    blocks = {block["start"]: block for block in spec.get("blocks", [])}
+    if function_address not in blocks:
+        raise RuntimeError(f"AC1 MMX function entry 0x{function_address:08X} has no CFG block")
+    reachable = set()
+    queue = collections.deque([function_address])
+    while queue:
+        address = queue.popleft()
+        if address in reachable:
+            continue
+        reachable.add(address)
+        block = blocks[address]
+        for successor in block["successors"]:
+            if successor not in blocks:
+                raise RuntimeError(
+                    f"AC1 MMX CFG successor 0x{successor:08X} has no block")
+            queue.append(successor)
+
+    def mmx_reads_writes(insn) -> tuple[int, int]:
+        """Return (read mask, write mask) for exactly the supported MMX forms."""
+        destination, source = insn.operands
+        dst = mm_register(insn, destination)
+        src = mm_register(insn, source)
+        if insn.mnemonic == "movq":
+            if dst is not None:
+                if src is not None:
+                    return 1 << src, 1 << dst
+                if source.type == X86_OP_MEM and source.size == 8:
+                    return 0, 1 << dst
+            elif (destination.type == X86_OP_MEM and destination.size == 8 and
+                  src is not None):
+                return 1 << src, 0
+            raise RuntimeError(f"unexpected MMX MOVQ form at 0x{insn.address:08X}")
+        if insn.mnemonic in {"pcmpgtw", "paddw", "psubw", "pand"} and dst is not None:
+            if src is not None:
+                return (1 << dst) | (1 << src), 1 << dst
+            if source.type == X86_OP_MEM and source.size == 8:
+                return 1 << dst, 1 << dst
+        raise RuntimeError(f"unexpected MMX instruction form at 0x{insn.address:08X}")
+
+    def block_transfer(start: int, mask: int, *, check_reads: bool) -> int:
+        for va, _size in blocks[start]["instructions"]:
+            insn = decoded[va]
+            if insn.mnemonic == "emms":
+                continue
+            if insn.mnemonic not in AC1_MMX_MNEMONICS:
+                continue
+            reads, writes = mmx_reads_writes(insn)
+            if check_reads and (mask & reads) != reads:
+                missing = reads & ~mask
+                register = (missing & -missing).bit_length() - 1
+                raise RuntimeError(
+                    f"AC1 MMX mm{register} is not initialized on every path before "
+                    f"0x{insn.address:08X}")
+            mask |= writes
+        return mask
+
+    all_registers = 0xff
+    in_masks = {address: all_registers for address in reachable}
+    out_masks = {address: all_registers for address in reachable}
+    in_masks[function_address] = 0
+    changed = True
+    while changed:
+        changed = False
+        for address in sorted(reachable):
+            if address == function_address:
+                incoming = 0
+            else:
+                predecessors = [source for source in reachable
+                                if address in blocks[source]["successors"]]
+                if not predecessors:
+                    incoming = 0
+                else:
+                    incoming = all_registers
+                    for predecessor in predecessors:
+                        incoming &= out_masks[predecessor]
+            outgoing = block_transfer(address, incoming, check_reads=False)
+            if in_masks[address] != incoming or out_masks[address] != outgoing:
+                in_masks[address] = incoming
+                out_masks[address] = outgoing
+                changed = True
+    for address in sorted(reachable):
+        block_transfer(address, in_masks[address], check_reads=True)
+
+    # Track both possibilities at joins, so every function exit must execute
+    # EMMS, including the zero-count early-exit edge.
+    pending = collections.deque([(function_address, False)])
+    visited = set()
+    while pending:
+        address, emms_seen = pending.popleft()
+        state = (address, emms_seen)
+        if state in visited:
+            continue
+        visited.add(state)
+        block = blocks[address]
+        state_after = emms_seen
+        for va, _size in block["instructions"]:
+            insn = decoded[va]
+            if insn.mnemonic == "emms":
+                state_after = True
+            elif state_after and insn.mnemonic in AC1_MMX_MNEMONICS:
+                raise RuntimeError(
+                    f"AC1 MMX instruction occurs after EMMS at 0x{insn.address:08X}")
+        if block["is_exit"]:
+            if not state_after:
+                raise RuntimeError(
+                    f"AC1 MMX function exit at 0x{block['end']:08X} bypasses EMMS")
+            continue
+        for successor in block["successors"]:
+            pending.append((successor, state_after))
 
 
 def ac1_int3_translation(insn) -> list[str]:
@@ -399,6 +684,74 @@ def run_selftest() -> None:
     from capstone.x86 import X86_OP_MEM, X86_OP_REG
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     md.detail = True
+    class MMXFixtureLifter:
+        @staticmethod
+        def addr_expr(insn, operand):
+            return "0x12345678u"
+
+    mmx_cases = [
+        ("0f6f442408", "ac1_mmx_write", "rd64(0x12345678u)"),
+        ("0f7f442408", "wr64(0x12345678u,", "ac1_mmx_read"),
+        ("0f6fc1", "ac1_mmx_write", "ac1_mmx_read"),
+        ("0f65c1", "ac1_mmx_pcmpgtw", "ac1_mmx_read"),
+        ("0ffdc1", "ac1_mmx_paddw", "ac1_mmx_read"),
+        ("0ff9c1", "ac1_mmx_psubw", "ac1_mmx_read"),
+        ("0fdbc1", "ac1_mmx_pand", "ac1_mmx_read"),
+        ("0f77", "ac1_mmx_emms", ""),
+    ]
+    for raw, required, also_required in mmx_cases:
+        fixture = next(md.disasm(bytes.fromhex(raw), 0x00401100))
+        emitted = ac1_mmx_translation(MMXFixtureLifter(), fixture)
+        text = " ".join(emitted or [])
+        assert emitted and required in text and also_required in text, (raw, fixture.mnemonic, text)
+    assert "rd64(0x12345678u)" in " ".join(
+        ac1_mmx_translation(MMXFixtureLifter(), next(md.disasm(bytes.fromhex("0f6f442408"), 0x401100))))
+    assert "wr64(0x12345678u," in " ".join(
+        ac1_mmx_translation(MMXFixtureLifter(), next(md.disasm(bytes.fromhex("0f7f442408"), 0x401100))))
+    # Pin that the bounded local-state validator accepts a zero-count path that
+    # bypasses the loop but still reaches EMMS, and rejects a join that reads
+    # MM1 on a path that skipped its MOVQ definition.
+    mmx_fixture_start = 0x00401100
+    valid_mmx_bytes = bytes.fromhex("0f6f44240885c974060f6f080f65c10f77c3")
+    valid_insns = list(md.disasm(valid_mmx_bytes, mmx_fixture_start))
+    valid_decoded = {insn.address: insn for insn in valid_insns}
+    assert [insn.mnemonic for insn in valid_insns] == [
+        "movq", "test", "je", "movq", "pcmpgtw", "emms", "ret"
+    ]
+    valid_spec = {"blocks": [
+        {"start": 0x00401100, "end": 0x00401109, "successors": [0x00401109, 0x0040110F],
+         "is_exit": False, "instructions": [[i.address, i.size] for i in valid_insns[:3]]},
+        {"start": 0x00401109, "end": 0x0040110F, "successors": [0x0040110F],
+         "is_exit": False, "instructions": [[i.address, i.size] for i in valid_insns[3:5]]},
+        {"start": 0x0040110F, "end": 0x00401112, "successors": [],
+         "is_exit": True, "instructions": [[i.address, i.size] for i in valid_insns[5:]]},
+    ]}
+    previous_count = AC1_MMX_FUNCTION_COUNTS.get(mmx_fixture_start)
+    AC1_MMX_FUNCTION_COUNTS[mmx_fixture_start] = 4
+    try:
+        validate_ac1_mmx_interval(mmx_fixture_start, valid_spec, valid_decoded)
+        invalid_mmx_bytes = bytes.fromhex("0f6f44240885c974030f6f080f65c10f77c3")
+        invalid_insns = list(md.disasm(invalid_mmx_bytes, mmx_fixture_start))
+        invalid_decoded = {insn.address: insn for insn in invalid_insns}
+        invalid_spec = {"blocks": [
+            {"start": 0x00401100, "end": 0x00401109, "successors": [0x00401109, 0x0040110C],
+             "is_exit": False, "instructions": [[i.address, i.size] for i in invalid_insns[:3]]},
+            {"start": 0x00401109, "end": 0x0040110C, "successors": [0x0040110C],
+             "is_exit": False, "instructions": [[invalid_insns[3].address, invalid_insns[3].size]]},
+            {"start": 0x0040110C, "end": 0x00401112, "successors": [],
+             "is_exit": True, "instructions": [[i.address, i.size] for i in invalid_insns[4:]]},
+        ]}
+        try:
+            validate_ac1_mmx_interval(mmx_fixture_start, invalid_spec, invalid_decoded)
+        except RuntimeError as exc:
+            assert "not initialized on every path" in str(exc)
+        else:
+            raise AssertionError("MMX validator accepted an uninitialized register at a CFG join")
+    finally:
+        if previous_count is None:
+            del AC1_MMX_FUNCTION_COUNTS[mmx_fixture_start]
+        else:
+            AC1_MMX_FUNCTION_COUNTS[mmx_fixture_start] = previous_count
     int3_fixture = next(md.disasm(b"\xCC", 0x00401234))
     int3_code = ac1_int3_translation(int3_fixture)
     assert int3_fixture.mnemonic == "int3" and int3_code == [
@@ -2061,6 +2414,10 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         def translate(self, insn, labels):
             if insn.mnemonic == "int3":
                 return ac1_int3_translation(insn)
+            if self.func_start in AC1_MMX_FUNCTION_COUNTS:
+                mmx = ac1_mmx_translation(self, insn)
+                if mmx is not None:
+                    return mmx
             narrow_memory_sse = ac1_sse_width_translation(self, insn)
             if narrow_memory_sse is not None:
                 return narrow_memory_sse
@@ -2201,6 +2558,11 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "#endif",
         "",
     ])
+    def tu_header_for(addresses: list[int]) -> str:
+        if any(address in AC1_MMX_FUNCTION_COUNTS for address in addresses):
+            return tu_header + AC1_MMX_LOCAL_HELPERS + "\n"
+        return tu_header
+
     tu_names = []
     if translation_unit_buckets:
         buckets = partition_functions_by_bucket(
@@ -2209,13 +2571,16 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         for bucket_index in range(translation_unit_buckets):
             tu_path = output_dir / f"initial_{bucket_index:04d}.c"
             tu_names.append(tu_path.name)
-            write_text_if_changed(tu_path, tu_header + "\n\n".join(
-                item["body"] for item in buckets[bucket_index]) + "\n")
+            bucket = buckets[bucket_index]
+            write_text_if_changed(tu_path, tu_header_for(
+                [item["address"] for item in bucket]) + "\n\n".join(
+                    item["body"] for item in bucket) + "\n")
     else:
         for index in range(0, len(bodies), functions_per_tu):
             tu_path = output_dir / f"initial_{index // functions_per_tu:04d}.c"
             tu_names.append(tu_path.name)
-            write_text_if_changed(tu_path, tu_header + "\n\n".join(
+            group_addresses = lifted[index:index + functions_per_tu]
+            write_text_if_changed(tu_path, tu_header_for(group_addresses) + "\n\n".join(
                 bodies[index:index + functions_per_tu]) + "\n")
     # Keep the original stable source path as a harmless marker; CMake globs
     # each bounded initial_NNNN.c translation unit alongside this file.
@@ -2311,6 +2676,7 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
     lifter.jumptables = {}
     lifter.func_start = address
     lifter.func_end = max(block["end"] for block in blocks)
+    validate_ac1_mmx_interval(address, spec, decoded)
     labels = set()
     block_starts = {block["start"] for block in blocks}
     for insn in insns:
@@ -2340,6 +2706,8 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
                         labels.update(target for target in targets if target in decoded)
 
     output = [f"void L_{address:08X}(CPU *c)", "{"]
+    if address in AC1_MMX_FUNCTION_COUNTS:
+        output.append("    uint64_t ac1_mmx[8] = {0}; uint8_t ac1_mmx_valid = 0u; int ac1_mmx_active = 0;")
     entry_jump = entry_guard_lines(address, [insn.address for insn in insns])
     output.extend(entry_jump)
     for index, insn in enumerate(insns):
