@@ -77,6 +77,33 @@ static inline void ac1_direct_write(uint32_t a, const void *i, size_t w)
 }
 #define guest_execution_read(a, o, w) ac1_direct_read((a), (o), (w))
 #define guest_execution_write(a, i, w) ac1_direct_write((a), (i), (w))
+/* LOCK-prefixed read-modify-writes (31k sites) operate in place on the arena
+ * with sequentially consistent builtins, matching x86 LOCK's full fence.
+ * Unaligned operands keep the checked path and its diagnostic. */
+static inline uint32_t *ac1_direct_atomic_cell(uint32_t a)
+{
+    return (ac1_direct_arena && !(a & 3u)) ? (uint32_t *)(ac1_direct_arena + a) : NULL;
+}
+static inline uint32_t ac1_direct_xadd32(uint32_t a, uint32_t v)
+{
+    uint32_t *cell = ac1_direct_atomic_cell(a);
+    return cell ? __atomic_fetch_add(cell, v, __ATOMIC_SEQ_CST) : (guest_atomic_xadd32)(a, v);
+}
+static inline uint32_t ac1_direct_cmpxchg32(uint32_t a, uint32_t compare, uint32_t value)
+{
+    uint32_t *cell = ac1_direct_atomic_cell(a);
+    if (!cell) return (guest_atomic_cmpxchg32)(a, compare, value);
+    __atomic_compare_exchange_n(cell, &compare, value, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return compare;  /* the previous value, as CMPXCHG leaves it in EAX */
+}
+static inline uint32_t ac1_direct_xchg32(uint32_t a, uint32_t v)
+{
+    uint32_t *cell = ac1_direct_atomic_cell(a);
+    return cell ? __atomic_exchange_n(cell, v, __ATOMIC_SEQ_CST) : (guest_atomic_xchg32)(a, v);
+}
+#define guest_atomic_xadd32(a, v) ac1_direct_xadd32((a), (v))
+#define guest_atomic_cmpxchg32(a, c, v) ac1_direct_cmpxchg32((a), (c), (v))
+#define guest_atomic_xchg32(a, v) ac1_direct_xchg32((a), (v))
 #endif
 
 '''
