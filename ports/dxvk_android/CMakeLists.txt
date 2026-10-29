@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.22)
 project(AC1DXVKAndroid C CXX)
 
-if(NOT ANDROID OR NOT ANDROID_ABI STREQUAL "arm64-v8a")
-  message(FATAL_ERROR "AC1 DXVK target requires Android arm64-v8a")
+if(NOT ANDROID OR NOT ANDROID_ABI MATCHES "^(arm64-v8a|x86_64)$")
+  message(FATAL_ERROR "AC1 DXVK target requires Android arm64-v8a or x86_64 (emulator)")
 endif()
 
 set(DXVK_SOURCE "" CACHE PATH "Prepared DXVK Native source directory")
