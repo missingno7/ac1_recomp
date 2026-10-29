@@ -27,6 +27,7 @@ DUKE_DEFAULT = Path("D:/Prog/dukemp_recomp/.deps/pcrecomp")
 PYTHON_DEFAULT = Path("D:/Prog/dukemp_recomp/.venv/Scripts/python.exe")
 OUT_DEFAULT = ROOT / "work/lift_initial"
 AC1_ARRAY_CTOR_HELPER = 0x00F9FA43
+AC1_SCHEMA_CALLBACK_HELPER = 0x00438EF0
 
 
 FP_ADAPTER_HELPERS = r"""
@@ -470,6 +471,49 @@ int main(void)
         f9fa43_fixture(tail=bytes.fromhex("89450c")),    # EBP-based alias
     )
     assert all(not ac1_array_constructor_call_edges(fixture) for fixture in reject_fixtures)
+    def schema_fixture(callback: int | None = 0x00438860, tail: bytes = b""):
+        start = 0x00402000
+        code = bytearray(b"\x52\x51")  # arg4=EDX, arg3=ECX
+        if callback is None:
+            code += b"\x56"             # dynamic arg2 must not be discovered
+        else:
+            code += b"\x68" + callback.to_bytes(4, "little")
+        code += b"\x50"                 # arg1=EAX
+        code += tail
+        call_at = start + len(code)
+        rel = (AC1_SCHEMA_CALLBACK_HELPER - (call_at + 5)) & 0xFFFFFFFF
+        code += b"\xE8" + rel.to_bytes(4, "little")
+        instructions = list(md.disasm(bytes(code), start))
+        return SimpleNamespace(blocks={start: SimpleNamespace(instructions=instructions)})
+    def schema_middle_fixture(middle: bytes):
+        start = 0x00403000
+        code = bytearray(b"\x52\x51\x68\x60\x88\x43\x00")  # arg4, arg3, literal arg2
+        code += middle
+        code += b"\x50"  # arg1=EAX
+        call_at = start + len(code)
+        rel = (AC1_SCHEMA_CALLBACK_HELPER - (call_at + 5)) & 0xFFFFFFFF
+        code += b"\xE8" + rel.to_bytes(4, "little")
+        instructions = list(md.disasm(bytes(code), start))
+        return SimpleNamespace(blocks={start: SimpleNamespace(instructions=instructions)})
+    schema_edges = ac1_schema_callback_call_edges(schema_fixture())
+    assert schema_edges == [{"callsite": 0x00402008, "callback": 0x00438860}], schema_edges
+    # At call-time ESP+4..+7 is arg2. Exact adjacent DWORD writes are safe;
+    # the same [ESP] write between arg2 and arg1 pushes aliases arg2.
+    assert ac1_schema_callback_call_edges(schema_fixture(tail=bytes.fromhex("89542400")))
+    assert ac1_schema_callback_call_edges(schema_fixture(tail=bytes.fromhex("89542408")))
+    schema_rejects = (
+        schema_fixture(callback=None),                         # nonconstant callback
+        schema_fixture(tail=bytes.fromhex("89542404")),       # call-time arg2 slot
+        schema_fixture(tail=bytes.fromhex("6689542406")),     # partial overlap of arg2
+        schema_fixture(tail=bytes.fromhex("89441408")),       # indexed ESP alias
+        schema_fixture(tail=bytes.fromhex("83ec04")),         # explicit ESP change
+        schema_fixture(tail=bytes.fromhex("9c")),             # implicit PUSHFD
+        schema_fixture(tail=bytes.fromhex("e800000000")),     # intervening CALL
+        schema_fixture(tail=bytes.fromhex("8945fc")),         # unknown EBP alias
+        schema_middle_fixture(bytes.fromhex("891424")),       # [ESP] aliases arg2 after arg1 push
+        schema_fixture(tail=bytes.fromhex("66686000")),       # operand-size-override PUSH
+    )
+    assert all(not ac1_schema_callback_call_edges(fixture) for fixture in schema_rejects)
     print("lift control-flow and instruction-adapter self-test: ok")
 
 
@@ -703,7 +747,9 @@ def run_ac1_switch_selftest(binary: Path, pcrecomp: Path) -> None:
                 print(result.stdout.strip())
         else:
             print("memmove semantic self-test skipped (gcc not found)")
-        run_ac1_array_callback_selftest(dis, info, build_iat_map(info))
+        selftest_iat = build_iat_map(info)
+        run_ac1_array_callback_selftest(dis, info, selftest_iat)
+        run_ac1_schema_callback_selftest(dis, info, selftest_iat)
     finally:
         pe.close()
     print("AC1 actual-base jump-table self-test: local, remapped, and negative-index switches recovered")
@@ -742,6 +788,58 @@ def run_ac1_array_callback_selftest(dis, info, iat) -> None:
             if not validate_callback_code_entry(target, dis, info, iat, {}):
                 raise AssertionError(f"F9FA43 argument 0x{target:08X} is not a code entry")
     print("AC1 F9FA43 callback self-test: 22 direct calls, 21 constant constructors, cleanup entries validated")
+
+
+def run_ac1_schema_callback_selftest(dis, info, iat) -> None:
+    """Pin 438EF0's ABI and real recursively discovered callback chains."""
+    helper = dis.disassemble_function(AC1_SCHEMA_CALLBACK_HELPER, iat)
+    if not helper or not helper.blocks:
+        raise AssertionError("AC1 438EF0 schema callback helper did not disassemble")
+    instructions = {ins.address: ins for block in helper.blocks.values()
+                    for ins in block.instructions}
+    ret = instructions.get(0x00438F79)
+    if (not ret or ret.mnemonic != "ret" or not ret.operands or
+            ret.operands[0].imm != 0x10):
+        raise AssertionError("AC1 438EF0 must clean four stack arguments")
+    assert instructions[0x00438F3E].op_str == "ebp, dword ptr [esp + 0x1c]"
+    assert instructions[0x00438F42].mnemonic == "push"
+    assert instructions[0x00438F42].op_str == "esi"
+    assert instructions[0x00438F43].op_str == "ecx, ebp"
+    assert instructions[0x00438F45].mnemonic == "call"
+    assert instructions[0x00438F45].op_str == "dword ptr [esp + 0x1c]"
+
+    caller = dis.disassemble_function(0x00439A50, iat)
+    if not caller or not caller.blocks:
+        raise AssertionError("AC1 schema callback producer did not disassemble")
+    edges = ac1_schema_callback_call_edges(caller)
+    match = [edge for edge in edges if edge["callsite"] == 0x00439BCE]
+    if match != [{"callsite": 0x00439BCE, "callback": 0x00438860}]:
+        raise AssertionError(f"AC1 schema callback arg2 recovery changed: {match}")
+    if not validate_callback_code_entry(0x00438860, dis, info, iat, {}):
+        raise AssertionError("AC1 0x00438860 callback is not a validated code entry")
+
+    # These two chains are observed in the canonical catalog refresh. The
+    # outer producer installs C73600; that callback itself registers C72BB0.
+    # A separate producer installs 526BB0, which in turn registers 524FD0.
+    # Pin both levels so discovery cannot silently stop after the first edge.
+    def require_edge(caller_va: int, callsite: int, target: int) -> None:
+        function = dis.disassemble_function(caller_va, iat)
+        if not function or not function.blocks:
+            raise AssertionError(f"schema callback caller 0x{caller_va:08X} did not disassemble")
+        actual = {edge["callsite"]: edge["callback"]
+                  for edge in ac1_schema_callback_call_edges(function)}
+        if actual.get(callsite) != target:
+            raise AssertionError(
+                f"schema callback edge 0x{caller_va:08X}/0x{callsite:08X}: "
+                f"expected 0x{target:08X}, got {actual.get(callsite)!r}")
+        if not validate_callback_code_entry(target, dis, info, iat, {}):
+            raise AssertionError(f"schema callback 0x{target:08X} is not a validated code entry")
+
+    require_edge(0x00D28AF0, 0x00D28B17, 0x00C73600)
+    require_edge(0x00C73600, 0x00C73768, 0x00C72BB0)
+    require_edge(0x00CDF430, 0x00CDF59A, 0x00526BB0)
+    require_edge(0x00526BB0, 0x00526C0A, 0x00524FD0)
+    print("AC1 438EF0 schema-callback self-test: RET 16 ABI and both recursive real callback chains validated")
 
 
 def infer_remapped_switch_limit(md, read_va, jump_insn, reg_type: int,
@@ -1156,6 +1254,79 @@ def ac1_array_constructor_call_edges(function) -> list[dict]:
     return edges
 
 
+def ac1_schema_callback_call_edges(function) -> list[dict]:
+    """Extract constant arg2 callbacks passed to AC1's four-argument schema helper."""
+    from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
+    from capstone.x86_const import X86_REG_EBP, X86_REG_ESP
+
+    edges = []
+    for block in function.blocks.values():
+        instructions = list(block.instructions)
+        for index, insn in enumerate(instructions):
+            if (insn.mnemonic != "call" or not insn.operands or
+                    insn.operands[0].type != X86_OP_IMM or
+                    (insn.operands[0].imm & 0xFFFFFFFF) != AC1_SCHEMA_CALLBACK_HELPER):
+                continue
+            # The helper's RET 16 proves four stack arguments; nearest push is
+            # arg1, so its callback is the second push encountered in reverse.
+            pushed = []
+            proven = True
+            for prev in reversed(instructions[:index]):
+                if prev.mnemonic == "push":
+                    # This stack-argument layout is four DWORDs. Operand-size
+                    # override and segment/word pushes change the ESP offsets.
+                    if (len(prev.operands) != 1 or
+                            prev.operands[0].size != 4):
+                        proven = False
+                        break
+                    pushed.append(prev)
+                    if len(pushed) == 4:
+                        break
+                    continue
+                if prev.mnemonic in ("call", "ret", "retf", "jmp", "leave", "pop",
+                                     "enter", "pushf", "pushfd", "pushfw", "pusha", "pushad",
+                                     "popf", "popfd", "popfw", "popa", "popad"):
+                    proven = False
+                    break
+                if any(operand.type == X86_OP_REG and operand.reg == X86_REG_ESP
+                       for operand in prev.operands):
+                    proven = False
+                    break
+                # At the indirect CALL, arg2 is [ESP+4..ESP+7]: arg1 occupies
+                # [ESP], followed by the callback at +4. A frame-based access
+                # can alias the target slot without a proven EBP-to-ESP
+                # relation. Reject indexed ESP accesses; otherwise account
+                # for DWORD pushes crossed while scanning back.
+                for operand in prev.operands:
+                    if operand.type != X86_OP_MEM:
+                        continue
+                    mem = operand.mem
+                    if mem.base == X86_REG_EBP:
+                        proven = False
+                        break
+                    if mem.base == X86_REG_ESP:
+                        if mem.index:
+                            proven = False
+                            break
+                        slot = int(mem.disp) + 4 * len(pushed)
+                        width = max(1, operand.size)
+                        if slot < 8 and slot + width > 4:
+                            proven = False
+                            break
+                if not proven:
+                    break
+            if not proven or len(pushed) != 4:
+                continue
+            callback_push = pushed[1]
+            if not callback_push.operands or callback_push.operands[0].type != X86_OP_IMM:
+                continue
+            edges.append({
+                "callsite": insn.address,
+                "callback": callback_push.operands[0].imm & 0xFFFFFFFF,
+            })
+    return edges
+
+
 def validate_callback_code_entry(target: int, disassembler, info, iat,
                                  discovered: dict) -> bool:
     """Validate a callback as executable code and reject known mid-instruction pointers."""
@@ -1261,6 +1432,21 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
                 if target not in results and target not in queued:
                     queued.add(target)
                     queue.append((target, depth + 1))
+        for call_edge in ac1_schema_callback_call_edges(function):
+            target = call_edge["callback"]
+            if not validate_callback_code_entry(target, dis, info, iat, results):
+                continue
+            callback_edges.append({
+                "caller": address,
+                "callsite": call_edge["callsite"],
+                "role": "schema_callback",
+                "helper": AC1_SCHEMA_CALLBACK_HELPER,
+                "target": target,
+                "depth": depth + 1,
+            })
+            if target not in results and target not in queued:
+                queued.add(target)
+                queue.append((target, depth + 1))
     return info, dis, results, failures, len(queue), entry, iat, callback_edges
 
 
@@ -1722,9 +1908,9 @@ def main() -> int:
         "capstone_version": importlib.metadata.version("capstone"),
         "pefile_version": importlib.metadata.version("pefile"),
         "limitations": [
-            "Discovery follows bounded direct calls from the PE entry point and any explicit --seed targets; indirect calls, callbacks, exports and data-pointer targets are not yet seeded.",
+            "Discovery follows bounded direct calls and validated direct tail thunks from the PE entry point and explicit --seed targets; arbitrary indirect calls, exports, and generic data-pointer targets remain uncovered.",
             "No menu, graphics, or gameplay has been verified through this generated slice.",
-            "The table-seeded startup set includes validated C/C++ initializer functions but does not yet cover every indirect callback, export, or data-pointer target.",
+            "Callback discovery is limited to the validated AC1 F9FA43 constructor/cleanup ABI and 438EF0 schema-helper arg2 ABI; it does not cover arbitrary virtual calls, callback records, or exports.",
             "Any RECOMP_TODO emitted by the upstream lifter remains a concrete translation gap.",
             "The inspected DX9 image has no base-relocation directory, so the first runtime must preserve its preferred image base 0x00400000 unless relocation evidence changes.",
         ],

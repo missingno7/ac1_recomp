@@ -1,5 +1,6 @@
 param(
     [ValidateSet('Host', 'Android')][string]$Target = 'Host',
+    [ValidateSet('Debug', 'RelWithDebInfo')][string]$BuildType = 'Debug',
     [string]$Python = 'D:\Prog\dukemp_recomp\.venv\Scripts\python.exe',
     [string]$Sdk = "$env:LOCALAPPDATA\Android\Sdk",
     [switch]$Generate,
@@ -46,7 +47,8 @@ try {
     $CMake = Join-Path $Sdk 'cmake/3.22.1/bin/cmake.exe'
     $Ninja = Join-Path $Sdk 'cmake/3.22.1/bin/ninja.exe'
     $BuildDir = "build/$($Target.ToLower())"
-    $ConfigureArgs = @('-S', '.', '-B', $BuildDir, '-G', 'Ninja', "-DCMAKE_MAKE_PROGRAM=$Ninja", '-DCMAKE_BUILD_TYPE=Debug')
+    if ($BuildType -ne 'Debug') { $BuildDir += "-$($BuildType.ToLower())" }
+    $ConfigureArgs = @('-S', '.', '-B', $BuildDir, '-G', 'Ninja', "-DCMAKE_MAKE_PROGRAM=$Ninja", "-DCMAKE_BUILD_TYPE=$BuildType")
     if ($Target -eq 'Host') {
         $ConfigureArgs += '-DCMAKE_C_COMPILER=C:/msys64/mingw64/bin/gcc.exe'
         $ConfigureArgs += '-DCMAKE_CXX_COMPILER=C:/msys64/mingw64/bin/g++.exe'

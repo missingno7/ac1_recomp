@@ -15,6 +15,10 @@ The current configuration uses the actual local DukeMP pcrecomp checkout and its
 # Runtime edits only: incremental compile and execute.
 .\tools\build.ps1 -Run
 
+# Optional optimized host build with symbols, in build/host-relwithdebinfo.
+# Generated instructions still retain their guest-address diagnostics.
+.\tools\build.ps1 -BuildType RelWithDebInfo -Run
+
 # Run twice in one process to check repeatability and worker cleanup.
 .\tools\build.ps1 -CheckRepeat
 
@@ -24,7 +28,7 @@ The current configuration uses the actual local DukeMP pcrecomp checkout and its
 
 Host tools: MSYS2 MinGW64 GCC and the Android SDK's CMake 3.22.1/Ninja. Python dependencies are in `requirements.txt`. Android uses NDK 28.2.13676358, SDK 35 and JDK 17 or 21. See [Android instructions](docs/android.md) for installation and user-supplied game data.
 
-The generator assigns functions to 100 fixed groups by address and preserves unchanged files. Existing functions keep their group when the catalog grows, avoiding unnecessary recompilation; a runtime edit does not regenerate game code. Driver/config changes trigger generation automatically. It seeds the original C and C++ initializer tables (1,750 validated function pointers) from the bounds in `config/startup_initializers.json`, follows validated one-instruction direct tail thunks, and recovers constant constructor/cleanup callbacks passed to the observed MSVC array-construction helper. Add other observed indirect targets to `initial_discovery.startup_seeds`; `--seed` and `--seed-file` also support focused experiments. Unsupported instructions remain explicit runtime failures.
+The generator assigns functions to 100 fixed groups by address and preserves unchanged files. Existing functions keep their group when the catalog grows, avoiding unnecessary recompilation; a runtime edit does not regenerate game code. Driver/config changes trigger generation automatically. It seeds the original C and C++ initializer tables (1,750 validated function pointers) from the bounds in `config/startup_initializers.json`, follows validated one-instruction direct tail thunks, and recovers constant constructor/cleanup callbacks passed to the observed MSVC array-construction helper. It also follows constant callbacks passed as argument 2 to the game's four-argument schema parser at `0x00438EF0`, including nested parser callbacks. Both rules require bounded stack-argument evidence and executable entry validation. Add other observed indirect targets to `initial_discovery.startup_seeds`; `--seed` and `--seed-file` also support focused experiments. Unsupported instructions remain explicit runtime failures.
 
 Configured roots also include 1,968 validated factory pointers from the game's WinMain registration graph, separate from the CRT initializer tables. Exact registrar calls identify named records whose factory field at `+0x68` feeds the observed object-creation dispatcher. A further 1,746 serialization entries come from unambiguous primary RTTI vtables for those registered `Object` types, using slot 2 as in the observed generic deserializers. Compiling these conditional callbacks avoids discovering each type in a separate run; it does not establish that every registered type has executed. Private provenance, entry-validation and isolated-build evidence is retained in `work/factory_seed_manifest_winmain_1968.json`, `work/factory_slot2_object_broad_rtti_scan.json` and `work/lift_factory_broad/`.
 
