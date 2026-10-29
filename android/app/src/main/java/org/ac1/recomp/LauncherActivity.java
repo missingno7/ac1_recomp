@@ -13,6 +13,9 @@ import android.widget.TextView;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
+import android.view.InputDevice;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -34,15 +37,22 @@ public final class LauncherActivity extends Activity {
     private SurfaceView gameSurface;
     private boolean surfaceReady;
     private boolean busy;
+    private boolean autoRun;
+    private String inputScript;
 
     static { System.loadLibrary(LIB_NAME); }
 
-    private static native int nativeRun(String exePath, String userdataPath);
+    private static native int nativeRun(String exePath, String userdataPath, String scriptPath);
     private static native String nativeLastError();
     private static native boolean nativeSetSurface(Surface surface);
+    private static native void nativeKey(int dik, boolean down);
+    private static native void nativeMouse(int dx, int dy, int wheel, int buttons);
+    private static native void nativeResetInput();
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        autoRun = getIntent().getBooleanExtra("run", false);
+        inputScript = getIntent().getStringExtra("input_script");
         status = new TextView(this);
         status.setText("Select the folder containing your legally obtained Assassin's Creed installation. Its files will be copied into app-private storage.");
         status.setTextSize(16);
@@ -55,6 +65,17 @@ public final class LauncherActivity extends Activity {
         run.setEnabled(false);
         run.setOnClickListener(v -> runGuest());
         gameSurface = new SurfaceView(this);
+        gameSurface.setFocusableInTouchMode(true);
+        gameSurface.setOnTouchListener((v, event) -> {
+            if (!busy) return false;
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                nativeKey(0x1c, true); return true;
+            }
+            if (event.getActionMasked() == MotionEvent.ACTION_UP || event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
+                nativeKey(0x1c, false); return true;
+            }
+            return true;
+        });
         gameSurface.getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override public void surfaceCreated(SurfaceHolder holder) {
                 updateSurface(holder.getSurface());
@@ -77,11 +98,79 @@ public final class LauncherActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0f));
         setContentView(content);
         restoreImportedExe();
+        maybeAutoRun();
     }
 
     private void updateSurface(Surface surface) {
         surfaceReady = surface != null && surface.isValid() && nativeSetSurface(surface);
         refreshRunEnabled();
+        maybeAutoRun();
+    }
+
+    private void maybeAutoRun() {
+        if (autoRun && surfaceReady && exeFile != null && exeFile.isFile() && !busy) {
+            autoRun = false;
+            runGuest();
+        }
+    }
+
+    private static int dik(int key) {
+        final int[] letters = {0x1e,0x30,0x2e,0x20,0x12,0x21,0x22,0x23,0x17,0x24,0x25,0x26,0x32,
+                0x31,0x18,0x19,0x10,0x13,0x1f,0x14,0x16,0x2f,0x11,0x2d,0x15,0x2c};
+        if (key >= KeyEvent.KEYCODE_A && key <= KeyEvent.KEYCODE_Z) return letters[key-KeyEvent.KEYCODE_A];
+        if (key >= KeyEvent.KEYCODE_1 && key <= KeyEvent.KEYCODE_9) return 2+key-KeyEvent.KEYCODE_1;
+        switch (key) {
+            case KeyEvent.KEYCODE_0: return 0x0b;
+            case KeyEvent.KEYCODE_ENTER: case KeyEvent.KEYCODE_BUTTON_A: case KeyEvent.KEYCODE_BUTTON_START: return 0x1c;
+            case KeyEvent.KEYCODE_ESCAPE: case KeyEvent.KEYCODE_BUTTON_B: case KeyEvent.KEYCODE_BUTTON_SELECT: return 1;
+            case KeyEvent.KEYCODE_SPACE: case KeyEvent.KEYCODE_BUTTON_X: return 0x39;
+            case KeyEvent.KEYCODE_BUTTON_Y: return 0x12;
+            case KeyEvent.KEYCODE_DPAD_UP: return 0xc8;
+            case KeyEvent.KEYCODE_DPAD_DOWN: return 0xd0;
+            case KeyEvent.KEYCODE_DPAD_LEFT: return 0xcb;
+            case KeyEvent.KEYCODE_DPAD_RIGHT: return 0xcd;
+            case KeyEvent.KEYCODE_SHIFT_LEFT: case KeyEvent.KEYCODE_BUTTON_L1: return 0x2a;
+            case KeyEvent.KEYCODE_SHIFT_RIGHT: return 0x36;
+            case KeyEvent.KEYCODE_CTRL_LEFT: case KeyEvent.KEYCODE_BUTTON_R1: return 0x1d;
+            case KeyEvent.KEYCODE_CTRL_RIGHT: return 0x9d;
+            case KeyEvent.KEYCODE_ALT_LEFT: return 0x38;
+            case KeyEvent.KEYCODE_ALT_RIGHT: return 0xb8;
+            case KeyEvent.KEYCODE_TAB: return 0x0f;
+            case KeyEvent.KEYCODE_DEL: return 0x0e;
+            default: return -1;
+        }
+    }
+
+    @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        int code = dik(event.getKeyCode());
+        if (busy && code >= 0 && (event.getAction() == KeyEvent.ACTION_DOWN || event.getAction() == KeyEvent.ACTION_UP)) {
+            nativeKey(code, event.getAction() == KeyEvent.ACTION_DOWN);
+            return true;
+        }
+        return super.dispatchKeyEvent(event);
+    }
+
+    @Override public boolean onGenericMotionEvent(MotionEvent event) {
+        if (busy && (event.getSource() & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK) {
+            float x = event.getAxisValue(MotionEvent.AXIS_X), y = event.getAxisValue(MotionEvent.AXIS_Y);
+            nativeKey(0x1e, x < -0.3f); nativeKey(0x20, x > 0.3f);
+            nativeKey(0x11, y < -0.3f); nativeKey(0x1f, y > 0.3f);
+            nativeMouse((int)(event.getAxisValue(MotionEvent.AXIS_Z)*20),
+                    (int)(event.getAxisValue(MotionEvent.AXIS_RZ)*20), 0, 0);
+            return true;
+        }
+        if (busy && (event.getSource() & InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE) {
+            nativeMouse((int)event.getAxisValue(MotionEvent.AXIS_RELATIVE_X),
+                    (int)event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y),
+                    (int)(event.getAxisValue(MotionEvent.AXIS_VSCROLL)*120), event.getButtonState());
+            return true;
+        }
+        return super.onGenericMotionEvent(event);
+    }
+
+    @Override protected void onPause() {
+        nativeResetInput();
+        super.onPause();
     }
 
     private void refreshRunEnabled() {
@@ -177,7 +266,7 @@ public final class LauncherActivity extends Activity {
         busy = true;
         run.setEnabled(false);
         choose.setEnabled(false);
-        status.setText("Calling the original executable through the native startup harness…");
+        status.setText("Tap the surface for Enter; keyboard/gamepad enabled. Calling the original executable through the native startup harness…");
         worker.execute(() -> {
             final int result;
             final String detail;
@@ -185,7 +274,15 @@ public final class LauncherActivity extends Activity {
                 File userdata = new File(getFilesDir(), "userdata");
                 if (!userdata.isDirectory() && !userdata.mkdirs())
                     throw new IllegalStateException("Cannot create app-private userdata directory");
-                result = nativeRun(exeFile.getAbsolutePath(), userdata.getCanonicalPath());
+                String scriptPath = null;
+                if (inputScript != null && !inputScript.isEmpty()) {
+                    if (!inputScript.matches("[A-Za-z0-9_-]+\\.txt"))
+                        throw new IllegalArgumentException("input_script must be a filename in input_scripts");
+                    File script = new File(new File(getGameDirectory().getParentFile(), "input_scripts"), inputScript);
+                    if (!script.isFile()) throw new IllegalArgumentException("Missing input script: " + script);
+                    scriptPath = script.getCanonicalPath();
+                }
+                result = nativeRun(exeFile.getAbsolutePath(), userdata.getCanonicalPath(), scriptPath);
                 detail = nativeLastError();
             }
             catch (Throwable error) {

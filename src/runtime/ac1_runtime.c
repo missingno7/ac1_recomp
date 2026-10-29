@@ -34,6 +34,12 @@ extern uintptr_t ac1_android_d3d9_guest_hwnd(void *context, uint32_t guest_hwnd)
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#if defined(_WIN32) || defined(__ANDROID__)
+#include "../platform/ac1_window_win32.h"
+#include "../platform/ac1_ds8_bridge.h"
+#include "../platform/ac1_dinput8_bridge.h"
+#include "../platform/ac1_input_script.h"
+#endif
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -207,10 +213,12 @@ static char bink_module_path[32768];
 #ifdef __ANDROID__
 static char bink_host_path[32768];
 #endif
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
 static ac1_window_win32 *window_bridge;
 static int ds8_configured;
 static int dinput8_configured;
+#endif
+#ifdef _WIN32
 typedef struct { uintptr_t native; uint32_t guest; } ac1_guest_monitor;
 static ac1_guest_monitor *guest_monitors;
 static size_t guest_monitor_count;
@@ -1543,7 +1551,7 @@ static uintptr_t d3d9_guest_hwnd_to_host(void *context, uint32_t guest_hwnd)
 #endif
 #endif /* AC1_HOST_D3D9 */
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
 static void *ds8_guest_resolve(void *context, uint32_t address,
                                uint32_t size, uint32_t access)
 {
@@ -1583,6 +1591,19 @@ static uintptr_t ds8_guest_hwnd_to_host(void *context, uint32_t guest_hwnd)
         ? ac1_window_win32_resolve_hwnd(window_bridge, guest_hwnd) : 0u;
 }
 
+#ifdef __ANDROID__
+static int ds8_signal_event(void *context, uint32_t handle)
+{
+    (void)context;
+    for (unsigned i=0; i<AC1_MAX_SYNC_OBJECTS; ++i) {
+        sync_object *object=&sync_objects[i];
+        if (object->handle==handle && object->kind==1u) {
+            object->signaled=1; ++object->signals; return 1;
+        }
+    }
+    return 0;
+}
+#endif
 static int ds8_ensure_configured(void)
 {
     if (ds8_configured) return 1;
@@ -1593,6 +1614,9 @@ static int ds8_ensure_configured(void)
     callbacks.guest_alloc = ds8_guest_alloc;
     callbacks.guest_free = ds8_guest_free;
     callbacks.guest_hwnd_to_host = ds8_guest_hwnd_to_host;
+#ifdef __ANDROID__
+    callbacks.signal_event = ds8_signal_event;
+#endif
     if (!ac1_ds8_configure(&callbacks, NULL)) return 0;
     ds8_configured = 1;
     return 1;
@@ -1631,7 +1655,11 @@ static uintptr_t dinput8_guest_hinstance_to_host(void *context,
 {
     (void)context;
     if (guest_hinstance == image_base)
+#ifdef _WIN32
         return (uintptr_t)GetModuleHandleA(NULL);
+#else
+        return 1u; /* validated guest executable instance, never a host handle */
+#endif
     return 0u;
 }
 
@@ -3622,6 +3650,14 @@ static void scheduler_trace_waits(ac1_scheduler *scheduler, uint64_t now)
 
 static void scheduler_refresh_waits(ac1_scheduler *scheduler)
 {
+#ifdef __ANDROID__
+    if (ds8_configured && ac1_ds8_service() < 0) {
+        scheduler->failed = 1;
+        scheduler->failure_target = last_guest_target;
+        snprintf(scheduler->failure_reason, sizeof(scheduler->failure_reason),
+                 "%s", ac1_ds8_last_error());
+    }
+#endif
     uint64_t now = guest_monotonic_ns();
     scheduler_trace_waits(scheduler, now);
     for (unsigned i = 0; i < scheduler->count; ++i) {
@@ -3698,6 +3734,9 @@ static uint32_t scheduler_next_timeout(ac1_scheduler *scheduler)
 {
     uint64_t now = guest_monotonic_ns();
     uint64_t nearest = UINT64_MAX;
+#ifdef __ANDROID__
+    if (ds8_configured) nearest = now + UINT64_C(10000000);
+#endif
 #ifdef _WIN32
     int poll_native_events = 0;
     if (guest_files && ac1_files_has_pending(guest_files)) {
@@ -4245,7 +4284,7 @@ static int invoke_guest_stdcall_callback(CPU *cpu, uint32_t procedure,
     return 1;
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
 static int window_read_guest(void *context, uint32_t address,
                              void *output, size_t bytes)
 {
@@ -4316,6 +4355,8 @@ static int ensure_window_bridge(void)
     return 1;
 }
 
+#endif /* shared window callbacks */
+#ifdef _WIN32
 typedef struct {
     CPU *cpu;
     uint32_t procedure;
@@ -4459,6 +4500,8 @@ static int handle_window_import(CPU *cpu, const import_record *import)
 #ifdef _WIN32
     if (!strcmp(import->name, "EnumDisplayMonitors"))
         return handle_enum_display_monitors_import(cpu, import);
+#endif
+#if defined(_WIN32) || defined(__ANDROID__)
     if (!ensure_window_bridge()) return 0;
     char error[256] = {0};
     int status = ac1_window_win32_call(window_bridge, cpu, import->name,
@@ -5856,7 +5899,7 @@ static int handle_audio_import(CPU *cpu, const import_record *import)
         !equal_ascii_fold(import->dll, "DSOUND.dll") || import->ordinal != 2u)
         return 0;
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__ANDROID__)
     (void)cpu;
     return 0;
 #else
@@ -6365,7 +6408,7 @@ static ac1_lifted_fn profile_lifted_lookup(uint32_t target)
     return lifted_lookup_o1(target);
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
 static int handle_window_keyboard_import(CPU *cpu, const import_record *import)
 {
     return !import->by_ordinal && (!strcmp(import->name, "GetKeyboardState") ||
@@ -6377,7 +6420,7 @@ typedef int (*import_handler_fn)(CPU *, const import_record *);
 /* Handler chain in priority order. */
 static const import_handler_fn import_handler_chain[] = {
     handle_network_import,
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
     handle_window_keyboard_import,
 #endif
     handle_win32_compat_import,
@@ -6385,7 +6428,7 @@ static const import_handler_fn import_handler_chain[] = {
     handle_audio_import,
     handle_optional_eax_import,
     handle_bink_import,
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
     handle_dinput8_import,
     handle_ds8_import,
 #endif
@@ -6697,7 +6740,7 @@ void dispatch(CPU *cpu, uint32_t target)
 #if defined(AC1_HOST_D3D9)
     if (dispatch_d3d9_method(cpu, target)) return;
 #endif
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
     if (dispatch_dinput8_method(cpu, target)) return;
     if (dispatch_ds8_method(cpu, target)) return;
 #endif
@@ -7072,7 +7115,7 @@ int ac1_run(const char *exe_path)
         unsigned seconds = setting ? (unsigned)strtoul(setting, NULL, 10) : 0u;
         trace_wait_interval_ns = (uint64_t)seconds * UINT64_C(1000000000);
     }
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
     window_bridge = NULL;
     ds8_configured = 0;
     dinput8_configured = 0;
@@ -7419,7 +7462,7 @@ cleanup:
         free(scheduler);
         scheduler = NULL;
     }
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
     if (dinput8_configured) {
         ac1_dinput8_shutdown();
         dinput8_configured = 0;
@@ -7430,7 +7473,7 @@ cleanup:
 #endif
     ac1_network_reset();
     ac1_crypto_reset();
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)
     if (ds8_configured) {
         ac1_ds8_shutdown();
         ds8_configured = 0;
@@ -7448,6 +7491,8 @@ cleanup:
     guest_monitor_count = 0u;
     guest_monitor_capacity = 0u;
     next_guest_monitor = 0xE6000004u;
+#endif
+#if defined(_WIN32) || defined(__ANDROID__)
     if (window_bridge) {
         ac1_window_win32_destroy(window_bridge);
         window_bridge = NULL;

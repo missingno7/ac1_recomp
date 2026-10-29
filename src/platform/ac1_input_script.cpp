@@ -8,7 +8,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#if defined(_WIN32) && !defined(AC1_PORTABLE_TEST)
 #include <dinput.h>
+#else
+#include "ac1_input_codes.h"
+#include <chrono>
+static uint64_t GetTickCount64() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+#endif
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -16,7 +22,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#if defined(_WIN32) && !defined(AC1_PORTABLE_TEST)
 #include <windows.h>
+#endif
 #ifdef AC1_HOST_D3D9
 extern "C" uint64_t ac1_d3d9_present_count(void);
 #endif
@@ -142,10 +150,12 @@ const KeyName names[] = {KEY(ESCAPE),
                          {"PAGEUP", DIK_PRIOR},
                          {"PAGEDOWN", DIK_NEXT}};
 #undef KEY
+#if defined(_WIN32) && !defined(AC1_PORTABLE_TEST)
 HKL layout() {
     static HKL value = LoadKeyboardLayoutW(L"00000409", KLF_NOTELLSHELL);
     return value;
 }
+#endif
 uint64_t number(const std::string &s, uint64_t max = UINT64_MAX) {
     if (s.empty() || s[0] == '-' || s[0] == '+')
         throw std::runtime_error("expected unsigned integer: " + s);
@@ -243,7 +253,12 @@ extern "C" uint32_t ac1_input_key_vk(unsigned dik) {
         return VK_SNAPSHOT;
     if (dik == DIK_NUMLOCK)
         return VK_NUMLOCK;
+    #if defined(_WIN32) && !defined(AC1_PORTABLE_TEST)
     return MapVirtualKeyExW((dik & 0x7f) | (dik & 0x80 ? 0xe000 : 0), MAPVK_VSC_TO_VK_EX, layout());
+    #else
+    static const uint8_t vk[256] = {0,27,49,50,51,52,53,54,55,56,57,48,189,187,8,9,81,87,69,82,84,89,85,73,79,80,219,221,13,162,65,83,68,70,71,72,74,75,76,186,222,192,160,220,90,88,67,86,66,78,77,188,190,191,161,0,164,32,20,112,113,114,115,116,117,118,119,120,121,144,145,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,122,123,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,13,163,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,111,0,44,165,0,0,0,0,0,0,0,0,0,0,0,0,19,0,36,38,33,0,37,0,39,0,35,40,34,45,46,0,0,0,0,0,0,0,91,92,93,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    return vk[dik];
+    #endif
 }
 extern "C" uint32_t ac1_input_key_lparam(unsigned dik, int down, int previous) {
     if (dik > 255)
@@ -526,6 +541,7 @@ std::mutex session_mutex;
 bool initialized = false, failed = false;
 std::string failure;
 ac1_input_script *session = nullptr;
+ac1_input_script physical;
 FILE *record = nullptr;
 uint64_t started = 0, last_frame = UINT64_MAX, recorded_keyboard_poll = 0, recorded_mouse_poll = 0;
 uint64_t recorded_keyboard_frame = UINT64_MAX, recorded_mouse_frame = UINT64_MAX;
@@ -578,6 +594,7 @@ extern "C" int ac1_input_session_init(char *error, size_t cap) {
     initialized = true;
     started = GetTickCount64();
     // Include loader/CRT time before the first USER32/DirectInput call.
+    #if defined(_WIN32) && !defined(AC1_PORTABLE_TEST)
     FILETIME creation, exit, kernel, user, now;
     if (GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) {
         GetSystemTimeAsFileTime(&now);
@@ -589,6 +606,7 @@ extern "C" int ac1_input_session_init(char *error, size_t cap) {
         if (current.QuadPart >= created_at.QuadPart)
             started -= (current.QuadPart - created_at.QuadPart) / 10000;
     }
+    #endif
     const char *script = std::getenv("AC1_INPUT_SCRIPT"), *out = std::getenv("AC1_INPUT_RECORD");
     if (script && *script) {
         std::ifstream file(script, std::ios::binary);
@@ -705,16 +723,58 @@ extern "C" void ac1_input_record_message(uint32_t m, uint32_t wp, uint32_t lp) {
 }
 extern "C" int ac1_input_next_message(ac1_input_message *m) {
     std::lock_guard<std::mutex> lock(session_mutex);
-    return ac1_input_pop(session, m);
+    return ac1_input_pop(session ? session : &physical, m);
 }
 extern "C" void ac1_input_cursor(int32_t *x, int32_t *y) {
     std::lock_guard<std::mutex> lock(session_mutex);
-    *x = dispatch ? dispatch->x : session->x;
-    *y = dispatch ? dispatch->y : session->y;
+    const auto *s = session ? session : &physical;
+    *x = dispatch ? dispatch->x : s->x;
+    *y = dispatch ? dispatch->y : s->y;
 }
 extern "C" void ac1_input_vk_state(uint8_t *state) {
     std::lock_guard<std::mutex> lock(session_mutex);
-    std::memcpy(state, dispatch ? dispatch->keyboard : session->vk.data(), 256);
+    std::memcpy(state, dispatch ? dispatch->keyboard : (session ? session : &physical)->vk.data(), 256);
+}
+extern "C" void ac1_input_physical_key(unsigned dik, int down) {
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (session || dik > 255) return;
+    bool was = physical.keys[dik] != 0;
+    if (was == !!down) return;
+    physical.keys[dik] = down ? 0x80 : 0;
+    unsigned vk = ac1_input_key_vk(dik);
+    vk_change(&physical, vk, down != 0);
+    unsigned wp = vk;
+    if (vk == VK_LSHIFT || vk == VK_RSHIFT) wp = VK_SHIFT;
+    if (vk == VK_LCONTROL || vk == VK_RCONTROL) wp = VK_CONTROL;
+    if (vk == VK_LMENU || vk == VK_RMENU) wp = VK_MENU;
+    if (physical.messages.size() < 1024)
+        message(&physical, down ? WM_KEYDOWN : WM_KEYUP, wp,
+                ac1_input_key_lparam(dik, down, was));
+}
+extern "C" void ac1_input_physical_mouse(int32_t dx, int32_t dy, int32_t wheel, unsigned buttons) {
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (session) return;
+    int32_t delta[3]; std::memcpy(delta, physical.mouse.data(), 12);
+    int32_t add[3] = {dx,dy,wheel};
+    for(unsigned i=0;i<3;++i) delta[i]=static_cast<int32_t>(
+        std::max<int64_t>(INT32_MIN,std::min<int64_t>(INT32_MAX,int64_t(delta[i])+add[i])));
+    std::memcpy(physical.mouse.data(),delta,12);
+    for(unsigned i=0;i<8;++i) physical.mouse[12+i] = buttons & (1u<<i) ? 0x80 : 0;
+    physical.x = static_cast<int32_t>(uint32_t(physical.x)+uint32_t(dx));
+    physical.y = static_cast<int32_t>(uint32_t(physical.y)+uint32_t(dy));
+    if((dx||dy) && physical.messages.size()<1024)
+        message(&physical,WM_MOUSEMOVE,0,(uint32_t(physical.x)&0xffff)|(uint32_t(physical.y)<<16));
+}
+extern "C" int ac1_input_physical_state(int keyboard,void *state,size_t size) {
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if(!state || (keyboard ? size!=256 : size!=16 && size!=20))return -1;
+    std::memcpy(state,keyboard?physical.keys.data():physical.mouse.data(),size);
+    if(!keyboard)std::memset(physical.mouse.data(),0,12);
+    return 1;
+}
+extern "C" void ac1_input_physical_reset(void) {
+    std::lock_guard<std::mutex> lock(session_mutex);
+    physical = ac1_input_script{};
 }
 extern "C" const ac1_input_message *ac1_input_dispatch_state(const ac1_input_message *m) {
     const ac1_input_message *previous = dispatch;

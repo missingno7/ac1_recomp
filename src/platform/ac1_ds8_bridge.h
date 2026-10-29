@@ -39,6 +39,10 @@ typedef struct ac1_ds8_callbacks {
     ac1_ds8_guest_free_fn guest_free;
     ac1_ds8_guest_hwnd_to_host_fn guest_hwnd_to_host;
     ac1_ds8_log_fn log;
+    /* Portable backend: called under the guest scheduler baton, never from
+     * an audio thread. Optional clock injection also supports focused tests. */
+    int (*signal_event)(void *context, uint32_t guest_event);
+    uint64_t (*monotonic_ns)(void *context);
 } ac1_ds8_callbacks;
 
 /* Configure with the active process guest-memory and HWND adapters. Must be
@@ -67,6 +71,9 @@ int ac1_ds8_dispatch(uint32_t token, const uint32_t *args,
  * address-space teardown. The real System32 DirectSound module unloads here. */
 void ac1_ds8_shutdown(void);
 const char *ac1_ds8_last_error(void);
+#if !defined(_WIN32) || defined(AC1_PORTABLE_TEST)
+int ac1_ds8_service(void);
+#endif
 
 #ifdef __cplusplus
 }

@@ -39,7 +39,7 @@ if ($LASTEXITCODE -ne 0) { throw 'DXVK shader generation failed' }
 & $Cmake -S $PSScriptRoot -B $Build -G Ninja `
     "-DCMAKE_MAKE_PROGRAM=$Ninja" `
     "-DCMAKE_TOOLCHAIN_FILE=$NdkRoot\build\cmake\android.toolchain.cmake" `
-    '-DANDROID_ABI=arm64-v8a' '-DANDROID_PLATFORM=26' `
+    '-DANDROID_ABI=arm64-v8a' '-DANDROID_PLATFORM=29' `
     "-DDXVK_SOURCE=$Prepared" '-DCMAKE_BUILD_TYPE=Release'
 if ($LASTEXITCODE -ne 0) { throw 'DXVK CMake configure failed' }
 & $Cmake --build $Build --parallel

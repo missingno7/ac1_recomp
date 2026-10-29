@@ -32,6 +32,12 @@ void ac1_input_tick(void);
 int ac1_input_next_message(ac1_input_message *message);
 void ac1_input_cursor(int32_t *x, int32_t *y);
 void ac1_input_vk_state(uint8_t state[256]);
+/* UI-thread injection. DIK scan codes; ignored during scripted replay. */
+void ac1_input_physical_key(unsigned dik, int down);
+void ac1_input_physical_mouse(int32_t dx, int32_t dy, int32_t wheel,
+                              unsigned buttons);
+int ac1_input_physical_state(int keyboard, void *state, size_t size);
+void ac1_input_physical_reset(void);
 /* Apply the event snapshot only while executing its guest WndProc. */
 const ac1_input_message *ac1_input_dispatch_state(const ac1_input_message *message);
 #ifdef __cplusplus

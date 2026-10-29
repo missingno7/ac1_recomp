@@ -154,7 +154,17 @@ int ac1_audio_enumerate_a(ac1_audio_device_list *list)
 int ac1_audio_enumerate_a(ac1_audio_device_list *list)
 {
     if (list) memset(list, 0, sizeof(*list));
+#ifdef __ANDROID__
+    if (!list) return AC1_AUDIO_ENUM_ERROR;
+    list->devices = calloc(1, sizeof(*list->devices));
+    if (!list->devices) return AC1_AUDIO_ENUM_ERROR;
+    list->count = list->capacity = 1;
+    strcpy(list->devices[0].description, "AC1 clock-driven silent output");
+    strcpy(list->devices[0].module, "ac1_ds8_portable");
+    return AC1_AUDIO_ENUM_HANDLED;
+#else
     return list ? AC1_AUDIO_ENUM_UNSUPPORTED : AC1_AUDIO_ENUM_ERROR;
+#endif
 }
 
 #endif

@@ -5,6 +5,7 @@
         android:theme="@android:style/Theme.Material.NoActionBar">
         <activity
             android:name=".LauncherActivity"
+            android:screenOrientation="sensorLandscape"
             android:configChanges="keyboard|keyboardHidden|orientation|screenSize"
             android:exported="true">
             <intent-filter>
