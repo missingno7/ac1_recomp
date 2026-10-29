@@ -165,6 +165,10 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 def write_text_if_changed(path: Path, text: str) -> bool:
     """Preserve output mtimes unless the generated content changed."""
     data = text.encode("utf-8")
@@ -173,6 +177,60 @@ def write_text_if_changed(path: Path, text: str) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     return True
+
+
+def write_report_if_inputs_unchanged(path: Path, text: str,
+                                     inputs: dict[str, tuple[Path, str]]) -> None:
+    """Refuse to publish a success report if any generation input changed."""
+    changed = []
+    for name, (input_path, expected_hash) in inputs.items():
+        try:
+            actual_hash = sha256(input_path)
+        except OSError as exc:
+            changed.append(f"{name} ({input_path}: {exc})")
+            continue
+        if actual_hash != expected_hash:
+            changed.append(f"{name} ({input_path})")
+    if changed:
+        raise RuntimeError("generation inputs changed during lift: " + ", ".join(changed))
+    write_text_if_changed(path, text)
+
+
+def invalidate_success_report(path: Path) -> None:
+    """Remove a prior success marker before any outputs for a new run change."""
+    path.unlink(missing_ok=True)
+
+
+def run_input_fingerprint_selftest() -> None:
+    """Prove stable inputs publish a report and a changed input cannot."""
+    with tempfile.TemporaryDirectory(prefix="lift_input_guard_") as temp_name:
+        temp = Path(temp_name)
+        config_path = temp / "config.json"
+        seed_path = temp / "seeds.json"
+        config_path.write_bytes(b'{"depth": 2}')
+        seed_path.write_bytes(b'[4198400]')
+        inputs = {
+            "config": (config_path, sha256_bytes(config_path.read_bytes())),
+            "seed": (seed_path, sha256_bytes(seed_path.read_bytes())),
+        }
+        success_report = temp / "success.json"
+        write_report_if_inputs_unchanged(success_report, '{"ok":true}\n', inputs)
+        assert json.loads(success_report.read_text(encoding="utf-8"))["ok"] is True
+
+        seed_path.write_bytes(b'[4198401]')
+        blocked_report = temp / "blocked.json"
+        blocked_report.write_text('{"ok":true}\n', encoding="utf-8")
+        invalidate_success_report(blocked_report)
+        assert not blocked_report.exists()
+        # A failed verification after invalidation must not leave the previous
+        # success marker available to a build that inspects the output folder.
+        try:
+            write_report_if_inputs_unchanged(blocked_report, '{"ok":true}\n', inputs)
+        except RuntimeError as exc:
+            assert "seed" in str(exc)
+        else:
+            raise AssertionError("input-change guard accepted a modified seed file")
+        assert not blocked_report.exists()
 
 
 def entry_guard_lines(function_start: int, ordered_addresses: list[int]) -> list[str]:
@@ -585,6 +643,10 @@ int main(void)
         schema_fixture(tail=bytes.fromhex("66686000"), helper=AC1_READER_CALLBACK_HELPER),
     )
     assert all(not ac1_reader_callback_call_edges(fixture) for fixture in reader_rejects)
+    run_input_fingerprint_selftest()
+    print("lift generation-input fingerprint self-test: unchanged inputs publish; changed inputs reject")
+    run_instruction_span_index_selftest()
+    print("instruction-span index self-test: indexed overlap matches linear scan")
     print("lift control-flow and instruction-adapter self-test: ok")
 
 
@@ -1588,19 +1650,72 @@ def ac1_four_dword_arg2_callback_edges(function, helper_target: int) -> list[dic
     return edges
 
 
+class InstructionSpanIndex:
+    """Page-index exact instruction spans for fast mid-instruction checks."""
+
+    PAGE_SHIFT = 12
+
+    def __init__(self) -> None:
+        self._pages: dict[int, list[tuple[int, int]]] = {}
+
+    def add_function(self, function: dict) -> None:
+        for block in function["blocks"]:
+            for start, size in block["instructions"]:
+                if size <= 0:
+                    continue
+                end = start + size
+                span = (start, end)
+                # Index a span on every page it touches, so cross-page x86
+                # instructions are found without assuming a maximum length.
+                for page in range(start >> self.PAGE_SHIFT, ((end - 1) >> self.PAGE_SHIFT) + 1):
+                    self._pages.setdefault(page, []).append(span)
+
+    def overlaps(self, target: int) -> bool:
+        return any(start < target < end
+                   for start, end in self._pages.get(target >> self.PAGE_SHIFT, ()))
+
+
+def linear_instruction_span_overlap(target: int, discovered: dict) -> bool:
+    """Reference implementation retained for exact-equivalence tests."""
+    for function in discovered.values():
+        for block in function["blocks"]:
+            for start, size in block["instructions"]:
+                if start < target < start + size:
+                    return True
+    return False
+
+
+def run_instruction_span_index_selftest() -> None:
+    # Covers a span crossing into the target page, duplicate spans, exact
+    # start/end boundaries, and non-overlap regions.
+    discovered = {
+        0x1000: {"blocks": [{"instructions": [
+            [0x1FFF, 3], [0x1FFF, 3], [0x2004, 5], [0x2FFF, 2],
+        ]}]},
+        0x3000: {"blocks": [{"instructions": [[0x3008, 1], [0x3010, 6]]}]},
+    }
+    index = InstructionSpanIndex()
+    for function in discovered.values():
+        index.add_function(function)
+    for target in range(0x1FF0, 0x3020):
+        assert index.overlaps(target) == linear_instruction_span_overlap(target, discovered), (
+            f"instruction-span index mismatch at 0x{target:08X}"
+        )
+
+
 def validate_callback_code_entry(target: int, disassembler, info, iat,
-                                 discovered: dict) -> bool:
+                                 discovered: dict | InstructionSpanIndex) -> bool:
     """Validate a callback as executable code and reject known mid-instruction pointers."""
     if not (info.code_start <= target < info.code_end and
             disassembler.is_code_address(target)):
         return False
     if not disassembler.probes_as_function_body(target):
         return False
-    for function in discovered.values():
-        for block in function["blocks"]:
-            for start, size in block["instructions"]:
-                if start < target < start + size:
-                    return False
+    overlaps = (discovered.overlaps(target)
+                if isinstance(discovered, InstructionSpanIndex)
+                else linear_instruction_span_overlap(target, discovered))
+    if overlaps:
+        return False
     try:
         candidate = disassembler.disassemble_function(target, iat)
     except Exception:
@@ -1624,6 +1739,7 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
     queue = collections.deque((seed, 0) for seed in initial_seeds)
     queued = set(initial_seeds)
     results = {}
+    instruction_spans = InstructionSpanIndex()
     failures = []
     callback_edges = []
     while queue and len(results) < max_functions:
@@ -1661,9 +1777,10 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
                 for block in sorted(function.blocks.values(), key=lambda item: item.start)
             ],
         }
+        instruction_spans.add_function(results[address])
         tail_target = direct_tail_thunk_target(function)
         if (tail_target is not None and
-                validate_callback_code_entry(tail_target, dis, info, iat, results)):
+                validate_callback_code_entry(tail_target, dis, info, iat, instruction_spans)):
             # Keep the exact architectural jump destination. Do not advance
             # through alignment bytes or rewrite the target based on padding.
             results[address]["is_thunk"] = True
@@ -1681,7 +1798,7 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
         for call_edge in ac1_array_constructor_call_edges(function):
             for role in ("constructor", "cleanup"):
                 target = call_edge[role]
-                if not validate_callback_code_entry(target, dis, info, iat, results):
+                if not validate_callback_code_entry(target, dis, info, iat, instruction_spans):
                     continue
                 callback_edges.append({
                     "caller": address,
@@ -1696,7 +1813,7 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
         for helper, role in AC1_ARG2_CALLBACK_HELPERS.items():
             for call_edge in ac1_four_dword_arg2_callback_edges(function, helper):
                 target = call_edge["callback"]
-                if not validate_callback_code_entry(target, dis, info, iat, results):
+                if not validate_callback_code_entry(target, dis, info, iat, instruction_spans):
                     continue
                 callback_edges.append({
                     "caller": address,
@@ -2047,17 +2164,34 @@ def main() -> int:
         run_selftest()
         run_ac1_switch_selftest(binary, pcrecomp)
         return 0
-    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    driver_path = Path(__file__).resolve()
+    driver_hash = sha256(driver_path)
+    config_bytes = CONFIG_PATH.read_bytes()
+    config_hash = sha256_bytes(config_bytes)
+    config = json.loads(config_bytes)
     python, pcrecomp = resolve_tooling(config, args)
     binary = (args.binary or Path(config["binary"])).resolve()
     output_dir = args.output_dir.resolve()
     if not output_dir.is_relative_to((ROOT / "work").resolve()):
         parser.error(f"output-dir must be under {ROOT / 'work'}")
-    if sha256(binary) != config["sha256"]:
+    binary_hash = sha256(binary)
+    if binary_hash != config["sha256"]:
         parser.error("installed executable SHA-256 does not match config/ac1_dx9.json")
     revision = subprocess.check_output(["git", "-C", str(pcrecomp), "rev-parse", "HEAD"], text=True).strip()
     if revision != config["pcrecomp_revision"]:
         parser.error(f"pcrecomp revision mismatch: expected {config['pcrecomp_revision']}, got {revision}")
+    donor_paths = {
+        "pcrecomp_pe_analyze": pcrecomp / "tools/pe/pe_analyze.py",
+        "pcrecomp_disasm32": pcrecomp / "tools/disasm/disasm32.py",
+        "pcrecomp_lifter": pcrecomp / "tools/lift/lift32_cpu.py",
+        "initializer_analyzer": ROOT / "tools/analyze_initializer_tables.py",
+    }
+    input_fingerprints: dict[str, tuple[Path, str]] = {
+        "driver": (driver_path, driver_hash),
+        "config": (CONFIG_PATH, config_hash),
+        "binary": (binary, binary_hash),
+        **{name: (path, sha256(path)) for name, path in donor_paths.items()},
+    }
     max_functions = args.max_functions or config["initial_discovery"]["max_functions"]
     max_depth = args.max_depth if args.max_depth is not None else config["initial_discovery"]["max_depth"]
     functions_per_tu = args.functions_per_tu or config.get("functions_per_translation_unit", 100)
@@ -2068,8 +2202,13 @@ def main() -> int:
         parser.error("translation-unit-buckets must be zero or positive")
     extra_seeds = [int(seed, 0) for seed in config["initial_discovery"].get("startup_seeds", [])]
     extra_seeds.extend(int(seed, 0) for seed in args.seed)
+    seed_file_hash = None
     if args.seed_file:
-        seed_text = args.seed_file.read_text(encoding="utf-8").strip()
+        seed_path = args.seed_file.resolve()
+        seed_bytes = seed_path.read_bytes()
+        seed_file_hash = sha256_bytes(seed_bytes)
+        input_fingerprints["seed_file"] = (seed_path, seed_file_hash)
+        seed_text = seed_bytes.decode("utf-8").strip()
         try:
             seed_values = json.loads(seed_text)
             if not isinstance(seed_values, list):
@@ -2089,8 +2228,11 @@ def main() -> int:
     if args.initializer_group != "none":
         sys.path.insert(0, str(ROOT / "tools"))
         from analyze_initializer_tables import analyze as analyze_initializer_tables
-        initializer_config = json.loads(args.initializer_tables.read_text(encoding="utf-8"))
-        initializer_config_hash = sha256(args.initializer_tables)
+        initializer_path = args.initializer_tables.resolve()
+        initializer_bytes = initializer_path.read_bytes()
+        initializer_config = json.loads(initializer_bytes)
+        initializer_config_hash = sha256_bytes(initializer_bytes)
+        input_fingerprints["initializer_tables"] = (initializer_path, initializer_config_hash)
         if args.initializer_group != "all":
             initializer_config["tables"] = [
                 table for table in initializer_config["tables"]
@@ -2104,12 +2246,16 @@ def main() -> int:
         extra_seeds.extend(initializer_report["unique_executable_pointers_across_tables"])
     extra_seeds = sorted(set(extra_seeds))
     output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / "lift-report.json"
+    invalidate_success_report(report_path)
     start_time = time.perf_counter()
+    discovery_start = time.perf_counter()
     info, dis, catalog, discovery_failures, queued, entry, iat, callback_edges = discover_entry_cone(
         binary, pcrecomp, max_functions, max_depth, extra_seeds
     )
+    discovery_seconds = time.perf_counter() - discovery_start
     catalog_doc = {
-        "binary_sha256": config["sha256"],
+        "binary_sha256": binary_hash,
         "pcrecomp_revision": revision,
         "entry_point": entry,
         "image_base": info.image_base,
@@ -2144,8 +2290,10 @@ def main() -> int:
         f"0x{f['address']:08X} {f['size']} ac1_{f['address']:08X}\n"
         for f in catalog_doc["functions"]))
     output = output_dir / "initial.c"
+    emit_start = time.perf_counter()
     lift_result = emit_lift(binary, pcrecomp, catalog_doc["functions"], output_dir,
                             functions_per_tu, translation_unit_buckets)
+    emit_seconds = time.perf_counter() - emit_start
     todo_count = sum((output_dir / name).read_text(encoding="utf-8").count("RECOMP_TODO")
                      for name in lift_result["translation_units"])
     report = {
@@ -2167,8 +2315,15 @@ def main() -> int:
             "function_bounds": funcs_path.name,
         },
         "elapsed_seconds": round(time.perf_counter() - start_time, 3),
+        "discovery_seconds": round(discovery_seconds, 3),
+        "emit_seconds": round(emit_seconds, 3),
         "pcrecomp_root": str(pcrecomp),
-        "pcrecomp_lifter_sha256": sha256(pcrecomp / "tools/lift/lift32_cpu.py"),
+        "pcrecomp_lifter_sha256": input_fingerprints["pcrecomp_lifter"][1],
+        "generation_input_sha256": {
+            name: expected_hash
+            for name, (_path, expected_hash) in sorted(input_fingerprints.items())
+        },
+        "seed_file_sha256": seed_file_hash,
         "python": str(python),
         "capstone_version": importlib.metadata.version("capstone"),
         "pefile_version": importlib.metadata.version("pefile"),
@@ -2190,10 +2345,25 @@ def main() -> int:
         "CPUID through the runtime guest CPUID helper.",
         "Optional AC1_TRACE_EIP instrumentation updates CPU.eip before each instruction.",
     ]
-    report["lift_driver_sha256"] = sha256(Path(__file__).resolve())
-    report["config_sha256"] = sha256(CONFIG_PATH)
+    report["lift_driver_sha256"] = driver_hash
+    report["config_sha256"] = config_hash
     report["initializer_tables_sha256"] = initializer_config_hash
-    write_text_if_changed(output_dir / "lift-report.json", json.dumps(report, indent=2) + "\n")
+    try:
+        current_revision = subprocess.check_output(
+            ["git", "-C", str(pcrecomp), "rev-parse", "HEAD"], text=True).strip()
+    except Exception as exc:
+        print(f"error: unable to recheck pcrecomp revision before report: {exc}", file=sys.stderr)
+        return 2
+    if current_revision != revision:
+        print("error: pcrecomp revision changed during lift; no success report written", file=sys.stderr)
+        return 2
+    try:
+        write_report_if_inputs_unchanged(
+            report_path, json.dumps(report, indent=2) + "\n",
+            input_fingerprints)
+    except RuntimeError as exc:
+        print(f"error: {exc}; no success report written", file=sys.stderr)
+        return 2
     print(f"entry=0x{entry:08X}; discovered={len(catalog)}; lifted={len(lift_result['lifted'])}; "
           f"discovery failures={len(discovery_failures)}; lift failures={len(lift_result['lift_failures'])}; "
           f"RECOMP_TODO={todo_count}; remaining call queue={queued}; out={output_dir}")

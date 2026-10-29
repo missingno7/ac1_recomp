@@ -112,6 +112,10 @@ struct ac1_scheduler {
     uint32_t failure_caller, failure_thread_id;
     CPU failure_cpu;
     uint32_t failure_stack[8];
+    uint32_t failure_object_words[8];
+    uint32_t failure_vtable_words[8];
+    int failure_object_readable;
+    int failure_vtable_readable;
     char failure_reason[512];
 };
 
@@ -4600,6 +4604,23 @@ static void stop_guest(const char *reason, uint32_t target)
                 uint32_t at = active_guest_thread->cpu.esp + i * 4u;
                 scheduler->failure_stack[i] = guest_memory_try_ptr(at, 4u) ? rd32(at) : 0u;
             }
+            scheduler->failure_object_readable = 0;
+            scheduler->failure_vtable_readable = 0;
+            if (trace_imports &&
+                guest_memory_try_ptr(active_guest_thread->cpu.ecx,
+                                     sizeof(scheduler->failure_object_words))) {
+                for (unsigned i = 0; i < 8u; ++i)
+                    scheduler->failure_object_words[i] =
+                        rd32(active_guest_thread->cpu.ecx + i * 4u);
+                scheduler->failure_object_readable = 1;
+                uint32_t vptr = scheduler->failure_object_words[0];
+                if (guest_memory_try_ptr(vptr,
+                                         sizeof(scheduler->failure_vtable_words))) {
+                    for (unsigned i = 0; i < 8u; ++i)
+                        scheduler->failure_vtable_words[i] = rd32(vptr + i * 4u);
+                    scheduler->failure_vtable_readable = 1;
+                }
+            }
             snprintf(scheduler->failure_reason, sizeof(scheduler->failure_reason),
                      "guest thread %u: %s", active_guest_thread->id,
                      reason ? reason : "unsupported guest operation");
@@ -4617,6 +4638,29 @@ static void stop_guest(const char *reason, uint32_t target)
     }
     fprintf(stderr, "AC1 native runtime: %s; target=0x%08x\n", reason, target);
     abort();
+}
+
+static void trace_receiver_snapshot(const CPU *cpu)
+{
+    if (!trace_imports || !cpu ||
+        !guest_memory_try_ptr(cpu->ecx, 8u * sizeof(uint32_t)))
+        return;
+    uint32_t object_words[8];
+    for (unsigned i = 0; i < 8u; ++i)
+        object_words[i] = rd32(cpu->ecx + i * 4u);
+    fprintf(stderr,
+            "AC1 guest receiver: ecx=0x%08x words=[%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x]\n",
+            cpu->ecx, object_words[0], object_words[1], object_words[2],
+            object_words[3], object_words[4], object_words[5],
+            object_words[6], object_words[7]);
+    if (!guest_memory_try_ptr(object_words[0], 8u * sizeof(uint32_t)))
+        return;
+    fprintf(stderr,
+            "AC1 guest candidate vtable: address=0x%08x slots=[%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x]\n",
+            object_words[0], rd32(object_words[0]), rd32(object_words[0] + 4u),
+            rd32(object_words[0] + 8u), rd32(object_words[0] + 12u),
+            rd32(object_words[0] + 16u), rd32(object_words[0] + 20u),
+            rd32(object_words[0] + 24u), rd32(object_words[0] + 28u));
 }
 
 static int resolve_import(void *context, const char *dll_name,
@@ -5686,6 +5730,8 @@ int ac1_run(const char *exe_path)
         fprintf(stderr, "AC1 guest stop: %s; caller=0x%08x EIP=0x%08x ESP=0x%08x EAX=0x%08x dispatches=%llu\n",
                 stop_reason, last_guest_target, cpu->eip, cpu->esp, cpu->eax,
                 (unsigned long long)dispatch_count);
+        if (!(scheduler && scheduler->failed))
+            trace_receiver_snapshot(cpu);
         if (scheduler && scheduler->failed) {
             const CPU *failed = &scheduler->failure_cpu;
             fprintf(stderr,
@@ -5699,6 +5745,30 @@ int ac1_run(const char *exe_path)
                     scheduler->failure_stack[2], scheduler->failure_stack[3],
                     scheduler->failure_stack[4], scheduler->failure_stack[5],
                     scheduler->failure_stack[6], scheduler->failure_stack[7]);
+            if (trace_imports && scheduler->failure_object_readable) {
+                fprintf(stderr,
+                        "AC1 worker receiver: ecx=0x%08x words=[%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x]\n",
+                        failed->ecx, scheduler->failure_object_words[0],
+                        scheduler->failure_object_words[1],
+                        scheduler->failure_object_words[2],
+                        scheduler->failure_object_words[3],
+                        scheduler->failure_object_words[4],
+                        scheduler->failure_object_words[5],
+                        scheduler->failure_object_words[6],
+                        scheduler->failure_object_words[7]);
+                if (scheduler->failure_vtable_readable)
+                    fprintf(stderr,
+                            "AC1 worker candidate vtable: address=0x%08x slots=[%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x]\n",
+                            scheduler->failure_object_words[0],
+                            scheduler->failure_vtable_words[0],
+                            scheduler->failure_vtable_words[1],
+                            scheduler->failure_vtable_words[2],
+                            scheduler->failure_vtable_words[3],
+                            scheduler->failure_vtable_words[4],
+                            scheduler->failure_vtable_words[5],
+                            scheduler->failure_vtable_words[6],
+                            scheduler->failure_vtable_words[7]);
+            }
         }
         result = 8;
     }
