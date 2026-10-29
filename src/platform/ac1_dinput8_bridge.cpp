@@ -303,6 +303,10 @@ int method_argument_count(uint32_t token)
         return 5; /* EnumDevices(this, type, callback, ref, flags). */
     if (kind == ObjectKind::DeviceW && slot == 4u)
         return 4; /* EnumObjects(this, callback, ref, flags). */
+    if (kind == ObjectKind::DeviceW && slot == 7u)
+        return 1; /* Acquire(this). */
+    if (kind == ObjectKind::DeviceW && slot == 9u)
+        return 3; /* GetDeviceState(this, cbData, output). */
     if (kind == ObjectKind::DeviceW && slot == 11u)
         return 2; /* SetDataFormat(this, guest DIDATAFORMAT*). */
     if (kind == ObjectKind::DeviceW && slot == 13u)
@@ -528,6 +532,40 @@ int invoke_set_data_format(GuestObject &object, const uint32_t *args,
     native_format.rgodf = native_objects.empty() ? nullptr : native_objects.data();
     const HRESULT result = reinterpret_cast<IDirectInputDevice8W *>(object.native)
         ->SetDataFormat(&native_format);
+    *result_out = static_cast<uint32_t>(result);
+    return AC1_DINPUT8_HANDLED;
+}
+
+int invoke_acquire(GuestObject &object, uint32_t *result_out)
+{
+    if (object.kind != ObjectKind::DeviceW) {
+        set_error("DirectInput Acquire currently supports only the observed W interface");
+        return AC1_DINPUT8_METHOD_UNSUPPORTED;
+    }
+    const HRESULT result = reinterpret_cast<IDirectInputDevice8W *>(object.native)
+        ->Acquire();
+    *result_out = static_cast<uint32_t>(result);
+    return AC1_DINPUT8_HANDLED;
+}
+
+int invoke_get_device_state(GuestObject &object, const uint32_t *args,
+                            uint32_t *result_out)
+{
+    if (object.kind != ObjectKind::DeviceW) {
+        set_error("DirectInput GetDeviceState currently supports only the observed W interface");
+        return AC1_DINPUT8_METHOD_UNSUPPORTED;
+    }
+    void *output = guest_memory(args[2], args[1], AC1_DINPUT8_GUEST_WRITE);
+    if (!output) {
+        std::ostringstream message;
+        message << "DirectInput GetDeviceState output range is not writable guest memory"
+                << " (address=0x" << std::hex << args[2]
+                << " bytes=0x" << args[1] << ')';
+        set_error(message.str());
+        return AC1_DINPUT8_ERROR;
+    }
+    const HRESULT result = reinterpret_cast<IDirectInputDevice8W *>(object.native)
+        ->GetDeviceState(args[1], output);
     *result_out = static_cast<uint32_t>(result);
     return AC1_DINPUT8_HANDLED;
 }
@@ -804,6 +842,10 @@ extern "C" int ac1_dinput8_dispatch(uint32_t token, const uint32_t *args,
         return invoke_enum_devices(object, args, result_out);
     if (kind == ObjectKind::DeviceW && slot == 4u)
         return invoke_enum_objects(object, args, result_out);
+    if (kind == ObjectKind::DeviceW && slot == 7u)
+        return invoke_acquire(object, result_out);
+    if (kind == ObjectKind::DeviceW && slot == 9u)
+        return invoke_get_device_state(object, args, result_out);
     if (kind == ObjectKind::DeviceW && slot == 11u)
         return invoke_set_data_format(object, args, result_out);
     if (kind == ObjectKind::DeviceW && slot == 13u)

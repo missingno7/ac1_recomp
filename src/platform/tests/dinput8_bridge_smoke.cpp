@@ -157,12 +157,20 @@ int main()
         AC1_DINPUT8_TOKEN_BASE + 3u * 0x1000u + 4u * 0x10u;
     const uint32_t enum_objects_token =
         AC1_DINPUT8_TOKEN_BASE + 5u * 0x1000u + 4u * 0x10u;
+    const uint32_t acquire_token =
+        AC1_DINPUT8_TOKEN_BASE + 5u * 0x1000u + 7u * 0x10u;
+    const uint32_t get_state_token =
+        AC1_DINPUT8_TOKEN_BASE + 5u * 0x1000u + 9u * 0x10u;
     if (!check(ac1_dinput8_argument_count(create_device_token) == 4,
                "CreateDevice x86 arity includes this and three parameters") ||
         !check(ac1_dinput8_argument_count(enum_devices_token) == 5,
                "W EnumDevices x86 arity includes this and four parameters") ||
         !check(ac1_dinput8_argument_count(enum_objects_token) == 4,
                "W EnumObjects x86 arity includes this, callback, context, and flags") ||
+        !check(ac1_dinput8_argument_count(acquire_token) == 1,
+               "W Acquire x86 arity includes this only") ||
+        !check(ac1_dinput8_argument_count(get_state_token) == 3,
+               "W GetDeviceState x86 arity includes this, byte count, and output") ||
         !check(ac1_dinput8_argument_count(0x12345678u) == AC1_DINPUT8_NOT_HANDLED,
                "foreign dispatch token is not claimed")) {
         ac1_dinput8_shutdown();
@@ -403,6 +411,64 @@ int main()
             g_test_window = nullptr;
             ac1_dinput8_shutdown();
             return 1;
+        }
+
+        constexpr uint32_t state_buffer_address = kGuestBase + 0xa00u;
+        std::array<uint8_t, 0x100u> state_buffer{};
+        state_buffer.fill(0xcdu);
+        if (!check(put(state_buffer_address, state_buffer),
+                   "prepare guest keyboard state output")) {
+            DestroyWindow(g_test_window);
+            g_test_window = nullptr;
+            ac1_dinput8_shutdown();
+            return 1;
+        }
+        const uint32_t get_state_args[] = {
+            guest_device, 0x100u, state_buffer_address
+        };
+        uint32_t state_hr = 0u;
+        if (!check(ac1_dinput8_dispatch(get_state_token, get_state_args, 3u,
+                                        &state_hr) == AC1_DINPUT8_HANDLED,
+                   "native keyboard GetDeviceState before Acquire")) {
+            DestroyWindow(g_test_window);
+            g_test_window = nullptr;
+            ac1_dinput8_shutdown();
+            return 1;
+        }
+        std::printf("native keyboard GetDeviceState before Acquire HRESULT=0x%08x\n",
+                    state_hr);
+
+        uint32_t acquire_hr = 0u;
+        const uint32_t acquire_args[] = {guest_device};
+        if (!check(ac1_dinput8_dispatch(acquire_token, acquire_args, 1u,
+                                        &acquire_hr) == AC1_DINPUT8_HANDLED,
+                   "native keyboard Acquire dispatch")) {
+            DestroyWindow(g_test_window);
+            g_test_window = nullptr;
+            ac1_dinput8_shutdown();
+            return 1;
+        }
+        std::printf("native keyboard Acquire HRESULT=0x%08x\n", acquire_hr);
+        if (static_cast<int32_t>(acquire_hr) >= 0) {
+            state_buffer.fill(0xcdu);
+            if (!check(put(state_buffer_address, state_buffer),
+                       "reset guest keyboard state output")) {
+                DestroyWindow(g_test_window);
+                g_test_window = nullptr;
+                ac1_dinput8_shutdown();
+                return 1;
+            }
+            state_hr = 0u;
+            if (!check(ac1_dinput8_dispatch(get_state_token, get_state_args, 3u,
+                                            &state_hr) == AC1_DINPUT8_HANDLED,
+                       "native keyboard GetDeviceState after successful Acquire")) {
+                DestroyWindow(g_test_window);
+                g_test_window = nullptr;
+                ac1_dinput8_shutdown();
+                return 1;
+            }
+            std::printf("native keyboard GetDeviceState after Acquire HRESULT=0x%08x\n",
+                        state_hr);
         }
         DestroyWindow(g_test_window);
         g_test_window = nullptr;
