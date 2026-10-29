@@ -11,6 +11,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(ac1_d3d9_bridge STATIC ac1_d3d9_bridge.cpp)
 target_include_directories(ac1_d3d9_bridge PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+
+# Isolated DLL-oracle contract: no bridge/runtime/generated-game link needed.
+enable_testing()
+add_executable(ac1_d3dx_portable_contract EXCLUDE_FROM_ALL ../../tests/d3dx_portable_contract.cpp)
+target_compile_features(ac1_d3dx_portable_contract PRIVATE cxx_std_17)
+add_test(NAME ac1_d3dx_portable_contract COMMAND ac1_d3dx_portable_contract)
+set_tests_properties(ac1_d3dx_portable_contract PROPERTIES TIMEOUT 60)
 target_compile_definitions(ac1_d3d9_bridge PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 if(MSVC)
   target_compile_options(ac1_d3d9_bridge PRIVATE /W4 /permissive-)

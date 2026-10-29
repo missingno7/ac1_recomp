@@ -471,8 +471,8 @@ void check_arities()
     }
     require(ac1_d3d9_argument_count(0x12345678)==0,"foreign token");
     require(ac1_d3d9_argument_count(0x7e011000)==0,"foreign kind");
-    // The separate D3DX extension is intentionally outside D3D9 coverage.
-    const int d3dx[] = {3,1,1,-2,-2,2,4,-2,3,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2};
+    // D3DX buffer pointers and matrix-pointer arrays still require adapters.
+    const int d3dx[] = {3,1,1,-2,-2,2,4,2,3,3,3,2,5,4,5,4,5,4,5,4,5,4,5,-2,4,5,-2};
     for (uint32_t slot=0;slot<27;++slot) require(ac1_d3d9_argument_count(0x7e00a000+slot*16)==d3dx[slot],"D3DX extension arities");
     std::puts("SDK arity coverage passed: all 16 kinds, including 119 device slots");
 }

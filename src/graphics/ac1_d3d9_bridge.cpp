@@ -16,6 +16,13 @@
 #if defined(_WIN32)
 #include <windows.h>
 #include <d3dx9shader.h>
+#else
+#include "ac1_d3dx_portable.h"
+using ID3DXConstantTable = ac1_d3dx::Table;
+using D3DXCONSTANTTABLE_DESC = ac1_d3dx::TableDesc;
+using D3DXCONSTANT_DESC = ac1_d3dx::ConstantDesc;
+using D3DXVECTOR4 = ac1_d3dx::Vector;
+using D3DXMATRIX = ac1_d3dx::Matrix;
 #endif
 
 #include <algorithm>
@@ -640,8 +647,9 @@ int token_argument_count(uint32_t token)
     static constexpr int arity14[] = {3, 1, 1, 2, 5, 4, 2, 3, 2, 4, 1}; // IDirect3DVolume9
     static constexpr int arity15[] = {3, 1, 1, 2, 1, 1}; // IDirect3DStateBlock9
     static constexpr int arity16[] = {3, 1, 1, 6, 2, 4, 2, 2, 2, 2}; // IDirect3DSwapChain9
-    // D3DX constant tables retain their separately validated observed profile.
-    static constexpr int arity10[] = {3,1,1,-2,-2,2,4,-2,3,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2};
+    // ID3DXConstantTable SDK slots. Buffer pointers and matrix pointer arrays
+    // have no guest ABI adapter; unsupported slots remain explicit stops.
+    static constexpr int arity10[] = {3,1,1,-2,-2,2,4,2,3,3,3,2,5,4,5,4,5,4,5,4,5,4,5,-2,4,5,-2};
     const int *const tables[] = {nullptr, arity1, arity2, arity3, arity4,
         arity5, arity6, arity7, arity8, arity9, arity10, arity11, arity12,
         arity13, arity14, arity15, arity16};
@@ -1611,7 +1619,30 @@ uint32_t guest_constant_handle(uint32_t table_address, const char *native_handle
     return address;
 }
 
-#if defined(_WIN32)
+bool constant_table_guest_string(uint32_t address, std::string *value)
+{
+    value->clear();
+    for (uint32_t i = 0; address && i < 4096 && uint64_t(address)+i <= UINT32_MAX; ++i) {
+        char c;
+        if (!guest_read(address+i,&c,1)) break;
+        if (!c) return true;
+        value->push_back(c);
+    }
+    set_error("ID3DXConstantTable name is null, unmapped or exceeds 4095 bytes");
+    return false;
+}
+
+const char *constant_table_handle(ID3DXConstantTable *table, uint32_t owner,
+                                  uint32_t address, bool optional)
+{
+    if (!address && optional) return nullptr;
+    auto found = g_constant_handles.find(address);
+    if (found != g_constant_handles.end()) return native_constant_handle(owner,address,false);
+    std::string name;
+    if (!constant_table_guest_string(address,&name)) return nullptr;
+    return table->GetConstantByName(nullptr,name.c_str());
+}
+
 HRESULT invoke_constant_table_method(GuestObject &object, uint32_t method,
                                     const uint32_t *args, uint32_t argc)
 {
@@ -1638,7 +1669,7 @@ HRESULT invoke_constant_table_method(GuestObject &object, uint32_t method,
     if (method == 8) {
         if (!require_count(argc, 3, "ID3DXConstantTable::GetConstant"))
             return 0;
-        const char *parent = native_constant_handle(args[0], args[1], true);
+        const char *parent = constant_table_handle(table, args[0], args[1], true);
         if (args[1] && !parent) return 0;
         return guest_constant_handle(args[0], table->GetConstant(parent, args[2]));
     }
@@ -1658,10 +1689,7 @@ HRESULT invoke_constant_table_method(GuestObject &object, uint32_t method,
             set_error("ID3DXConstantTable::GetConstantDesc count output is not writable or capacity is outside 1..64");
             return D3DERR_INVALIDCALL;
         }
-        const uint32_t native_handle = native_constant_handle(args[0], args[1], false)
-            ? args[1] : 0;
-        if (!native_handle) return D3DERR_INVALIDCALL;
-        const char *handle = native_constant_handle(args[0], args[1], false);
+        const char *handle = constant_table_handle(table, args[0], args[1], false);
         if (!handle) return D3DERR_INVALIDCALL;
         const uint64_t guest_bytes_64 = static_cast<uint64_t>(guest_capacity) *
                                         sizeof(GuestD3DXConstantDesc);
@@ -1704,9 +1732,60 @@ HRESULT invoke_constant_table_method(GuestObject &object, uint32_t method,
         }
         return status;
     }
+    if (method == 7 || method == 9 || method == 10) {
+        const char *handle = constant_table_handle(table,args[0],args[1],method==9);
+        if (args[1] && !handle) return method==7 ? UINT32_MAX : 0;
+        if (method==7) return table->GetSamplerIndex(handle);
+        if (method==10) return guest_constant_handle(args[0],table->GetConstantElement(handle,args[2]));
+        std::string name;
+        if (!constant_table_guest_string(args[2],&name)) return 0;
+        return guest_constant_handle(args[0],table->GetConstantByName(handle,name.c_str()));
+    }
+    if (method >= 11 && method <= 25 && method != 23) {
+        GuestObject *device_object = find_object(args[1],ObjectKind::Device);
+        if (!device_object) {
+            set_error("ID3DXConstantTable setter received an unknown guest device");
+            return D3DERR_INVALIDCALL;
+        }
+        auto *device=static_cast<IDirect3DDevice9 *>(device_object->native);
+        if (method==11) return table->SetDefaults(device);
+        const char *handle=constant_table_handle(table,args[0],args[2],false);
+        if (!handle) return D3DERR_INVALIDCALL;
+        if (method==13) return table->SetBool(device,handle,static_cast<BOOL>(args[3]));
+        if (method==15) return table->SetInt(device,handle,static_cast<INT>(args[3]));
+        if (method==17) { float f; std::memcpy(&f,&args[3],4); return table->SetFloat(device,handle,f); }
+        uint64_t count=1, stride=4;
+        if (method==12) { count=args[4]; stride=1; }
+        if (method==14 || method==16 || method==18) count=args[4];
+        if (method==19 || method==20) { stride=sizeof(D3DXVECTOR4); if (method==20) count=args[4]; }
+        if (method>=21) { stride=sizeof(D3DXMATRIX); if (method==22 || method==25) count=args[4]; }
+        if (count*stride > 1024*1024) {
+            set_error("ID3DXConstantTable setter input exceeds 1 MiB staging bound");
+            return D3DERR_INVALIDCALL;
+        }
+        // Copy to aligned host storage: guest arrays may be byte-aligned.
+        std::vector<uint32_t> storage(std::max<size_t>(1,static_cast<size_t>((count*stride+3)/4)));
+        if (count && (!args[3] || !guest_read(args[3],storage.data(),static_cast<uint32_t>(count*stride)))) {
+            set_error("ID3DXConstantTable setter input is null or unmapped");
+            return D3DERR_INVALIDCALL;
+        }
+        const void *p=storage.data();
+        switch (method) {
+        case 12: return table->SetValue(device,handle,p,args[4]);
+        case 14: return table->SetBoolArray(device,handle,static_cast<const BOOL *>(p),args[4]);
+        case 16: return table->SetIntArray(device,handle,static_cast<const INT *>(p),args[4]);
+        case 18: return table->SetFloatArray(device,handle,static_cast<const float *>(p),args[4]);
+        case 19: return table->SetVector(device,handle,static_cast<const D3DXVECTOR4 *>(p));
+        case 20: return table->SetVectorArray(device,handle,static_cast<const D3DXVECTOR4 *>(p),args[4]);
+        case 21: return table->SetMatrix(device,handle,static_cast<const D3DXMATRIX *>(p));
+        case 22: return table->SetMatrixArray(device,handle,static_cast<const D3DXMATRIX *>(p),args[4]);
+        case 24: return table->SetMatrixTranspose(device,handle,static_cast<const D3DXMATRIX *>(p));
+        case 25: return table->SetMatrixTransposeArray(device,handle,static_cast<const D3DXMATRIX *>(p),args[4]);
+        }
+    }
+    set_error("ID3DXConstantTable unsupported slot " + std::to_string(method));
     return D3DERR_NOTAVAILABLE;
 }
-#endif
 
 uint32_t invoke_constant_table(GuestObject &object, uint32_t method,
                               const uint32_t *args, uint32_t argc)
@@ -1742,15 +1821,14 @@ uint32_t invoke_constant_table(GuestObject &object, uint32_t method,
         }
         return guest_count;
     }
-#if defined(_WIN32)
-    return hresult(invoke_constant_table_method(object, method, args, argc));
-#else
-    (void)method;
-    (void)args;
-    (void)argc;
-    set_error("ID3DXConstantTable native methods are unsupported on this platform");
-    return hresult(D3DERR_NOTAVAILABLE);
+#if !defined(_WIN32)
+    ac1_d3dx::diagnostic.clear();
 #endif
+    HRESULT status=invoke_constant_table_method(object, method, args, argc);
+#if !defined(_WIN32)
+    if (!ac1_d3dx::diagnostic.empty()) set_error(ac1_d3dx::diagnostic);
+#endif
+    return hresult(status);
 }
 
 int scan_shader_for_d3dx(uint32_t guest_bytecode, std::vector<DWORD> *bytecode)
@@ -3689,13 +3767,14 @@ extern "C" AC1_D3D9_API int ac1_d3d9_check_texture_requirements(
     *native_hresult_out = 0;
     std::lock_guard<std::mutex> lock(g_mutex);
     clear_error();
-#if defined(_WIN32)
     GuestObject *device_object = find_object(guest_device, ObjectKind::Device);
     if (!device_object) {
         set_error("D3DXCheckTextureRequirements received an unknown guest D3D9 device");
         return -1;
     }
+#if defined(_WIN32)
     if (!ensure_d3dx9_module()) return -2;
+#endif
 
     const uint32_t guest_addresses[4] = {
         guest_width, guest_height, guest_mip_levels, guest_format
@@ -3724,12 +3803,20 @@ extern "C" AC1_D3D9_API int ac1_d3d9_check_texture_requirements(
         native_values[i] = &staged_values[i];
     }
 
-    const HRESULT status = g_d3dx_check_texture_requirements(
+    const HRESULT status =
+#if defined(_WIN32)
+        g_d3dx_check_texture_requirements(
+#else
+        ac1_d3dx::check_texture_requirements(
+#endif
         static_cast<IDirect3DDevice9 *>(device_object->native),
         reinterpret_cast<UINT *>(native_values[0]),
         reinterpret_cast<UINT *>(native_values[1]),
         reinterpret_cast<UINT *>(native_values[2]), usage,
         reinterpret_cast<D3DFORMAT *>(native_values[3]), static_cast<D3DPOOL>(pool));
+#if !defined(_WIN32)
+    if (!ac1_d3dx::diagnostic.empty()) set_error(ac1_d3dx::diagnostic);
+#endif
     for (size_t i = 0; i < 4; ++i) {
         if (!guest_addresses[i]) continue;
         bool already_written = false;
@@ -3747,17 +3834,6 @@ extern "C" AC1_D3D9_API int ac1_d3d9_check_texture_requirements(
     }
     *native_hresult_out = hresult(status);
     return 1;
-#else
-    (void)guest_device;
-    (void)guest_width;
-    (void)guest_height;
-    (void)guest_mip_levels;
-    (void)usage;
-    (void)guest_format;
-    (void)pool;
-    set_error("D3DXCheckTextureRequirements is not supported by this platform bridge");
-    return -2;
-#endif
 }
 
 extern "C" AC1_D3D9_API int ac1_d3d9_get_shader_constant_table(
@@ -3782,15 +3858,21 @@ extern "C" AC1_D3D9_API int ac1_d3d9_get_shader_constant_table(
         return -1;
     }
 
-#if defined(_WIN32)
     std::vector<DWORD> bytecode;
     const int scan_status = scan_shader_for_d3dx(guest_bytecode, &bytecode);
     if (scan_status != 1) return scan_status;
+#if defined(_WIN32)
     if (!ensure_d3dx_shader_table_export()) return -2;
+#endif
 
     ID3DXConstantTable *native_table = nullptr;
+#if defined(_WIN32)
     const HRESULT status = g_d3dx_get_shader_constant_table(
         bytecode.data(), &native_table);
+#else
+    const HRESULT status = ac1_d3dx::Table::create(bytecode.data(), bytecode.size(), &native_table);
+    if (!ac1_d3dx::diagnostic.empty()) set_error(ac1_d3dx::diagnostic);
+#endif
     if (FAILED(status)) {
         if (native_table) native_table->Release();
         *native_hresult_out = hresult(status);
@@ -3823,11 +3905,6 @@ extern "C" AC1_D3D9_API int ac1_d3d9_get_shader_constant_table(
     }
     *native_hresult_out = hresult(status);
     return 1;
-#else
-    (void)guest_bytecode;
-    set_error("D3DXGetShaderConstantTable is unsupported on this platform");
-    return -2;
-#endif
 }
 
 extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,

@@ -2,7 +2,7 @@
 
 This repository builds and executes a statically translated portion of the original GOG DX9 executable on a 64-bit Windows host. The host runtime uses native code generated from the original x86 program; Android remains a compile-only port with an older frozen diagnostic APK.
 
-Android preparation on `android-prep`: current runtime/platform/JNI ARM64 syntax checks and Java compilation pass; portable silent DS8 and keyboard/gamepad/touch/replay adapters are wired. No game-code build or device execution was performed. ARM64 FFmpeg archives and portable D3DX remain required; see the [current Android audit and post-benchmark commands](docs/android.md#current-preparation-android-prep-2026-10-29).
+Android preparation on `android-prep`: current runtime/platform/JNI ARM64 syntax checks and Java compilation pass; portable silent DS8 and keyboard/gamepad/touch/replay adapters are wired. Portable D3DX texture requirements and SM3 constant tables now pass native-DLL oracle contracts (80,425 matches, zero mismatches) and ARM64 bridge syntax. Texture tests used deterministic caps/format fixtures because native HAL caps were unavailable. No game-code build or device execution was performed. ARM64 FFmpeg archives and actual graphics/device validation remain required; see the [current Android audit and post-benchmark commands](docs/android.md#current-preparation-android-prep-2026-10-29) and [focused D3DX check command and limits](docs/android.md#portable-d3dx-2026-10-30).
 
 ## Current host checkpoint: first original image (loading screen)
 
