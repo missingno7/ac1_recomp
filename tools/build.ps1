@@ -24,9 +24,11 @@ try {
             $Report = Get-Content -LiteralPath $ReportPath -Raw | ConvertFrom-Json
             $ConfigHash = (Get-FileHash -LiteralPath 'config/ac1_dx9.json' -Algorithm SHA256).Hash.ToLowerInvariant()
             $DriverHash = (Get-FileHash -LiteralPath 'tools/lift_ac1.py' -Algorithm SHA256).Hash.ToLowerInvariant()
+            $EmissionCacheHash = (Get-FileHash -LiteralPath 'tools/emission_cache.py' -Algorithm SHA256).Hash.ToLowerInvariant()
             $TablesHash = (Get-FileHash -LiteralPath 'config/startup_initializers.json' -Algorithm SHA256).Hash.ToLowerInvariant()
             $NeedGenerate = $Report.config_sha256 -ne $ConfigHash -or
-                $Report.lift_driver_sha256 -ne $DriverHash -or $Report.initializer_tables_sha256 -ne $TablesHash
+                $Report.lift_driver_sha256 -ne $DriverHash -or $Report.initializer_tables_sha256 -ne $TablesHash -or
+                $Report.generation_input_sha256.emission_cache -ne $EmissionCacheHash
         }
     }
     if ($NeedGenerate) {

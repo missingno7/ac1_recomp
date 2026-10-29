@@ -203,6 +203,17 @@ def write_report_if_inputs_unchanged(path: Path, text: str,
     write_text_if_changed(path, text)
 
 
+def generation_inputs_unchanged(inputs: dict[str, tuple[Path, str]]) -> bool:
+    """Return whether the exact inputs captured before generation still match."""
+    for input_path, expected_hash in inputs.values():
+        try:
+            if sha256(input_path) != expected_hash:
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def invalidate_success_report(path: Path) -> None:
     """Remove a prior success marker before any outputs for a new run change."""
     path.unlink(missing_ok=True)
@@ -1948,7 +1959,8 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
 
 
 def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: Path,
-              functions_per_tu: int, translation_unit_buckets: int = 0) -> dict:
+              functions_per_tu: int, translation_unit_buckets: int = 0,
+              emission_cache=None) -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
@@ -2072,7 +2084,12 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     for spec in functions:
         address, size = spec["address"], spec["size"]
         try:
-            body = lift_exact_function(lifter, spec, read_va, X86_OP_IMM, X86_OP_MEM)
+            if emission_cache is None:
+                body = lift_exact_function(lifter, spec, read_va, X86_OP_IMM, X86_OP_MEM)
+            else:
+                body = emission_cache.get_or_lift(
+                    spec, lambda: lift_exact_function(
+                        lifter, spec, read_va, X86_OP_IMM, X86_OP_MEM))
             bodies.append(body)
             lifted.append(address)
             instruction_counts[address] = spec["instruction_count"]
@@ -2274,6 +2291,8 @@ def main() -> int:
                         help="maximum generated functions per C translation unit")
     parser.add_argument("--translation-unit-buckets", type=int,
                         help="fixed address-hash partition count; overrides functions-per-tu grouping")
+    parser.add_argument("--no-emission-cache", action="store_true",
+                        help="disable the persistent generated-body cache")
     args = parser.parse_args()
     if args.selftest:
         config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -2312,6 +2331,8 @@ def main() -> int:
         "binary": (binary, binary_hash),
         **{name: (path, sha256(path)) for name, path in donor_paths.items()},
     }
+    cache_module = ROOT / "tools/emission_cache.py"
+    input_fingerprints["emission_cache"] = (cache_module, sha256(cache_module))
     max_functions = args.max_functions or config["initial_discovery"]["max_functions"]
     max_depth = args.max_depth if args.max_depth is not None else config["initial_discovery"]["max_depth"]
     functions_per_tu = args.functions_per_tu or config.get("functions_per_translation_unit", 100)
@@ -2411,8 +2432,34 @@ def main() -> int:
         for f in catalog_doc["functions"]))
     output = output_dir / "initial.c"
     emit_start = time.perf_counter()
-    lift_result = emit_lift(binary, pcrecomp, catalog_doc["functions"], output_dir,
-                            functions_per_tu, translation_unit_buckets)
+    emission_cache = None
+    if not args.no_emission_cache:
+        sys.path.insert(0, str(ROOT / "tools"))
+        from emission_cache import EmissionCache
+        semantic_inputs = {
+            "binary_sha256": binary_hash,
+            "driver_sha256": driver_hash,
+            "pcrecomp_revision": revision,
+            "pcrecomp_inputs": {
+                name: expected_hash
+                for name, (_path, expected_hash) in sorted(input_fingerprints.items())
+                if name.startswith("pcrecomp_")
+            },
+            "image_base": info.image_base,
+            "python": sys.version,
+            "capstone_version": importlib.metadata.version("capstone"),
+            "pefile_version": importlib.metadata.version("pefile"),
+        }
+        emission_cache = EmissionCache(
+            ROOT / "work/emission_cache/ac1_bodies.sqlite3", semantic_inputs)
+    try:
+        lift_result = emit_lift(binary, pcrecomp, catalog_doc["functions"], output_dir,
+                                functions_per_tu, translation_unit_buckets,
+                                emission_cache)
+    except Exception:
+        if emission_cache is not None:
+            emission_cache.close()
+        raise
     emit_seconds = time.perf_counter() - emit_start
     todo_count = sum((output_dir / name).read_text(encoding="utf-8").count("RECOMP_TODO")
                      for name in lift_result["translation_units"])
@@ -2437,6 +2484,11 @@ def main() -> int:
         "elapsed_seconds": round(time.perf_counter() - start_time, 3),
         "discovery_seconds": round(discovery_seconds, 3),
         "emit_seconds": round(emit_seconds, 3),
+        "emission_cache": ({
+            "enabled": True,
+            "semantic_stamp": emission_cache.semantic_stamp,
+            **emission_cache.stats,
+        } if emission_cache is not None else {"enabled": False}),
         "pcrecomp_root": str(pcrecomp),
         "pcrecomp_lifter_sha256": input_fingerprints["pcrecomp_lifter"][1],
         "generation_input_sha256": {
@@ -2472,16 +2524,63 @@ def main() -> int:
         current_revision = subprocess.check_output(
             ["git", "-C", str(pcrecomp), "rev-parse", "HEAD"], text=True).strip()
     except Exception as exc:
+        if emission_cache is not None:
+            emission_cache.close()
         print(f"error: unable to recheck pcrecomp revision before report: {exc}", file=sys.stderr)
         return 2
     if current_revision != revision:
+        if emission_cache is not None:
+            emission_cache.close()
         print("error: pcrecomp revision changed during lift; no success report written", file=sys.stderr)
         return 2
+
+    def current_inputs_match() -> bool:
+        if not generation_inputs_unchanged(input_fingerprints):
+            return False
+        try:
+            return subprocess.check_output(
+                ["git", "-C", str(pcrecomp), "rev-parse", "HEAD"],
+                text=True).strip() == revision
+        except Exception:
+            return False
+
+    # Verify once before cache publication. The cache module repeats this guard
+    # around its staged database replacement; the success report is written
+    # only after publication and receives the final cache timing/status.
+    if not current_inputs_match():
+        if emission_cache is not None:
+            emission_cache.close()
+        print("error: generation inputs changed during lift; no success report written",
+              file=sys.stderr)
+        return 2
+    if emission_cache is not None:
+        try:
+            published = emission_cache.publish(current_inputs_match)
+        except Exception as exc:
+            emission_cache.close()
+            print(f"error: emission cache publication failed: {exc}; no success report written",
+                  file=sys.stderr)
+            return 2
+        publish_status = emission_cache.stats["publish_status"]
+        if not published and publish_status in ("guard-failed", "guard-error", "module-changed"):
+            emission_cache.close()
+            print(f"error: emission cache publication rejected ({publish_status}); "
+                  "no success report written", file=sys.stderr)
+            return 2
+        report["emission_cache"] = {
+            "enabled": True,
+            "semantic_stamp": emission_cache.semantic_stamp,
+            **emission_cache.stats,
+        }
+        emission_cache.close()
+    report["elapsed_seconds"] = round(time.perf_counter() - start_time, 3)
     try:
         write_report_if_inputs_unchanged(
             report_path, json.dumps(report, indent=2) + "\n",
             input_fingerprints)
     except RuntimeError as exc:
+        if emission_cache is not None:
+            emission_cache.close()
         print(f"error: {exc}; no success report written", file=sys.stderr)
         return 2
     print(f"entry=0x{entry:08X}; discovered={len(catalog)}; lifted={len(lift_result['lifted'])}; "
