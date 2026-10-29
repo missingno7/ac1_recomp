@@ -2612,6 +2612,20 @@ def code_immediate_has_function_boundary(target, dis, recovered) -> bool:
         preceding = dis.read_bytes(start, size)
         if preceding and len(preceding) == size and preceding[0] in opcodes:
             return True
+    # MSVC places a function's switch table after its code; the next function
+    # may start right at the table's end (e.g. 0x00D00260). Only tables the
+    # lifter itself bounded count, optionally followed by CC padding.
+    ranges = getattr(dis, "ac1_switch_table_ranges", ())
+    cache = getattr(dis, "_ac1_switch_end_cache", None)
+    if cache is None or cache[0] != len(ranges):
+        cache = (len(ranges), {end for _, end in ranges})
+        dis._ac1_switch_end_cache = cache
+    for gap_size in range(16):
+        end = target - gap_size
+        if end in cache[1]:
+            gap = dis.read_bytes(end, gap_size) if gap_size else b""
+            if gap is not None and all(byte == 0xCC for byte in gap):
+                return True
     return False
 
 

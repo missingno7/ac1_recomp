@@ -139,6 +139,24 @@ class CodeImmediateTests(unittest.TestCase):
         result = self.discover(max_functions=2)
         self.assertGreater(result[8]["pending_targets"], 0)
 
+    def test_function_starting_after_a_bounded_switch_table(self):
+        memory = {0x2000 + i: 0x11 for i in range(16)}       # table bytes, not opcodes
+        memory.update({0x2010: 0xCC, 0x2011: 0xCC})           # padding after the table
+
+        class Dis:
+            ac1_switch_table_ranges = {(0x2000, 0x2010)}
+            def is_code_address(self, address):
+                return True
+            def read_bytes(self, address, size):
+                return bytes(memory.get(address + i, 0x11) for i in range(size))
+
+        dis = Dis()
+        self.assertTrue(lift.code_immediate_has_function_boundary(0x2010, dis, {}))
+        self.assertTrue(lift.code_immediate_has_function_boundary(0x2012, dis, {}))
+        self.assertFalse(lift.code_immediate_has_function_boundary(0x2008, dis, {}))
+        dis.ac1_switch_table_ranges = set()
+        self.assertFalse(lift.code_immediate_has_function_boundary(0x2010, dis, {}))
+
 
 if __name__ == "__main__":
     unittest.main()
