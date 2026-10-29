@@ -41,7 +41,10 @@ if(AC1_NATIVE_BINK)
   enable_language(CXX)
   target_sources(ac1_runtime PRIVATE src/platform/ac1_bink_native.cpp)
   target_compile_features(ac1_runtime PRIVATE cxx_std_17)
-  target_compile_definitions(ac1_runtime PRIVATE AC1_NATIVE_BINK=1)
+  # Only the runtime source tests this; a target-wide define would rebuild
+  # every generated translation unit whenever the option changes.
+  set_source_files_properties(src/runtime/ac1_runtime.c PROPERTIES
+    COMPILE_DEFINITIONS AC1_NATIVE_BINK=1)
   # The sandbox bootstrap keeps generated config and archives at its prefix,
   # with unmodified public headers in the adjacent official source checkout.
   if(EXISTS "${AC1_FFMPEG_PREFIX}/libavutil/avconfig.h" AND
