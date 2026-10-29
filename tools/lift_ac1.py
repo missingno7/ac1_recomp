@@ -28,6 +28,11 @@ PYTHON_DEFAULT = Path("D:/Prog/dukemp_recomp/.venv/Scripts/python.exe")
 OUT_DEFAULT = ROOT / "work/lift_initial"
 AC1_ARRAY_CTOR_HELPER = 0x00F9FA43
 AC1_SCHEMA_CALLBACK_HELPER = 0x00438EF0
+AC1_READER_CALLBACK_HELPER = 0x009312F0
+AC1_ARG2_CALLBACK_HELPERS = {
+    AC1_SCHEMA_CALLBACK_HELPER: "schema_callback",
+    AC1_READER_CALLBACK_HELPER: "reader_callback",
+}
 
 
 FP_ADAPTER_HELPERS = r"""
@@ -105,6 +110,55 @@ def pmaxsw_lanes_code(destination: int, source_expression: str) -> str:
         f"c->xmm[{destination}].i16[_i] = _d.i16[_i] > _s.i16[_i] "
         f"? _d.i16[_i] : _s.i16[_i]; }}"
     )
+
+
+def ac1_sse_width_translation(lifter, insn) -> list[str] | None:
+    """Lower two proven 64-bit SIMD memory forms without 16-byte overreads."""
+    from capstone.x86 import X86_OP_MEM
+
+    ops = insn.operands
+    if len(ops) < 2:
+        return None
+    destination, source = ops[0], ops[1]
+    if insn.mnemonic == "movq":
+        if lifter._is_xmm(destination):
+            dst = lifter._xi(destination)
+            if lifter._is_xmm(source):
+                bits = f"c->xmm[{lifter._xi(source)}].u64[0]"
+            elif source.type == X86_OP_MEM and source.size == 8:
+                bits = f"rd64({lifter.addr_expr(insn, source)})"
+            else:
+                return None
+            # Snapshot the source before writing either lane; this also gives
+            # the self-move form its required zeroed upper qword.
+            return [f"{{ uint64_t _bits = {bits}; c->xmm[{dst}].u64[0] = _bits; "
+                    f"c->xmm[{dst}].u64[1] = 0; }}"]
+        if (destination.type == X86_OP_MEM and destination.size == 8 and
+                lifter._is_xmm(source)):
+            return [f"wr64({lifter.addr_expr(insn, destination)}, "
+                    f"c->xmm[{lifter._xi(source)}].u64[0]);"]
+        return None
+
+    if insn.mnemonic == "cvtdq2pd" and lifter._is_xmm(destination):
+        dst = lifter._xi(destination)
+        if lifter._is_xmm(source):
+            bits = f"c->xmm[{lifter._xi(source)}].u64[0]"
+        elif source.type == X86_OP_MEM and source.size == 8:
+            bits = f"rd64({lifter.addr_expr(insn, source)})"
+        else:
+            return None
+        # The architectural source is exactly two signed dwords. Decode their
+        # two's-complement values explicitly, then convert exactly to binary64.
+        return [
+            f"{{ uint64_t _bits = {bits}; "
+            "int64_t _lo = (int64_t)(uint32_t)_bits; "
+            "int64_t _hi = (int64_t)(uint32_t)(_bits >> 32); "
+            "if (_lo >= INT64_C(0x80000000)) _lo -= INT64_C(0x100000000); "
+            "if (_hi >= INT64_C(0x80000000)) _hi -= INT64_C(0x100000000); "
+            f"c->xmm[{dst}].f64[0] = (double)_lo; "
+            f"c->xmm[{dst}].f64[1] = (double)_hi; }}"
+        ]
+    return None
 
 
 def sha256(path: Path) -> str:
@@ -471,7 +525,8 @@ int main(void)
         f9fa43_fixture(tail=bytes.fromhex("89450c")),    # EBP-based alias
     )
     assert all(not ac1_array_constructor_call_edges(fixture) for fixture in reject_fixtures)
-    def schema_fixture(callback: int | None = 0x00438860, tail: bytes = b""):
+    def schema_fixture(callback: int | None = 0x00438860, tail: bytes = b"",
+                       helper: int = AC1_SCHEMA_CALLBACK_HELPER):
         start = 0x00402000
         code = bytearray(b"\x52\x51")  # arg4=EDX, arg3=ECX
         if callback is None:
@@ -481,22 +536,25 @@ int main(void)
         code += b"\x50"                 # arg1=EAX
         code += tail
         call_at = start + len(code)
-        rel = (AC1_SCHEMA_CALLBACK_HELPER - (call_at + 5)) & 0xFFFFFFFF
+        rel = (helper - (call_at + 5)) & 0xFFFFFFFF
         code += b"\xE8" + rel.to_bytes(4, "little")
         instructions = list(md.disasm(bytes(code), start))
         return SimpleNamespace(blocks={start: SimpleNamespace(instructions=instructions)})
-    def schema_middle_fixture(middle: bytes):
+    def schema_middle_fixture(middle: bytes, helper: int = AC1_SCHEMA_CALLBACK_HELPER):
         start = 0x00403000
         code = bytearray(b"\x52\x51\x68\x60\x88\x43\x00")  # arg4, arg3, literal arg2
         code += middle
         code += b"\x50"  # arg1=EAX
         call_at = start + len(code)
-        rel = (AC1_SCHEMA_CALLBACK_HELPER - (call_at + 5)) & 0xFFFFFFFF
+        rel = (helper - (call_at + 5)) & 0xFFFFFFFF
         code += b"\xE8" + rel.to_bytes(4, "little")
         instructions = list(md.disasm(bytes(code), start))
         return SimpleNamespace(blocks={start: SimpleNamespace(instructions=instructions)})
     schema_edges = ac1_schema_callback_call_edges(schema_fixture())
     assert schema_edges == [{"callsite": 0x00402008, "callback": 0x00438860}], schema_edges
+    for helper in AC1_ARG2_CALLBACK_HELPERS:
+        assert ac1_four_dword_arg2_callback_edges(
+            schema_fixture(helper=helper), helper) == schema_edges
     # At call-time ESP+4..+7 is arg2. Exact adjacent DWORD writes are safe;
     # the same [ESP] write between arg2 and arg1 pushes aliases arg2.
     assert ac1_schema_callback_call_edges(schema_fixture(tail=bytes.fromhex("89542400")))
@@ -514,6 +572,19 @@ int main(void)
         schema_fixture(tail=bytes.fromhex("66686000")),       # operand-size-override PUSH
     )
     assert all(not ac1_schema_callback_call_edges(fixture) for fixture in schema_rejects)
+    reader_rejects = (
+        schema_fixture(callback=None, helper=AC1_READER_CALLBACK_HELPER),
+        schema_fixture(tail=bytes.fromhex("89542404"), helper=AC1_READER_CALLBACK_HELPER),
+        schema_fixture(tail=bytes.fromhex("6689542406"), helper=AC1_READER_CALLBACK_HELPER),
+        schema_fixture(tail=bytes.fromhex("89441408"), helper=AC1_READER_CALLBACK_HELPER),
+        schema_fixture(tail=bytes.fromhex("83ec04"), helper=AC1_READER_CALLBACK_HELPER),
+        schema_fixture(tail=bytes.fromhex("9c"), helper=AC1_READER_CALLBACK_HELPER),
+        schema_fixture(tail=bytes.fromhex("e800000000"), helper=AC1_READER_CALLBACK_HELPER),
+        schema_fixture(tail=bytes.fromhex("8945fc"), helper=AC1_READER_CALLBACK_HELPER),
+        schema_middle_fixture(bytes.fromhex("891424"), AC1_READER_CALLBACK_HELPER),
+        schema_fixture(tail=bytes.fromhex("66686000"), helper=AC1_READER_CALLBACK_HELPER),
+    )
+    assert all(not ac1_reader_callback_call_edges(fixture) for fixture in reader_rejects)
     print("lift control-flow and instruction-adapter self-test: ok")
 
 
@@ -750,9 +821,141 @@ def run_ac1_switch_selftest(binary: Path, pcrecomp: Path) -> None:
         selftest_iat = build_iat_map(info)
         run_ac1_array_callback_selftest(dis, info, selftest_iat)
         run_ac1_schema_callback_selftest(dis, info, selftest_iat)
+        run_ac1_reader_callback_selftest(dis, info, selftest_iat)
+        run_ac1_sse_width_selftest(
+            remap_lifter, dis.md,
+            lambda va, count: pe.get_data((va - image_base) & 0xFFFFFFFF, count))
     finally:
         pe.close()
     print("AC1 actual-base jump-table self-test: local, remapped, and negative-index switches recovered")
+
+
+def run_ac1_sse_width_selftest(lifter, md, read_va) -> None:
+    """Execute narrow MOVQ/CVTDQ2PD adapters at an exact eight-byte boundary."""
+    def decode(hex_bytes: str, address: int):
+        decoded = list(md.disasm(bytes.fromhex(hex_bytes), address))
+        if len(decoded) != 1:
+            raise AssertionError(f"SSE width test bytes failed to decode: {hex_bytes}")
+        return decoded[0]
+
+    movq_load = next(iter(md.disasm(read_va(0x00974270, 8), 0x00974270)), None)
+    if (not movq_load or movq_load.mnemonic != "movq" or
+            movq_load.op_str != "xmm0, qword ptr [eax + 0x18]"):
+        raise AssertionError("original AC1 MOVQ width fault site changed")
+    instructions = {
+        "movq_load": movq_load,
+        "movq_store": decode("660FD64818", 0x00404000),
+        "movq_reg": decode("F30F7EC1", 0x00404010),
+        "movq_alias": decode("F30F7EC0", 0x00404020),
+        "cvtdq2pd_load": decode("F30FE64018", 0x00404030),
+        "cvtdq2pd_alias": decode("F30FE6C0", 0x00404040),
+    }
+    lowered = {name: ac1_sse_width_translation(lifter, insn)
+               for name, insn in instructions.items()}
+    if any(lines is None for lines in lowered.values()):
+        raise AssertionError("narrow SSE adapter did not handle every tested XMM form")
+    if "rd64(" not in lowered["movq_load"][0] or "rdxm(" in lowered["movq_load"][0]:
+        raise AssertionError("MOVQ m64 load must read exactly one qword")
+    if "wr64(" not in lowered["movq_store"][0] or "wrsd(" in lowered["movq_store"][0]:
+        raise AssertionError("MOVQ m64 store must write the source qword bitwise")
+    if "rd64(" not in lowered["cvtdq2pd_load"][0] or "rdxm(" in lowered["cvtdq2pd_load"][0]:
+        raise AssertionError("CVTDQ2PD m64 load must read exactly one qword")
+
+    compiler = shutil.which("gcc")
+    if not compiler:
+        raise AssertionError("GCC is required for the exact-width SSE adapter self-test")
+    work_dir = ROOT / "work"
+    work_dir.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="sse_width_selftest_", dir=work_dir) as temp_name:
+        temp_dir = Path(temp_name)
+        source_path = temp_dir / "sse_width_semantics.c"
+        executable = temp_dir / "sse_width_semantics.exe"
+
+        def wrapper(name: str) -> str:
+            body = "\n".join(lowered[name])
+            return f"static void {name}(CPU *c) {{ {body} }}\n"
+
+        source = r'''#include "cpu.h"
+#include <stdio.h>
+#include <string.h>
+
+'''
+        source += "\n".join(wrapper(name) for name in instructions)
+        source += r'''
+#define CHECK(x) do { if (!(x)) { fprintf(stderr, "SSE width check failed at line %d: %s\n", __LINE__, #x); return 1; } } while (0)
+static void capture(CPU *c, uint32_t gpr[8], uint32_t flg[8]) {
+    gpr[0]=c->eax; gpr[1]=c->ecx; gpr[2]=c->edx; gpr[3]=c->ebx;
+    gpr[4]=c->esp; gpr[5]=c->ebp; gpr[6]=c->esi; gpr[7]=c->edi;
+    flg[0]=c->cf; flg[1]=c->pf; flg[2]=c->af; flg[3]=c->zf;
+    flg[4]=c->sf; flg[5]=c->of; flg[6]=c->df; flg[7]=c->eflags_misc;
+}
+static int unchanged(CPU *c, uint32_t gpr[8], uint32_t flg[8]) {
+    return c->eax==gpr[0] && c->ecx==gpr[1] && c->edx==gpr[2] && c->ebx==gpr[3] &&
+           c->esp==gpr[4] && c->ebp==gpr[5] && c->esi==gpr[6] && c->edi==gpr[7] &&
+           c->cf==flg[0] && c->pf==flg[1] && c->af==flg[2] && c->zf==flg[3] &&
+           c->sf==flg[4] && c->of==flg[5] && c->df==flg[6] && c->eflags_misc==flg[7];
+}
+int main(void) {
+    enum { BASE=0x1087F000u, PAGE=4096u, EA=0x1087FFF8u };
+    uint8_t memory[PAGE]={0};
+    uint32_t gpr[8], flg[8];
+    const uint64_t patterns[]={0, UINT64_C(0x8000000000000000),
+        UINT64_C(0x7ff0000000000001), UINT64_C(0xfff8000012345678),
+        UINT64_C(0x1122334455667788)};
+    CPU c={0};
+    guest_memory_bind(memory, BASE, sizeof memory);
+    CHECK(guest_memory_try_ptr(EA, 8u)!=NULL);
+    CHECK(guest_memory_try_ptr(EA, 16u)==NULL);
+    c.eax=EA-0x18u; c.ecx=0x11223344u; c.edx=0x55667788u; c.ebx=0x99aabbccu;
+    c.esp=0x7feff000u; c.ebp=0x12345678u; c.esi=0x87654321u; c.edi=0xa5a5a5a5u;
+    c.cf=1; c.pf=0; c.af=1; c.zf=0; c.sf=1; c.of=1; c.df=1; c.eflags_misc=0x202u;
+    for (unsigned i=0;i<sizeof patterns/sizeof patterns[0];++i) {
+        memcpy(memory+PAGE-8,&patterns[i],8);
+        c.xmm[0].u64[1]=UINT64_C(0xdeadbeefcafebabe);
+        capture(&c,gpr,flg); movq_load(&c);
+        CHECK(c.xmm[0].u64[0]==patterns[i]); CHECK(c.xmm[0].u64[1]==0);
+        CHECK(unchanged(&c,gpr,flg));
+
+        c.xmm[1].u64[0]=patterns[i]; c.xmm[1].u64[1]=UINT64_C(0x7ff0000000000001);
+        memset(memory+PAGE-8,0,8); capture(&c,gpr,flg); movq_store(&c);
+        uint64_t stored=0; memcpy(&stored,memory+PAGE-8,8);
+        CHECK(stored==patterns[i]); CHECK(unchanged(&c,gpr,flg));
+    }
+    c.xmm[1].u64[0]=UINT64_C(0x0123456789abcdef);
+    c.xmm[1].u64[1]=UINT64_C(0xfedcba9876543210);
+    capture(&c,gpr,flg); movq_reg(&c);
+    CHECK(c.xmm[0].u64[0]==UINT64_C(0x0123456789abcdef)); CHECK(c.xmm[0].u64[1]==0);
+    CHECK(c.xmm[1].u64[1]==UINT64_C(0xfedcba9876543210)); CHECK(unchanged(&c,gpr,flg));
+    c.xmm[0].u64[0]=UINT64_C(0x7ff0000000000001);
+    c.xmm[0].u64[1]=UINT64_C(0x0123456789abcdef);
+    capture(&c,gpr,flg); movq_alias(&c);
+    CHECK(c.xmm[0].u64[0]==UINT64_C(0x7ff0000000000001)); CHECK(c.xmm[0].u64[1]==0);
+    CHECK(unchanged(&c,gpr,flg));
+
+    { int32_t values[2]={INT32_MIN,INT32_MAX}; memcpy(memory+PAGE-8,values,8); }
+    capture(&c,gpr,flg); cvtdq2pd_load(&c);
+    CHECK(c.xmm[0].f64[0]==-2147483648.0); CHECK(c.xmm[0].f64[1]==2147483647.0);
+    CHECK(unchanged(&c,gpr,flg));
+    c.xmm[0].u32[0]=UINT32_C(0x80000000); c.xmm[0].u32[1]=UINT32_C(0x7fffffff);
+    capture(&c,gpr,flg); cvtdq2pd_alias(&c);
+    CHECK(c.xmm[0].f64[0]==-2147483648.0); CHECK(c.xmm[0].f64[1]==2147483647.0);
+    CHECK(unchanged(&c,gpr,flg));
+    guest_memory_unbind();
+    puts("MOVQ/CVTDQ2PD exact-width boundary and lane tests passed");
+    return 0;
+}
+'''
+        source_path.write_text(source, encoding="utf-8")
+        command = [compiler, "-std=c11", "-O0", "-I", str(ROOT / "src/runtime"),
+                   str(source_path), str(ROOT / "src/runtime/guest_memory.c"),
+                   str(ROOT / "src/runtime/guest_clock.c"), "-o", str(executable)]
+        build = subprocess.run(command, text=True, capture_output=True)
+        if build.returncode:
+            raise AssertionError("SSE width self-test compile failed:\n" + build.stdout + build.stderr)
+        result = subprocess.run([str(executable)], text=True, capture_output=True)
+        if result.returncode:
+            raise AssertionError("SSE width semantic self-test failed:\n" + result.stdout + result.stderr)
+        print(result.stdout.strip())
 
 
 def run_ac1_array_callback_selftest(dis, info, iat) -> None:
@@ -840,6 +1043,52 @@ def run_ac1_schema_callback_selftest(dis, info, iat) -> None:
     require_edge(0x00CDF430, 0x00CDF59A, 0x00526BB0)
     require_edge(0x00526BB0, 0x00526C0A, 0x00524FD0)
     print("AC1 438EF0 schema-callback self-test: RET 16 ABI and both recursive real callback chains validated")
+
+
+def run_ac1_reader_callback_selftest(dis, info, iat) -> None:
+    """Pin 9312F0's callback ABI, one external producer, and recursive self edges."""
+    helper = dis.disassemble_function(AC1_READER_CALLBACK_HELPER, iat)
+    if not helper or not helper.blocks:
+        raise AssertionError("AC1 9312F0 reader callback helper did not disassemble")
+    instructions = {ins.address: ins for block in helper.blocks.values()
+                    for ins in block.instructions}
+    returns = [ins for ins in instructions.values() if ins.mnemonic == "ret"]
+    if (len(returns) < 3 or any(not ins.operands or ins.operands[0].imm != 0x10
+                                for ins in returns)):
+        raise AssertionError("AC1 9312F0 must clean four DWORD stack arguments on every return")
+    assert instructions[0x009312F0].mnemonic == "push"
+    assert instructions[0x009312F0].op_str == "esi"
+    assert instructions[0x009312F1].op_str == "esi, ecx"
+    # At 9313B5 ESP+1c is entry arg3 after four saved registers. The callback
+    # reloads *(arg3) into ECX and passes its saved ESI/reader as stack arg1.
+    assert instructions[0x009313B5].op_str == "edi, dword ptr [esp + 0x1c]"
+    assert instructions[0x009313F0].op_str == "ecx, dword ptr [edi]"
+    assert instructions[0x009313F2].mnemonic == "push"
+    assert instructions[0x009313F2].op_str == "esi"
+    assert instructions[0x009313F3].mnemonic == "call"
+    assert instructions[0x009313F3].op_str == "dword ptr [esp + 0x1c]"
+
+    def require_edge(caller_va: int, callsite: int, target: int) -> None:
+        function = dis.disassemble_function(caller_va, iat)
+        if not function or not function.blocks:
+            raise AssertionError(f"reader callback caller 0x{caller_va:08X} did not disassemble")
+        actual = {edge["callsite"]: edge["callback"]
+                  for edge in ac1_reader_callback_call_edges(function)}
+        if actual.get(callsite) != target:
+            raise AssertionError(
+                f"reader callback edge 0x{caller_va:08X}/0x{callsite:08X}: "
+                f"expected 0x{target:08X}, got {actual.get(callsite)!r}")
+        if not validate_callback_code_entry(target, dis, info, iat, {}):
+            raise AssertionError(f"reader callback 0x{target:08X} is not a validated code entry")
+
+    require_edge(0x006FA880, 0x006FA928, 0x005FD1D0)
+    require_edge(0x006446D0, 0x00644809, 0x006446D0)
+    require_edge(0x00A9B370, 0x00A9B548, 0x00A9B370)
+    dynamic_caller = dis.disassemble_function(0x00931820, iat)
+    if not dynamic_caller or any(edge["callsite"] == 0x00931B97
+                                 for edge in ac1_reader_callback_call_edges(dynamic_caller)):
+        raise AssertionError("AC1 9312F0 dynamic arg2 at 931B97 must remain undiscovered")
+    print("AC1 9312F0 reader-callback self-test: RET 16 / arg2 / ECX / saved-reader ABI, producer, self edges, and dynamic rejection validated")
 
 
 def infer_remapped_switch_limit(md, read_va, jump_insn, reg_type: int,
@@ -1255,7 +1504,19 @@ def ac1_array_constructor_call_edges(function) -> list[dict]:
 
 
 def ac1_schema_callback_call_edges(function) -> list[dict]:
-    """Extract constant arg2 callbacks passed to AC1's four-argument schema helper."""
+    """Extract constant arg2 callbacks passed to AC1's 438EF0 schema helper."""
+    return ac1_four_dword_arg2_callback_edges(function, AC1_SCHEMA_CALLBACK_HELPER)
+
+
+def ac1_reader_callback_call_edges(function) -> list[dict]:
+    """Extract constant arg2 callbacks passed to AC1's 9312F0 reader helper."""
+    return ac1_four_dword_arg2_callback_edges(function, AC1_READER_CALLBACK_HELPER)
+
+
+def ac1_four_dword_arg2_callback_edges(function, helper_target: int) -> list[dict]:
+    """Recover literal arg2 for the two exact AC1 four-DWORD callback helpers."""
+    if helper_target not in AC1_ARG2_CALLBACK_HELPERS:
+        return []
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
     from capstone.x86_const import X86_REG_EBP, X86_REG_ESP
 
@@ -1265,7 +1526,7 @@ def ac1_schema_callback_call_edges(function) -> list[dict]:
         for index, insn in enumerate(instructions):
             if (insn.mnemonic != "call" or not insn.operands or
                     insn.operands[0].type != X86_OP_IMM or
-                    (insn.operands[0].imm & 0xFFFFFFFF) != AC1_SCHEMA_CALLBACK_HELPER):
+                    (insn.operands[0].imm & 0xFFFFFFFF) != helper_target):
                 continue
             # The helper's RET 16 proves four stack arguments; nearest push is
             # arg1, so its callback is the second push encountered in reverse.
@@ -1432,21 +1693,22 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
                 if target not in results and target not in queued:
                     queued.add(target)
                     queue.append((target, depth + 1))
-        for call_edge in ac1_schema_callback_call_edges(function):
-            target = call_edge["callback"]
-            if not validate_callback_code_entry(target, dis, info, iat, results):
-                continue
-            callback_edges.append({
-                "caller": address,
-                "callsite": call_edge["callsite"],
-                "role": "schema_callback",
-                "helper": AC1_SCHEMA_CALLBACK_HELPER,
-                "target": target,
-                "depth": depth + 1,
-            })
-            if target not in results and target not in queued:
-                queued.add(target)
-                queue.append((target, depth + 1))
+        for helper, role in AC1_ARG2_CALLBACK_HELPERS.items():
+            for call_edge in ac1_four_dword_arg2_callback_edges(function, helper):
+                target = call_edge["callback"]
+                if not validate_callback_code_entry(target, dis, info, iat, results):
+                    continue
+                callback_edges.append({
+                    "caller": address,
+                    "callsite": call_edge["callsite"],
+                    "role": role,
+                    "helper": helper,
+                    "target": target,
+                    "depth": depth + 1,
+                })
+                if target not in results and target not in queued:
+                    queued.add(target)
+                    queue.append((target, depth + 1))
     return info, dis, results, failures, len(queue), entry, iat, callback_edges
 
 
@@ -1460,6 +1722,9 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     class AC1Lifter(BaseLifter):
         """AC1-specific instruction semantics missing from the donor lifter."""
         def translate(self, insn, labels):
+            narrow_memory_sse = ac1_sse_width_translation(self, insn)
+            if narrow_memory_sse is not None:
+                return narrow_memory_sse
             if insn.mnemonic in ("movhlps", "movlhps"):
                 destination, source = insn.operands
                 dst = self._xi(destination)
@@ -1910,7 +2175,7 @@ def main() -> int:
         "limitations": [
             "Discovery follows bounded direct calls and validated direct tail thunks from the PE entry point and explicit --seed targets; arbitrary indirect calls, exports, and generic data-pointer targets remain uncovered.",
             "No menu, graphics, or gameplay has been verified through this generated slice.",
-            "Callback discovery is limited to the validated AC1 F9FA43 constructor/cleanup ABI and 438EF0 schema-helper arg2 ABI; it does not cover arbitrary virtual calls, callback records, or exports.",
+            "Callback discovery is limited to validated AC1 F9FA43 constructor/cleanup, 438EF0 schema-helper arg2, and 9312F0 reader-helper arg2 ABIs; it does not cover arbitrary virtual calls, callback records, or exports.",
             "Any RECOMP_TODO emitted by the upstream lifter remains a concrete translation gap.",
             "The inspected DX9 image has no base-relocation directory, so the first runtime must preserve its preferred image base 0x00400000 unless relocation evidence changes.",
         ],
