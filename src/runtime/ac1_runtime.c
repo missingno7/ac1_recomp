@@ -6675,6 +6675,7 @@ static LONG CALLBACK ac1_direct_fault_handler(EXCEPTION_POINTERS *info)
             (unsigned long long)(address - arena),
             active_guest_thread ? active_guest_thread->cpu.eip : 0u,
             active_guest_thread ? active_guest_thread->id : 0u);
+    fflush(stderr);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 #endif

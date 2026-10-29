@@ -145,6 +145,7 @@ def main():
     module_threads, symbol_threads, category_threads, guest_threads = (defaultdict(Counter) for _ in range(4))
     all_frames, ticks = [], set()
     guest_unknown = 0
+    entry_detail, entry_symbols = defaultdict(Counter), defaultdict(Counter)
     before, after = {}, {}
     cpu_before, cpu_after = {}, {}
     previous_guest, previous_cpu = {}, {}
@@ -207,6 +208,8 @@ def main():
                 if address:
                     guest_functions[address] += 1
                     guest_threads[tid][address] += 1
+                    entry_detail[address][category(name) if name != "[external]" else "external: "+modname] += 1
+                    entry_symbols[address][name if name != "[external]" else "external: "+modname] += 1
                 else: guest_unknown += 1
     total = sum(modules.values())
     lines = [f"AC1 profile: PID {latest['pid']}, {latest['mode']}, window {(low-origin)/hz:.3f}..{(high-origin)/hz:.3f}s ({elapsed:.3f}s)",
@@ -245,6 +248,19 @@ def main():
     if bounds and total:
         add_cpu_top("Guest entries including helpers (OS CPU-time weighted sample mix)", guest_threads, render=lambda a: f"0x{a:08X} L_{a:08X}")
     lines.append(f"  Guest samples with unknown EIP attribution: {guest_unknown}")
+    # Where does each hot guest entry's time actually go (generated code vs
+    # memory/dispatch helpers vs imports/bridges/baton waits)?
+    lines.append("Host breakdown under the top guest entries (% of that entry's samples)")
+    for address, n in guest_functions.most_common(min(args.top, 10)):
+        detail = ", ".join(f"{name} {100*k/n:.0f}%" for name, k in entry_detail[address].most_common(5))
+        top_symbols = ", ".join(f"{name} {100*k/n:.0f}%" for name, k in entry_symbols[address].most_common(4))
+        lines.append(f"  0x{address:08X} ({n:,}): {detail}")
+        lines.append(f"      symbols: {top_symbols}")
+    lines.append("Top guest entries per busy guest thread (% of that thread's attributed samples)")
+    for tid, mix in sorted(guest_threads.items(), key=lambda item: -sum(item[1].values()))[:3]:
+        n = sum(mix.values())
+        top = ", ".join(f"0x{a:08X} {100*k/n:.1f}%" for a, k in mix.most_common(8))
+        lines.append(f"  tid={tid} guest={by_thread[tid]['guest']:#x} ({n:,}): {top}")
     all_frames.sort()
     intervals = sorted((b-a)*1000/hz for a, b in zip(all_frames, all_frames[1:]))
     fps = (len(all_frames)-1)*hz/(all_frames[-1]-all_frames[0]) if len(all_frames)>1 else 0

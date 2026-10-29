@@ -133,6 +133,10 @@ struct GuestObject {
     uint32_t buffer_lock_size = 0;
     uint32_t buffer_lock_flags = 0;
     void *buffer_lock_native_pointer = nullptr;
+    /* Persistent guest copy of a vertex/index buffer (see lock_guest_buffer). */
+    uint32_t buffer_shadow = 0;
+    uint32_t buffer_shadow_size = 0;
+    bool buffer_lock_shadowed = false;
 };
 
 #pragma pack(push, 4)
@@ -357,6 +361,9 @@ void trace_frame_success(bool is_present, const char *method)
                          static_cast<unsigned long long>(n),
                          static_cast<unsigned long long>(g_successful_draw_calls),
                          static_cast<unsigned long>(GetTickCount()));
+        /* stderr is block-buffered; keep the log useful when a timed run is
+         * terminated. Power-of-two presents make this rare. */
+        if (n >= 2u && !(n & (n - 1u))) std::fflush(stderr);
         if (!g_first_present_reported) {
             std::fprintf(stderr,
                 "AC1 D3D9 trace: first successful Present via %s (present_calls=%llu, draw_calls=%llu)\n",
@@ -649,6 +656,7 @@ bool write_guest_word(uint32_t address, uint32_t value)
 void free_guest_object(uint32_t address, const GuestObject &object)
 {
     if (g_callbacks.guest_free) {
+        if (object.buffer_shadow) g_callbacks.guest_free(g_context, object.buffer_shadow);
         if (object.guest_vtable) g_callbacks.guest_free(g_context, object.guest_vtable);
         if (address) g_callbacks.guest_free(g_context, address);
     }
@@ -2708,8 +2716,11 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
 
 void clear_buffer_lock(GuestObject &object)
 {
-    if (object.buffer_lock_guest_address && g_callbacks.guest_free)
+    /* A shadowed lock points into the persistent buffer shadow; keep it. */
+    if (object.buffer_lock_guest_address && !object.buffer_lock_shadowed &&
+        g_callbacks.guest_free)
         g_callbacks.guest_free(g_context, object.buffer_lock_guest_address);
+    object.buffer_lock_shadowed = false;
     object.buffer_lock_guest_address = 0;
     object.buffer_lock_offset = 0;
     object.buffer_lock_size = 0;
@@ -2734,6 +2745,30 @@ void abandon_buffer_lock(GuestObject &object)
         return;
     if (!object.buffer_lock_guest_address && !object.buffer_lock_native_pointer)
         return;
+    if (object.buffer_lock_shadowed) {
+        /* No native lock is held between a shadowed Lock and its Unlock; write
+         * the locked range back as Unlock would before dropping the lock. */
+        void *shadow = object.buffer_lock_size
+            ? guest_memory(object.buffer_lock_guest_address, object.buffer_lock_size,
+                           AC1_D3D9_GUEST_READ) : nullptr;
+        void *native_pointer = nullptr;
+        const HRESULT status = !shadow ? D3DERR_INVALIDCALL
+            : object.kind == ObjectKind::VertexBuffer
+            ? static_cast<IDirect3DVertexBuffer9 *>(object.native)->Lock(
+                object.buffer_lock_offset, object.buffer_lock_size, &native_pointer,
+                object.buffer_lock_flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE))
+            : static_cast<IDirect3DIndexBuffer9 *>(object.native)->Lock(
+                object.buffer_lock_offset, object.buffer_lock_size, &native_pointer,
+                object.buffer_lock_flags & (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE));
+        if (SUCCEEDED(status)) {
+            if (native_pointer) std::memcpy(native_pointer, shadow, object.buffer_lock_size);
+            unlock_native_buffer(object);
+        } else {
+            set_error("locked D3D9 buffer shadow could not be written back during release cleanup");
+        }
+        clear_buffer_lock(object);
+        return;
+    }
     if (object.buffer_lock_native_pointer && object.buffer_lock_guest_address &&
         object.buffer_lock_size &&
         (object.buffer_lock_flags & D3DLOCK_READONLY) == 0) {
@@ -2772,6 +2807,17 @@ HRESULT get_native_buffer_size(GuestObject &object, uint32_t *size_out)
     }
     set_error("buffer size requested for a non-buffer COM object");
     return D3DERR_INVALIDCALL;
+}
+
+/* AC1_D3D9_SHADOW_BUFFERS=0 restores per-lock staging (A/B and debugging). */
+bool shadow_buffer_locks_enabled()
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = std::getenv("AC1_D3D9_SHADOW_BUFFERS");
+        enabled = !(value && std::strcmp(value, "0") == 0);
+    }
+    return enabled != 0;
 }
 
 HRESULT lock_guest_buffer(GuestObject &object, const uint32_t *args, uint32_t argc)
@@ -2818,6 +2864,57 @@ HRESULT lock_guest_buffer(GuestObject &object, const uint32_t *args, uint32_t ar
     if (!g_callbacks.guest_alloc || !g_callbacks.guest_free) {
         set_error(std::string(name) + " requires guest staging allocation callbacks");
         return D3DERR_INVALIDCALL;
+    }
+    /* READONLY locks keep private staging: guest writes through them must not
+     * reach the buffer, and a shared shadow would retain them. */
+    if (shadow_buffer_locks_enabled() && (flags & D3DLOCK_READONLY) == 0) {
+        /* Persistent guest shadow: the guest copy is authoritative, so Lock
+         * returns shadow+offset without reading native (often GPU-mapped,
+         * write-combined) memory or allocating, and Unlock writes only the
+         * locked range back with the guest DISCARD/NOOVERWRITE flags. The
+         * profiler measured per-lock allocation plus native read-back as 53%
+         * of the render thread (dynamic vertex buffer at 0x00A26370). */
+        if (!object.buffer_shadow) {
+            const uint32_t shadow = g_callbacks.guest_alloc(g_context, buffer_size, 16u);
+            void *host = shadow &&
+                    static_cast<uint64_t>(shadow) + buffer_size <= UINT64_C(0x100000000)
+                ? guest_memory(shadow, buffer_size, AC1_D3D9_GUEST_WRITE) : nullptr;
+            if (!host) {
+                if (shadow) g_callbacks.guest_free(g_context, shadow);
+                set_error(std::string(name) + " could not allocate a persistent guest buffer shadow");
+                return E_OUTOFMEMORY;
+            }
+            /* One-time initialization from the native contents; write-only
+             * buffers may refuse a read lock, and their contents are undefined. */
+            void *native_contents = nullptr;
+            const HRESULT read_status = object.kind == ObjectKind::VertexBuffer
+                ? static_cast<IDirect3DVertexBuffer9 *>(object.native)->Lock(
+                    0, 0, &native_contents, D3DLOCK_READONLY)
+                : static_cast<IDirect3DIndexBuffer9 *>(object.native)->Lock(
+                    0, 0, &native_contents, D3DLOCK_READONLY);
+            if (SUCCEEDED(read_status)) {
+                if (native_contents) std::memcpy(host, native_contents, buffer_size);
+                else std::memset(host, 0, buffer_size);
+                unlock_native_buffer(object);
+            } else {
+                std::memset(host, 0, buffer_size);
+            }
+            object.buffer_shadow = shadow;
+            object.buffer_shadow_size = buffer_size;
+        }
+        if (buffer_size > object.buffer_shadow_size) {
+            set_error(std::string(name) + " native buffer grew beyond its guest shadow");
+            return D3DERR_INVALIDCALL;
+        }
+        const uint32_t shadow_address = object.buffer_shadow + args[1];
+        std::memcpy(output, &shadow_address, sizeof(shadow_address));
+        object.buffer_lock_guest_address = shadow_address;
+        object.buffer_lock_offset = args[1];
+        object.buffer_lock_size = lock_size;
+        object.buffer_lock_flags = flags;
+        object.buffer_lock_native_pointer = nullptr;
+        object.buffer_lock_shadowed = true;
+        return D3D_OK;
     }
     const uint32_t staging_address = g_callbacks.guest_alloc(g_context, lock_size, 4u);
     if (!staging_address ||
@@ -2873,6 +2970,37 @@ HRESULT unlock_guest_buffer(GuestObject &object, uint32_t argc)
     const char *name = object.kind == ObjectKind::VertexBuffer
         ? "IDirect3DVertexBuffer9::Unlock" : "IDirect3DIndexBuffer9::Unlock";
     if (!require_count(argc, 1, name)) return D3DERR_INVALIDCALL;
+    if (object.buffer_lock_shadowed) {
+        if (!object.buffer_lock_size) {
+            set_error(std::string(name) + " called without a matching successful Lock");
+            return D3DERR_INVALIDCALL;
+        }
+        HRESULT status = D3D_OK;
+        if ((object.buffer_lock_flags & D3DLOCK_READONLY) == 0) {
+            void *shadow = guest_memory(object.buffer_lock_guest_address,
+                                        object.buffer_lock_size, AC1_D3D9_GUEST_READ);
+            const DWORD write_flags = object.buffer_lock_flags &
+                (D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE | D3DLOCK_NOSYSLOCK);
+            void *native_pointer = nullptr;
+            status = !shadow ? D3DERR_INVALIDCALL
+                : object.kind == ObjectKind::VertexBuffer
+                ? static_cast<IDirect3DVertexBuffer9 *>(object.native)->Lock(
+                    object.buffer_lock_offset, object.buffer_lock_size, &native_pointer, write_flags)
+                : static_cast<IDirect3DIndexBuffer9 *>(object.native)->Lock(
+                    object.buffer_lock_offset, object.buffer_lock_size, &native_pointer, write_flags);
+            if (SUCCEEDED(status)) {
+                if (native_pointer)
+                    std::memcpy(native_pointer, shadow, object.buffer_lock_size);
+                const HRESULT unlock_status = unlock_native_buffer(object);
+                if (!native_pointer) status = E_FAIL;
+                else if (FAILED(unlock_status)) status = unlock_status;
+            }
+            if (FAILED(status))
+                set_error(std::string(name) + " could not write the guest shadow back to the native buffer");
+        }
+        clear_buffer_lock(object);
+        return status;
+    }
     if (!object.buffer_lock_guest_address || !object.buffer_lock_native_pointer ||
         !object.buffer_lock_size) {
         set_error(std::string(name) + " called without a matching successful Lock");
