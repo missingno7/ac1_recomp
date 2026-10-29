@@ -175,6 +175,14 @@ static inline void ac1_x87_set_tag(CPU *c, unsigned reg, unsigned tag) {
 #define SET8H(r, v)   ((r) = ((r) & 0xFFFF00FFu) | ((uint32_t)(uint8_t)(v) << 8))
 #define SET16(r, v)   ((r) = ((r) & 0xFFFF0000u) | (uint16_t)(v))
 
+/* Guest memory accessors are force-inlined: in very large generated
+ * functions GCC otherwise emits calls (and variable-size memcpy). The CMake
+ * option AC1_FORCE_INLINE_ACCESSORS=OFF defines AC1_NO_FORCE_INLINE for A/B. */
+#ifdef AC1_NO_FORCE_INLINE
+#define AC1_ACCESSOR_INLINE static inline
+#else
+#define AC1_ACCESSOR_INLINE static inline __attribute__((always_inline))
+#endif
 /* AC1 direct memory: one process-wide 4 GiB arena maps guest VA a at
  * ac1_direct_arena + a, so lifted fixed-width accesses become plain loads and
  * stores. A plain global (not _Thread_local, which MinGW lowers to emutls
@@ -184,12 +192,12 @@ static inline void ac1_x87_set_tag(CPU *c, unsigned reg, unsigned tag) {
 #ifdef AC1_DIRECT_MEMORY
 #include <string.h>
 extern uint8_t *ac1_direct_arena;
-static inline void ac1_direct_read(uint32_t a, void *o, size_t w)
+AC1_ACCESSOR_INLINE void ac1_direct_read(uint32_t a, void *o, size_t w)
 {
     if (__builtin_expect(ac1_direct_arena != NULL, 1)) memcpy(o, ac1_direct_arena + a, w);
     else (guest_execution_read)(a, o, w);
 }
-static inline void ac1_direct_write(uint32_t a, const void *i, size_t w)
+AC1_ACCESSOR_INLINE void ac1_direct_write(uint32_t a, const void *i, size_t w)
 {
     if (__builtin_expect(ac1_direct_arena != NULL, 1)) memcpy(ac1_direct_arena + a, i, w);
     else (guest_execution_write)(a, i, w);
@@ -199,23 +207,23 @@ static inline void ac1_direct_write(uint32_t a, const void *i, size_t w)
 /* LOCK-prefixed read-modify-writes (31k sites) operate in place on the arena
  * with sequentially consistent builtins, matching x86 LOCK's full fence.
  * Unaligned operands keep the checked path and its diagnostic. */
-static inline uint32_t *ac1_direct_atomic_cell(uint32_t a)
+AC1_ACCESSOR_INLINE uint32_t *ac1_direct_atomic_cell(uint32_t a)
 {
     return (ac1_direct_arena && !(a & 3u)) ? (uint32_t *)(ac1_direct_arena + a) : NULL;
 }
-static inline uint32_t ac1_direct_xadd32(uint32_t a, uint32_t v)
+AC1_ACCESSOR_INLINE uint32_t ac1_direct_xadd32(uint32_t a, uint32_t v)
 {
     uint32_t *cell = ac1_direct_atomic_cell(a);
     return cell ? __atomic_fetch_add(cell, v, __ATOMIC_SEQ_CST) : (guest_atomic_xadd32)(a, v);
 }
-static inline uint32_t ac1_direct_cmpxchg32(uint32_t a, uint32_t compare, uint32_t value)
+AC1_ACCESSOR_INLINE uint32_t ac1_direct_cmpxchg32(uint32_t a, uint32_t compare, uint32_t value)
 {
     uint32_t *cell = ac1_direct_atomic_cell(a);
     if (!cell) return (guest_atomic_cmpxchg32)(a, compare, value);
     __atomic_compare_exchange_n(cell, &compare, value, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     return compare;  /* the previous value, as CMPXCHG leaves it in EAX */
 }
-static inline uint32_t ac1_direct_xchg32(uint32_t a, uint32_t v)
+AC1_ACCESSOR_INLINE uint32_t ac1_direct_xchg32(uint32_t a, uint32_t v)
 {
     uint32_t *cell = ac1_direct_atomic_cell(a);
     return cell ? __atomic_exchange_n(cell, v, __ATOMIC_SEQ_CST) : (guest_atomic_xchg32)(a, v);
@@ -226,12 +234,12 @@ static inline uint32_t ac1_direct_xchg32(uint32_t a, uint32_t v)
 #endif
 
 /* ---- memory access: checked uint32 guest VA to native pointer ---- */
-static inline uint8_t rd8(uint32_t a) { uint8_t v; guest_execution_read(a, &v, 1); return v; }
-static inline uint16_t rd16(uint32_t a) { uint16_t v; guest_execution_read(a, &v, 2); return v; }
-static inline uint32_t rd32(uint32_t a) { uint32_t v; guest_execution_read(a, &v, 4); return v; }
-static inline void wr8(uint32_t a, uint8_t v) { guest_execution_write(a, &v, 1); }
-static inline void wr16(uint32_t a, uint16_t v) { guest_execution_write(a, &v, 2); }
-static inline void wr32(uint32_t a, uint32_t v) { guest_execution_write(a, &v, 4); }
+AC1_ACCESSOR_INLINE uint8_t rd8(uint32_t a) { uint8_t v; guest_execution_read(a, &v, 1); return v; }
+AC1_ACCESSOR_INLINE uint16_t rd16(uint32_t a) { uint16_t v; guest_execution_read(a, &v, 2); return v; }
+AC1_ACCESSOR_INLINE uint32_t rd32(uint32_t a) { uint32_t v; guest_execution_read(a, &v, 4); return v; }
+AC1_ACCESSOR_INLINE void wr8(uint32_t a, uint8_t v) { guest_execution_write(a, &v, 1); }
+AC1_ACCESSOR_INLINE void wr16(uint32_t a, uint16_t v) { guest_execution_write(a, &v, 2); }
+AC1_ACCESSOR_INLINE void wr32(uint32_t a, uint32_t v) { guest_execution_write(a, &v, 4); }
 
 /* ---- fs:-relative access (TIB / SEH chain) ----
  *
@@ -268,8 +276,8 @@ static inline void wr32(uint32_t a, uint32_t v) { guest_execution_write(a, &v, 4
  * round-trip would be exact for every value except the signalling NaNs a
  * mask-producing compare leaves behind. memcpy, because the address need
  * not be aligned. */
-static inline uint64_t rd64(uint32_t a) { uint64_t v; guest_execution_read(a, &v, 8); return v; }
-static inline void wr64(uint32_t a, uint64_t v) { guest_execution_write(a, &v, 8); }
+AC1_ACCESSOR_INLINE uint64_t rd64(uint32_t a) { uint64_t v; guest_execution_read(a, &v, 8); return v; }
+AC1_ACCESSOR_INLINE void wr64(uint32_t a, uint64_t v) { guest_execution_write(a, &v, 8); }
 
 /* ---- EFLAGS pack/unpack (modelled bits only) ---- */
 /* `lock`-prefixed read-modify-write.
@@ -306,8 +314,8 @@ static inline void eflags_unpack(CPU *c, uint32_t v) {
 #ifndef STACK_BASE
 #define STACK_BASE(c) 0u
 #endif
-static inline void push32(CPU *c, uint32_t v) { c->esp -= 4; wr32(STACK_BASE(c) + c->esp, v); }
-static inline uint32_t pop32(CPU *c) { uint32_t v = rd32(STACK_BASE(c) + c->esp); c->esp += 4; return v; }
+AC1_ACCESSOR_INLINE void push32(CPU *c, uint32_t v) { c->esp -= 4; wr32(STACK_BASE(c) + c->esp, v); }
+AC1_ACCESSOR_INLINE uint32_t pop32(CPU *c) { uint32_t v = rd32(STACK_BASE(c) + c->esp); c->esp += 4; return v; }
 
 /* An instruction the lifter could not express. Plain abort() by default, so a
  * project that includes only cpu.h is unchanged; a runtime that can say

@@ -6287,10 +6287,82 @@ static int handle_bink_import(CPU *cpu, const import_record *import)
  * assigned unique IAT tokens and stop here until a measured implementation is
  * added; an unknown guest address is equally fatal and includes its caller. */
 #include "ac1_win32_compat.inc"
+/* O(1) main-catalog lookup: line_first[k] is the index of the first lifted
+ * function at or after lifted_line_base + 16*k, so a lookup is one table read
+ * plus a forward step within one 16-byte line (most lines hold at most one
+ * entry). Equivalent to the generated table's lower-bound binary search,
+ * which dominated lookup misses (~17 steps over ~102k entries). */
+static uint32_t *lifted_line_first;
+static uint32_t lifted_line_base, lifted_line_count;
+/* A/B switches: AC1_LIFTED_LINE_INDEX=0 keeps the binary search,
+ * AC1_DISPATCH_FAST=0 disables the dispatch fast path below. */
+static int dispatch_fast_enabled = 1;
+
+static int env_switch_enabled(const char *name)
+{
+    const char *value = getenv(name);
+    return !(value && strcmp(value, "0") == 0);
+}
+
+static ac1_lifted_fn lifted_lookup_o1(uint32_t target);
+
+static void build_lifted_line_index(void)
+{
+    dispatch_fast_enabled = env_switch_enabled("AC1_DISPATCH_FAST");
+    if (lifted_line_first || !ac1_lifted_function_count ||
+        !env_switch_enabled("AC1_LIFTED_LINE_INDEX")) return;
+    const uint32_t first = ac1_lifted_functions[0].guest_va & ~15u;
+    const uint32_t last = ac1_lifted_functions[ac1_lifted_function_count - 1u].guest_va;
+    const uint32_t count = ((last - first) >> 4) + 1u;
+    uint32_t *table = (uint32_t *)malloc((size_t)count * sizeof(uint32_t));
+    if (!table) return;  /* lookups keep using the binary search */
+    size_t index = 0;
+    for (uint32_t line = 0; line < count; ++line) {
+        const uint32_t line_va = first + (line << 4);
+        while (index < ac1_lifted_function_count &&
+               ac1_lifted_functions[index].guest_va < line_va)
+            ++index;
+        table[line] = (uint32_t)index;
+    }
+    lifted_line_base = first;
+    lifted_line_count = count;
+    lifted_line_first = table;
+    /* Exactness check against the generated binary search: every entry, its
+     * neighbours (shared 16-byte lines, interior and invalid addresses), and
+     * both range ends. ~306k lookups, a few milliseconds at startup. */
+    for (size_t i = 0; i < ac1_lifted_function_count; ++i) {
+        const uint32_t va = ac1_lifted_functions[i].guest_va;
+        const uint32_t probes[3] = {va, va + 1u, va - 1u};
+        for (unsigned k = 0; k < 3u; ++k) {
+            if (lifted_lookup_o1(probes[k]) != ac1_lifted_lookup(probes[k])) {
+                fprintf(stderr, "AC1 lifted line index mismatch at 0x%08x; using binary search\n",
+                        probes[k]);
+                free(lifted_line_first);
+                lifted_line_first = NULL;
+                return;
+            }
+        }
+    }
+}
+
+static ac1_lifted_fn lifted_lookup_o1(uint32_t target)
+{
+    if (!lifted_line_first) return ac1_lifted_lookup(target);
+    const uint32_t line = (target - lifted_line_base) >> 4;
+    if (target < lifted_line_base || line >= lifted_line_count) return 0;
+    size_t index = lifted_line_first[line];
+    while (index < ac1_lifted_function_count &&
+           ac1_lifted_functions[index].guest_va < target)
+        ++index;
+    return index < ac1_lifted_function_count &&
+           ac1_lifted_functions[index].guest_va == target
+        ? ac1_lifted_functions[index].function : 0;
+}
+
 static ac1_lifted_fn profile_lifted_lookup(uint32_t target)
 {
     AC1_PROFILE_COUNT(misses);
-    return ac1_lifted_lookup(target);
+    return lifted_lookup_o1(target);
 }
 
 #ifdef _WIN32
@@ -6400,6 +6472,28 @@ void dispatch(CPU *cpu, uint32_t target)
     }
     if (calls->depth >= AC1_DISPATCH_DEPTH)
         stop_guest("guest call depth exceeded", target);
+
+    /* Fast path for indirect transfers into the main catalog (virtual calls,
+     * callbacks, jump tables): imports, COM tokens and Bink lie outside this
+     * range, so their handling below is unchanged; tracing keeps the slow
+     * path, as does the logged CRT handoff. */
+    if (dispatch_fast_enabled && !ac1_direct_slow_mode && lifted_line_first &&
+        target != 0x00401375u &&
+        target - lifted_line_base < (lifted_line_count << 4)) {
+        ac1_lifted_fn function = ac1_lifted_lookup_cached(
+            target, ac1_main_lifted_lookup_cache_enabled,
+            ac1_main_lifted_lookup_cache, profile_lifted_lookup);
+        if (function) {
+            uint32_t previous_target = calls->last_target;
+            calls->last_target = target;
+            ++calls->depth;
+            function(cpu);
+            --calls->depth;
+            calls->last_target = previous_target;
+            ac1_scheduler_return_checkpoint(cpu);
+            return;
+        }
+    }
 
     if (trace_object_types && !object_type_registry_traced &&
         target == 0x0085B160u) {
@@ -6966,6 +7060,7 @@ int ac1_run(const char *exe_path)
     }
     lock_ac1_run();
     reset_main_lifted_lookup_cache();
+    build_lifted_line_index();
     dispatch_limit = read_dispatch_limit();
     scheduler_return_slice_ns = read_scheduler_return_slice_ns();
     {

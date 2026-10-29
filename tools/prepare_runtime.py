@@ -97,7 +97,15 @@ static inline void ac1_x87_set_tag(CPU *c, unsigned reg, unsigned tag) {
 }
 '''
 
-DIRECT_ACCESS_HELPERS = r'''/* AC1 direct memory: one process-wide 4 GiB arena maps guest VA a at
+DIRECT_ACCESS_HELPERS = r'''/* Guest memory accessors are force-inlined: in very large generated
+ * functions GCC otherwise emits calls (and variable-size memcpy). The CMake
+ * option AC1_FORCE_INLINE_ACCESSORS=OFF defines AC1_NO_FORCE_INLINE for A/B. */
+#ifdef AC1_NO_FORCE_INLINE
+#define AC1_ACCESSOR_INLINE static inline
+#else
+#define AC1_ACCESSOR_INLINE static inline __attribute__((always_inline))
+#endif
+/* AC1 direct memory: one process-wide 4 GiB arena maps guest VA a at
  * ac1_direct_arena + a, so lifted fixed-width accesses become plain loads and
  * stores. A plain global (not _Thread_local, which MinGW lowers to emutls
  * calls) is safe because every AC1 guest thread shares one address space.
@@ -106,12 +114,12 @@ DIRECT_ACCESS_HELPERS = r'''/* AC1 direct memory: one process-wide 4 GiB arena m
 #ifdef AC1_DIRECT_MEMORY
 #include <string.h>
 extern uint8_t *ac1_direct_arena;
-static inline void ac1_direct_read(uint32_t a, void *o, size_t w)
+AC1_ACCESSOR_INLINE void ac1_direct_read(uint32_t a, void *o, size_t w)
 {
     if (__builtin_expect(ac1_direct_arena != NULL, 1)) memcpy(o, ac1_direct_arena + a, w);
     else (guest_execution_read)(a, o, w);
 }
-static inline void ac1_direct_write(uint32_t a, const void *i, size_t w)
+AC1_ACCESSOR_INLINE void ac1_direct_write(uint32_t a, const void *i, size_t w)
 {
     if (__builtin_expect(ac1_direct_arena != NULL, 1)) memcpy(ac1_direct_arena + a, i, w);
     else (guest_execution_write)(a, i, w);
@@ -121,23 +129,23 @@ static inline void ac1_direct_write(uint32_t a, const void *i, size_t w)
 /* LOCK-prefixed read-modify-writes (31k sites) operate in place on the arena
  * with sequentially consistent builtins, matching x86 LOCK's full fence.
  * Unaligned operands keep the checked path and its diagnostic. */
-static inline uint32_t *ac1_direct_atomic_cell(uint32_t a)
+AC1_ACCESSOR_INLINE uint32_t *ac1_direct_atomic_cell(uint32_t a)
 {
     return (ac1_direct_arena && !(a & 3u)) ? (uint32_t *)(ac1_direct_arena + a) : NULL;
 }
-static inline uint32_t ac1_direct_xadd32(uint32_t a, uint32_t v)
+AC1_ACCESSOR_INLINE uint32_t ac1_direct_xadd32(uint32_t a, uint32_t v)
 {
     uint32_t *cell = ac1_direct_atomic_cell(a);
     return cell ? __atomic_fetch_add(cell, v, __ATOMIC_SEQ_CST) : (guest_atomic_xadd32)(a, v);
 }
-static inline uint32_t ac1_direct_cmpxchg32(uint32_t a, uint32_t compare, uint32_t value)
+AC1_ACCESSOR_INLINE uint32_t ac1_direct_cmpxchg32(uint32_t a, uint32_t compare, uint32_t value)
 {
     uint32_t *cell = ac1_direct_atomic_cell(a);
     if (!cell) return (guest_atomic_cmpxchg32)(a, compare, value);
     __atomic_compare_exchange_n(cell, &compare, value, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     return compare;  /* the previous value, as CMPXCHG leaves it in EAX */
 }
-static inline uint32_t ac1_direct_xchg32(uint32_t a, uint32_t v)
+AC1_ACCESSOR_INLINE uint32_t ac1_direct_xchg32(uint32_t a, uint32_t v)
 {
     uint32_t *cell = ac1_direct_atomic_cell(a);
     return cell ? __atomic_exchange_n(cell, v, __ATOMIC_SEQ_CST) : (guest_atomic_xchg32)(a, v);
@@ -862,6 +870,18 @@ void guest_execution_write(uint32_t address, const void *input, size_t width)
             if text.count(access) != 1:
                 raise SystemExit("unexpected CPU header memory-access marker")
             text = text.replace(access, DIRECT_ACCESS_HELPERS + access)
+            # The gameplay profile showed ac1_direct_read/write and push/pop as
+            # out-of-line functions: in very large generated functions GCC's
+            # inline-growth limits stop inlining, turning each guest load into a
+            # call plus a variable-size memcpy. Force the tiny accessors inline.
+            for name in ("rd8", "rd16", "rd32", "wr8", "wr16", "wr32", "rd64", "wr64",
+                         "push32", "pop32"):
+                hits = [line for line in text.split("\n")
+                        if line.startswith("static inline ") and f" {name}(" in line.split("{")[0]]
+                if len(hits) != 1:
+                    raise SystemExit(f"unexpected CPU header accessor shape: {name}")
+                text = text.replace(hits[0], hits[0].replace(
+                    "static inline ", "AC1_ACCESSOR_INLINE ", 1))
             content = text.replace("\r\n", "\n").encode("utf-8")
         if not output.exists() or output.read_bytes() != content:
             output.write_bytes(content)

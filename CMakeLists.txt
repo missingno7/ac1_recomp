@@ -108,6 +108,10 @@ option(AC1_DIRECT_MEMORY "Inline guest accesses into one reserved 4 GiB arena (6
 if(AC1_DIRECT_MEMORY)
   target_compile_definitions(ac1_runtime PRIVATE AC1_DIRECT_MEMORY)
 endif()
+option(AC1_FORCE_INLINE_ACCESSORS "Force-inline guest memory accessors in generated code" ON)
+if(NOT AC1_FORCE_INLINE_ACCESSORS)
+  target_compile_definitions(ac1_runtime PRIVATE AC1_NO_FORCE_INLINE)
+endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(ac1_runtime PRIVATE -fwrapv -fno-strict-aliasing -ffp-contract=off)
   set_source_files_properties(src/runtime/ac1_runtime.c PROPERTIES
