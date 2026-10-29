@@ -8,6 +8,8 @@ The traced startup has exercised `CreateThread`, worker `TlsGetValue`/`TlsSetVal
 
 Guest instructions execute under a serialized baton. A native worker can wait while another guest thread owns the baton, but only one guest CPU executes guest instructions at a time. Native worker creation therefore does not currently provide multicore guest execution. Waits yield cooperatively, and teardown stops and joins workers before shared guest memory is released. `ac1_run` serializes launches so process-global runtime state is not reused concurrently.
 
+The default scheduler slice is 1,000 µs, with a check every 64 ordinary guest returns and immediate yields at API and blocking boundaries. Setting `AC1_SCHEDULER_SLICE_US=0` preserves the previous scheduling path; guest execution remains serialized in either mode. On the same executable, the legacy run took 52.729 s (47,078,418 guest dispatches) and the 1,000 µs run took 25.616 s (45,051,075 dispatches), about twice as fast through startup. The traces are `work/startup_slice_legacy.log` and `work/startup_slice_1000.log`. Their workloads differ slightly because crypto initialization uses random input, so this is a startup comparison, not a gameplay benchmark.
+
 ## Parallel execution later
 
 Relaxing the baton requires auditing guest shared-memory access, heaps, memory-map changes, handle tables, TLS bookkeeping, graphics callbacks, and process-wide service state. Those structures need explicit synchronization or safe ownership partitioning, followed by profiling to show guest-thread parallelism helps. Do not pin host workers to physical cores by default; guest affinity remains metadata until there is a demonstrated host scheduling need.

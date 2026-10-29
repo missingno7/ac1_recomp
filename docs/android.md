@@ -64,20 +64,20 @@ executable or assets are packaged.
 
 The Android CMake build links the D3D9 bridge and DXVK Native library, and the
 Java/JNI `SurfaceView` handoff has passed compilation. The latest runtime C
-source also compiles to an ARM64 object. These changes have not been packaged
-into a new APK; the only assembled APK is the older frozen checkpoint below.
+source also compiles to a 230,472-byte ARM64 object without diagnostics. These
+changes have not been packaged into a new APK; the only assembled APK is the
+older frozen checkpoint below.
 There has been no Android device run. The original startup still cannot reach
 the Android DXVK factory because ordinary USER32 calls such as `LoadCursorA`,
 `RegisterClassExA`, `AdjustWindowRect`, and `CreateWindowExA` lack an Android
 implementation. Windows-only audio and input providers and portable Android
 D3DX services also remain unresolved.
 
-The latest host-only evidence is
-`work/startup_dxvk_monitors_d3dx_success.log` (SHA-256
-`C6F2726D97409F6BED53D2EDE5EE6C0DEC1335A9B3E3B3D1E8FCDFC1DB514E7C`): the
-host completed 460 shader constant-table calls and one monitor callback before
-stopping at guest target `0x00A25E90`. This does not establish Android startup
-or rendering.
+The latest host-only evidence is `work/startup_slice_1000.log` (SHA-256
+`E45E3C1FC0F5DDCEDFC8999D333DD6836FFC36CB68009380D2CA07118A70B45B`): the
+host completed 460 shader constant-table calls and one monitor callback, joined
+five workers, and stopped at D3D9 `TestCooperativeLevel` slot 3. This does not
+establish Android startup or rendering.
 
 ## Isolated ARM64 package checkpoint
 
