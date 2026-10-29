@@ -917,6 +917,30 @@ int main(int argc, char **argv)
         ac1_d3d9_shutdown();
         return 27;
     }
+    const D3DVIEWPORT9 viewport{0, 0, 640u, 480u, 0.0f, 1.0f};
+    const uint32_t viewport_address = allocate_guest(nullptr, sizeof(viewport), 4);
+    std::memcpy(resolve_guest(nullptr, viewport_address, sizeof(viewport),
+                              AC1_D3D9_GUEST_WRITE), &viewport, sizeof(viewport));
+    const uint32_t set_viewport_args[] = {device, viewport_address};
+    const uint32_t unmapped_viewport_args[] = {device, 0xfffffff0u};
+    if (ac1_d3d9_argument_count(object_slot(device, 47)) != 2 ||
+        ac1_d3d9_dispatch(object_slot(device, 47), set_viewport_args, 2,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "native SetViewport smoke failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 28;
+    }
+    if (ac1_d3d9_dispatch(object_slot(device, 47), unmapped_viewport_args, 2,
+                          &getter_result) != 1 ||
+        getter_result != static_cast<uint32_t>(D3DERR_INVALIDCALL)) {
+        std::fprintf(stderr, "SetViewport did not reject an unmapped guest structure\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 29;
+    }
     const uint32_t surface_desc_token = object_slot(surface, 12);
     const uint32_t desc_address = allocate_guest(nullptr, 32, 4);
     const uint32_t desc_args[] = {surface, desc_address};

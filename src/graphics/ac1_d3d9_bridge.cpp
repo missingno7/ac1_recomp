@@ -311,6 +311,7 @@ int token_argument_count(uint32_t token)
     if (kind == kDeviceKind) {
         if (method < 3) return method == 0 ? 3 : 1;
         if (method == 35) return 4;
+        if (method == 47) return 2;
         if (method == 26 || method == 27) return 7;
         if (method == 65 || method == 92 || method == 107) return method == 65 ? 3 : 2;
         if (method == 67 || method == 69) return 4;
@@ -1040,6 +1041,19 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
         }
         return hresult(static_cast<IDirect3DDevice9 *>(object.native)->ColorFill(
             static_cast<IDirect3DSurface9 *>(surface->native), rect_pointer, args[3]));
+    }
+    if (method == 47) {
+        if (!require_count(argc, 2, "IDirect3DDevice9::SetViewport"))
+            return hresult(D3DERR_INVALIDCALL);
+        static_assert(sizeof(D3DVIEWPORT9) == 24,
+                      "guest D3DVIEWPORT9 must remain 24 bytes");
+        D3DVIEWPORT9 viewport{};
+        if (!guest_read(args[1], &viewport, sizeof(viewport))) {
+            set_error("IDirect3DDevice9::SetViewport viewport is unmapped");
+            return hresult(D3DERR_INVALIDCALL);
+        }
+        return hresult(static_cast<IDirect3DDevice9 *>(object.native)->SetViewport(
+            &viewport));
     }
     if (method == 26 || method == 27) {
         if (!require_count(argc, 7, method == 26
