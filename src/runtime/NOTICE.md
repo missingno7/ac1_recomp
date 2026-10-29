@@ -27,4 +27,44 @@ original AC1 assets, translated game code or their linked private executables.
 
 Generated game functions are private local build products under ignored `work/`. APKs and host executables that include those translations are likewise local build products. No game executable, assets, or translated game functions belong in the source repository.
 
-`tools/lift_ac1.py` has a bounded MMX lowering for the two validated Havok record routines at `0x01023410` and `0x01023520`. It uses function-local MMX registers because both intervals are call-free, initialize every MMX read on all paths, and execute `EMMS` before every exit. This does not model general MMX/x87 register aliasing or x87 tag state; MMX instructions outside these pinned intervals remain unsupported diagnostics.
+`tools/lift_ac1.py` lowers MMX through the CPU-owned eight-register file generated
+by `tools/prepare_runtime.py`. AC1 and Bink share this lowering, including packed
+integer saturation, full-width shift counts, shuffles, unpacking and SSE-era
+MMX conversions. Registers persist across translated calls. The original Havok
+interval proofs and native oracle remain regression tests; those routines now
+use the same CPU state as audio and Bink.
+
+The transformation preserves every pinned donor hash and records the prepared
+header hash in runtime provenance. Its project-owned helpers set TOP to zero
+and all tags valid on MMX entry; EMMS empties the tags without changing TOP or
+register payloads. Raw significands and exponent words survive environment
+saves, including after EMMS. x87 writes synchronize their physical-register
+MMX views when MMX next enters. An x87 data instruction while MMX is active
+produces an exact-address diagnostic and stops the translated function.
+Because environment images have no separate MMX-mode bit, FRSTOR conservatively
+recognizes a full, TOP-zero stack containing an MMX-shaped `0xffff` exponent;
+an unusual full x87 stack containing negative NaNs can trigger that diagnostic.
+
+FNSTENV/FLDENV use the 28-byte protected-mode environment; FNSAVE/FRSTOR add
+eight logical ST registers in 80-bit format for 108 bytes. Control/status words,
+physical tags, TOP, instruction/opcode and data pointers/selectors are retained;
+FNSTENV masks exceptions after storing and FNSAVE initializes the FPU afterward.
+The underlying x87 arithmetic remains binary64: extended precision/range and
+NaN payloads can be lost when values participate in x87 computation. Precision
+control bits are recorded but do not create 80-bit arithmetic. Unmodified raw
+restored register payloads retain their saved representation.
+
+MMX floating conversions honor MXCSR rounding, DAZ and masked invalid/precision
+flags; unmasked exceptions receive a diagnostic rather than a guest exception.
+x87 integer conversions honor the saved rounding control. Other x87/SSE
+arithmetic retains the existing model's precision and exception limitations,
+including incomplete empty-stack/FXAM behavior.
+MOVNTQ uses the ordinary checked guest store; the cache hint has no modeled
+effect. Sixteen-bit environment layouts and segmented MMX memory operands
+remain explicit diagnostics.
+
+Instruction/layout references: Intel's [instruction-set manual](https://cdrdv2-public.intel.com/774492/325383-sdm-vol-2abcd.pdf)
+and [MMX state-management description](https://www.intel.com/content/dam/support/us/en/documents/processors/pentium4/sb/25366821.pdf).
+Native and generated-code checks are in `tests/run_mmx_general.py` and
+`tests/run_mmx_havok.py`; generated functions and oracle binaries stay private
+under `work/`.

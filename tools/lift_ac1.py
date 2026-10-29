@@ -26,6 +26,7 @@ CONFIG_PATH = ROOT / "config/ac1_dx9.json"
 DUKE_DEFAULT = Path("D:/Prog/dukemp_recomp/.deps/pcrecomp")
 PYTHON_DEFAULT = Path("D:/Prog/dukemp_recomp/.venv/Scripts/python.exe")
 OUT_DEFAULT = ROOT / "work/lift_initial"
+_TEST_RUNTIME = None
 AC1_ARRAY_CTOR_HELPER = 0x00F9FA43
 AC1_SCHEMA_CALLBACK_HELPER = 0x00438EF0
 AC1_READER_CALLBACK_HELPER = 0x009312F0
@@ -34,89 +35,28 @@ AC1_ARG2_CALLBACK_HELPERS = {
     AC1_READER_CALLBACK_HELPER: "reader_callback",
 }
 
-# These are the only MMX intervals in the current observed AC1 catalog. Each
-# begins with a MOVQ from memory, contains no calls or x87 operations, and ends
-# with EMMS before returning. Keep MMX lowering scoped to these closed paths
-# until the CPU model grows full x87/MMX physical-register alias semantics.
+
+def prepare_test_runtime() -> Path:
+    """Build pinned test headers privately, without changing tracked runtime copies."""
+    global _TEST_RUNTIME
+    if _TEST_RUNTIME is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ac1_test_prepare_runtime", ROOT / "tools/prepare_runtime.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.ROOT = ROOT / "work/test_runtime"
+        module.FINGERPRINT_HEADER = module.ROOT / "src/runtime/ac1_fingerprint.h"
+        module.main()
+        _TEST_RUNTIME = module.ROOT / "src/runtime"
+    return _TEST_RUNTIME
+
+# Retain the original Havok interval proofs as regression checks. Emission
+# now uses CPU-owned MMX registers for every function in AC1 and Bink.
 AC1_MMX_FUNCTION_COUNTS = {
     0x01023410: 30,
     0x01023520: 29,
 }
 AC1_MMX_MNEMONICS = {"movq", "pcmpgtw", "paddw", "psubw", "pand"}
-
-AC1_MMX_LOCAL_HELPERS = r"""
-static inline void ac1_mmx_enter(CPU *c, int *active)
-{
-    if (!*active) { c->fpu_top = 0; *active = 1; }
-}
-static inline uint64_t ac1_mmx_read(CPU *c, uint64_t regs[8], uint8_t *valid,
-                                    int *active, unsigned reg)
-{
-    ac1_mmx_enter(c, active);
-    if (reg >= 8u || !(*valid & (uint8_t)(1u << reg))) {
-        ac1_unsupported_instruction(c->eip, "uninitialized register in bounded MMX interval");
-        return 0u;
-    }
-    return regs[reg];
-}
-static inline void ac1_mmx_write(CPU *c, uint64_t regs[8], uint8_t *valid,
-                                 int *active, unsigned reg, uint64_t value)
-{
-    ac1_mmx_enter(c, active);
-    if (reg >= 8u) {
-        ac1_unsupported_instruction(c->eip, "invalid register in bounded MMX interval");
-        return;
-    }
-    regs[reg] = value;
-    *valid |= (uint8_t)(1u << reg);
-}
-static inline void ac1_mmx_pcmpgtw(CPU *c, uint64_t regs[8], uint8_t *valid,
-                                   int *active, unsigned dst, uint64_t src)
-{
-    uint64_t left = ac1_mmx_read(c, regs, valid, active, dst), result = 0u;
-    for (unsigned lane = 0; lane < 4u; ++lane) {
-        unsigned shift = lane * 16u;
-        uint16_t a = (uint16_t)(left >> shift), b = (uint16_t)(src >> shift);
-        if ((uint16_t)(a ^ 0x8000u) > (uint16_t)(b ^ 0x8000u))
-            result |= UINT64_C(0xffff) << shift;
-    }
-    ac1_mmx_write(c, regs, valid, active, dst, result);
-}
-static inline void ac1_mmx_paddw(CPU *c, uint64_t regs[8], uint8_t *valid,
-                                 int *active, unsigned dst, uint64_t src)
-{
-    uint64_t left = ac1_mmx_read(c, regs, valid, active, dst), result = 0u;
-    for (unsigned lane = 0; lane < 4u; ++lane) {
-        unsigned shift = lane * 16u;
-        uint16_t sum = (uint16_t)((uint16_t)(left >> shift) + (uint16_t)(src >> shift));
-        result |= (uint64_t)sum << shift;
-    }
-    ac1_mmx_write(c, regs, valid, active, dst, result);
-}
-static inline void ac1_mmx_psubw(CPU *c, uint64_t regs[8], uint8_t *valid,
-                                 int *active, unsigned dst, uint64_t src)
-{
-    uint64_t left = ac1_mmx_read(c, regs, valid, active, dst), result = 0u;
-    for (unsigned lane = 0; lane < 4u; ++lane) {
-        unsigned shift = lane * 16u;
-        uint16_t difference = (uint16_t)((uint16_t)(left >> shift) - (uint16_t)(src >> shift));
-        result |= (uint64_t)difference << shift;
-    }
-    ac1_mmx_write(c, regs, valid, active, dst, result);
-}
-static inline void ac1_mmx_pand(CPU *c, uint64_t regs[8], uint8_t *valid,
-                                int *active, unsigned dst, uint64_t src)
-{
-    uint64_t left = ac1_mmx_read(c, regs, valid, active, dst);
-    ac1_mmx_write(c, regs, valid, active, dst, left & src);
-}
-static inline void ac1_mmx_emms(CPU *c, int *active)
-{
-    *active = 0;
-    c->fpu_top = 0;
-}
-""".strip()
-
 
 FP_ADAPTER_HELPERS = r"""
 /* The legacy SSE reciprocal instructions have implementation-defined low
@@ -245,59 +185,150 @@ def ac1_sse_width_translation(lifter, insn) -> list[str] | None:
 
 
 def ac1_mmx_translation(lifter, insn) -> list[str] | None:
-    """Lower the observed MOVQ/word-arithmetic MMX forms with exact m64 widths."""
-    from capstone.x86 import X86_OP_MEM, X86_OP_REG
+    """CPU-owned MMX state, including the SSE-era MMX operand forms."""
+    from capstone.x86 import X86_OP_MEM, X86_OP_REG, X86_OP_IMM, X86_REG_FS, X86_REG_GS
+    m, ops = insn.mnemonic, insn.operands
 
-    if insn.mnemonic == "emms":
-        return ["ac1_mmx_emms(c, &ac1_mmx_active);"]
-    if insn.mnemonic not in AC1_MMX_MNEMONICS or len(insn.operands) != 2:
-        return None
+    def mm(op):
+        name = insn.reg_name(op.reg) if op.type == X86_OP_REG else ""
+        return int(name[2]) if len(name) == 3 and name[:2] == "mm" and name[2] in "01234567" else None
 
-    destination, source = insn.operands
+    if m in ("emms", "femms"):
+        return ["ac1_mmx_emms(c);"]
+    if not any(mm(op) is not None for op in ops):
+        return None
+    for op in ops:
+        if op.type == X86_OP_MEM and op.mem.segment in (X86_REG_FS, X86_REG_GS):
+            raise NotImplementedError(f"segmented MMX operand at 0x{insn.address:08X}: {insn.op_str}")
 
-    def mm_register(operand) -> int | None:
-        if operand.type != X86_OP_REG or operand.size != 8:
-            return None
-        name = insn.reg_name(operand.reg)
-        if len(name) == 3 and name.startswith("mm") and name[2] in "01234567":
-            return int(name[2])
-        return None
+    def src(op, width=8):
+        reg = mm(op)
+        if reg is not None:
+            return f"ac1_mmx_read(c, {reg}u)"
+        if op.type == X86_OP_IMM:
+            return f"{op.imm & 255}u"
+        if op.type == X86_OP_MEM:
+            return f"rd{width*8}({lifter.addr_expr(insn, op)})"
+        name = insn.reg_name(op.reg)
+        if name.startswith("xmm"):
+            return f"c->xmm[{int(name[3:])}].u64[0]"
+        return lifter.src(insn, op)
 
-    def source_expression(operand) -> str | None:
-        register = mm_register(operand)
-        if register is not None:
-            return ("ac1_mmx_read(c, ac1_mmx, &ac1_mmx_valid, "
-                    f"&ac1_mmx_active, {register}u)")
-        if operand.type == X86_OP_MEM and operand.size == 8:
-            return f"rd64({lifter.addr_expr(insn, operand)})"
-        return None
+    def write(value):
+        reg = mm(ops[0])
+        if reg is not None:
+            return [f"ac1_mmx_write(c, {reg}u, {value});"]
+        if ops[0].type == X86_OP_MEM:
+            width = 4 if m == "movd" else 8
+            return [f"wr{width*8}({lifter.addr_expr(insn, ops[0])}, ({'uint32_t' if width==4 else 'uint64_t'})({value}));"]
+        name = insn.reg_name(ops[0].reg)
+        if name.startswith("xmm"):
+            return [f"c->xmm[{int(name[3:])}].u64[0] = {value};",
+                    f"c->xmm[{int(name[3:])}].u64[1] = 0;"]
+        return [lifter.dst_write(insn, ops[0], f"(uint32_t)({value})")]
 
-    destination_register = mm_register(destination)
-    source_register = mm_register(source)
-    source_value = source_expression(source)
-    if insn.mnemonic == "movq":
-        if destination_register is not None and source_value is not None:
-            return [f"ac1_mmx_write(c, ac1_mmx, &ac1_mmx_valid, &ac1_mmx_active, "
-                    f"{destination_register}u, {source_value});"]
-        if (destination.type == X86_OP_MEM and destination.size == 8 and
-                source_register is not None):
-            return [f"wr64({lifter.addr_expr(insn, destination)}, "
-                    f"ac1_mmx_read(c, ac1_mmx, &ac1_mmx_valid, &ac1_mmx_active, "
-                    f"{source_register}u));"]
-        return None
+    prefix = ["ac1_mmx_enter(c);"]
+    if m in ("movq", "movd", "movntq", "movq2dq", "movdq2q"):
+        value = src(ops[1], 4 if m == "movd" else 8)
+        if m == "movd":
+            value = f"(uint32_t)({value})"
+        return prefix + write(value)
+    if m in ("cvtps2pi", "cvttps2pi"):
+        return prefix + write(f"ac1_mmx_from_ps(c, {src(ops[1])}, {int(m=='cvttps2pi')}u, 0x{insn.address:08X}u)")
+    if m == "cvtpi2ps":
+        name = insn.reg_name(ops[0].reg)
+        return prefix + [f"c->xmm[{int(name[3:])}].u64[0] = ac1_mmx_to_ps(c, {src(ops[1])}, 0x{insn.address:08X}u);"]
+    if m == "pshufw":
+        return prefix + write(f"ac1_mmx_shuffle({src(ops[1])}, {ops[2].imm & 255}u)")
+    if m == "pinsrw":
+        lane = ops[2].imm & 3
+        return prefix + write(f"({src(ops[0])} & ~(UINT64_C(0xffff) << {lane*16})) | ((uint64_t)(({src(ops[1],2)}) & 0xffffu) << {lane*16})")
+    if m == "pextrw":
+        return prefix + write(f"({src(ops[1])} >> {(ops[2].imm & 3)*16}) & 0xffffu")
+    if m == "pmovmskb":
+        return prefix + write(f"ac1_mmx_mask({src(ops[1])})")
+    if m == "maskmovq":
+        return prefix + [f"{{ uint64_t _v={src(ops[0])}, _mask={src(ops[1])}; "
+                         "for(unsigned _i=0;_i<8;++_i) if((_mask>>(_i*8+7))&1u) "
+                         "wr8(c->edi+_i,(uint8_t)(_v>>(_i*8))); }"]
+    a, b = src(ops[0]), src(ops[1])
+    logic = {"pand": f"({a}) & ({b})", "pandn": f"~({a}) & ({b})",
+             "por": f"({a}) | ({b})", "pxor": f"({a}) ^ ({b})"}
+    if m in logic:
+        return prefix + write(logic[m])
+    if m in ("packsswb", "packssdw", "packuswb"):
+        return prefix + write(f"ac1_mmx_pack({a}, {b}, {32 if m=='packssdw' else 16}u, {int(m=='packuswb')}u)")
+    if m.startswith(("punpckl", "punpckh")) and m[-2:] in ("bw", "wd", "dq"):
+        return prefix + write(f"ac1_mmx_unpack({a}, {b}, {dict(bw=8,wd=16,dq=32)[m[-2:]]}u, {int(m.startswith('punpckh'))}u)")
+    if m.startswith(("psll", "psrl", "psra")) and m[-1] in "wdq":
+        return prefix + write(f"ac1_mmx_shift({a}, {b}, {dict(w=16,d=32,q=64)[m[-1]]}u, {dict(psll=0,psrl=1,psra=2)[m[:4]]}u)")
+    if m == "pmaddwd":
+        return prefix + write(f"ac1_mmx_madd({a}, {b})")
+    if m == "pmuludq":
+        return prefix + write(f"(uint64_t)(uint32_t)({a}) * (uint32_t)({b})")
+    if m == "psadbw":
+        return prefix + write(f"ac1_mmx_sad({a}, {b})")
+    lane_ops = {"padd": 0, "psub": 1, "padds": 2, "psubs": 3,
+                "paddus": 4, "psubus": 5, "pcmpeq": 6, "pcmpgt": 7,
+                "pavg": 8, "pminu": 9, "pmaxu": 10, "pmins": 11, "pmaxs": 12}
+    special = {"pmullw": (16,13), "pmulhw": (16,14), "pmulhuw": (16,15)}
+    if m in special:
+        bits, operation = special[m]
+    elif m[-1] in "bwdq" and m[:-1] in lane_ops:
+        bits, operation = dict(b=8,w=16,d=32,q=64)[m[-1]], lane_ops[m[:-1]]
+    else:
+        raise NotImplementedError(f"unimplemented MMX at 0x{insn.address:08X}: {m} {insn.op_str}")
+    return prefix + write(f"ac1_mmx_lanes({a}, {b}, {bits}u, {operation}u)")
 
-    if destination_register is None or source_value is None:
-        return None
-    helper = {
-        "pcmpgtw": "ac1_mmx_pcmpgtw",
-        "paddw": "ac1_mmx_paddw",
-        "psubw": "ac1_mmx_psubw",
-        "pand": "ac1_mmx_pand",
-    }.get(insn.mnemonic)
-    if helper is None:
-        return None
-    return [f"{helper}(c, ac1_mmx, &ac1_mmx_valid, &ac1_mmx_active, "
-            f"{destination_register}u, {source_value});"]
+
+def ac1_state_translation(lifter, insn) -> list[str] | None:
+    """State-management instructions shared by AC1 and Bink's exact emitter."""
+    from capstone.x86 import X86_OP_MEM
+    m, ops = insn.mnemonic, insn.operands
+    if m in ("pushal", "pushad"):
+        return ["{ uint32_t _esp=c->esp; push32(c,c->eax); push32(c,c->ecx); push32(c,c->edx); "
+                "push32(c,c->ebx); push32(c,_esp); push32(c,c->ebp); push32(c,c->esi); push32(c,c->edi); }"]
+    if m in ("popal", "popad"):
+        return ["c->edi=pop32(c); c->esi=pop32(c); c->ebp=pop32(c); (void)pop32(c); "
+                "c->ebx=pop32(c); c->edx=pop32(c); c->ecx=pop32(c); c->eax=pop32(c);"]
+    if m in ("fninit", "finit"):
+        return ["ac1_x87_reset(c);"]
+    if m in ("fnstenv", "fstenv", "fldenv", "fnsave", "fsave", "frstor"):
+        if 0x66 in insn.prefix:
+            return [f'ac1_unsupported_instruction(0x{insn.address:08X}u,"16-bit x87 environment layout"); return;']
+        helper = {"fnstenv":"store_env", "fstenv":"store_env", "fldenv":"load_env",
+                  "fnsave":"save", "fsave":"save", "frstor":"restore"}[m]
+        return [f"ac1_x87_{helper}(c, {lifter.addr_expr(insn,ops[0])});"]
+    if m in ("fnstcw", "fstcw", "fldcw", "stmxcsr", "ldmxcsr", "fnstsw", "fstsw"):
+        prefix = ["ac1_fp_init(c);"]
+        if m in ("fnstcw", "fstcw"):
+            return prefix + [lifter.dst_write(insn,ops[0],"c->fpu_cw")]
+        if m == "fldcw":
+            return prefix + [f"c->fpu_cw=(uint16_t)({lifter.src(insn,ops[0])});"]
+        if m in ("fnstsw", "fstsw"):
+            return prefix + [lifter.dst_write(insn,ops[0],"ac1_x87_status(c)")]
+        if m == "stmxcsr":
+            return prefix + [lifter.dst_write(insn,ops[0],"c->mxcsr")]
+        return prefix + [f"{{ uint32_t _mx={lifter.src(insn,ops[0])}; "
+                         f'if(_mx&0xffff0000u) {{ ac1_unsupported_instruction(0x{insn.address:08X}u,"reserved MXCSR bits"); return; }} '
+                         "c->mxcsr=_mx; }"]
+    if m in ("fnclex", "fclex"):
+        return ["ac1_fp_init(c); c->fpu_sw &= ~0x80ffu;"]
+    if m in ("fincstp", "fdecstp"):
+        return [f"ac1_fp_init(c); c->fpu_top=(c->fpu_top+{1 if m=='fincstp' else 7})&7; c->fpu_sw &= ~0x200u;"]
+    if m in ("ffree", "ffreep"):
+        name = insn.reg_name(ops[0].reg)
+        index = lifter._st_idx(ops[0])
+        return [f"ac1_fp_init(c); ac1_x87_set_tag(c,(unsigned)(c->fpu_top+{index})&7u,3);" +
+                (" c->fpu_top=(c->fpu_top+1)&7;" if m=="ffreep" else "")]
+    if m in ("fist", "fistp", "fisttp") and ops and ops[0].type == X86_OP_MEM:
+        bits = ops[0].size*8
+        return [f"{{ uint64_t _i=ac1_x87_integer(c,*fst(c,0),{bits}u,{int(m=='fisttp')}u,0x{insn.address:08X}u); "
+                f"wr{bits}({lifter.addr_expr(insn,ops[0])},(uint{bits}_t)_i); " +
+                ("fpop(c);" if m != "fist" else "") + " }"]
+    if m == "frndint":
+        return ["*fst(c,0)=ac1_fp_round(*fst(c,0),(c->fpu_cw>>10)&3u);"]
+    return None
 
 
 def validate_ac1_mmx_interval(function_address: int, spec: dict, decoded: dict) -> None:
@@ -693,10 +724,10 @@ def run_selftest() -> None:
         ("0f6f442408", "ac1_mmx_write", "rd64(0x12345678u)"),
         ("0f7f442408", "wr64(0x12345678u,", "ac1_mmx_read"),
         ("0f6fc1", "ac1_mmx_write", "ac1_mmx_read"),
-        ("0f65c1", "ac1_mmx_pcmpgtw", "ac1_mmx_read"),
-        ("0ffdc1", "ac1_mmx_paddw", "ac1_mmx_read"),
-        ("0ff9c1", "ac1_mmx_psubw", "ac1_mmx_read"),
-        ("0fdbc1", "ac1_mmx_pand", "ac1_mmx_read"),
+        ("0f65c1", "ac1_mmx_lanes", "ac1_mmx_read"),
+        ("0ffdc1", "ac1_mmx_lanes", "ac1_mmx_read"),
+        ("0ff9c1", "ac1_mmx_lanes", "ac1_mmx_read"),
+        ("0fdbc1", "ac1_mmx_write", "ac1_mmx_read"),
         ("0f77", "ac1_mmx_emms", ""),
     ]
     for raw, required, also_required in mmx_cases:
@@ -1377,7 +1408,7 @@ def run_ac1_switch_selftest(binary: Path, pcrecomp: Path) -> None:
                 table_page.write_bytes(original_page)
                 command = [
                     compiler, "-std=c11", "-O0", "-DAC1_TRACE_EIP",
-                    "-I", str(ROOT / "src/runtime"),
+                    "-I", str(prepare_test_runtime()),
                     str(ROOT / "tests/memmove_semantics.c"), str(generated_c),
                     str(ROOT / "src/runtime/guest_memory.c"),
                     str(ROOT / "src/runtime/guest_clock.c"), "-lm", "-o", str(executable),
@@ -1573,7 +1604,7 @@ int main(void) {
 }
 '''
         source_path.write_text(source, encoding="utf-8")
-        command = [compiler, "-std=c11", "-O0", "-I", str(ROOT / "src/runtime"),
+        command = [compiler, "-std=c11", "-O0", "-I", str(prepare_test_runtime()),
                    str(source_path), str(ROOT / "src/runtime/guest_memory.c"),
                    str(ROOT / "src/runtime/guest_clock.c"), "-o", str(executable)]
         build = subprocess.run(command, text=True, capture_output=True)
@@ -2991,10 +3022,6 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         def translate(self, insn, labels):
             if insn.mnemonic == "int3":
                 return ac1_int3_translation(insn)
-            if self.func_start in AC1_MMX_FUNCTION_COUNTS:
-                mmx = ac1_mmx_translation(self, insn)
-                if mmx is not None:
-                    return mmx
             narrow_memory_sse = ac1_sse_width_translation(self, insn)
             if narrow_memory_sse is not None:
                 return narrow_memory_sse
@@ -3136,8 +3163,6 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "",
     ])
     def tu_header_for(addresses: list[int]) -> str:
-        if any(address in AC1_MMX_FUNCTION_COUNTS for address in addresses):
-            return tu_header + AC1_MMX_LOCAL_HELPERS + "\n"
         return tu_header
 
     tu_names = []
@@ -3293,8 +3318,6 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
                         labels.update(target for target in targets if target in decoded)
 
     output = [f"void L_{address:08X}(CPU *c)", "{"]
-    if address in AC1_MMX_FUNCTION_COUNTS:
-        output.append("    uint64_t ac1_mmx[8] = {0}; uint8_t ac1_mmx_valid = 0u; int ac1_mmx_active = 0;")
     entry_jump = entry_guard_lines(address, [insn.address for insn in insns])
     output.extend(entry_jump)
     for index, insn in enumerate(insns):
@@ -3309,9 +3332,31 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
                 translated.append(f"  if (_jt == GVA(0x{target:08X})) goto L_{target:08X};")
             translated.append("  dispatch_jmp(c, _jt); return; }")
         else:
-            translated = translate_directional_string_instruction(insn)
+            translated = ac1_mmx_translation(lifter, insn)
+            if translated is None:
+                translated = ac1_state_translation(lifter, insn)
+            if translated is None:
+                translated = translate_directional_string_instruction(insn)
         if translated is None:
             translated = lifter.translate(insn, labels)
+        controls = {"fwait", "wait", "fnop", "fninit", "finit", "fnclex", "fclex", "fnstcw", "fstcw",
+                    "fldcw", "fnstsw", "fstsw", "fnstenv", "fstenv", "fldenv", "fnsave", "fsave", "frstor",
+                    "fincstp", "fdecstp", "ffree", "ffreep", "femms"}
+        if insn.mnemonic.startswith("f") and insn.mnemonic not in controls:
+            prefix = [f"if (!ac1_x87_check(c, 0x{insn.address:08X}u)) return;",
+                      f"c->fpu_ip=GVA(0x{insn.address:08X}); c->fpu_cs=c->cs; "
+                      f"c->fpu_opcode=0x{((insn.opcode[0]&7)<<8)|insn.modrm:03X}u;"]
+            for operand in insn.operands:
+                if operand.type == X86_OP_MEM:
+                    base = lifter.md.reg_name(operand.mem.base) if operand.mem.base else ""
+                    segment = lifter.md.reg_name(operand.mem.segment) if operand.mem.segment else (
+                        "ss" if base in ("esp", "ebp") else "ds")
+                    prefix.append(f"c->fpu_dp={lifter.addr_expr(insn,operand)}; c->fpu_ds=c->{segment};")
+                    break
+            if insn.mnemonic in ("fst", "fstp") and insn.operands[0].type == X86_OP_REG:
+                index = lifter._st_idx(insn.operands[0])
+                prefix.append(f"ac1_x87_set_tag(c,(unsigned)(c->fpu_top+{index})&7u,0);")
+            translated = prefix + translated
         for line in translated:
             output.append(f"    {line:<60} /* {insn.address:08X}: {insn.mnemonic} {insn.op_str} */")
         next_decoded = insns[index + 1].address if index + 1 < len(insns) else None
