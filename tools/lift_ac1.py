@@ -11,6 +11,7 @@ import collections
 import hashlib
 import importlib.metadata
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -3023,9 +3024,28 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
             immediate_summary, indexed.summary(results))
 
 
+def specialize_direct_calls(body: str, lifted: set[int]) -> tuple[str, set[int], int]:
+    """Bind only successful main-image entries, after cached bodies are lifted.
+
+    Keep the CRT handoff in dispatch for its one-time diagnostic. Indirect
+    operands, imports, DLL entries and failed lifts retain the slow path.
+    """
+    callees, count = set(), 0
+    def replace(match):
+        nonlocal count
+        target = int(match.group(1), 16)
+        if target not in lifted or target == 0x00401375:
+            return match.group(0)
+        callees.add(target)
+        count += 1
+        return f"AC1_CALL(c, L_{target:08X}, 0x{target:08X}u)"
+    body = re.sub(r"\bdispatch\(c, 0x([0-9A-Fa-f]{8})u\)", replace, body)
+    return body, callees, count
+
+
 def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: Path,
               functions_per_tu: int, translation_unit_buckets: int = 0,
-              emission_cache=None) -> dict:
+              emission_cache=None, direct_calls: bool = True) -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
@@ -3161,6 +3181,15 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         except Exception as exc:  # preserve other real bodies when one is unsupported
             failures.append({"address": address, "error": repr(exc)})
     pe.close()
+    # Specialize after the complete success set is known. Cached bodies remain
+    # independent of catalog membership; failed/removed callees cannot become
+    # dangling C symbols. Bink uses this emitter with its own image base.
+    direct_callees, direct_sites = {}, 0
+    if direct_calls and image_base == 0x00400000:
+        successful = set(lifted)
+        for index, address in enumerate(lifted):
+            bodies[index], direct_callees[address], sites = specialize_direct_calls(bodies[index], successful)
+            direct_sites += sites
     if translation_unit_buckets < 0:
         raise ValueError("translation_unit_buckets must be zero or positive")
     if not translation_unit_buckets and functions_per_tu < 1:
@@ -3176,8 +3205,13 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "#endif",
         "",
     ])
+    direct_prototypes = 0
     def tu_header_for(addresses: list[int]) -> str:
-        return tu_header
+        nonlocal direct_prototypes
+        # Per-shard prototypes avoid parsing all 100k entries in every TU.
+        callees = set().union(*(direct_callees.get(a, set()) for a in addresses))
+        direct_prototypes += len(callees)
+        return tu_header + "".join(f"void L_{a:08X}(CPU *);\n" for a in sorted(callees)) + "\n"
 
     tu_names = []
     if translation_unit_buckets:
@@ -3257,6 +3291,8 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "lift_failures": failures,
         "instruction_counts": instruction_counts,
         "relocation_entries": len(reloc_vas),
+        "direct_call_sites": direct_sites,
+        "direct_callee_declarations": direct_prototypes,
     }
 
 
@@ -3386,6 +3422,8 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=CONFIG_PATH,
                         help="discovery configuration (allows private seed-set A/B comparisons)")
     parser.add_argument("--selftest", action="store_true", help="run the focused block-entry ordering check")
+    parser.add_argument("--no-direct-calls", action="store_true",
+                        help="keep constant main-catalog transfers in dispatch for A/B comparisons")
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--pcrecomp", type=Path)
     parser.add_argument("--python", type=Path)
@@ -3589,7 +3627,7 @@ def main() -> int:
     try:
         lift_result = emit_lift(binary, pcrecomp, catalog_doc["functions"], output_dir,
                                 functions_per_tu, translation_unit_buckets,
-                                emission_cache)
+                                emission_cache, direct_calls=not args.no_direct_calls)
     except Exception:
         if emission_cache is not None:
             emission_cache.close()
@@ -3605,6 +3643,8 @@ def main() -> int:
         "lift_failures": lift_result["lift_failures"],
         "unsupported_count": todo_count,
         "relocation_entries": lift_result["relocation_entries"],
+        "direct_call_sites": lift_result["direct_call_sites"],
+        "direct_callee_declarations": lift_result["direct_callee_declarations"],
         "translation_unit_buckets": lift_result["translation_unit_buckets"],
         "outputs": {
             "c": output.name,

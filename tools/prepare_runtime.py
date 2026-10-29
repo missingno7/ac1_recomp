@@ -25,6 +25,47 @@ SOURCE_FILES = {
     "src/runtime/cpu.h": ("work/generated/cpu.h", "ded33fb92194b50c42d80f03ec9142f3517bb62400545ca57f00e903e3383dfe"),
 }
 
+# CPU copies made for host callbacks retain this pointer: dispatch accounting
+# belongs to the guest thread, not to the snapshot of its architectural state.
+CALL_STATE_DECL = r'''
+typedef struct ac1_call_state {
+    uint64_t count;
+    uint32_t depth, last_target;
+} ac1_call_state;
+'''
+CALL_HELPERS = r'''
+extern uint64_t ac1_dispatch_limit;
+extern int ac1_direct_slow_mode;
+void ac1_dispatch_guard_failed(CPU *c, uint32_t target);
+void ac1_scheduler_return_checkpoint(CPU *c);
+
+/* Tracing takes the original dispatcher, including its callsite-specific
+ * diagnostics. Unbound test CPUs also retain that path. The runtime binds
+ * calls on its first dispatch, without reading emulated TLS on later calls. */
+#if defined(AC1_NO_DIRECT_CALLS)
+#define AC1_CALL(c, fn, target) dispatch((c), (target))
+#else
+#define AC1_CALL(c, fn, target) do { \
+    CPU *_ac = (c); \
+    if (ac1_direct_slow_mode || !_ac->calls) { \
+        dispatch(_ac, (target)); \
+    } else { \
+        ac1_call_state *_as = _ac->calls; \
+        ++_as->count; \
+        if ((ac1_dispatch_limit && _as->count > ac1_dispatch_limit) || _as->depth >= 4096u) \
+            ac1_dispatch_guard_failed(_ac, (target)); \
+        uint32_t _ap = _as->last_target; \
+        _as->last_target = (target); \
+        ++_as->depth; \
+        fn(_ac); \
+        --_as->depth; \
+        _as->last_target = _ap; \
+        ac1_scheduler_return_checkpoint(_ac); \
+    } \
+} while (0)
+#endif
+'''
+
 # Project-owned additions to the pinned CPU ABI. No donor input/hash is changed.
 FP_STATE_FIELDS = r'''
     uint64_t mmx[8];
@@ -549,11 +590,15 @@ void guest_execution_write(uint32_t address, const void *input, size_t width)
                 raise SystemExit(f"unexpected pcrecomp CPU header shape: {source}")
             text = text.replace(
                 marker,
-                FP_STATE_FIELDS + marker + "\n\n/* Project-owned native dispatcher, called by generated code. */\n"
+                FP_STATE_FIELDS + "    ac1_call_state *calls;\n" + marker + "\n\n/* Project-owned native dispatcher, called by generated code. */\n"
                 "void dispatch(CPU *cpu, uint32_t target);\n"
                 "void dispatch_jmp(CPU *cpu, uint32_t target);\n"
-                "void ac1_unsupported_instruction(uint32_t guest_va, const char *reason);\n" + FP_STATE_BASIC,
+                "void ac1_unsupported_instruction(uint32_t guest_va, const char *reason);\n" + CALL_HELPERS + FP_STATE_BASIC,
             )
+            cpu_start = "typedef struct {\n    uint32_t eax"
+            if text.count(cpu_start) != 1:
+                raise SystemExit(f"unexpected pinned CPU declaration: {source}")
+            text = text.replace(cpu_start, CALL_STATE_DECL + cpu_start)
             x87_helpers = {
                 "static inline void   fpush(CPU *c, double v) { c->fpu_top = (c->fpu_top - 1) & 7; c->st[c->fpu_top] = v; }":
                     "static inline void fpush(CPU *c, double v) { if(!ac1_x87_check(c,c->eip)) return; "
