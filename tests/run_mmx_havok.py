@@ -122,6 +122,7 @@ def run() -> None:
     functions = [by_address[address] for address in ADDRESSES]
 
     module = load_lifter()
+    runtime_include = module.prepare_test_runtime()
     tooling_args = argparse.Namespace(python=args.python, pcrecomp=args.pcrecomp)
     _python, pcrecomp = module.resolve_tooling(config, tooling_args)
     generated_dir = WORK / "generated"
@@ -147,11 +148,11 @@ def run() -> None:
     ], cwd=ROOT, check=True)
     subprocess.run([
         args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
-        "-I", str(ROOT / "src/runtime"), "-c", str(generated_c), "-o", str(generated_obj),
+        "-I", str(runtime_include), "-c", str(generated_c), "-o", str(generated_obj),
     ], cwd=ROOT, check=True)
     subprocess.run([
         args.cxx, "-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
-        "-I", str(ROOT / "src/runtime"), str(ROOT / "tests/mmx_havok_generated_compare.cpp"),
+        "-I", str(runtime_include), str(ROOT / "tests/mmx_havok_generated_compare.cpp"),
         str(generated_obj), "-o", str(compare_exe),
     ], cwd=ROOT, check=True)
     subprocess.run([str(oracle_exe)], cwd=ROOT, check=True)
