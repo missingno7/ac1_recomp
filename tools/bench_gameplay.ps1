@@ -13,6 +13,12 @@ param(
     [switch]$KeepBuild,
     [switch]$AllowDirty,
     [switch]$WaitForQuiet,
+    # The hot-function experiments share this PC with other workers. Record the
+    # interference and interleave runs instead of requiring a globally idle PC.
+    [switch]$AllowConcurrent,
+    # Reuse one normal build, copying and stripping it once into the immutable
+    # bench store. This avoids a second ~GB build for runtime-only A/B switches.
+    [string]$Binary = '',
     [string]$Python = 'D:\Prog\dukemp_recomp\.venv\Scripts\python.exe',
     [string]$GameExe = 'C:\Program Files (x86)\GOG.com\Assassins Creed\AssassinsCreed_Dx9.exe'
 )
@@ -32,6 +38,7 @@ public static class AC1BenchThreadTimes {
 Push-Location $Root
 try {
     function Wait-ForQuietMachine {
+        if ($AllowConcurrent) { return }
         while ($true) {
             $busy = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -in @('cc1','cc1plus','ninja','mingw32-make','ac1_startup','python') })
             if (-not $busy.Count) { return }
@@ -52,6 +59,10 @@ try {
     $trace = if ($TraceEip) { 'ON' } else { 'OFF' }
     $inline = if ($ForceInline) { 'ON' } else { 'OFF' }
     $cfgSpec = "type=RelWithDebInfo;direct=$direct;trace_eip=$trace;force_inline=$inline;lift_args=$LiftArgs;compiler=C:/msys64/mingw64/bin/gcc.exe;generator=Ninja;dirty=$dirtyHash"
+    if ($Binary) {
+        $Binary = (Resolve-Path -LiteralPath $Binary).Path
+        $cfgSpec += ";input_binary_sha256=$((Get-FileHash -LiteralPath $Binary -Algorithm SHA256).Hash.ToLowerInvariant())"
+    }
     $cfg = (& $Python -B -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:12])" $cfgSpec).Trim()
     $key = "$sha-$cfg"
     # One debug-stripped binary per build config; results per runtime label.
@@ -59,6 +70,12 @@ try {
     $resultDir = Join-Path $Root ("work/bench/$key" + $(if ($Label) { "-$Label" } else { '' }))
     $binaryPath = Join-Path $binDir 'ac1_startup.exe'
     New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+    if ($Binary -and -not (Test-Path $binaryPath)) {
+        & 'C:/msys64/mingw64/bin/objcopy.exe' --strip-debug $Binary $binaryPath
+        if ($LASTEXITCODE) { throw 'objcopy --strip-debug failed for supplied binary' }
+        @{ source=$Binary; config_spec=$cfgSpec; sha256=(Get-FileHash $binaryPath -Algorithm SHA256).Hash.ToLowerInvariant() } |
+            ConvertTo-Json | Set-Content (Join-Path $binDir 'binary.json') -Encoding UTF8
+    }
     $buildDir = "build/bench-$key"
     $cmake = Join-Path $env:LOCALAPPDATA 'Android/Sdk/cmake/3.22.1/bin/cmake.exe'
     $ninja = Join-Path $env:LOCALAPPDATA 'Android/Sdk/cmake/3.22.1/bin/ninja.exe'
@@ -179,7 +196,7 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
         foreach ($k in $Env.Keys) { $envs[$k] = [string]$Env[$k] }
         $envs['AC1_PROFILE_DIR'] = (Join-Path $runDir 'profile')
         $profileDir = Join-Path $runDir 'profile'
-        $profileSource = Join-Path $Root 'work/work/profile'
+        $profileSource = $profileDir
         New-Item -ItemType Directory -Force -Path $envs.AC1_D3D9_CAPTURE_DIR,$profileDir,$profileSource | Out-Null
         $profileBefore = @{}; Get-ChildItem "$profileSource/raw_*.json" -ErrorAction SilentlyContinue | ForEach-Object { $profileBefore[$_.Name] = $_.LastWriteTimeUtc }
         $gpuLog = Join-Path $runDir 'gpu.csv'; $gpuProc = $null
@@ -212,7 +229,9 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
         } finally {
             if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue; $proc.WaitForExit() }
             if ($gpuProc -and -not $gpuProc.HasExited) { Stop-Process -Id $gpuProc.Id -Force -ErrorAction SilentlyContinue; $gpuProc.WaitForExit() }
-            Get-ChildItem "$profileSource/raw_*.json" -ErrorAction SilentlyContinue | Where-Object { -not $profileBefore.ContainsKey($_.Name) -or $_.LastWriteTimeUtc -gt $profileBefore[$_.Name] } | ForEach-Object { Copy-Item $_.FullName $profileDir; $bin = Join-Path $_.DirectoryName ($_.BaseName + '.bin'); if (Test-Path $bin) { Copy-Item $bin $profileDir } }
+            if ($profileSource -ne $profileDir) {
+                Get-ChildItem "$profileSource/raw_*.json" -ErrorAction SilentlyContinue | Where-Object { -not $profileBefore.ContainsKey($_.Name) -or $_.LastWriteTimeUtc -gt $profileBefore[$_.Name] } | ForEach-Object { Copy-Item $_.FullName $profileDir; $bin = Join-Path $_.DirectoryName ($_.BaseName + '.bin'); if (Test-Path $bin) { Copy-Item $bin $profileDir } }
+            }
             foreach ($k in $envs.Keys) { [Environment]::SetEnvironmentVariable($k,$previousEnv[$k],'Process') }
         }
         $runOut = & $Python -B tools/bench_report.py --internal-run $runDir --seconds $Seconds | ConvertFrom-Json

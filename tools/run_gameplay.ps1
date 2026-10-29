@@ -2,6 +2,8 @@ param(
     [string]$Script = 'tools/input/to_gameplay.txt',
     [ValidateRange(0, 86400)][int]$Seconds = 0,
     [Alias('Env')][hashtable]$Environment = @{},
+    [switch]$SkipBuild,
+    [string]$BuildDirectory = 'build/host-relwithdebinfo',
     [string]$GameExe = 'C:\Program Files (x86)\GOG.com\Assassins Creed\AssassinsCreed_Dx9.exe',
     [string]$OutputDirectory = ''
 )
@@ -62,6 +64,7 @@ public static class AC1InputProcessTree {
     if (-not $OwnedProcess.WaitForExit(5000)) { throw "Cannot stop owned build process $($OwnedProcess.Id)" }
 }
 try {
+    if (-not $SkipBuild) {
     # Keep the standard preparation/build entry point. Some Windows sandboxes
     # stall Ninja after its compiler probe exits; detect that specific idle probe
     # and build the same CMake targets with MinGW Makefiles instead.
@@ -89,7 +92,6 @@ try {
         Get-Content -LiteralPath $BuildErr -Tail 20 | Write-Host
         throw "Standard AC1 build failed; see $BuildLogDirectory"
     }
-    $BuildDirectory = 'build/host-relwithdebinfo'
     if ($UseMake) {
         $BuildDirectory = 'build/host-make-relwithdebinfo'
         $CMake = Join-Path $env:LOCALAPPDATA 'Android/Sdk/cmake/3.22.1/bin/cmake.exe'
@@ -97,6 +99,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'MinGW Makefiles configure failed' }
         & $CMake --build $BuildDirectory --parallel 16
         if ($LASTEXITCODE -ne 0) { throw 'MinGW Makefiles build failed' }
+    }
     }
     $Script = (Resolve-Path -LiteralPath $Script).Path
     $Provider = (Resolve-Path -LiteralPath (Join-Path $ProjectRoot 'work/d3d9_dxvk_probe/d3d9.dll')).Path

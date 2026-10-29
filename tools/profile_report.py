@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = struct.Struct("<QQQIIIIII")
 HANDOFF_CAUSES = ("return-slice", "import", "sleep", "yield/Sleep(0)", "wait/block",
                   "critical-section", "event/semaphore/mutex", "I/O", "thread-start", "thread-exit")
-GUEST = re.compile(r"(?:^|\b)(?:L|ac1|bink)_([0-9A-Fa-f]{8})(?:\b|\.)")
+GUEST = re.compile(r"(?:^|\b)(?:L|ac1|bink|ac1_translated|ac1_native)_([0-9A-Fa-f]{8})(?:\b|\.)")
 
 
 @lru_cache(maxsize=16)
@@ -81,11 +81,14 @@ def syscall_parked(module, rip):
 
 
 def category(name: str) -> str:
+    if re.search(r"\bac1_native_[0-9A-Fa-f]{8}\b", name): return "native guest overrides"
+    if re.search(r"\bac1_native_", name): return "native override machinery"
     if GUEST.search(name): return "generated guest code"
     if re.search(r"guest_(?:ptr|execution|memory)|scalar_|\b(?:rd|wr)(?:8|16|32|64|f)", name): return "guest memory access"
     if re.search(r"dispatch|lifted_lookup|lookup_cache", name): return "dispatch/lookup"
     if re.search(r"x87|mmx|sse|ac1_fp|ac1_mm_|ac1_rcpps|ac1_rsqrt|fpush|fpop|\bfst\b|ac1_simd", name): return "x87/MMX/SSE helpers"
     if re.search(r"scheduler|sync_|critical_section|guest_thread|profile_wait", name): return "scheduler/sync"
+    if re.search(r"handle_(?:.*_)?import|import_(?:lookup|resolve)|find_import", name): return "import adapters"
     if re.search(r"d3d9|D3D|present_device|trace_frame_success|draw_|shader_|texture_|surface_", name, re.I): return "D3D9 bridge"
     if re.search(r"ds8|bink|ac1_files|file_|audio_|sound|waveOut", name, re.I): return "DS8/Bink/files"
     return "other runtime"
@@ -134,6 +137,9 @@ def main():
     parser.add_argument("--pid", type=int, help="select a specific run's process ID instead of the latest run")
     parser.add_argument("--run-start", type=int, help="select the run_start QPC value in raw metadata (disambiguates reused PIDs)")
     parser.add_argument("--top", type=int, default=15)
+    parser.add_argument("--from-present", type=int, help="start after this many successful Presents (1628 for gameplay)")
+    parser.add_argument("--seconds", type=float, help="window length after --from-present")
+    parser.add_argument("--json-output", type=Path, help="machine-readable exclusive guest and category samples")
     args = parser.parse_args()
     single = None if args.capture.is_dir() else args.capture.with_suffix(".json")
     paths = list((args.capture if single is None else single.parent).glob("raw_*.json"))
@@ -150,11 +156,17 @@ def main():
     hz, origin = latest["frequency"], latest["run_start"]
     low = max(captures[0][1]["start"], origin+args.from_seconds*hz, latest["start"] if single else origin)
     high = min(captures[-1][1]["end"], origin+args.to_seconds*hz, latest["end"] if single else captures[-1][1]["end"])
+    if args.from_present is not None:
+        frames = sorted(f for _, d in captures for f in d["frames"])
+        if not 0 <= args.from_present < len(frames): parser.error("requested Present is absent from capture")
+        low = max(low, frames[args.from_present])
+        if args.seconds is not None: high = min(high, low+args.seconds*hz)
     if high <= low: parser.error("empty requested time window")
     elapsed = (high-low)/hz
     rvas, names = load_symbols(args.exe, args.nm)
     guest_entries = sorted({int(m.group(1), 16) for n in names if (m := GUEST.search(n))})
     modules, symbols, categories, guest_functions = Counter(), Counter(), Counter(), Counter()
+    exclusive = Counter()
     external_exports = Counter()
     by_thread = defaultdict(Counter)
     module_threads, symbol_threads, category_threads, guest_threads = (defaultdict(Counter) for _ in range(4))
@@ -207,6 +219,7 @@ def main():
                 index = bisect.bisect_right(rvas, rip-mod["base"])-1
                 name = names[index] if index >= 0 else "[unknown exe address]"
                 symbols[name] += 1; categories[category(name)] += 1
+                if match := GUEST.search(name): exclusive[int(match.group(1), 16)] += 1
                 symbol_threads[tid][name] += 1; category_threads[tid][category(name)] += 1
             else:
                 categories["external: "+modname] += 1
@@ -261,6 +274,8 @@ def main():
         missing_cpu = all_cpu-sum(cpu_estimates(module_threads).values())
         lines.append(f"  CPU without an active observation: {missing_cpu:.2f}ms ({100*missing_cpu/max(all_cpu,1):.2f}%)")
     add_top("Exe symbols (% of exe CPU-active samples)", symbols, sum(symbols.values()))
+    add_top("Exclusive guest bodies (% of ALL CPU-active samples; helpers excluded, no stack inference)", exclusive, total,
+            render=lambda a: f"0x{a:08X} L_{a:08X}")
     add_top("Guest entries including helper/import samples (% of attributed guest-thread CPU-active samples)", guest_functions, sum(guest_functions.values()), render=lambda a: f"0x{a:08X} L_{a:08X}")
     if bounds and total:
         add_cpu_top("Guest entries including helpers (OS CPU-time weighted sample mix)", guest_threads, render=lambda a: f"0x{a:08X} L_{a:08X}")
@@ -311,6 +326,15 @@ def main():
     lines.append("Notes: sampler threads exclude themselves. CPU-active means nonzero QueryThreadCycleTime delta and RIP outside known syscall wait stubs (capture flags plus local ntdll/win32u PE exports); raw deltas are retained. Suspension can itself charge sleeping threads kernel cycles. This is not exact scheduled CPU residency. OS CPU times cover complete counter intervals. Inlined helpers remain charged to generated code. Helper guest-entry attribution via EIP is approximate where discovery entries overlap. Baton wait counts condition sleeps entered without ownership, including guest API blocking after relinquishing ownership. Enumeration is every 250ms; short-lived threads can be missed. Guest/native samplers are separate so a slow graphics GetThreadContext cannot stall guest observations.")
     report = "\n".join(lines)+"\n"
     if args.output: args.output.write_text(report, encoding="utf-8")
+    if args.json_output:
+        args.json_output.write_text(json.dumps({
+            "pid": latest["pid"], "run_start": latest["run_start"],
+            "from_seconds": (low-origin)/hz, "seconds": elapsed,
+            "active_samples": total, "categories": dict(categories),
+            "exclusive_guest": [{"va": f"0x{a:08X}", "samples": n, "percent": 100*n/max(total,1)}
+                                for a, n in exclusive.most_common()],
+            "symbols": dict(symbols), "guest_attributed": {f"0x{a:08X}": n for a, n in guest_functions.items()},
+        }, indent=2)+"\n", encoding="utf-8")
     print(report, end="")
 
 
