@@ -99,7 +99,7 @@ public static class AC1BenchProcessTree {
     if (-not (Test-Path $binaryPath)) {
         Wait-ForQuietMachine
         if ($LiftArgs -and -not (Test-LiftFresh $generated)) {
-            $liftArgv = @(); if ($LiftArgs) { $liftArgv = $LiftArgs -split '\s+' | Where-Object { $_ } }
+            $liftArgv = @(); if ($LiftArgs) { $liftArgv = @($LiftArgs -split '\s+' | Where-Object { $_ }) }
             & $Python -B tools/analyze_pe.py; if ($LASTEXITCODE) { throw 'PE analysis failed' }
             & $Python -B tools/lift_ac1.py --output-dir $generated @liftArgv; if ($LASTEXITCODE) { throw 'AC1 lift failed' }
         } elseif (-not $LiftArgs -and -not (Test-LiftFresh $generated)) {
