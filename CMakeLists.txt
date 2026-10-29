@@ -6,6 +6,9 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 option(AC1_TRACE_EIP "Record the last original instruction address for startup diagnostics" ON)
 option(AC1_HOST_D3D9 "Build the native Windows D3D9 bridge" ${WIN32})
+option(AC1_NATIVE_BINK "Decode Bink imports through host FFmpeg (Android requires its own build)" ${WIN32})
+set(AC1_FFMPEG_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/work/bink_native/ffmpeg-native"
+    CACHE PATH "Private FFmpeg static libraries; bootstrap with ports/ffmpeg/build_mingw_probe.py")
 set(AC1_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/work/lift_initial" CACHE PATH "Private generated AC1 C source")
 set(AC1_BINK_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/work/lift_bink" CACHE PATH "Private generated Bink C source")
 file(GLOB AC1_GENERATED CONFIGURE_DEPENDS
@@ -34,6 +37,32 @@ add_library(ac1_runtime STATIC
   ${AC1_BINK_GENERATED})
 set_target_properties(ac1_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(ac1_runtime PUBLIC Threads::Threads)
+if(AC1_NATIVE_BINK)
+  enable_language(CXX)
+  target_sources(ac1_runtime PRIVATE src/platform/ac1_bink_native.cpp)
+  target_compile_features(ac1_runtime PRIVATE cxx_std_17)
+  target_compile_definitions(ac1_runtime PRIVATE AC1_NATIVE_BINK=1)
+  # The sandbox bootstrap keeps generated config and archives at its prefix,
+  # with unmodified public headers in the adjacent official source checkout.
+  if(EXISTS "${AC1_FFMPEG_PREFIX}/libavutil/avconfig.h" AND
+     EXISTS "${AC1_FFMPEG_PREFIX}/libavcodec.a")
+    target_include_directories(ac1_runtime PRIVATE "${AC1_FFMPEG_PREFIX}"
+      "${AC1_FFMPEG_PREFIX}/../ffmpeg-src")
+    set(ac1_ffmpeg_libdir "${AC1_FFMPEG_PREFIX}")
+  else()
+    target_include_directories(ac1_runtime PRIVATE "${AC1_FFMPEG_PREFIX}/include")
+    set(ac1_ffmpeg_libdir "${AC1_FFMPEG_PREFIX}/lib")
+  endif()
+  foreach(component avformat avcodec swscale avutil)
+    if(NOT EXISTS "${ac1_ffmpeg_libdir}/lib${component}.a")
+      message(FATAL_ERROR "Missing static FFmpeg ${component}; run python -B ports/ffmpeg/build_mingw_probe.py or set AC1_FFMPEG_PREFIX")
+    endif()
+    target_link_libraries(ac1_runtime PRIVATE "${ac1_ffmpeg_libdir}/lib${component}.a")
+  endforeach()
+  if(WIN32)
+    target_link_libraries(ac1_runtime PRIVATE bcrypt ole32 ws2_32 psapi m)
+  endif()
+endif()
 if(WIN32)
   enable_language(CXX)
   target_sources(ac1_runtime PRIVATE

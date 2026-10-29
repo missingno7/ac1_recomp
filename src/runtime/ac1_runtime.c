@@ -5785,6 +5785,238 @@ static int handle_optional_eax_import(CPU *cpu, const import_record *import)
     return 1;
 }
 
+#if defined(AC1_NATIVE_BINK)
+#include "../platform/ac1_bink_native.h"
+/* Native Bink records use the runtime heap. AC1 only releases the handle via
+ * BinkClose (009e8bdb), then zeros player+78; it never frees this pointer itself.
+ * Guest allocator callbacks are metadata, never cast to native functions. */
+typedef struct {
+    uint32_t record, file, io_error;
+    uint64_t size;
+} ac1_native_bink_file;
+static ac1_bink_provider *native_bink;
+static ac1_native_bink_file native_bink_files[16];
+static int native_bink_enabled, native_bink_silent;
+static uint32_t native_bink_allocator, native_bink_free;
+static uint64_t native_bink_frames, native_bink_copies, native_bink_pcm_frames, native_bink_trace_at;
+#ifdef _WIN32
+static void *native_bink_audio;
+#endif
+
+static void native_bink_trace(int force)
+{
+    uint64_t now = guest_monotonic_ns();
+    if (!trace_imports || !native_bink_enabled ||
+        (!force && now - native_bink_trace_at < UINT64_C(1000000000))) return;
+    native_bink_trace_at = now;
+    fprintf(stderr, "AC1 native Bink progress: DoFrame=%llu CopyToBuffer=%llu PCM-frames=%llu audio=%s%s\n",
+            (unsigned long long)native_bink_frames, (unsigned long long)native_bink_copies,
+            (unsigned long long)native_bink_pcm_frames, native_bink_silent ? "silent" : "DirectSound",
+            force ? " final" : "");
+}
+static int native_bink_write(void *opaque, uint32_t address, const void *input, size_t bytes)
+{
+    (void)opaque;
+    void *dest = guest_memory_try_ptr(address, bytes);
+    if (!dest) return 0;
+    memcpy(dest, input, bytes); return 1;
+}
+static uint64_t native_bink_clock(void *opaque)
+{
+    (void)opaque; return guest_monotonic_ns() / 1000u;
+}
+static int native_bink_read(void *opaque, uint8_t *buffer, int bytes)
+{
+    ac1_native_bink_file *file = (ac1_native_bink_file *)opaque;
+    uint32_t got = 0u;
+    int rc = ac1_files_read(guest_files, file->file, buffer, (uint32_t)bytes, &got, &file->io_error);
+    return rc == AC1_FILES_HANDLED && !file->io_error ? (int)got : -1;
+}
+static int64_t native_bink_seek(void *opaque, int64_t offset, int whence)
+{
+    ac1_native_bink_file *file = (ac1_native_bink_file *)opaque;
+    uint64_t raw = (uint64_t)offset;
+    uint32_t low = 0u, high = 0u;
+    if (whence < 0 || whence > 2) return -1;
+    int rc = ac1_files_seek(guest_files, file->file, (uint32_t)raw, 1,
+                            (uint32_t)(raw >> 32), (uint32_t)whence, &low, &high, &file->io_error);
+    if (rc != AC1_FILES_HANDLED || file->io_error || high > INT32_MAX) return -1;
+    return (int64_t)(((uint64_t)high << 32) | low);
+}
+static int native_bink_pcm(void *opaque, uint32_t record, uint32_t track,
+                           const int16_t *pcm, size_t frames, uint32_t rate,
+                           uint32_t channels, uint64_t pts)
+{
+    (void)opaque;
+    if (native_bink_silent) return 1;
+#ifdef _WIN32
+    if (!ac1_bink_audio_submit(native_bink_audio, record, track, pcm, frames, rate, channels, pts)) return 0;
+    native_bink_pcm_frames += frames;
+    return 1;
+#else
+    (void)record; (void)track; (void)pcm; (void)frames; (void)rate; (void)channels; (void)pts;
+    return 0;
+#endif
+}
+static void native_bink_control(void *opaque, uint32_t record, int event)
+{
+    (void)opaque;
+#ifdef _WIN32
+    ac1_bink_audio_control(native_bink_audio, record, event);
+#else
+    (void)record; (void)event;
+#endif
+}
+static void native_bink_file_release(ac1_native_bink_file *file)
+{
+    uint32_t error = 0u;
+    if (file->file) ac1_files_close(guest_files, file->file, &error);
+    if (file->record && process_heap) pcrecomp_heap_free(process_heap, file->record);
+    memset(file, 0, sizeof(*file));
+}
+static void native_bink_shutdown(void)
+{
+    native_bink_trace(1);
+    ac1_bink_destroy(native_bink); native_bink = NULL;
+    for (unsigned i = 0; i < 16u; ++i) native_bink_file_release(&native_bink_files[i]);
+#ifdef _WIN32
+    ac1_bink_audio_destroy(native_bink_audio); native_bink_audio = NULL;
+#endif
+}
+static void native_bink_reset(void)
+{
+    const char *translated = getenv("AC1_BINK_TRANSLATED");
+    const char *silent = getenv("AC1_BINK_SILENT");
+    native_bink_enabled = !(translated && !strcmp(translated, "1"));
+    native_bink_silent = silent && !strcmp(silent, "1");
+#ifndef _WIN32
+    native_bink_silent = 1;
+#endif
+    native_bink_allocator = native_bink_free = 0u;
+    native_bink_frames = native_bink_copies = native_bink_pcm_frames = native_bink_trace_at = 0u;
+    if (trace_imports || native_bink_silent)
+        fprintf(stderr, "AC1 Bink provider: %s%s\n", native_bink_enabled ? "native FFmpeg" : "translated DLL",
+                native_bink_enabled && native_bink_silent ? " (explicit silent-audio mode)" : "");
+}
+static int native_bink_factory(uint32_t address)
+{
+    const import_record *factory = find_import(address);
+    if (factory && !factory->by_ordinal && equal_ascii_fold(factory->dll, "binkw32.dll") &&
+        !strcmp(factory->name, "_BinkOpenDirectSound@4")) return 1;
+    uint32_t original = 0u; char error[128];
+    return pe32_export_by_name(&bink_image, "_BinkOpenDirectSound@4", &original, error, sizeof error) && original == address;
+}
+static int handle_native_bink_import(CPU *cpu, const import_record *import)
+{
+    static const struct { const char *name; unsigned argc; } api[] = {
+        {"_BinkWait@4",1}, {"_BinkSetSoundTrack@8",2}, {"_BinkShouldSkip@4",1},
+        {"_BinkNextFrame@4",1}, {"_BinkSetSoundSystem@8",2}, {"_BinkDoFrame@4",1},
+        {"_BinkOpen@8",2}, {"_BinkSetVolume@12",3}, {"_BinkPause@8",2},
+        {"_BinkClose@4",1}, {"_BinkSetMemory@8",2}, {"_BinkGetFrameBuffersInfo@8",2},
+        {"_BinkCopyToBuffer@28",7}, {"_BinkOpenDirectSound@4",1}
+    };
+    unsigned op;
+    for (op = 0u; op < sizeof(api)/sizeof(api[0]); ++op)
+        if (!import->by_ordinal && !strcmp(import->name, api[op].name)) break;
+    if (op == sizeof(api)/sizeof(api[0])) stop_guest("unknown native Bink import/ordinal", import->token);
+    size_t stack_bytes = 4u + api[op].argc * 4u;
+    if ((uint64_t)cpu->esp + stack_bytes > UINT64_C(0x100000000) ||
+        !guest_memory_try_ptr(cpu->esp, stack_bytes)) stop_guest("native Bink stdcall frame is unmapped", import->token);
+    uint32_t a[7] = {0u};
+    for (unsigned i = 0; i < api[op].argc; ++i) a[i] = rd32(cpu->esp + 4u + i*4u);
+    if (!native_bink) {
+        ac1_bink_callbacks cb = {NULL, native_bink_write, native_bink_clock, native_bink_pcm, native_bink_control};
+        native_bink = ac1_bink_create(&cb);
+        if (!native_bink) stop_guest("cannot allocate native Bink provider", import->token);
+    }
+#ifdef _WIN32
+    if (!ac1_bink_audio_service(native_bink_audio))
+        stop_guest("native Bink DirectSound streaming service/control failed", import->token);
+#endif
+    int rc = 1; uint32_t result = 0u;
+    switch (op) {
+    case 0: rc = ac1_bink_wait(native_bink,a[0]); result = (uint32_t)rc; break;
+    case 1: {
+        uint32_t tracks[8];
+        if (a[0] > 8u || (a[0] && (!a[1] || !guest_memory_try_ptr(a[1], (size_t)a[0]*4u))))
+            stop_guest("native BinkSetSoundTrack list is invalid/unmapped", import->token);
+        for (unsigned i=0; i<a[0]; ++i) tracks[i] = rd32(a[1]+i*4u);
+        rc = ac1_bink_set_sound_tracks(native_bink,a[0],tracks); break;
+    }
+    case 2: rc = ac1_bink_should_skip(native_bink,a[0]); result = (uint32_t)rc; break;
+    case 3: rc = ac1_bink_next_frame(native_bink,a[0]); break;
+    case 4:
+        if (!native_bink_factory(a[0])) stop_guest("native BinkSetSoundSystem requires the BinkOpenDirectSound factory", import->token);
+#ifdef _WIN32
+        if (!native_bink_silent && !native_bink_audio) {
+            char error[192]; native_bink_audio = ac1_bink_audio_create(error,sizeof error);
+            if (!native_bink_audio) {
+                native_bink_silent = 1;
+                fprintf(stderr,"AC1 native Bink explicit silent-audio fallback: %s\n",error);
+            }
+        }
+#endif
+        if (trace_imports) fprintf(stderr,"AC1 native Bink sound handshake: factory=0x%08x guest-DirectSound=0x%08x audio=%s\n",a[0],a[1],native_bink_silent?"silent":"DirectSound");
+        result = 1u; break;
+    case 5: rc = ac1_bink_do_frame(native_bink,a[0]); if (rc>0) ++native_bink_frames; break;
+    case 6: {
+        const char *path = guest_cstring(a[0],32768u);
+        if (!path) stop_guest("native BinkOpen filename is unmapped/unterminated", import->token);
+        ac1_native_bink_file *file = NULL;
+        for (unsigned i=0; i<16u; ++i) if (!native_bink_files[i].record) { file=&native_bink_files[i]; break; }
+        if (!file) stop_guest("native Bink active movie limit (16)",import->token);
+        uint32_t handle = UINT32_MAX, error = 0u;
+        int status = ac1_files_open(guest_files,path,0x80000000u,3u,0,3u,0x08000080u,0u,&handle,&error);
+        if (status != AC1_FILES_HANDLED || error) {
+            char message[512]; snprintf(message,sizeof message,"native BinkOpen rooted asset '%s': service=%d Win32=%u",path,status,error);
+            stop_guest(message,import->token);
+        }
+        file->file = handle;
+        if (ac1_files_get_size(guest_files,handle,&file->size,&error) != AC1_FILES_HANDLED || error)
+            stop_guest("native BinkOpen cannot query rooted asset size",import->token);
+        file->record = pcrecomp_heap_alloc(process_heap,AC1_BINK_RECORD_BYTES,1);
+        if (!file->record) stop_guest("native Bink guest record heap exhausted",import->token);
+        ac1_bink_input source = {file,file->size,native_bink_read,native_bink_seek};
+        rc = ac1_bink_open_input(native_bink,file->record,&source,a[1]);
+        result = file->record;
+        if (trace_imports && rc>0) fprintf(stderr,"AC1 native Bink open: '%s' flags=0x%08x record=0x%08x size=%ux%u frames=%u fps=%u/%u guest-allocator=0x%08x (runtime heap)\n",path,a[1],result,rd32(result),rd32(result+4),rd32(result+8),rd32(result+0x14),rd32(result+0x18),native_bink_allocator);
+        break;
+    }
+    case 7: rc = ac1_bink_set_volume(native_bink,a[0],a[1],(int32_t)a[2]); break;
+    case 8: rc = ac1_bink_pause(native_bink,a[0],(int)a[1]); break;
+    case 9:
+        rc = ac1_bink_close(native_bink,a[0]);
+        if (rc>0) for (unsigned i=0;i<16u;++i) if (native_bink_files[i].record==a[0]) { native_bink_file_release(&native_bink_files[i]); break; }
+        break;
+    case 10:
+        native_bink_allocator=a[0]; native_bink_free=a[1];
+        rc = ac1_bink_set_memory(native_bink,a[0],a[1]);
+        if (trace_imports) fprintf(stderr,"AC1 native BinkSetMemory: allocator=0x%08x free=0x%08x recorded; records owned by runtime heap\n",a[0],a[1]);
+        break;
+    case 11: rc = ac1_bink_get_frame_buffers_info(native_bink,a[0],a[1]); break;
+    case 12: {
+        uint64_t span = (uint64_t)a[2]*a[3];
+        if ((int32_t)a[2] <= 0 || !a[1] || !span || span > SIZE_MAX ||
+            (uint64_t)a[1]+span > UINT64_C(0x100000000)) stop_guest("native BinkCopyToBuffer invalid guest surface extent",import->token);
+        void *dest = guest_memory_try_ptr(a[1],(size_t)span);
+        if (!dest) stop_guest("native BinkCopyToBuffer full guest staging surface is unmapped",import->token);
+        rc = ac1_bink_copy_to_buffer(native_bink,a[0],dest,(size_t)span,(int32_t)a[2],a[3],a[4],a[5],a[6]);
+        if (rc>0) ++native_bink_copies;
+        break;
+    }
+    case 13: result = import->token; break; /* Recognized guest factory token; never a host pointer. */
+    }
+    if (rc < 0) {
+        char message[512]; snprintf(message,sizeof message,"native %s record/arg0=0x%08x: %s",api[op].name,a[0],ac1_bink_error(native_bink));
+        stop_guest(message,import->token);
+    }
+    native_bink_trace(0);
+    cpu->eax = result; /* EBX/ESI/EDI/EBP and all other guest registers untouched. */
+    return_stdcall(cpu,api[op].argc*4u);
+    return 1;
+}
+#endif
+
 static int handle_bink_import(CPU *cpu, const import_record *import)
 {
     uint32_t export_address = 0u;
@@ -5813,6 +6045,10 @@ static int handle_bink_import(CPU *cpu, const import_record *import)
                      import->name, error);
         stop_guest(message, import->token);
     }
+
+#if defined(AC1_NATIVE_BINK)
+    if (native_bink_enabled) return handle_native_bink_import(cpu, import);
+#endif
 
     uint32_t allocator = 0u, free_callback = 0u;
     int check_set_memory = !import->by_ordinal &&
@@ -6458,6 +6694,9 @@ int ac1_run(const char *exe_path)
     if (trace_imports)
         fprintf(stderr, "AC1 dispatch guard: limit=%llu (0 disables)\n",
                 (unsigned long long)dispatch_limit);
+#if defined(AC1_NATIVE_BINK)
+    native_bink_reset();
+#endif
     trace_import_count = 0;
     trace_callback_count = 0;
     trace_file_read_count = 0;
@@ -6720,6 +6959,9 @@ cleanup:
         ac1_dinput8_shutdown();
         dinput8_configured = 0;
     }
+#endif
+#if defined(AC1_NATIVE_BINK)
+    native_bink_shutdown();
 #endif
     ac1_network_reset();
     ac1_crypto_reset();
