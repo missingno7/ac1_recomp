@@ -24,6 +24,7 @@ extern uintptr_t ac1_android_d3d9_guest_hwnd(void *context, uint32_t guest_hwnd)
 #endif
 #endif
 
+#include <ctype.h>
 #include <setjmp.h>
 #include <errno.h>
 #include <stdint.h>
@@ -4376,6 +4377,68 @@ static int handle_version_import(CPU *cpu, const import_record *import)
     return 1;
 }
 
+/* Bulk guest copy across adjacent mappings (each piece is one region).
+ * Returns 0 before writing anything if any byte is unmapped. */
+static size_t guest_span_piece(uint32_t address, size_t remaining)
+{
+    if (guest_memory_try_ptr(address, remaining)) return remaining;
+    size_t low = 0u, high = remaining;
+    while (high - low > 1u) {
+        size_t mid = low + (high - low) / 2u;
+        if (guest_memory_try_ptr(address, mid)) low = mid; else high = mid;
+    }
+    return low;
+}
+
+static int guest_span_mapped(uint32_t address, size_t size)
+{
+    if ((uint64_t)address + size > UINT64_C(0x100000000)) return 0;
+    while (size) {
+        size_t piece = guest_span_piece(address, size);
+        if (!piece) return 0;
+        address += (uint32_t)piece;
+        size -= piece;
+    }
+    return 1;
+}
+
+static int guest_span_write(uint32_t address, const void *input, size_t size)
+{
+    if (!guest_span_mapped(address, size)) return 0;
+    const uint8_t *bytes = (const uint8_t *)input;
+    while (size) {
+        size_t piece = guest_span_piece(address, size);
+        memcpy(guest_memory_try_ptr(address, piece), bytes, piece);
+        address += (uint32_t)piece;
+        bytes += piece;
+        size -= piece;
+    }
+    return 1;
+}
+
+/* Development option mirroring players who delete intro videos:
+ * AC1_HIDE_FILES="videos\UBI_LOGO.bik;videos\DemoIntro.bik" makes those exact
+ * guest paths (case-insensitive) report ERROR_FILE_NOT_FOUND. Unset: no effect. */
+static int guest_path_hidden(const char *guest_path)
+{
+    const char *list = getenv("AC1_HIDE_FILES");
+    if (!list || !*list) return 0;
+    size_t length = strlen(guest_path);
+    while (*list) {
+        const char *end = strchr(list, ';');
+        size_t item = end ? (size_t)(end - list) : strlen(list);
+        if (item == length) {
+            size_t i = 0;
+            while (i < item && tolower((unsigned char)list[i]) ==
+                               tolower((unsigned char)guest_path[i])) ++i;
+            if (i == item) return 1;
+        }
+        if (!end) break;
+        list = end + 1;
+    }
+    return 0;
+}
+
 static int handle_file_import(CPU *cpu, const import_record *import)
 {
     if (!import || import->by_ordinal ||
@@ -4398,6 +4461,14 @@ static int handle_file_import(CPU *cpu, const import_record *import)
 
         uint32_t handle = UINT32_MAX;
         uint32_t error = 0u;
+        if (guest_path_hidden(guest_path)) {
+            if (trace_imports)
+                fprintf(stderr, "AC1 file hidden by AC1_HIDE_FILES: path=\"%s\"\n", guest_path);
+            cpu->eax = UINT32_MAX;
+            last_error = 2u; /* ERROR_FILE_NOT_FOUND */
+            return_stdcall(cpu, 28u);
+            return 1;
+        }
         int file_result = ac1_files_open(
             guest_files, guest_path, arguments[1], arguments[2],
             arguments[3] != 0u, arguments[4], arguments[5], arguments[6],
@@ -4434,8 +4505,19 @@ static int handle_file_import(CPU *cpu, const import_record *import)
         void *buffer = requested
             ? guest_memory_try_ptr(buffer_address, requested)
             : NULL;
-        if (requested && !buffer)
-            stop_guest("ReadFile buffer is unmapped", import->token);
+        /* A synchronous read into a buffer spanning adjacent mappings goes
+         * through a host bounce buffer; overlapped I/O needs one mapping. */
+        void *bounce = NULL;
+        if (requested && !buffer) {
+            if (overlapped_address)
+                stop_guest("ReadFile overlapped buffer is not inside one guest mapping",
+                           import->token);
+            if (!guest_span_mapped(buffer_address, requested))
+                stop_guest("ReadFile buffer is unmapped", import->token);
+            bounce = malloc(requested);
+            if (!bounce) stop_guest("ReadFile bounce buffer allocation failed", import->token);
+            buffer = bounce;
+        }
         uint32_t bytes_read = 0u;
         uint32_t error = 0u;
         ac1_files_overlapped_snapshot snapshot = {0};
@@ -4486,6 +4568,13 @@ static int handle_file_import(CPU *cpu, const import_record *import)
                 stop_guest("ReadFile byte-count output is unmapped", import->token);
             file_result = ac1_files_read(
                 guest_files, handle, buffer, requested, &bytes_read, &error);
+            if (bounce) {
+                if (file_result == AC1_FILES_HANDLED && bytes_read &&
+                    !guest_span_write(buffer_address, bounce, bytes_read))
+                    stop_guest("ReadFile spanning buffer became unmapped", import->token);
+                free(bounce);
+                buffer = NULL;
+            }
             if (file_result == AC1_FILES_HANDLED)
                 *transferred = bytes_read;
         }

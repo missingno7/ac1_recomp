@@ -478,18 +478,39 @@ bool copy_guest_wave_format(uint32_t address, std::vector<uint8_t> *native_bytes
     return true;
 }
 
+/* DSBUFFERDESC is 36 bytes; DirectX 7 clients (Bink's DirectSound backend)
+ * pass the 20-byte DSBUFFERDESC1 without guid3DAlgorithm, which means
+ * DS3DALG_DEFAULT (GUID_NULL). Only the declared size is read. */
+int read_guest_buffer_desc(uint32_t address, GuestDsBufferDesc *desc,
+                           const char *operation)
+{
+    constexpr uint32_t kDesc1Bytes = 20u;
+    *desc = GuestDsBufferDesc{};
+    if (!guest_read(address, &desc->size, sizeof(desc->size))) {
+        set_error(std::string("DirectSound ") + operation +
+                  " descriptor is not readable in guest memory");
+        return AC1_DS8_ERROR;
+    }
+    if (desc->size != kDesc1Bytes && desc->size != sizeof(GuestDsBufferDesc)) {
+        set_error(std::string("DirectSound ") + operation + " descriptor size " +
+                  std::to_string(desc->size) +
+                  " is neither the 20-byte DSBUFFERDESC1 nor the 36-byte DSBUFFERDESC");
+        return AC1_DS8_METHOD_UNSUPPORTED;
+    }
+    if (!guest_read(address, desc, desc->size)) {
+        set_error(std::string("DirectSound ") + operation +
+                  " descriptor is not readable in guest memory");
+        return AC1_DS8_ERROR;
+    }
+    return AC1_DS8_HANDLED;
+}
+
 int invoke_create_sound_buffer(GuestObject &object, const uint32_t *args,
                                uint32_t *result_out)
 {
     GuestDsBufferDesc guest_desc{};
-    if (!guest_read(args[1], &guest_desc, sizeof(guest_desc))) {
-        set_error("DirectSound CreateSoundBuffer descriptor is not readable in guest memory");
-        return AC1_DS8_ERROR;
-    }
-    if (guest_desc.size != sizeof(guest_desc)) {
-        set_error("DirectSound CreateSoundBuffer descriptor does not use the observed 36-byte x86 ABI");
-        return AC1_DS8_METHOD_UNSUPPORTED;
-    }
+    const int desc_status = read_guest_buffer_desc(args[1], &guest_desc, "CreateSoundBuffer");
+    if (desc_status != AC1_DS8_HANDLED) return desc_status;
     if (args[3] != 0u) {
         set_error("DirectSound CreateSoundBuffer aggregation is unsupported");
         return AC1_DS8_METHOD_UNSUPPORTED;
@@ -547,14 +568,8 @@ int invoke_buffer_initialize(GuestObject &object, const uint32_t *args,
         return AC1_DS8_ERROR;
     }
     GuestDsBufferDesc guest_desc{};
-    if (!guest_read(args[2], &guest_desc, sizeof(guest_desc))) {
-        set_error("DirectSound Buffer::Initialize descriptor is not readable in guest memory");
-        return AC1_DS8_ERROR;
-    }
-    if (guest_desc.size != sizeof(guest_desc)) {
-        set_error("DirectSound Buffer::Initialize descriptor does not use the observed 36-byte x86 ABI");
-        return AC1_DS8_METHOD_UNSUPPORTED;
-    }
+    const int desc_status = read_guest_buffer_desc(args[2], &guest_desc, "Buffer::Initialize");
+    if (desc_status != AC1_DS8_HANDLED) return desc_status;
     DSBUFFERDESC native_desc{};
     native_desc.dwSize = sizeof(native_desc);
     native_desc.dwFlags = guest_desc.flags;

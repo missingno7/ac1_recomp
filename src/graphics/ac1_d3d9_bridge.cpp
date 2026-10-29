@@ -274,6 +274,62 @@ using D3DXGetShaderConstantTableFn = HRESULT (WINAPI *)(
 D3DXGetShaderConstantTableFn g_d3dx_get_shader_constant_table = nullptr;
 #endif
 
+#if defined(_WIN32)
+/* Evidence capture: with AC1_D3D9_CAPTURE_DIR set, write the current back
+ * buffer as a 32-bit BMP before Presents 1, 2, 4, 8, ... (power-of-two count
+ * of the upcoming present). Failures are reported and never alter Present. */
+uint64_t g_capture_present_index = 0;
+void capture_back_buffer(IDirect3DDevice9 *device)
+{
+    const char *dir = std::getenv("AC1_D3D9_CAPTURE_DIR");
+    if (!dir || !*dir || !device) return;
+    const uint64_t n = ++g_capture_present_index;
+    if (n & (n - 1u)) return;
+    IDirect3DSurface9 *back = nullptr, *copy = nullptr;
+    D3DSURFACE_DESC desc{};
+    D3DLOCKED_RECT locked{};
+    HRESULT hr = device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back);
+    if (SUCCEEDED(hr)) hr = back->GetDesc(&desc);
+    if (SUCCEEDED(hr) && desc.Format != D3DFMT_X8R8G8B8 && desc.Format != D3DFMT_A8R8G8B8)
+        hr = E_NOTIMPL;
+    if (SUCCEEDED(hr))
+        hr = device->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format,
+                                                 D3DPOOL_SYSTEMMEM, &copy, nullptr);
+    if (SUCCEEDED(hr)) hr = device->GetRenderTargetData(back, copy);
+    if (SUCCEEDED(hr)) hr = copy->LockRect(&locked, nullptr, D3DLOCK_READONLY);
+    if (SUCCEEDED(hr)) {
+        char path[1024];
+        std::snprintf(path, sizeof(path), "%s/present_%06llu.bmp", dir,
+                      static_cast<unsigned long long>(n));
+        FILE *file = std::fopen(path, "wb");
+        if (file) {
+            const uint32_t row = desc.Width * 4u, image = row * desc.Height;
+            uint8_t header[54]{};
+            auto put32 = [&](int at, uint32_t v) { std::memcpy(header + at, &v, 4); };
+            header[0] = 'B'; header[1] = 'M';
+            put32(2, 54u + image); put32(10, 54u); put32(14, 40u);
+            put32(18, desc.Width); put32(22, static_cast<uint32_t>(-static_cast<int32_t>(desc.Height)));
+            header[26] = 1; header[28] = 32; put32(34, image);
+            std::fwrite(header, 1, sizeof(header), file);
+            for (uint32_t y = 0; y < desc.Height; ++y)
+                std::fwrite(static_cast<const uint8_t *>(locked.pBits) + y * locked.Pitch, 1, row, file);
+            std::fclose(file);
+            std::fprintf(stderr, "AC1 D3D9 capture: %s (%ux%u format=%u draw_calls=%llu)\n",
+                         path, desc.Width, desc.Height, static_cast<unsigned>(desc.Format),
+                         static_cast<unsigned long long>(g_successful_draw_calls));
+        } else {
+            std::fprintf(stderr, "AC1 D3D9 capture: cannot open %s\n", path);
+        }
+        copy->UnlockRect();
+    } else {
+        std::fprintf(stderr, "AC1 D3D9 capture: present %llu failed hr=0x%08lx\n",
+                     static_cast<unsigned long long>(n), static_cast<unsigned long>(hr));
+    }
+    if (copy) copy->Release();
+    if (back) back->Release();
+}
+#endif
+
 void trace_frame_success(bool is_present, const char *method)
 {
 #if defined(_WIN32)
@@ -286,6 +342,11 @@ void trace_frame_success(bool is_present, const char *method)
     if (!g_frame_trace_enabled) return;
     if (is_present) {
         ++g_successful_present_calls;
+        const uint64_t n = g_successful_present_calls;
+        if (n >= 2u && !(n & (n - 1u)))
+            std::fprintf(stderr, "AC1 D3D9 trace: present_calls=%llu draw_calls=%llu\n",
+                         static_cast<unsigned long long>(n),
+                         static_cast<unsigned long long>(g_successful_draw_calls));
         if (!g_first_present_reported) {
             std::fprintf(stderr,
                 "AC1 D3D9 trace: first successful Present via %s (present_calls=%llu, draw_calls=%llu)\n",
@@ -2312,6 +2373,9 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
     if (method == 17) {
         if (!require_count(argc, 5, "IDirect3DDevice9::Present"))
             return hresult(D3DERR_INVALIDCALL);
+#if defined(_WIN32)
+        capture_back_buffer(static_cast<IDirect3DDevice9 *>(object.native));
+#endif
         const HRESULT status = present_device(
             static_cast<IDirect3DDevice9 *>(object.native), args);
         if (SUCCEEDED(status)) trace_frame_success(true, "Present");
