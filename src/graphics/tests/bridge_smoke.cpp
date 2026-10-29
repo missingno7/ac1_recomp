@@ -28,9 +28,10 @@ uint32_t allocate_guest(void *context, uint32_t size, uint32_t alignment);
 uint32_t guest_word(uint32_t address);
 uint32_t object_slot(uint32_t object, uint32_t slot);
 
-bool compile_native_smoke_shader(std::vector<uint8_t> *bytecode)
+bool compile_native_smoke_shader(const char *source, const char *profile,
+                                 std::vector<uint8_t> *bytecode)
 {
-    if (!bytecode) return false;
+    if (!source || !profile || !bytecode) return false;
     HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
     if (!compiler) return false;
     auto compile = reinterpret_cast<pD3DCompile>(GetProcAddress(compiler, "D3DCompile"));
@@ -38,12 +39,10 @@ bool compile_native_smoke_shader(std::vector<uint8_t> *bytecode)
         FreeLibrary(compiler);
         return false;
     }
-    static const char source[] =
-        "float4 main() : COLOR0 { return float4(1.0, 0.0, 0.0, 1.0); }";
     ID3DBlob *shader = nullptr;
     ID3DBlob *errors = nullptr;
-    const HRESULT status = compile(source, sizeof(source) - 1, "ac1-d3d9-smoke",
-        nullptr, nullptr, "main", "ps_3_0", 0, 0, &shader, &errors);
+    const HRESULT status = compile(source, std::strlen(source), "ac1-d3d9-smoke",
+        nullptr, nullptr, "main", profile, 0, 0, &shader, &errors);
     if (FAILED(status) && errors)
         std::fprintf(stderr, "D3DCompile diagnostic: %s\n",
                      static_cast<const char *>(errors->GetBufferPointer()));
@@ -56,6 +55,49 @@ bool compile_native_smoke_shader(std::vector<uint8_t> *bytecode)
     if (errors) errors->Release();
     FreeLibrary(compiler);
     return ok;
+}
+
+bool run_native_shader_smoke(uint32_t device, const char *source,
+                             const char *profile, uint32_t create_slot,
+                             uint32_t bind_slot, const char *label)
+{
+    std::vector<uint8_t> bytecode;
+    if (!compile_native_smoke_shader(source, profile, &bytecode)) {
+        std::fprintf(stderr, "could not compile synthetic %s smoke shader\n", profile);
+        return false;
+    }
+    const uint32_t code_address = allocate_guest(
+        nullptr, static_cast<uint32_t>(bytecode.size()), 4);
+    const uint32_t shader_output = allocate_guest(nullptr, sizeof(uint32_t), 4);
+    std::memcpy(resolve_guest(nullptr, code_address,
+        static_cast<uint32_t>(bytecode.size()), AC1_D3D9_GUEST_WRITE),
+        bytecode.data(), bytecode.size());
+    const uint32_t create_args[] = {device, code_address, shader_output};
+    uint32_t result = 0;
+    if (ac1_d3d9_dispatch(object_slot(device, create_slot), create_args, 3,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result)) ||
+        !guest_word(shader_output)) {
+        std::fprintf(stderr, "native DXVK Create%sShader smoke failed: 0x%08x %s\n",
+                     label, result, ac1_d3d9_last_error());
+        return false;
+    }
+
+    const uint32_t shader = guest_word(shader_output);
+    const uint32_t bind_args[] = {device, shader};
+    const uint32_t clear_args[] = {device, 0};
+    const uint32_t release_args[] = {shader};
+    if (ac1_d3d9_dispatch(object_slot(device, bind_slot), bind_args, 2,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result)) ||
+        ac1_d3d9_dispatch(object_slot(device, bind_slot), clear_args, 2,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result)) ||
+        ac1_d3d9_dispatch(object_slot(shader, 2), release_args, 1, &result) != 1 ||
+        result != 0) {
+        std::fprintf(stderr, "native DXVK %s-shader bind/release smoke failed: %s\n",
+                     label, ac1_d3d9_last_error());
+        return false;
+    }
+    std::printf("native DXVK %s-shader create/bind/unbind/release passed\n", label);
+    return true;
 }
 
 struct GuestPresentParameters {
@@ -1021,48 +1063,16 @@ int main(int argc, char **argv)
         return fake_passed ? 0 : 19;
     }
 
-    std::vector<uint8_t> native_pixel_shader_code;
-    if (!compile_native_smoke_shader(&native_pixel_shader_code)) {
-        std::fprintf(stderr, "could not compile synthetic ps_3_0 smoke shader\n");
+    static const char pixel_source[] =
+        "float4 main() : COLOR0 { return float4(1.0, 0.0, 0.0, 1.0); }";
+    static const char vertex_source[] =
+        "float4 main(float4 position : POSITION) : POSITION { return position; }";
+    if (!run_native_shader_smoke(device, pixel_source, "ps_3_0", 106, 107, "Pixel") ||
+        !run_native_shader_smoke(device, vertex_source, "vs_3_0", 91, 92, "Vertex")) {
         DestroyWindow(hidden_window);
         ac1_d3d9_shutdown();
         return 46;
     }
-    const uint32_t native_shader_code_address = allocate_guest(
-        nullptr, static_cast<uint32_t>(native_pixel_shader_code.size()), 4);
-    const uint32_t native_shader_output = allocate_guest(nullptr, sizeof(uint32_t), 4);
-    std::memcpy(resolve_guest(nullptr, native_shader_code_address,
-        static_cast<uint32_t>(native_pixel_shader_code.size()), AC1_D3D9_GUEST_WRITE),
-        native_pixel_shader_code.data(), native_pixel_shader_code.size());
-    const uint32_t native_create_shader_args[] = {
-        device, native_shader_code_address, native_shader_output
-    };
-    if (ac1_d3d9_dispatch(object_slot(device, 106), native_create_shader_args, 3,
-                          &create_result) != 1 ||
-        FAILED(static_cast<HRESULT>(create_result)) || !guest_word(native_shader_output)) {
-        std::fprintf(stderr, "native DXVK CreatePixelShader smoke failed: 0x%08x %s\n",
-                     create_result, ac1_d3d9_last_error());
-        DestroyWindow(hidden_window);
-        ac1_d3d9_shutdown();
-        return 46;
-    }
-    const uint32_t native_shader = guest_word(native_shader_output);
-    const uint32_t native_bind_shader_args[] = {device, native_shader};
-    const uint32_t native_clear_shader_args[] = {device, 0};
-    const uint32_t native_shader_release_args[] = {native_shader};
-    if (ac1_d3d9_dispatch(object_slot(device, 107), native_bind_shader_args, 2,
-                          &create_result) != 1 || FAILED(static_cast<HRESULT>(create_result)) ||
-        ac1_d3d9_dispatch(object_slot(device, 107), native_clear_shader_args, 2,
-                          &create_result) != 1 || FAILED(static_cast<HRESULT>(create_result)) ||
-        ac1_d3d9_dispatch(object_slot(native_shader, 2), native_shader_release_args, 1,
-                          &create_result) != 1 || create_result != 0) {
-        std::fprintf(stderr, "native DXVK pixel-shader bind/release smoke failed: %s\n",
-                     ac1_d3d9_last_error());
-        DestroyWindow(hidden_window);
-        ac1_d3d9_shutdown();
-        return 47;
-    }
-    std::printf("native DXVK pixel-shader create/bind/unbind/release passed\n");
 
     uint32_t getter_result = 0;
     const uint32_t width_address = allocate_guest(nullptr, 4, 4);
