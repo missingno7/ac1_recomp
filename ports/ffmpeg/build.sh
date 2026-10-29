@@ -2,7 +2,8 @@
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 mode=${1:-mingw64}
-src=${FFMPEG_SOURCE:-$repo/work/bink_native/ffmpeg-src}
+# Full official n8.1 checkout (git clone --depth 1 --branch n8.1 https://github.com/FFmpeg/FFmpeg.git work/deps/ffmpeg-n8.1).
+src=${FFMPEG_SOURCE:-$repo/work/deps/ffmpeg-n8.1}
 if command -v cygpath >/dev/null; then src=$(cygpath -u "$src"); fi
 out=$repo/work/bink_native/ffmpeg-$mode
 pin=9047fa1b084f76b1b4d065af2d743df1b40dfb56
@@ -27,7 +28,8 @@ case "$mode" in
   if command -v cygpath >/dev/null; then ANDROID_NDK_HOME=$(cygpath -u "$ANDROID_NDK_HOME"); fi
   host=${NDK_HOST_TAG:-windows-x86_64}
   tc=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$host/bin
-  export PATH="$tc:$PATH"
+  # Host tools (configure probes, generators) use MSYS2 MinGW gcc.
+  export PATH="$tc:$PATH:/mingw64/bin"
   make_cmd=${MAKE:-make}
   # Direct clang avoids executing Windows .cmd compiler wrappers from MSYS.
   # -j1 by default below; this dependency build never compiles lifted game code.
