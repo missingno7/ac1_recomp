@@ -781,6 +781,52 @@ def run_ac1_switch_selftest(binary: Path, pcrecomp: Path) -> None:
             assert f"_jt == GVA(0x{target:08X})" in remapped_body
         assert "0x01010300" not in remapped_body
 
+        # GoSellMerchandise has a direct unsigned guard `cmp eax,3; ja`
+        # before its four-entry table. The next dword is an executable-section
+        # address inside a CALL displacement, so code-address-only scanning
+        # must stop at the proven bound rather than decode it as a switch arm.
+        merchandise = dis.disassemble_function(0x00EAD7A0, build_iat_map(info))
+        if merchandise is None or not merchandise.blocks:
+            raise AssertionError("AC1 GoSellMerchandise switch did not disassemble")
+        merchandise_jump = next(
+            ins for block in merchandise.blocks.values() for ins in block.instructions
+            if ins.address == 0x00EAD7B6)
+        merchandise_targets = {0x00EAD7BD, 0x00EAD7C5}
+        assert ac1_pinned_switch_limit(merchandise_jump) == 4
+        assert set(dis.jump_table_targets(merchandise_jump)) == merchandise_targets
+        assert merchandise_targets <= merchandise.blocks.keys()
+        assert 0x00C70424 not in merchandise.blocks
+        # This false CFG entry lies inside the CALL immediate in C70420. A
+        # CMP/JA-looking byte suffix must never authorize a generic bound.
+        false_operand_jump = SimpleNamespace(
+            address=0x00C7042F, mnemonic="jmp",
+            operands=[SimpleNamespace(type=X86_OP_MEM, mem=SimpleNamespace(
+                base=0, index=merchandise_jump.operands[0].mem.index,
+                scale=4, disp=0x00EAD830))],
+        )
+        assert ac1_pinned_switch_limit(false_operand_jump) is None
+        merchandise_spec = {
+            "address": 0x00EAD7A0,
+            "size": merchandise.size,
+            "blocks": [{
+                "start": block.start,
+                "end": block.end,
+                "successors": sorted(set(block.successors)),
+                "is_exit": block.is_exit,
+                "instructions": [[ins.address, ins.size] for ins in block.instructions],
+            } for block in merchandise.blocks.values()],
+        }
+        merchandise_body = lift_exact_function(
+            remap_lifter, merchandise_spec,
+            lambda va, count: pe.get_data((va - image_base) & 0xFFFFFFFF, count),
+            X86_OP_IMM, X86_OP_MEM)
+        for target in sorted(merchandise_targets):
+            assert f"if (_jt == GVA(0x{target:08X})) goto L_{target:08X};" in merchandise_body
+            assert f"L_{target:08X}:" in merchandise_body
+        assert "0x00C70424" not in merchandise_body
+        assert "aad 0xcb" not in merchandise_body
+        print("AC1 guarded-switch regression: GoSellMerchandise table bounded to four proven arms")
+
         # This scalar memmove switch has an invalid dword in slot 0 because
         # the nominal table base overlaps the previous JMP+NOP. The guarded
         # EAX mask selects slots 1..3, all three of which are local CFG blocks.
@@ -1249,6 +1295,21 @@ def infer_remapped_switch_limit(md, read_va, jump_insn, reg_type: int,
     return None
 
 
+def ac1_pinned_switch_limit(insn) -> int | None:
+    """Return the proven bound for AC1's exact GoSellMerchandise dispatch."""
+    if insn.address != 0x00EAD7B6 or insn.mnemonic != "jmp" or not insn.operands:
+        return None
+    from capstone.x86 import X86_OP_MEM, X86_REG_EAX
+    operand = insn.operands[0]
+    if operand.type != X86_OP_MEM:
+        return None
+    mem = operand.mem
+    if (mem.base == 0 and mem.index == X86_REG_EAX and mem.scale == 4 and
+            (mem.disp & 0xFFFFFFFF) == 0x00EAD830):
+        return 4
+    return None
+
+
 def install_ac1_jump_table_bounds(disassembler) -> None:
     """Apply AC1-local bounds and discover negatively biased switch tables."""
     from types import MethodType
@@ -1257,10 +1318,14 @@ def install_ac1_jump_table_bounds(disassembler) -> None:
     original = disassembler.jump_table_targets
 
     def bounded(self, insn, limit=256):
-        inferred = infer_remapped_switch_limit(
-            self.md, self.read_bytes, insn, X86_OP_REG, X86_OP_MEM, X86_OP_IMM)
-        if inferred is not None:
-            limit = min(limit, inferred[0])
+        pinned_limit = ac1_pinned_switch_limit(insn)
+        if pinned_limit is not None:
+            limit = min(limit, pinned_limit)
+        else:
+            inferred = infer_remapped_switch_limit(
+                self.md, self.read_bytes, insn, X86_OP_REG, X86_OP_MEM, X86_OP_IMM)
+            if inferred is not None:
+                limit = min(limit, inferred[0])
         targets = list(original(insn, limit))
         if (insn.mnemonic == "jmp" and insn.operands and
                 insn.operands[0].type == X86_OP_MEM and

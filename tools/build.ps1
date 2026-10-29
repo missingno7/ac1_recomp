@@ -1,6 +1,7 @@
 param(
     [ValidateSet('Host', 'Android')][string]$Target = 'Host',
     [ValidateSet('Debug', 'RelWithDebInfo')][string]$BuildType = 'Debug',
+    [ValidateRange(1, 64)][int]$Jobs = 8,
     [string]$Python = 'D:\Prog\dukemp_recomp\.venv\Scripts\python.exe',
     [string]$Sdk = "$env:LOCALAPPDATA\Android\Sdk",
     [switch]$Generate,
@@ -57,12 +58,12 @@ try {
     }
     & $CMake @ConfigureArgs
     if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
-    & $CMake --build $BuildDir --parallel 8
+    & $CMake --build $BuildDir --parallel $Jobs
     if ($LASTEXITCODE -ne 0) { throw 'Native build failed' }
     Write-Host ('Native build completed in {0:N2} s' -f $Timer.Elapsed.TotalSeconds)
     if ($CheckRepeat) {
         if ($Target -ne 'Host') { throw '-CheckRepeat applies to Host' }
-        & $CMake --build $BuildDir --target ac1_repeat_run --parallel 8
+        & $CMake --build $BuildDir --target ac1_repeat_run --parallel $Jobs
         if ($LASTEXITCODE -ne 0) { throw 'Repeat-run check build failed' }
         & (Join-Path $ProjectRoot "$BuildDir/ac1_repeat_run.exe") $GameExe
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
