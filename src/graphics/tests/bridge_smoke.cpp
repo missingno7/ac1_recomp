@@ -847,7 +847,7 @@ int main(int argc, char **argv)
     uint32_t d3dx_hresult = 0;
     if (ac1_d3d9_check_texture_requirements(
             device, width_address, height_address, mip_address, 0,
-            format_address, D3DPOOL_DEFAULT, &d3dx_hresult) != 1 ||
+            format_address, D3DPOOL_MANAGED, &d3dx_hresult) != 1 ||
         FAILED(static_cast<HRESULT>(d3dx_hresult))) {
         std::fprintf(stderr, "D3DXCheckTextureRequirements failed: %s (HRESULT=0x%08x)\n",
                      ac1_d3d9_last_error(), d3dx_hresult);
@@ -860,7 +860,7 @@ int main(int argc, char **argv)
                 guest_word(mip_address), guest_word(format_address));
     if (ac1_d3d9_check_texture_requirements(
             device, 0xfffffff0u, height_address, mip_address, 0,
-            format_address, D3DPOOL_DEFAULT, &d3dx_hresult) != -1) {
+            format_address, D3DPOOL_MANAGED, &d3dx_hresult) != -1) {
         std::fprintf(stderr, "D3DX helper accepted an unmapped guest in/out pointer\n");
         DestroyWindow(hidden_window);
         ac1_d3d9_shutdown();
@@ -870,7 +870,7 @@ int main(int argc, char **argv)
     const uint32_t create_texture_args[] = {
         device, guest_word(width_address), guest_word(height_address),
         guest_word(mip_address), 0u, guest_word(format_address),
-        D3DPOOL_DEFAULT, texture_output, 0u
+        D3DPOOL_MANAGED, texture_output, 0u
     };
     if (ac1_d3d9_dispatch(object_slot(device, 23), create_texture_args, 9,
                           &getter_result) != 1 ||
@@ -918,10 +918,107 @@ int main(int argc, char **argv)
         ac1_d3d9_shutdown();
         return 43;
     }
+    const uint32_t locked_rect_output = allocate_guest(nullptr, 8, 4);
+    const uint32_t lock_texture_args[] = {texture, 0u, locked_rect_output, 0u, 0u};
+    if (ac1_d3d9_argument_count(object_slot(texture, 19)) != 5 ||
+        ac1_d3d9_argument_count(object_slot(texture, 20)) != 2 ||
+        ac1_d3d9_dispatch(object_slot(texture, 19), lock_texture_args, 5,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "native texture LockRect failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 46;
+    }
+    int32_t locked_pitch = 0;
+    uint32_t locked_bits = 0;
+    std::memcpy(&locked_pitch,
+                resolve_guest(nullptr, locked_rect_output, 4, AC1_D3D9_GUEST_READ), 4);
+    std::memcpy(&locked_bits,
+                resolve_guest(nullptr, locked_rect_output + 4, 4, AC1_D3D9_GUEST_READ), 4);
+    std::array<uint8_t, 64> expected_texture_bytes{};
+    for (uint32_t i = 0; i < expected_texture_bytes.size(); ++i)
+        expected_texture_bytes[i] = static_cast<uint8_t>(i * 3u + 7u);
+    if (locked_pitch < 16 || !locked_bits) {
+        std::fprintf(stderr, "texture LockRect returned invalid guest pitch/bits\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 47;
+    }
+    auto *locked_staging = static_cast<uint8_t *>(resolve_guest(nullptr, locked_bits,
+        static_cast<uint32_t>(locked_pitch) * 4u, AC1_D3D9_GUEST_WRITE));
+    if (!locked_staging) {
+        std::fprintf(stderr, "texture LockRect staging span is unmapped\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 48;
+    }
+    for (uint32_t row = 0; row < 4; ++row)
+        std::memcpy(locked_staging + static_cast<size_t>(row) * locked_pitch,
+                    expected_texture_bytes.data() + row * 16u, 16u);
+    const uint32_t unlock_texture_args[] = {texture, 0u};
+    if (ac1_d3d9_dispatch(object_slot(texture, 20), unlock_texture_args, 2,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result)) ||
+        ac1_d3d9_dispatch(object_slot(texture, 19), lock_texture_args, 5,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "texture UnlockRect/relock failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 49;
+    }
+    std::memcpy(&locked_pitch,
+                resolve_guest(nullptr, locked_rect_output, 4, AC1_D3D9_GUEST_READ), 4);
+    std::memcpy(&locked_bits,
+                resolve_guest(nullptr, locked_rect_output + 4, 4, AC1_D3D9_GUEST_READ), 4);
+    locked_staging = static_cast<uint8_t *>(resolve_guest(nullptr, locked_bits,
+        static_cast<uint32_t>(locked_pitch) * 4u, AC1_D3D9_GUEST_READ));
+    bool texture_roundtrip_ok = locked_staging != nullptr;
+    for (uint32_t row = 0; texture_roundtrip_ok && row < 4; ++row) {
+        if (std::memcmp(locked_staging + static_cast<size_t>(row) * locked_pitch,
+                        expected_texture_bytes.data() + row * 16u, 16u) != 0)
+            texture_roundtrip_ok = false;
+    }
+    if (!texture_roundtrip_ok ||
+        ac1_d3d9_dispatch(object_slot(texture, 20), unlock_texture_args, 2,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "texture LockRect staging readback failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 50;
+    }
+    std::printf("native texture LockRect round-trip passed; pitch=%d rows=4 bytes=64\n",
+                locked_pitch);
+    const RECT unsupported_texture_rect{0, 0, 4, 4};
+    const uint32_t unsupported_rect_address = allocate_guest(
+        nullptr, sizeof(unsupported_texture_rect), 4);
+    std::memcpy(resolve_guest(nullptr, unsupported_rect_address,
+                              sizeof(unsupported_texture_rect), AC1_D3D9_GUEST_WRITE),
+                &unsupported_texture_rect, sizeof(unsupported_texture_rect));
+    const uint32_t unsupported_rect_lock_args[] = {
+        texture, 0u, locked_rect_output, unsupported_rect_address, 0u
+    };
+    const uint32_t unsupported_flags_lock_args[] = {
+        texture, 0u, locked_rect_output, 0u, D3DLOCK_READONLY
+    };
+    if (ac1_d3d9_dispatch(object_slot(texture, 19), unsupported_rect_lock_args, 5,
+                          &getter_result) != -2 ||
+        ac1_d3d9_dispatch(object_slot(texture, 19), unsupported_flags_lock_args, 5,
+                          &getter_result) != -2) {
+        std::fprintf(stderr, "unsupported texture LockRect profile was not trapped\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 51;
+    }
     const uint32_t unsupported_texture_shared_args[] = {
         device, guest_word(width_address), guest_word(height_address),
         guest_word(mip_address), 0u, guest_word(format_address),
-        D3DPOOL_DEFAULT, texture_output, 1u
+        D3DPOOL_MANAGED, texture_output, 1u
     };
     if (ac1_d3d9_dispatch(object_slot(device, 23),
                           unsupported_texture_shared_args, 9, &getter_result) != -2) {

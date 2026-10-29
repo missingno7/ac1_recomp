@@ -80,6 +80,25 @@ struct GuestObject {
     uint32_t guest_references = 1;
 };
 
+#pragma pack(push, 4)
+struct GuestLockedRect {
+    int32_t pitch;
+    uint32_t bits;
+};
+#pragma pack(pop)
+static_assert(sizeof(GuestLockedRect) == 8,
+              "guest D3DLOCKED_RECT must match PE32 ABI");
+
+struct TextureLock {
+    void *native_bits = nullptr;
+    uint32_t guest_bits = 0;
+    uint32_t allocation_size = 0;
+    uint32_t pitch = 0;
+    uint32_t row_bytes = 0;
+    uint32_t rows = 0;
+    uint32_t level = 0;
+};
+
 /* D3DPRESENT_PARAMETERS is 56 bytes in the 32-bit guest ABI. HWND is the only
  * pointer-sized member; keep it explicitly 32-bit and translate it at the
  * host boundary instead of copying the 64-bit host structure. */
@@ -136,6 +155,7 @@ ac1_d3d9_callbacks g_callbacks{};
 void *g_context = nullptr;
 std::map<uint32_t, GuestObject> g_objects;
 std::map<IUnknown *, uint32_t> g_guest_by_native;
+std::map<uint64_t, TextureLock> g_texture_locks;
 std::mutex g_mutex;
 /* MinGW thread-exit crashes were reproduced with nontrivial TLS destructors. */
 thread_local char g_last_error[1024]{};
@@ -165,6 +185,41 @@ void set_error(const std::string &message)
 void clear_error()
 {
     g_last_error[0] = '\0';
+}
+
+uint64_t texture_lock_key(uint32_t guest_texture, uint32_t level)
+{
+    return (static_cast<uint64_t>(guest_texture) << 32u) | level;
+}
+
+void discard_texture_locks(uint32_t guest_texture, IDirect3DTexture9 *texture)
+{
+    auto it = g_texture_locks.lower_bound(texture_lock_key(guest_texture, 0));
+    while (it != g_texture_locks.end() &&
+           static_cast<uint32_t>(it->first >> 32u) == guest_texture) {
+        if (texture) {
+            auto *staging = g_callbacks.guest_resolve
+                ? static_cast<const uint8_t *>(g_callbacks.guest_resolve(
+                    g_context, it->second.guest_bits, it->second.allocation_size,
+                    AC1_D3D9_GUEST_READ)) : nullptr;
+            if (staging) {
+                for (uint32_t row = 0; row < it->second.rows; ++row) {
+                    std::memcpy(static_cast<uint8_t *>(it->second.native_bits) +
+                                    static_cast<size_t>(row) * it->second.pitch,
+                                staging + static_cast<size_t>(row) * it->second.pitch,
+                                it->second.row_bytes);
+                }
+            } else {
+                set_error("texture release could not read its guest lock staging buffer");
+            }
+            const HRESULT status = texture->UnlockRect(it->second.level);
+            if (FAILED(status))
+                set_error("texture release encountered a native UnlockRect failure");
+        }
+        if (g_callbacks.guest_free && it->second.guest_bits)
+            g_callbacks.guest_free(g_context, it->second.guest_bits);
+        it = g_texture_locks.erase(it);
+    }
 }
 
 #if defined(_WIN32)
@@ -393,6 +448,8 @@ int token_argument_count(uint32_t token)
     }
     if (kind == kTextureKind) {
         if (method < 3) return method == 0 ? 3 : 1;
+        if (method == 19) return 5;
+        if (method == 20) return 2;
         return -2;
     }
 
@@ -938,6 +995,131 @@ HRESULT create_guest_texture(IDirect3DDevice9 *device, const uint32_t *args)
         static_cast<IUnknown *>(texture), ObjectKind::Texture, true);
     if (!guest_texture) return E_OUTOFMEMORY;
     *output = guest_texture;
+    return status;
+}
+
+HRESULT lock_texture_rect(uint32_t guest_texture, IDirect3DTexture9 *texture,
+                          const uint32_t *args)
+{
+    if (!args[2]) {
+        set_error("IDirect3DTexture9::LockRect output pointer is null");
+        return D3DERR_INVALIDCALL;
+    }
+    auto *guest_output = static_cast<GuestLockedRect *>(guest_memory(
+        args[2], sizeof(GuestLockedRect), AC1_D3D9_GUEST_WRITE));
+    if (!guest_output) {
+        set_error("IDirect3DTexture9::LockRect output structure is unmapped");
+        return D3DERR_INVALIDCALL;
+    }
+    if (args[3] || args[4]) {
+        set_error("texture LockRect RECT/flags profile is not implemented");
+        return D3DERR_INVALIDCALL;
+    }
+
+    const uint64_t key = texture_lock_key(guest_texture, args[1]);
+    if (g_texture_locks.find(key) != g_texture_locks.end()) {
+        set_error("IDirect3DTexture9::LockRect called twice for the same mip level");
+        return D3DERR_INVALIDCALL;
+    }
+
+    D3DSURFACE_DESC description{};
+    HRESULT status = texture->GetLevelDesc(args[1], &description);
+    if (FAILED(status)) return status;
+    if (description.Format != D3DFMT_A8R8G8B8) {
+        set_error("texture LockRect supports only the observed A8R8G8B8 format");
+        return D3DERR_NOTAVAILABLE;
+    }
+    const uint64_t row_bytes_64 = static_cast<uint64_t>(description.Width) * 4u;
+    if (!description.Width || !description.Height || row_bytes_64 > UINT32_MAX) {
+        set_error("texture LockRect dimensions exceed the guest staging ABI");
+        return D3DERR_INVALIDCALL;
+    }
+
+    D3DLOCKED_RECT native{};
+    status = texture->LockRect(args[1], &native, nullptr, 0);
+    if (FAILED(status)) return status;
+    if (!native.pBits || native.Pitch <= 0 ||
+        static_cast<uint32_t>(native.Pitch) < row_bytes_64) {
+        texture->UnlockRect(args[1]);
+        set_error("native texture LockRect returned an unsupported pitch or null bits");
+        return D3DERR_INVALIDCALL;
+    }
+
+    const uint64_t size_64 = static_cast<uint64_t>(native.Pitch) * description.Height;
+    if (size_64 > UINT32_MAX || !size_64) {
+        texture->UnlockRect(args[1]);
+        set_error("native texture LockRect span overflows 32-bit guest memory");
+        return D3DERR_INVALIDCALL;
+    }
+    const uint32_t allocation_size = static_cast<uint32_t>(size_64);
+    const uint32_t guest_bits = g_callbacks.guest_alloc
+        ? g_callbacks.guest_alloc(g_context, allocation_size, 4) : 0;
+    if (!guest_bits) {
+        texture->UnlockRect(args[1]);
+        set_error("guest allocation failed for the locked texture staging buffer");
+        return E_OUTOFMEMORY;
+    }
+    auto *staging = static_cast<uint8_t *>(guest_memory(
+        guest_bits, allocation_size, AC1_D3D9_GUEST_WRITE));
+    if (!staging) {
+        g_callbacks.guest_free(g_context, guest_bits);
+        texture->UnlockRect(args[1]);
+        set_error("allocated texture staging buffer is not writable in guest memory");
+        return D3DERR_INVALIDCALL;
+    }
+    std::memset(staging, 0, allocation_size);
+    const uint32_t pitch = static_cast<uint32_t>(native.Pitch);
+    const uint32_t row_bytes = static_cast<uint32_t>(row_bytes_64);
+    for (uint32_t row = 0; row < description.Height; ++row) {
+        std::memcpy(staging + static_cast<size_t>(row) * pitch,
+                    static_cast<const uint8_t *>(native.pBits) +
+                        static_cast<size_t>(row) * pitch,
+                    row_bytes);
+    }
+
+    try {
+        g_texture_locks.emplace(key, TextureLock{
+            native.pBits, guest_bits, allocation_size, pitch, row_bytes,
+            description.Height, args[1]});
+    } catch (...) {
+        g_callbacks.guest_free(g_context, guest_bits);
+        texture->UnlockRect(args[1]);
+        set_error("failed to register the guest texture lock");
+        return E_OUTOFMEMORY;
+    }
+
+    const GuestLockedRect locked{native.Pitch, guest_bits};
+    std::memcpy(guest_output, &locked, sizeof(locked));
+    return status;
+}
+
+HRESULT unlock_texture_rect(uint32_t guest_texture, IDirect3DTexture9 *texture,
+                            uint32_t level)
+{
+    const uint64_t key = texture_lock_key(guest_texture, level);
+    auto it = g_texture_locks.find(key);
+    if (it == g_texture_locks.end()) {
+        set_error("IDirect3DTexture9::UnlockRect has no matching guest LockRect");
+        return D3DERR_INVALIDCALL;
+    }
+    TextureLock &locked = it->second;
+    auto *staging = static_cast<const uint8_t *>(guest_memory(
+        locked.guest_bits, locked.allocation_size, AC1_D3D9_GUEST_READ));
+    if (!staging) {
+        set_error("locked texture staging buffer became unreadable in guest memory");
+        return D3DERR_INVALIDCALL;
+    }
+    for (uint32_t row = 0; row < locked.rows; ++row) {
+        std::memcpy(static_cast<uint8_t *>(locked.native_bits) +
+                        static_cast<size_t>(row) * locked.pitch,
+                    staging + static_cast<size_t>(row) * locked.pitch,
+                    locked.row_bytes);
+    }
+    const HRESULT status = texture->UnlockRect(level);
+    if (FAILED(status)) return status;
+    if (g_callbacks.guest_free)
+        g_callbacks.guest_free(g_context, locked.guest_bits);
+    g_texture_locks.erase(it);
     return status;
 }
 
@@ -1559,8 +1741,12 @@ uint32_t invoke_texture(GuestObject &object, uint32_t method,
         }
         IUnknown *native = object.native;
         const uint32_t guest_address = args[0];
+        const uint32_t guest_count = object.guest_references - 1;
+        if (!guest_count)
+            discard_texture_locks(guest_address,
+                static_cast<IDirect3DTexture9 *>(object.native));
         native->Release();
-        const uint32_t guest_count = --object.guest_references;
+        object.guest_references = guest_count;
         if (!guest_count) {
             GuestObject retired = object;
             g_guest_by_native.erase(native);
@@ -1568,6 +1754,18 @@ uint32_t invoke_texture(GuestObject &object, uint32_t method,
             free_guest_object(guest_address, retired);
         }
         return guest_count;
+    }
+    if (method == 19) {
+        if (!require_count(argc, 5, "IDirect3DTexture9::LockRect"))
+            return hresult(D3DERR_INVALIDCALL);
+        return hresult(lock_texture_rect(args[0],
+            static_cast<IDirect3DTexture9 *>(object.native), args));
+    }
+    if (method == 20) {
+        if (!require_count(argc, 2, "IDirect3DTexture9::UnlockRect"))
+            return hresult(D3DERR_INVALIDCALL);
+        return hresult(unlock_texture_rect(args[0],
+            static_cast<IDirect3DTexture9 *>(object.native), args[1]));
     }
     set_error("IDirect3DTexture9 method is not implemented");
     return hresult(D3DERR_NOTAVAILABLE);
@@ -1770,6 +1968,19 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
         set_error("D3D9 shared texture handles are unsupported by the guest bridge");
         return -2;
     }
+    if (object->kind == ObjectKind::Texture && method == 19) {
+        if (args[3] != 0u || args[4] != 0u) {
+            set_error("texture LockRect only supports the observed null RECT and zero flags");
+            return -2;
+        }
+        D3DSURFACE_DESC description{};
+        const HRESULT desc_status = static_cast<IDirect3DTexture9 *>(object->native)->GetLevelDesc(
+            args[1], &description);
+        if (SUCCEEDED(desc_status) && description.Format != D3DFMT_A8R8G8B8) {
+            set_error("texture LockRect format is outside the observed A8R8G8B8 profile");
+            return -2;
+        }
+    }
     if (method == 0) {
         GUID iid{};
         if (guest_read(args[1], &iid, sizeof(iid)) &&
@@ -1810,6 +2021,11 @@ extern "C" AC1_D3D9_API int ac1_d3d9_argument_count(uint32_t token)
 extern "C" AC1_D3D9_API void ac1_d3d9_shutdown(void)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
+    for (auto &entry : g_objects) {
+        if (entry.second.kind == ObjectKind::Texture)
+            discard_texture_locks(entry.first,
+                static_cast<IDirect3DTexture9 *>(entry.second.native));
+    }
     for (auto &entry : g_objects) {
         GuestObject &object = entry.second;
         for (uint32_t refs = object.guest_references; refs; --refs)
