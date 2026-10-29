@@ -87,7 +87,7 @@ rendering, title screen, audible output or Android hardware execution.
 | Input script / recording | Windows headers/layout/clock; excluded | Same parser, successful-Present clock and poll ordinals; static US DIK-to-VK mapping and WndProc event snapshots. `input_script` extra sets `AC1_INPUT_SCRIPT`; bad files remain fatal. Android launcher disables recording. |
 | USER32 window/message loop / HWND | Surface-to-DXVK existed; guest USER32 missing | Single guest HWND resolved to JNI's DXVK HWND. Class registration, CREATESTRUCT/WM_NCCREATE/WM_CREATE, activation, Peek/Dispatch/DefWindowProc, rectangles, cursor/keyboard state, US text entry and destruction implemented. Metrics outside the subset stop. No multiwindow/monitor enumeration. SystemParametersInfoA GET still reports ERROR_CALL_NOT_IMPLEMENTED; accessibility SET stays guest-local. Desktop hooks remain unavailable. |
 | D3D9 / DXVK / Surface | Bridge + imported provider already wired | Retained platform factory, windowed presentation, landscape SurfaceView, mutex/ref-counted ANativeWindow handoff. Surface loss/reset and Vulkan/device rendering untested. DXVK must be built separately after the benchmark. |
-| **D3DX texture requirements / shader constants** | Windows D3DX DLL | **Still a title-screen blocker:** non-Windows `ac1_d3d9_check_texture_requirements` and `ac1_d3d9_get_shader_constant_table` explicitly reject these APIs. CTAB proxy methods also rely on native D3DX. A portable requirements checker and CTAB provider are required. APK success will not remove this stop. |
+| **D3DX texture requirements / shader constants** | Windows D3DX DLL | Portable caps/format requirements and bounded SM3 CTAB provider wired; native D3DX36 oracle contracts and ARM64 bridge syntax pass. See [portable D3DX evidence](#portable-d3dx-2026-10-30). DXVK/device startup and title-screen execution remain unverified. |
 | Archive/file handles / overlapped I/O | Win32 handles plus existing POSIX services | Existing open/pread/stat and case-insensitive component resolution retained. POSIX overlapped reads complete synchronously with guest status/events. Rooted install reads and separate userdata writes remain enforced. No original-installation writes added. |
 | INI/profile/save/special folders / registry | Win32 APIs plus project services | Existing portable INI, UTF conversion, private userdata and narrow virtual registry retained. Virtual `C:\AC1` maps to imported game files. Phone save/profile round-trip untested. Unsupported path/API profiles stop. |
 | Events/semaphores/mutexes/critical sections / threads | Win32 native objects/threads | Existing guest object state and pthread mutex/cond/thread scheduler retained. DS notifications feed guest events. Priorities/affinities retain existing guest semantics. No device scheduler evidence yet. |
@@ -99,6 +99,72 @@ rendering, title screen, audible output or Android hardware execution.
 
 Native ELF TLS selection agrees with the [bionic NDK linker notes](https://android.googlesource.com/platform/bionic/+/HEAD/android-changes-for-ndk-developers.md#elf-tls-available-for-api-level-29).
 No pinned CPU/runtime donor inputs or transformations changed.
+
+### Portable D3DX (2026-10-30)
+
+`src/graphics/ac1_d3dx_portable.h` supplies the non-Windows implementation;
+Windows still forwards to System32 `d3dx9_36.dll`. Texture requirements query
+the supplied device's caps, creation parameters and display format, then its
+`IDirect3D9::CheckDeviceFormat`. Covered behavior includes default dimensions,
+formats and usage, zero sizes, mip limits/autogen, DXT block alignment, conditional
+power-of-two caps, square-only caps, scratch-pool exceptions and directional
+format fallback across the supported color/float/luminance/signed/depth profiles.
+Unknown formats/usages report their numeric value and fail.
+
+The existing bridge's `arity10` table and Windows
+`invoke_constant_table_method` previously admitted only slots **5, 6, 8**
+(GetDesc, GetConstantDesc, GetConstant), plus IUnknown. The shared checked guest
+adapter now also admits **7, 9–22, 24–25**: GetSamplerIndex, GetConstantByName,
+GetConstantElement, SetDefaults, SetValue, SetBool/Int/Float and their arrays,
+SetVector(Array), SetMatrix(Array), SetMatrixTranspose(Array). Names including
+`$`, `[i]` and `.member` work through guest strings or owned opaque handles;
+descriptors/defaults are copied into guest allocations released with the table.
+Numeric writes select vertex/pixel F/I/B banks, convert through the declared
+parameter type, honor matrix class and truncate to available CTAB registers.
+Native D3DX36 struct-array/default-descriptor quirks are retained where tested.
+
+Run only the small, sequential checks during the benchmark:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/check_d3dx_portable.ps1 -DxvkInclude D:/Prog/ac1_recomp/work/dxvk/prepared/include/native
+```
+
+This compiles `tests/d3dx_portable_contract.cpp` with MinGW g++ (`-O0`, warnings
+as errors), runs it against the absolute System32 DLL, and syntax-checks the
+Windows and ARM64/API29 bridge individually. No generated game C, dependency
+build, Gradle, game run or background process is involved. The test is also
+registered as `ac1_d3dx_portable_contract` in standalone graphics CTest, with an
+`EXCLUDE_FROM_ALL` executable independent of the bridge/game link.
+
+Actual result: **80,425 matches, zero mismatches**; 73 recursive constant
+descriptors, 2,973 setter cases and 77,088 texture cases. Four in-memory shaders
+(vs_3_0/ps_3_0, compiled by native D3DXCompileShader) exercise every register set,
+row/column matrices, partial register allocation, initialized arrays, mixed
+structs, samplers, bools/ints, one `$` name and nested lookup. Device callbacks
+record register addresses and exact bits, normalizing bulk writes to individual
+registers; no GPU rendering is performed. Malformed CTAB and device-write failure
+checks also pass. Both bridge syntax checks pass with `-Wall -Wextra -Werror`.
+Private logs stay in `work/d3dx_portable/`.
+
+Native HAL device creation returned `D3DERR_NOTAVAILABLE`, and native
+`IDirect3D9::GetDeviceCaps` was unavailable in this session. Texture comparisons
+therefore used eleven deterministic query-only COM fixtures with identical caps and
+format support for native and portable calls. The test automatically adds a real
+native caps/CheckDeviceFormat profile when available. Actual DXVK format/caps
+integration, title-screen execution and Android hardware remain unverified.
+
+Buffer-pointer slots **3–4** and matrix-pointer-array slots **23, 26** remain
+explicit unsupported-method stops. Transposed matrix input targeting a struct
+larger than four scalar components reports its name and fails; this cross-class
+conversion remains outside the implemented profile. Ordinary
+matrix targets and packed SetValue for mixed structs are covered. Only observed
+SM3 bytecode and the enumerated texture format/usage profiles are accepted.
+
+Behavior references (independent implementation, no Wine code copied):
+[Microsoft texture requirements](https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dxchecktexturerequirements),
+[Wine texture behavior](https://github.com/wine-mirror/wine/blob/master/dlls/d3dx9_36/texture.c),
+[Wine CTAB behavior](https://github.com/wine-mirror/wine/blob/master/dlls/d3dx9_36/shader.c).
+The local native D3DX36 DLL is the comparison oracle when its behavior differs.
 
 ### Remaining dependency build, after the benchmark
 
