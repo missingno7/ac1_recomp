@@ -6798,6 +6798,16 @@ int ac1_run(const char *exe_path)
         return 3;
     }
     free(file_bytes);
+    if (image.load_base != image.preferred_base) {
+        /* cpu.h's GVA() is the identity: the EXE has no relocations. */
+        snprintf(last_run_error, sizeof(last_run_error),
+                 "EXE must load at its preferred base 0x%08x (loaded at 0x%08x)",
+                 image.preferred_base, image.load_base);
+        fprintf(stderr, "AC1 native runtime: %s\n", last_run_error);
+        pe32_unload(&image);
+        unlock_ac1_run();
+        return 3;
+    }
     if (!pe32_link_imports(&image, resolve_import, NULL, error, sizeof(error))) {
         snprintf(last_run_error, sizeof(last_run_error), "import linking failed: %s", error);
         fprintf(stderr, "AC1 native runtime: import linking failed: %s\n", error);

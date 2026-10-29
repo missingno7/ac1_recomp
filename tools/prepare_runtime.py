@@ -608,6 +608,14 @@ void guest_execution_write(uint32_t address, const void *input, size_t width)
             if text.count(closing) != 1 or not text.rstrip().endswith(closing):
                 raise SystemExit("unexpected CPU header closing include guard")
             text = text.replace(closing, FP_STATE_HELPERS + "\n" + closing)
+            gva = "#define GVA(abs) ((uint32_t)((abs) + g_image_delta))"
+            if text.count(gva) != 1:
+                raise SystemExit("unexpected CPU header GVA definition")
+            # AC1's EXE has no relocation directory and both images load at
+            # their preferred bases (checked at load), so absolute guest
+            # addresses need no delta. Reading the _Thread_local delta cost an
+            # __emutls_get_address call on every global access under MinGW.
+            text = text.replace(gva, "#define GVA(abs) ((uint32_t)(abs))  /* AC1: image delta is always 0 */")
             access = "/* ---- memory access: checked uint32 guest VA to native pointer ---- */"
             if text.count(access) != 1:
                 raise SystemExit("unexpected CPU header memory-access marker")

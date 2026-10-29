@@ -256,7 +256,7 @@ static inline uint32_t pop32(CPU *c) { uint32_t v = rd32(STACK_BASE(c) + c->esp)
 
 /* ---- absolute image references: abs VA at preferred base -> live address ---- */
 extern _Thread_local uint32_t g_image_delta;   /* live_base - PE ImageBase (0 if loaded where it wanted) */
-#define GVA(abs) ((uint32_t)((abs) + g_image_delta))
+#define GVA(abs) ((uint32_t)(abs))  /* AC1: image delta is always 0 */
 
 /* ---- flag helpers ---- */
 static inline uint32_t parity8(uint8_t v) {
