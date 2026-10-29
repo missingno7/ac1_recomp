@@ -55,7 +55,17 @@ try {
     $Ninja = Join-Path $Sdk 'cmake/3.22.1/bin/ninja.exe'
     $BuildDir = "build/$($Target.ToLower())"
     if ($BuildType -ne 'Debug') { $BuildDir += "-$($BuildType.ToLower())" }
-    $ConfigureArgs = @('-S', '.', '-B', $BuildDir, '-G', 'Ninja', "-DCMAKE_MAKE_PROGRAM=$Ninja", "-DCMAKE_BUILD_TYPE=$BuildType")
+    # Keep the standard loop usable after the documented Ninja-probe fallback,
+    # without creating a second build directory or changing cache generators.
+    $Generator = 'Ninja'; $MakeProgram = $Ninja
+    if (Test-Path "$BuildDir/CMakeCache.txt") {
+        $ExistingGenerator = Select-String -Path "$BuildDir/CMakeCache.txt" -Pattern '^CMAKE_GENERATOR:INTERNAL=MinGW Makefiles$'
+        if ($ExistingGenerator) {
+            $Generator = 'MinGW Makefiles'
+            $MakeProgram = 'C:/msys64/mingw64/bin/mingw32-make.exe'
+        }
+    }
+    $ConfigureArgs = @('-S', '.', '-B', $BuildDir, '-G', $Generator, "-DCMAKE_MAKE_PROGRAM=$MakeProgram", "-DCMAKE_BUILD_TYPE=$BuildType")
     # Explicit, because an option default never overrides an existing CMake cache entry.
     $ConfigureArgs += "-DAC1_DIRECT_MEMORY=$(if ($CheckedMemory) { 'OFF' } else { 'ON' })"
     if ($Target -eq 'Host') {
