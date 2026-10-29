@@ -1,9 +1,13 @@
 #include "cpu.h"
+#include "../src/runtime/ac1_virtual_query.h"
 
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #define CHECK(expression) do { \
     if (!(expression)) { \
@@ -14,6 +18,56 @@
 
 int main(void)
 {
+    /* VirtualQuery is bounded to tracked allocations. An interior address
+     * reports its page base and the remainder of that allocation; adjacent
+     * allocations remain separate and gaps are rejected. */
+    ac1_virtual_query_region query_region = {0};
+    CHECK(ac1_virtual_query_region_for_allocation(
+        0x11AD0000u, 0x11AD0000u, 0x80000u, &query_region));
+    CHECK(query_region.base_address == 0x11AD0000u &&
+          query_region.allocation_base == 0x11AD0000u &&
+          query_region.region_size == 0x80000u);
+    CHECK(ac1_virtual_query_region_for_allocation(
+        0x11AE0123u, 0x11AD0000u, 0x80000u, &query_region));
+    CHECK(query_region.base_address == 0x11AE0000u &&
+          query_region.allocation_base == 0x11AD0000u &&
+          query_region.region_size == 0x70000u);
+    CHECK(ac1_virtual_query_region_for_allocation(
+        0x11B4FFFFu, 0x11AD0000u, 0x80000u, &query_region));
+    CHECK(query_region.base_address == 0x11B4F000u &&
+          query_region.allocation_base == 0x11AD0000u &&
+          query_region.region_size == 0x1000u);
+    CHECK(ac1_virtual_query_region_for_allocation(
+        0x11B50000u, 0x11B50000u, 0x10000u, &query_region));
+    CHECK(query_region.base_address == 0x11B50000u &&
+          query_region.allocation_base == 0x11B50000u &&
+          query_region.region_size == 0x10000u);
+    CHECK(!ac1_virtual_query_region_for_allocation(
+        0x11C00000u, 0x11AD0000u, 0x80000u, &query_region));
+    CHECK(!ac1_virtual_query_region_for_allocation(
+        0x11B50000u, 0x11AD0000u, 0x80000u, &query_region));
+#ifdef _WIN32
+    void *native_allocation = VirtualAlloc(NULL, 0x80000u,
+        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    CHECK(native_allocation != NULL);
+    MEMORY_BASIC_INFORMATION native_query;
+    uint8_t *native_address = (uint8_t *)native_allocation + 0x10123u;
+    CHECK(VirtualQuery(native_address, &native_query,
+                       sizeof(native_query)) == sizeof(native_query));
+    CHECK(ac1_virtual_query_region_for_allocation(
+        (uint32_t)(uintptr_t)native_address,
+        (uint32_t)(uintptr_t)native_allocation, 0x80000u, &query_region));
+    CHECK(query_region.base_address ==
+              (uint32_t)(uintptr_t)native_query.BaseAddress &&
+          query_region.allocation_base ==
+              (uint32_t)(uintptr_t)native_query.AllocationBase &&
+          query_region.region_size == native_query.RegionSize &&
+          native_query.State == MEM_COMMIT &&
+          native_query.Protect == PAGE_READWRITE &&
+          native_query.Type == MEM_PRIVATE);
+    CHECK(VirtualFree(native_allocation, 0, MEM_RELEASE));
+#endif
+
     guest_address_space *space = guest_address_space_create();
     CHECK(space);
     guest_address_space_select(space);
@@ -99,6 +153,6 @@ int main(void)
     CHECK(top[0] == 0x55 && top[1] == 0x66 && bottom[0] == 0x77 && bottom[1] == 0x88);
 
     guest_address_space_destroy(space);
-    puts("PASS: fixed-width CPU copies span only fully mapped adjacent guest regions");
+    puts("PASS: VirtualQuery stays within tracked allocations; fixed-width CPU copies span only fully mapped adjacent guest regions");
     return 0;
 }

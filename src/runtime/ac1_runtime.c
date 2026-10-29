@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include "ac1_runtime.h"
+#include "ac1_virtual_query.h"
 #include "cpu.h"
 #include "guest_memory.h"
 #include "pe32_loader.h"
@@ -138,6 +139,11 @@ static pcrecomp_heap *process_heap;
 static ac1_files *guest_files;
 static char exe_path_copy[32768];
 static char guest_current_directory[32768];
+#ifdef __ANDROID__
+/* POSIX path used only by the host filesystem. Guest APIs see the virtual
+ * Windows install root in guest_current_directory/exe_path_copy. */
+static char host_game_directory[32768];
+#endif
 static uint32_t command_line_guest_address;
 static struct { uint32_t handle; pcrecomp_heap *heap; } private_heaps[AC1_MAX_PRIVATE_HEAPS];
 static _Thread_local uint32_t last_error;
@@ -153,6 +159,9 @@ static uint32_t image_size_loaded;
 static pe32_module bink_image;
 static int bink_image_mapped;
 static char bink_module_path[32768];
+#ifdef __ANDROID__
+static char bink_host_path[32768];
+#endif
 #ifdef _WIN32
 static ac1_window_win32 *window_bridge;
 static int ds8_configured;
@@ -2476,14 +2485,83 @@ static int profile_path_is_absolute(const char *path)
              (path[0] >= 'a' && path[0] <= 'z')) &&
             path[1] == ':' && (path[2] == '\\' || path[2] == '/')) ||
            (length >= 2u && path[0] == '\\' && path[1] == '\\');
+#elif defined(__ANDROID__)
+    size_t length = strlen(path);
+    int drive_absolute = length >= 3u &&
+        (((path[0] >= 'A' && path[0] <= 'Z') ||
+          (path[0] >= 'a' && path[0] <= 'z')) &&
+         path[1] == ':' && (path[2] == '\\' || path[2] == '/'));
+    return path[0] == '/' || drive_absolute;
 #else
     return path[0] == '/';
 #endif
 }
 
+#ifdef __ANDROID__
+static int android_guest_path_is_root(const char *path)
+{
+    char normalized[32768];
+    size_t length;
+    if (!path || (length = strlen(path)) >= sizeof(normalized)) return 0;
+    memcpy(normalized, path, length + 1u);
+    for (size_t i = 0u; i < length; ++i)
+        if (normalized[i] == '/') normalized[i] = '\\';
+    return equal_ascii_fold(normalized, guest_current_directory);
+}
+
+/* Maps guest paths under C:\\AC1 to the imported host game folder. POSIX
+ * absolute paths, notably the app-private userdata paths returned by the
+ * special-folder shim, remain host-native. */
+static int android_guest_path_to_game_relative(const char *guest_path,
+                                               char *relative_path,
+                                               size_t capacity)
+{
+    char normalized[32768];
+    char root[32768];
+    size_t length, guest_length, root_length;
+    if (!guest_path || !relative_path || !capacity ||
+        (length = strlen(guest_path)) >= sizeof(normalized)) return 0;
+    memcpy(normalized, guest_path, length + 1u);
+    guest_length = length;
+    for (size_t i = 0u; i < length; ++i)
+        if (normalized[i] == '\\') normalized[i] = '/';
+    root_length = strlen(guest_current_directory);
+    if (root_length >= sizeof(root)) return 0;
+    memcpy(root, guest_current_directory, root_length + 1u);
+    for (size_t i = 0u; i < root_length; ++i)
+        if (root[i] == '\\') root[i] = '/';
+    root_length = strlen(root);
+    if (guest_length <= root_length || normalized[root_length] != '/') return 0;
+    for (size_t i = 0u; i < root_length; ++i) {
+        unsigned char a = (unsigned char)normalized[i];
+        unsigned char b = (unsigned char)root[i];
+        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+        if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+        if (a != b) return 0;
+    }
+    const char *suffix = normalized + root_length + 1u;
+    if (!*suffix || profile_component_is_parent(suffix) ||
+        strlen(suffix) >= capacity) return 0;
+    memcpy(relative_path, suffix, strlen(suffix) + 1u);
+    return 1;
+}
+#endif
+
 static int resolve_profile_path(const char *guest_path, char *host_path, size_t capacity)
 {
     if (!guest_path || !*guest_path || !host_path || !capacity) return 0;
+#ifdef __ANDROID__
+    if (guest_path[0] == '/') {
+        int written = snprintf(host_path, capacity, "%s", guest_path);
+        return written >= 0 && (size_t)written < capacity;
+    }
+    char relative[32768];
+    if (!android_guest_path_to_game_relative(guest_path, relative,
+                                             sizeof(relative))) return 0;
+    int written = snprintf(host_path, capacity, "%s/%s",
+                           host_game_directory, relative);
+    return written >= 0 && (size_t)written < capacity;
+#else
 #ifdef _WIN32
     size_t length = strlen(guest_path);
     int absolute = (length >= 3u &&
@@ -2514,6 +2592,7 @@ static int resolve_profile_path(const char *guest_path, char *host_path, size_t 
         if (*cursor == '\\') *cursor = '/';
 #endif
     return 1;
+#endif
 }
 
 static int profile_path_is_in_userdata(const char *path)
@@ -4044,20 +4123,30 @@ static int handle_import(CPU *cpu, const import_record *import)
         const uint32_t query_address = rd32(cpu->esp + 4u);
         const uint32_t information_address = rd32(cpu->esp + 8u);
         const uint32_t information_length = rd32(cpu->esp + 12u);
-        const uint64_t region_size = guest_memory_region_size(query_address);
+        ac1_virtual_query_region query_region = {0};
+        int tracked_allocation = 0;
+        for (size_t i = 0; i < GUEST_MEMORY_MAX_REGIONS; ++i) {
+            const uint32_t allocation_base = virtual_alloc_bases[i];
+            if (!allocation_base) continue;
+            const uint64_t allocation_size =
+                guest_memory_region_size(allocation_base);
+            if (ac1_virtual_query_region_for_allocation(
+                    query_address, allocation_base, allocation_size,
+                    &query_region)) {
+                tracked_allocation = 1;
+                break;
+            }
+        }
         uint8_t *information = (uint8_t *)guest_memory_try_ptr(
             information_address, 28u);
-        if (!information || information_length != 28u || !region_size ||
-            region_size > UINT32_MAX ||
-            !virtual_allocation_contains(query_address))
-            stop_guest("VirtualQuery supports only an exact base of a guest private allocation",
+        if (!information || information_length != 28u || !tracked_allocation)
+            stop_guest("VirtualQuery address is not inside a tracked guest private allocation",
                        import->token);
-        /* The observed MemSysPage request queries the exact base returned by
-         * VirtualAlloc. Guest allocations are committed private RW regions. */
-        wr32(information_address + 0u, query_address); /* BaseAddress */
-        wr32(information_address + 4u, query_address); /* AllocationBase */
+        /* Each tracked VirtualAlloc is one committed, private RW region. */
+        wr32(information_address + 0u, query_region.base_address); /* BaseAddress */
+        wr32(information_address + 4u, query_region.allocation_base); /* AllocationBase */
         wr32(information_address + 8u, 4u);            /* AllocationProtect */
-        wr32(information_address + 12u, (uint32_t)region_size); /* RegionSize */
+        wr32(information_address + 12u, query_region.region_size); /* RegionSize */
         wr32(information_address + 16u, 0x1000u);      /* MEM_COMMIT */
         wr32(information_address + 20u, 4u);            /* PAGE_READWRITE */
         wr32(information_address + 24u, 0x20000u);     /* MEM_PRIVATE */
@@ -4154,6 +4243,12 @@ static int handle_import(CPU *cpu, const import_record *import)
         DWORD attributes = GetFileAttributesA(path);
         int exists = attributes != INVALID_FILE_ATTRIBUTES &&
                      (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#elif defined(__ANDROID__)
+        int same_directory = android_guest_path_is_root(path);
+        struct stat directory_status;
+        int exists = same_directory &&
+                     stat(host_game_directory, &directory_status) == 0 &&
+                     S_ISDIR(directory_status.st_mode);
 #else
         int same_directory = strcmp(path, guest_current_directory) == 0;
         struct stat directory_status;
@@ -5371,6 +5466,7 @@ static int read_file(const char *path, uint8_t **bytes, size_t *size,
     return 1;
 }
 
+#ifndef __ANDROID__
 static void derive_guest_current_directory(const char *path)
 {
     size_t length = strlen(path);
@@ -5394,6 +5490,46 @@ static void derive_guest_current_directory(const char *path)
         if (guest_current_directory[i] == '/') guest_current_directory[i] = '\\';
 #endif
 }
+#endif
+
+#ifdef __ANDROID__
+static int derive_host_game_directory(const char *path, char *directory,
+                                      size_t capacity)
+{
+    const char *separator;
+    size_t length;
+    if (!path || !*path || !directory || !capacity) return 0;
+    separator = strrchr(path, '/');
+    if (!separator) separator = strrchr(path, '\\');
+    if (!separator) {
+        if (capacity < 2u) return 0;
+        memcpy(directory, ".", 2u);
+        return 1;
+    }
+    length = (size_t)(separator - path);
+    if (length == 0u) length = 1u; /* POSIX root */
+    if (length >= capacity) return 0;
+    memcpy(directory, path, length);
+    directory[length] = '\0';
+    return 1;
+}
+
+static int initialize_android_guest_paths(const char *host_exe_path)
+{
+    const char *basename = strrchr(host_exe_path, '/');
+    if (!basename) basename = strrchr(host_exe_path, '\\');
+    basename = basename ? basename + 1u : host_exe_path;
+    if (!*basename ||
+        !derive_host_game_directory(host_exe_path, host_game_directory,
+                                    sizeof(host_game_directory)))
+        return 0;
+    int written = snprintf(exe_path_copy, sizeof(exe_path_copy),
+                          "C:\\AC1\\%s", basename);
+    if (written < 0 || (size_t)written >= sizeof(exe_path_copy)) return 0;
+    memcpy(guest_current_directory, "C:\\AC1", sizeof("C:\\AC1"));
+    return 1;
+}
+#endif
 
 static int load_pinned_bink_module(char *error, size_t error_capacity)
 {
@@ -5403,6 +5539,25 @@ static int load_pinned_bink_module(char *error, size_t error_capacity)
     char hash[65];
     int path_length;
 
+#ifdef __ANDROID__
+    path_length = snprintf(bink_module_path, sizeof(bink_module_path),
+                           "%s\\%s", guest_current_directory, "binkw32.dll");
+    if (path_length < 0 || (size_t)path_length >= sizeof(bink_module_path)) {
+        snprintf(error, error_capacity, "pinned Bink DLL path is too long");
+        return 0;
+    }
+    int host_path_length = snprintf(bink_host_path, sizeof(bink_host_path),
+                                    "%s/%s", host_game_directory,
+                                    "binkw32.dll");
+    if (host_path_length < 0 ||
+        (size_t)host_path_length >= sizeof(bink_host_path)) {
+        snprintf(error, error_capacity, "pinned Bink host path is too long");
+        return 0;
+    }
+    if (!read_file(bink_host_path, &file_bytes, &file_size,
+                   error, error_capacity))
+        return 0;
+#else
     path_length = snprintf(bink_module_path, sizeof(bink_module_path),
                            "%s/%s", guest_current_directory, "binkw32.dll");
     if (path_length < 0 || (size_t)path_length >= sizeof(bink_module_path)) {
@@ -5416,6 +5571,7 @@ static int load_pinned_bink_module(char *error, size_t error_capacity)
     if (!read_file(bink_module_path, &file_bytes, &file_size,
                    error, error_capacity))
         return 0;
+#endif
     sha256(file_bytes, file_size, digest);
     digest_hex(digest, hash);
     if (strcmp(hash, BINK_MODULE_SHA256)) {
@@ -5511,6 +5667,10 @@ int ac1_run(const char *exe_path)
     memset(&bink_image, 0, sizeof(bink_image));
     bink_image_mapped = 0;
     bink_module_path[0] = '\0';
+#ifdef __ANDROID__
+    bink_host_path[0] = '\0';
+    host_game_directory[0] = '\0';
+#endif
     process_heap = NULL;
     guest_files = NULL;
     exe_path_copy[0] = '\0';
@@ -5550,12 +5710,22 @@ int ac1_run(const char *exe_path)
     trace_callback_count = 0;
     trace_file_read_count = 0;
     crt_handoff_logged = 0;
+#ifdef __ANDROID__
+    if (!initialize_android_guest_paths(exe_path)) {
+        snprintf(last_run_error, sizeof(last_run_error),
+                 "cannot derive Android host/guest executable paths");
+        fprintf(stderr, "AC1 native runtime: %s\n", last_run_error);
+        unlock_ac1_run();
+        return 2;
+    }
+#else
     memcpy(exe_path_copy, exe_path, strlen(exe_path) + 1u);
 #ifdef _WIN32
     for (size_t i = 0; exe_path_copy[i]; ++i)
         if (exe_path_copy[i] == '/') exe_path_copy[i] = '\\';
 #endif
     derive_guest_current_directory(exe_path_copy);
+#endif
     if (!read_file(exe_path, &file_bytes, &file_size, error, sizeof(error))) {
         snprintf(last_run_error, sizeof(last_run_error), "%s", error);
         fprintf(stderr, "AC1 native runtime: %s\n", error);
@@ -5617,7 +5787,12 @@ int ac1_run(const char *exe_path)
     guest_memory_add(image.image, image.load_base, image.image_size);
     guest_memory_add(bink_image.image, bink_image.load_base, bink_image.image_size);
     bink_image_mapped = 1;
+#ifdef __ANDROID__
+    guest_files = ac1_files_create_with_guest_root(host_game_directory,
+                                                   guest_current_directory);
+#else
     guest_files = ac1_files_create(guest_current_directory);
+#endif
     if (!guest_files) {
         snprintf(last_run_error, sizeof(last_run_error),
                  "read-only file service initialization failed for game directory");
