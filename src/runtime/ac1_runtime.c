@@ -3078,7 +3078,6 @@ static int profile_enumerate_sections(const char *path, char *output,
     if (!capacity) return 0;
     output[0] = '\0';
     if (capacity == 1u) return 0;
-    output[1] = '\0';
 
     FILE *stream = fopen(path, "rb");
     if (!stream) return 0;
@@ -3095,28 +3094,17 @@ static int profile_enumerate_sections(const char *path, char *output,
         size_t length = strlen(name);
         if (!length) continue;
 
-        int duplicate = 0;
-        for (size_t offset = 0u; offset < used;) {
-            size_t existing_length = strlen(output + offset);
-            if (equal_ascii_fold(output + offset, name)) {
-                duplicate = 1;
-                break;
-            }
-            offset += existing_length + 1u;
-        }
-        if (duplicate) continue;
-
-        if (capacity < 2u || used + length + 2u > capacity) {
+        if (capacity < 2u || used > capacity - 2u ||
+            length >= capacity - 2u - used) {
             fclose(stream);
-            if (capacity >= 2u) {
-                size_t available = capacity - used - 2u;
-                size_t copied = length < available ? length : available;
-                if (copied) memcpy(output + used, name, copied);
-                size_t terminator = used + copied;
-                output[terminator] = '\0';
-                output[terminator + 1u] = '\0';
-            }
-            return capacity > 2u ? (int)(capacity - 2u) : 0;
+            size_t max_chars = capacity - 2u;
+            if (used > max_chars) used = max_chars;
+            size_t available = max_chars - used;
+            size_t copied = length < available ? length : available;
+            if (copied) memcpy(output + used, name, copied);
+            output[used + copied] = '\0';
+            output[used + copied + 1u] = '\0';
+            return (int)max_chars;
         }
         memcpy(output + used, name, length);
         used += length;
@@ -3124,7 +3112,7 @@ static int profile_enumerate_sections(const char *path, char *output,
         output[used] = '\0';
     }
     fclose(stream);
-    return used;
+    return (int)used;
 }
 
 static int handle_profile_import(CPU *cpu, const import_record *import)
@@ -3132,9 +3120,60 @@ static int handle_profile_import(CPU *cpu, const import_record *import)
     if (!import || import->by_ordinal ||
         !equal_ascii_fold(import->dll, "KERNEL32.dll") ||
         (strcmp(import->name, "GetPrivateProfileStringA") &&
+         strcmp(import->name, "GetPrivateProfileSectionNamesA") &&
          strcmp(import->name, "GetPrivateProfileIntA") &&
          strcmp(import->name, "WritePrivateProfileStringA")))
         return 0;
+
+    if (!strcmp(import->name, "GetPrivateProfileSectionNamesA")) {
+        const uint32_t *arguments = (const uint32_t *)guest_memory_try_ptr(
+            cpu->esp + 4u, 12u);
+        if (!arguments)
+            stop_guest("GetPrivateProfileSectionNamesA arguments are unmapped", import->token);
+        uint32_t output_address = arguments[0];
+        uint32_t capacity = arguments[1];
+        uint32_t file_address = arguments[2];
+        char guest_path[32768] = "";
+        if (!file_address ||
+            !copy_guest_string(file_address, guest_path, sizeof(guest_path)))
+            stop_guest("GetPrivateProfileSectionNamesA filename is null, unmapped, or too long",
+                       import->token);
+        if (capacity && !guest_memory_try_ptr(output_address, capacity))
+            stop_guest("GetPrivateProfileSectionNamesA output is unmapped", import->token);
+        if (!profile_path_is_absolute(guest_path))
+            stop_guest("GetPrivateProfileSectionNamesA relative paths require Windows-directory lookup",
+                       import->token);
+
+        char host_path[32768];
+        if (!resolve_profile_path(guest_path, host_path, sizeof(host_path))) {
+            if (capacity) {
+                char *output = (char *)guest_memory_try_ptr(output_address, capacity);
+                output[0] = '\0';
+                if (capacity > 1u) output[1] = '\0';
+            }
+            cpu->eax = 0u;
+            last_error = 87u; /* ERROR_INVALID_PARAMETER */
+            if (trace_imports)
+                fprintf(stderr, "AC1 profile section names: unresolved file=\"%s\" size=%u\n",
+                        guest_path, capacity);
+            return_stdcall(cpu, 12u);
+            return 1;
+        }
+
+        int file_opened = 0;
+        cpu->eax = capacity
+            ? (uint32_t)profile_enumerate_sections(
+                host_path, (char *)guest_memory_try_ptr(output_address, capacity),
+                capacity, &file_opened)
+            : 0u;
+        if (file_opened) last_error = 0u;
+        else if (capacity >= 2u) last_error = (errno == ENOENT) ? 2u : 5u;
+        if (trace_imports)
+            fprintf(stderr, "AC1 profile section names: chars=%u file_opened=%d size=%u file=\"%s\"\n",
+                    cpu->eax, file_opened, capacity, guest_path);
+        return_stdcall(cpu, 12u);
+        return 1;
+    }
 
     if (!strcmp(import->name, "GetPrivateProfileIntA")) {
         const uint32_t *arguments = (const uint32_t *)guest_memory_try_ptr(cpu->esp + 4u, 16u);
@@ -3276,8 +3315,8 @@ static int handle_profile_import(CPU *cpu, const import_record *import)
         cpu->eax = capacity
             ? (uint32_t)profile_enumerate_sections(host_path, output, capacity, &file_opened)
             : 0u;
-        if (!file_opened) last_error = (errno == ENOENT) ? 2u : 5u;
-        else last_error = 0u;
+        if (file_opened) last_error = 0u;
+        else if (capacity >= 2u) last_error = (errno == ENOENT) ? 2u : 5u;
         if (trace_imports)
             fprintf(stderr, "AC1 profile section enumeration: chars=%u file_opened=%d\n",
                     cpu->eax, file_opened);
