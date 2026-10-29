@@ -1816,9 +1816,11 @@ def install_ac1_jump_table_bounds(disassembler) -> None:
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
 
     original = disassembler.jump_table_targets
+    disassembler.ac1_switch_table_ranges = set()
 
     def bounded(self, insn, limit=256):
         pinned_limit = ac1_pinned_switch_limit(insn)
+        proven_limit = pinned_limit
         if pinned_limit is not None:
             limit = min(limit, pinned_limit)
         else:
@@ -1826,7 +1828,9 @@ def install_ac1_jump_table_bounds(disassembler) -> None:
                 self.md, self.read_bytes, insn, X86_OP_REG, X86_OP_MEM, X86_OP_IMM)
             if inferred is not None:
                 limit = min(limit, inferred[0])
+                proven_limit = inferred[0]
         targets = list(original(insn, limit))
+        forward_count = len(targets)
         if (insn.mnemonic == "jmp" and insn.operands and
                 insn.operands[0].type == X86_OP_MEM and
                 insn.operands[0].mem.scale == 4 and insn.operands[0].mem.index):
@@ -1844,6 +1848,7 @@ def install_ac1_jump_table_bounds(disassembler) -> None:
                     neg.operands[0].type == X86_OP_REG and
                     neg.operands[0].reg == jump_index and bound is not None):
                 table_va = insn.operands[0].mem.disp & 0xFFFFFFFF
+                self.ac1_switch_table_ranges.add((table_va - 4 * (bound - 1), table_va + 4))
                 # CMP/JB proves the selected negated indexes are -1 through
                 # -(bound-1); index zero is handled by the forward table scan.
                 for index in range(1, min(limit, bound)):
@@ -1855,6 +1860,10 @@ def install_ac1_jump_table_bounds(disassembler) -> None:
                         break
                     if target not in targets:
                         targets.append(target)
+            if targets or proven_limit is not None:
+                table_va = insn.operands[0].mem.disp & 0xFFFFFFFF
+                self.ac1_switch_table_ranges.add(
+                    (table_va, table_va + 4 * (proven_limit or max(1, forward_count))))
         return targets
 
     disassembler.jump_table_targets = MethodType(bounded, disassembler)
@@ -2370,8 +2379,193 @@ def code_immediate_rejection(target, dis, info, iat, spans, results) -> str | No
     return None
 
 
+def initialized_table_ranges(info) -> list[tuple[int, int, str]]:
+    """Only file-backed initialized bytes, never the zero-filled data tail."""
+    return [(info.image_base + section.virtual_address,
+             info.image_base + section.virtual_address + section.raw_size, section.name)
+            for section in info.sections
+            if section.name.lower() in (".rdata", ".data", "_rdata", ".data1")
+            and section.characteristics & 0x40 and not section.characteristics & 0x20000000
+            and section.raw_size >= 4]
+
+
+def loaded_register_transfer(instructions, index, register, md) -> str | None:
+    """Prove a MOV result reaches a same-block CALL/JMP before a clobber.
+
+    Re-decode only this small candidate suffix for Capstone's implicit register
+    writes (the donor Instruction wrapper retains operands but not regs_access).
+    Partial-register writes kill the proof as well. Other calls/branches stop it.
+    """
+    def family(reg):
+        name = md.reg_name(reg)
+        for names in (("eax", "ax", "al", "ah"), ("ebx", "bx", "bl", "bh"),
+                      ("ecx", "cx", "cl", "ch"), ("edx", "dx", "dl", "dh"),
+                      ("esi", "si"), ("edi", "di"), ("esp", "sp"), ("ebp", "bp")):
+            if name in names:
+                return names[0]
+        return name
+
+    from capstone.x86 import X86_OP_REG
+    for following in instructions[index + 1:]:
+        if following.mnemonic in ("call", "jmp"):
+            ops = following.operands
+            return (following.mnemonic if len(ops) == 1 and ops[0].type == X86_OP_REG
+                    and ops[0].reg == register else None)
+        if (following.mnemonic.startswith(("j", "ret", "loop", "int")) or
+                following.mnemonic in ("lcall", "ljmp", "ud2", "hlt")):
+            return None
+        decoded = next(md.disasm(bytes(following.bytes), following.address, count=1), None)
+        if decoded is None:
+            return None
+        if any(family(reg) == family(register) for reg in decoded.regs_access()[1]):
+            return None
+    return None
+
+
+def indexed_table_references(function, ranges, md) -> tuple[list[dict], set[int]]:
+    """Extract actual memory reads, plus count unhandled pre-scaled loads."""
+    from capstone import CS_AC_READ
+    from capstone.x86 import X86_OP_MEM, X86_OP_REG, X86_REG_FS, X86_REG_GS
+    references = {}
+    prescaled = set()
+    for block in function.blocks.values():
+        instructions = block.instructions
+        for index, ins in enumerate(instructions):
+            if ins.mnemonic == "lea":
+                continue
+            for operand in ins.operands:
+                if operand.type != X86_OP_MEM or not operand.access & CS_AC_READ:
+                    continue
+                mem = operand.mem
+                table = mem.disp & 0xFFFFFFFF
+                if mem.segment in (X86_REG_FS, X86_REG_GS):
+                    continue
+                section = next((name for start, end, name in ranges if start <= table < end), None)
+                if section is None:
+                    continue
+                kind = None
+                if mem.index and mem.scale == 4:
+                    kind = "indexed"
+                elif (ins.mnemonic == "mov" and len(ins.operands) == 2 and
+                      ins.operands[0].type == X86_OP_REG and ins.operands[0].size == 4
+                      and operand is ins.operands[1] and operand.size == 4):
+                    transfer = loaded_register_transfer(instructions, index, ins.operands[0].reg, md)
+                    if not mem.base and not mem.index and transfer:
+                        kind = "absolute"
+                    elif (bool(mem.base) != bool(mem.index) and mem.scale == 1 and transfer == "call"):
+                        prescaled.add(ins.address)
+                if kind:
+                    references[(ins.address, table, kind)] = {
+                        "callsite": ins.address, "table": table, "kind": kind,
+                        "section": section, "instruction": f"{ins.mnemonic} {ins.op_str}",
+                    }
+    return list(references.values()), prescaled
+
+
+class IndexedTableDiscovery:
+    """Deferred table sweeps share the immediate rule's validation and queue.
+
+    Revisit tables after each recovered wave: a formerly unproven boundary may
+    now be an independently recovered entry, allowing a longer valid prefix.
+    Counts describe the last sweep's unique tables/stopping entries, rather
+    than multiplying the same rejection by callers or discovery waves.
+    """
+    def __init__(self, info, dis, enabled=True, entry_cap=1024):
+        self.info, self.dis, self.enabled, self.entry_cap = info, dis, enabled, entry_cap
+        self.ranges = initialized_table_ranges(info) if enabled else []
+        self.references = collections.defaultdict(dict)
+        self.prescaled = set()
+        self.edges = collections.defaultdict(list)
+        self.queued = set()
+        self.tables = []
+        self.last_count = -1
+        self.waves = 0
+        self.depth_rejections = 0
+        self.late_rejections = collections.Counter()
+
+    def collect(self, function, caller, depth, max_depth):
+        if not self.ranges:
+            return
+        refs, prescaled = indexed_table_references(function, self.ranges, self.dis.md)
+        self.prescaled.update(prescaled)
+        for ref in refs:
+            if depth >= max_depth:
+                self.depth_rejections += 1
+                continue
+            self.references[(ref["table"], ref["kind"])][(caller, ref["callsite"])] = {
+                **ref, "caller": caller, "depth": depth + 1, "role": "indexed_table",
+            }
+
+    def needs_sweep(self, results):
+        return bool(self.references) and self.last_count != len(results)
+
+    def sweep(self, results, spans, iat, queue, queued):
+        self.last_count = len(results)
+        self.waves += 1
+        self.edges.clear()
+        self.tables = []
+        validation = {}
+        switch_ranges = getattr(self.dis, "ac1_switch_table_ranges", ())
+        for (table, kind), refs in sorted(self.references.items()):
+            end = next(end for start, end, _ in self.ranges if start <= table < end)
+            report = {"table": table, "kind": kind, "reference_count": len(refs), "entry_count": 0}
+            cap = 1 if kind == "absolute" else self.entry_cap
+            for index in range(cap):
+                slot = table + 4 * index
+                report["stop_slot"] = slot
+                report.pop("stop_target", None)
+                if any(start <= slot < stop for start, stop in switch_ranges):
+                    report["stop_reason"] = "bounded_switch"
+                    break
+                if slot + 4 > end:
+                    report["stop_reason"] = "section_end"
+                    break
+                raw = self.dis.read_bytes(slot, 4)
+                if raw is None or len(raw) != 4:
+                    report["stop_reason"] = "unreadable_entry"
+                    break
+                target = int.from_bytes(raw, "little")
+                report["stop_target"] = target
+                if target not in validation:
+                    validation[target] = code_immediate_rejection(
+                        target, self.dis, self.info, iat, spans, results)
+                if validation[target]:
+                    report["stop_reason"] = validation[target]
+                    break
+                report["entry_count"] += 1
+                self.edges[target].extend({**ref, "slot": slot, "index": index, "target": target}
+                                          for ref in refs.values())
+                if target not in results and target not in queued:
+                    queued.add(target)
+                    self.queued.add(target)
+                    queue.append((target, min(ref["depth"] for ref in refs.values())))
+            else:
+                report["stop_reason"] = "single_entry" if kind == "absolute" else "entry_cap"
+                report["stop_slot"] = table + 4 * cap
+                report.pop("stop_target", None)
+            self.tables.append(report)
+
+    def summary(self, results):
+        rejections = collections.Counter(table["stop_reason"] for table in self.tables
+                                         if table["stop_reason"] != "single_entry")
+        if self.depth_rejections:
+            rejections["depth_limit"] = self.depth_rejections
+        return {
+            "enabled": self.enabled, "entry_cap": self.entry_cap, "waves": self.waves,
+            "pending_sweep": self.needs_sweep(results),
+            "candidate_table_count": len({table for table, _ in self.references}),
+            "table_count": len({table["table"] for table in self.tables if table["entry_count"]}),
+            "accepted_edges": sum(map(len, self.edges.values())),
+            "rejected_candidates": dict(sorted(rejections.items())),
+            "late_rejected_candidates": dict(sorted(self.late_rejections.items())),
+            "prescaled_loads_followed_by_indirect_call": len(self.prescaled),
+            "tables": self.tables,
+        }
+
+
 def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_depth: int,
-                        extra_seeds: list[int], code_immediates: bool = True):
+                        extra_seeds: list[int], code_immediates: bool = True,
+                        indexed_tables: bool = True):
     sys.path[:0] = [str(pcrecomp / "tools/pe"), str(pcrecomp / "tools/disasm")]
     from pe_analyze import analyze_pe, build_iat_map
     from disasm32 import Disassembler
@@ -2394,12 +2588,14 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
     immediate_queued = set()
     immediate_rejected = collections.Counter()
     immediate_waves = 0
-    while (queue or immediate_pending) and len(results) < max_functions:
+    indexed = IndexedTableDiscovery(info, dis, indexed_tables)
+    while (queue or immediate_pending or indexed.needs_sweep(results)) and len(results) < max_functions:
         if not queue:
             # First exhaust the direct/ABI-specific cone, so instruction spans
             # can reject continuations and mid-instruction literals. Repeat
             # after every new wave, scanning newly recovered bodies to closure.
-            immediate_waves += 1
+            if immediate_pending:
+                immediate_waves += 1
             for target, edges in sorted(immediate_pending.items()):
                 reason = code_immediate_rejection(target, dis, info, iat,
                                                  instruction_spans, results)
@@ -2412,18 +2608,21 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
                     immediate_queued.add(target)
                     queue.append((target, min(edge["depth"] for edge in edges)))
             immediate_pending.clear()
+            if not queue and indexed.needs_sweep(results):
+                indexed.sweep(results, instruction_spans, iat, queue, queued)
             if not queue:
                 break
         address, depth = queue.popleft()
         if address in results:
             continue
-        if address in immediate_queued:
+        if address in immediate_queued or address in indexed.queued:
             # Earlier roots in this wave may have recovered the instruction
             # containing this target since the batch was validated.
             if instruction_spans.overlaps(address) or instruction_spans.contains(address):
                 reason = ("mid_instruction" if instruction_spans.overlaps(address)
                           else "interior_instruction")
                 immediate_rejected[reason] += len(immediate_edges.pop(address, []))
+                indexed.late_rejections[reason] += len(indexed.edges.pop(address, []))
                 queued.discard(address)
                 continue
         try:
@@ -2458,6 +2657,7 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
             ],
         }
         instruction_spans.add_function(results[address])
+        indexed.collect(function, address, depth, max_depth)
         if code_immediates:
             for edge in constant_code_immediate_edges(function):
                 target = edge["target"]
@@ -2528,6 +2728,8 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
                     queue.append((target, depth + 1))
     for edges in immediate_edges.values():
         callback_edges.extend(edges)
+    for edges in indexed.edges.values():
+        callback_edges.extend(edges)
     immediate_summary = {
         "enabled": code_immediates,
         "waves": immediate_waves,
@@ -2536,7 +2738,7 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
         "pending_targets": len(immediate_pending),
     }
     return (info, dis, results, failures, len(queue), entry, iat, callback_edges,
-            immediate_summary)
+            immediate_summary, indexed.summary(results))
 
 
 def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: Path,
@@ -2867,6 +3069,8 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=CONFIG_PATH,
+                        help="discovery configuration (allows private seed-set A/B comparisons)")
     parser.add_argument("--selftest", action="store_true", help="run the focused block-entry ordering check")
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--pcrecomp", type=Path)
@@ -2891,20 +3095,23 @@ def main() -> int:
                         help="disable the persistent generated-body cache")
     parser.add_argument("--no-code-immediates", action="store_true",
                         help="disable callback discovery from decoded MOV/PUSH imm32 operands")
+    parser.add_argument("--no-indexed-tables", action="store_true",
+                        help="disable initialized-data function-table discovery")
     args = parser.parse_args()
+    config_path = args.config.resolve()
     if args.selftest:
-        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        config = json.loads(config_path.read_text(encoding="utf-8"))
         python, pcrecomp = resolve_tooling(config, args)
         binary = (args.binary or Path(config["binary"])).resolve()
         if sha256(binary) != config["sha256"]:
-            parser.error("installed executable SHA-256 does not match config/ac1_dx9.json")
+            parser.error(f"installed executable SHA-256 does not match {config_path}")
         run_selftest()
         run_ac1_switch_selftest(binary, pcrecomp)
         run_terminal_external_direct_jump_selftest(binary, pcrecomp)
         return 0
     driver_path = Path(__file__).resolve()
     driver_hash = sha256(driver_path)
-    config_bytes = CONFIG_PATH.read_bytes()
+    config_bytes = config_path.read_bytes()
     config_hash = sha256_bytes(config_bytes)
     config = json.loads(config_bytes)
     python, pcrecomp = resolve_tooling(config, args)
@@ -2914,7 +3121,7 @@ def main() -> int:
         parser.error(f"output-dir must be under {ROOT / 'work'}")
     binary_hash = sha256(binary)
     if binary_hash != config["sha256"]:
-        parser.error("installed executable SHA-256 does not match config/ac1_dx9.json")
+        parser.error(f"installed executable SHA-256 does not match {config_path}")
     revision = subprocess.check_output(["git", "-C", str(pcrecomp), "rev-parse", "HEAD"], text=True).strip()
     if revision != config["pcrecomp_revision"]:
         parser.error(f"pcrecomp revision mismatch: expected {config['pcrecomp_revision']}, got {revision}")
@@ -2926,7 +3133,7 @@ def main() -> int:
     }
     input_fingerprints: dict[str, tuple[Path, str]] = {
         "driver": (driver_path, driver_hash),
-        "config": (CONFIG_PATH, config_hash),
+        "config": (config_path, config_hash),
         "binary": (binary, binary_hash),
         **{name: (path, sha256(path)) for name, path in donor_paths.items()},
     }
@@ -2991,9 +3198,9 @@ def main() -> int:
     start_time = time.perf_counter()
     discovery_start = time.perf_counter()
     (info, dis, catalog, discovery_failures, queued, entry, iat, callback_edges,
-     immediate_summary) = discover_entry_cone(
+     immediate_summary, indexed_summary) = discover_entry_cone(
         binary, pcrecomp, max_functions, max_depth, extra_seeds,
-        code_immediates=not args.no_code_immediates)
+        code_immediates=not args.no_code_immediates, indexed_tables=not args.no_indexed_tables)
     discovery_seconds = time.perf_counter() - discovery_start
     catalog_doc = {
         "binary_sha256": binary_hash,
@@ -3023,6 +3230,7 @@ def main() -> int:
         "discovery_failures": discovery_failures,
         "discovered_callback_edges": callback_edges,
         "code_immediate_discovery": immediate_summary,
+        "indexed_table_discovery": indexed_summary,
         "functions": sorted(catalog.values(), key=lambda item: item["address"]),
     }
     catalog_path = output_dir / "functions.json"
@@ -3104,6 +3312,7 @@ def main() -> int:
             "Discovery follows bounded direct calls and validated direct tail thunks from the PE entry point and explicit --seed targets; arbitrary indirect calls, exports, and generic data-pointer targets remain uncovered.",
             "No menu, graphics, or gameplay has been verified through this generated slice.",
             "Callback discovery follows validated AC1 F9FA43 constructor/cleanup, 438EF0 schema-helper arg2, and 9312F0 reader-helper arg2 ABIs, plus decoded MOV/PUSH imm32 code pointers unless --no-code-immediates is set; arbitrary virtual calls, data-only callback records, and exports remain uncovered.",
+            "Initialized-data indexed function tables and proven same-block absolute-load CALL/JMP slots are scanned forward with a 1024-entry cap unless --no-indexed-tables is set; pre-scaled register tables are counted but not followed.",
             "Any RECOMP_TODO emitted by the upstream lifter remains a concrete translation gap.",
             "The inspected DX9 image has no base-relocation directory, so the first runtime must preserve its preferred image base 0x00400000 unless relocation evidence changes.",
         ],

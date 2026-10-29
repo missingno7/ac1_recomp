@@ -112,7 +112,7 @@ class CodeImmediateTests(unittest.TestCase):
                                             max_depth, [], enabled)
 
     def test_closure_provenance_and_rejections(self):
-        _, _, catalog, failures, remaining, _, _, edges, summary = self.discover()
+        _, _, catalog, failures, remaining, _, _, edges, summary, _ = self.discover()
         self.assertEqual(set(catalog), {0x1000, 0x1100, 0x1200, 0x1403})
         self.assertFalse(failures)
         self.assertEqual(remaining, 0)
