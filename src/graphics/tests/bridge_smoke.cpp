@@ -741,9 +741,11 @@ int main(int argc, char **argv)
         ac1_d3d9_argument_count(0x7e0021b0u) != 7 ||
         ac1_d3d9_argument_count(0x7e004000u) != 3 ||
         ac1_d3d9_argument_count(0x7e005000u) != 3 ||
+        ac1_d3d9_argument_count(0x7e006000u) != 3 ||
+        ac1_d3d9_argument_count(0x7e002560u) != 3 ||
         ac1_d3d9_dispatch(0x7e002030u, nullptr, 0, nullptr) != -2 ||
         ac1_d3d9_dispatch(0x7e0030b0u, nullptr, 0, nullptr) != -2 ||
-        ac1_d3d9_dispatch(0x7e006000u, nullptr, 0, nullptr) != 0) {
+        ac1_d3d9_dispatch(0x7e007000u, nullptr, 0, nullptr) != 0) {
         std::fprintf(stderr, "COM method-arity classification failed\n");
         ac1_d3d9_shutdown();
         return 3;
@@ -864,6 +866,93 @@ int main(int argc, char **argv)
         DestroyWindow(hidden_window);
         ac1_d3d9_shutdown();
         return 22;
+    }
+
+    const uint32_t declaration_output = allocate_guest(nullptr, 4, 4);
+    const D3DVERTEXELEMENT9 declaration_elements[] = {
+        {0, 0, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT,
+         D3DDECLUSAGE_POSITION, 0},
+        D3DDECL_END()
+    };
+    const uint32_t declaration_elements_address = allocate_guest(
+        nullptr, sizeof(declaration_elements), 4);
+    std::memcpy(resolve_guest(nullptr, declaration_elements_address,
+                              sizeof(declaration_elements), AC1_D3D9_GUEST_WRITE),
+                declaration_elements, sizeof(declaration_elements));
+    const uint32_t declaration_args[] = {
+        device, declaration_elements_address, declaration_output
+    };
+    const uint32_t unterminated_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t unterminated_address = allocate_guest(
+        nullptr, (MAXD3DDECLLENGTH + 1u) * sizeof(D3DVERTEXELEMENT9), 4);
+    std::array<D3DVERTEXELEMENT9, MAXD3DDECLLENGTH + 1u> unterminated_elements{};
+    for (auto &element : unterminated_elements) {
+        element = {0, 0, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT,
+                   D3DDECLUSAGE_POSITION, 0};
+    }
+    std::memcpy(resolve_guest(nullptr, unterminated_address,
+                              static_cast<uint32_t>(sizeof(unterminated_elements)),
+                              AC1_D3D9_GUEST_WRITE), unterminated_elements.data(),
+                sizeof(unterminated_elements));
+    const uint32_t unterminated_args[] = {
+        device, unterminated_address, unterminated_output
+    };
+    const uint32_t unmapped_declaration_args[] = {
+        device, 0xfffffff8u, unterminated_output
+    };
+    if (ac1_d3d9_dispatch(object_slot(device, 86), unterminated_args, 3,
+                          &getter_result) != 1 ||
+        getter_result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
+        guest_word(unterminated_output) != 0 ||
+        ac1_d3d9_dispatch(object_slot(device, 86), unmapped_declaration_args, 3,
+                          &getter_result) != 1 ||
+        getter_result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
+        ac1_d3d9_dispatch(object_slot(device, 86), declaration_args, 3,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result)) || !guest_word(declaration_output)) {
+        std::fprintf(stderr, "CreateVertexDeclaration smoke failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 30;
+    }
+    const uint32_t declaration = guest_word(declaration_output);
+    if (ac1_d3d9_argument_count(object_slot(declaration, 2)) != 1) {
+        std::fprintf(stderr, "vertex declaration proxy kind was not registered\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 31;
+    }
+    const uint8_t iid_vertex_declaration[16] = {
+        0x9c, 0xc5, 0x13, 0xdd, 0xfa, 0x36, 0x98, 0x40,
+        0xa8, 0xfb, 0xc7, 0xed, 0x39, 0xdc, 0x85, 0x46
+    };
+    const uint32_t declaration_iid_address = allocate_guest(
+        nullptr, sizeof(iid_vertex_declaration), 4);
+    const uint32_t declaration_query_output = allocate_guest(nullptr, 4, 4);
+    std::memcpy(resolve_guest(nullptr, declaration_iid_address,
+                              sizeof(iid_vertex_declaration), AC1_D3D9_GUEST_WRITE),
+                iid_vertex_declaration, sizeof(iid_vertex_declaration));
+    const uint32_t declaration_query_args[] = {
+        declaration, declaration_iid_address, declaration_query_output
+    };
+    if (ac1_d3d9_dispatch(object_slot(declaration, 0), declaration_query_args, 3,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result)) ||
+        guest_word(declaration_query_output) != declaration) {
+        std::fprintf(stderr, "vertex declaration QueryInterface identity failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 32;
+    }
+    const uint32_t declaration_this[] = {declaration};
+    if (ac1_d3d9_dispatch(object_slot(declaration, 2), declaration_this, 1,
+                          &references) != 1 || references != 1) {
+        std::fprintf(stderr, "vertex declaration reference balance failed\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 33;
     }
 
     const uint32_t get_render_target = object_slot(device, 38);
@@ -1053,6 +1142,14 @@ int main(int argc, char **argv)
         DestroyWindow(hidden_window);
         ac1_d3d9_shutdown();
         return 23;
+    }
+    if (ac1_d3d9_dispatch(object_slot(declaration, 2), declaration_this, 1,
+                          &references) != 1 || references != 0) {
+        std::fprintf(stderr, "vertex declaration Release failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 34;
     }
     if (ac1_d3d9_dispatch(device_release, device_this, 1, &references) != 1) {
         std::fprintf(stderr, "device release smoke failed: %s\n", ac1_d3d9_last_error());
