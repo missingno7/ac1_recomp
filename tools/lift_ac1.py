@@ -274,6 +274,38 @@ def direct_tail_thunk_target(function) -> int | None:
     return insn.operands[0].imm & 0xFFFFFFFF
 
 
+def terminal_external_direct_jump_targets(function) -> list[int]:
+    """Return external targets of terminal direct JMPs in recovered CFG blocks.
+
+    This catches real tail transfers in adapter functions that do work before
+    their final jump, while excluding local CFG edges and targets inside any
+    instruction span already decoded for the same function.
+    """
+    from capstone.x86 import X86_OP_IMM
+
+    blocks = list(function.blocks.values())
+    local_starts = {block.start for block in blocks}
+    instruction_spans = [
+        (insn.address, insn.address + insn.size)
+        for block in blocks for insn in block.instructions
+    ]
+    targets = set()
+    for block in blocks:
+        if not block.instructions:
+            continue
+        insn = block.instructions[-1]
+        if (insn.mnemonic != "jmp" or len(insn.operands) != 1 or
+                insn.operands[0].type != X86_OP_IMM):
+            continue
+        target = insn.operands[0].imm & 0xFFFFFFFF
+        if target in local_starts:
+            continue
+        if any(start <= target < end for start, end in instruction_spans):
+            continue
+        targets.add(target)
+    return sorted(targets)
+
+
 def fallthrough_target(mnemonic: str, next_pc: int, next_decoded: int | None) -> int | None:
     """Return the real next guest VA when sorted C would cross a code gap."""
     terminal = {"jmp", "ret", "retn", "retf", "iret", "iretd", "hlt", "int3"}
@@ -1000,6 +1032,57 @@ def run_ac1_switch_selftest(binary: Path, pcrecomp: Path) -> None:
     finally:
         pe.close()
     print("AC1 actual-base jump-table self-test: local, remapped, and negative-index switches recovered")
+
+
+def run_terminal_external_direct_jump_selftest(binary: Path, pcrecomp: Path) -> None:
+    """Check bounded discovery of real multi-instruction AC1 tail transfers."""
+    sys.path[:0] = [str(pcrecomp / "tools/pe"), str(pcrecomp / "tools/disasm")]
+    from pe_analyze import analyze_pe, build_iat_map
+    from disasm32 import Disassembler
+    from types import SimpleNamespace
+
+    info = analyze_pe(str(binary))
+    dis = Disassembler(binary.read_bytes(), info.image_base, info.sections)
+    install_ac1_jump_table_bounds(dis)
+    iat = build_iat_map(info)
+    adapter = dis.disassemble_function(0x004016D1, iat)
+    if adapter is None or not adapter.blocks:
+        raise AssertionError("AC1 startup adapter did not disassemble")
+    assert direct_tail_thunk_target(adapter) is None
+    assert terminal_external_direct_jump_targets(adapter) == [0x009D9600]
+    adapter_spec = {
+        "address": 0x004016D1,
+        "blocks": [{"instructions": [[ins.address, ins.size]
+                                      for ins in block.instructions]}
+                   for block in adapter.blocks.values()],
+    }
+    spans = InstructionSpanIndex()
+    spans.add_function(adapter_spec)
+    assert validate_callback_code_entry(0x009D9600, dis, info, iat, spans)
+    # The first jump in this function is internal and must not be promoted.
+    assert 0x00403290 not in terminal_external_direct_jump_targets(adapter)
+
+    # Existing exact one-instruction thunks still produce their same target.
+    thunk = dis.disassemble_function(0x004C2B30, iat)
+    assert thunk is not None
+    assert terminal_external_direct_jump_targets(thunk) == [0x005DA560]
+
+    indirect = next(dis.md.disasm(b"\xFF\xE0", 0x1000))
+    conditional = next(dis.md.disasm(b"\x74\x05", 0x2000))
+    indirect_fn = SimpleNamespace(blocks={0x1000: SimpleNamespace(start=0x1000, instructions=[indirect])})
+    conditional_fn = SimpleNamespace(blocks={0x2000: SimpleNamespace(start=0x2000, instructions=[conditional])})
+    assert terminal_external_direct_jump_targets(indirect_fn) == []
+    assert terminal_external_direct_jump_targets(conditional_fn) == []
+
+    interior = next(dis.md.disasm(b"\xE9\xFC\xFF\xFF\xFF", 0x3000))
+    interior_fn = SimpleNamespace(blocks={0x3000: SimpleNamespace(start=0x3000, instructions=[interior])})
+    assert terminal_external_direct_jump_targets(interior_fn) == []
+    nonexec = next(dis.md.disasm(b"\xE9\xFA\xBE\xAD\xDE", 0x4000))
+    nonexec_fn = SimpleNamespace(blocks={0x4000: SimpleNamespace(start=0x4000, instructions=[nonexec])})
+    target = terminal_external_direct_jump_targets(nonexec_fn)[0]
+    assert not dis.is_code_address(target)
+    assert not validate_callback_code_entry(target, dis, info, iat, spans)
+    print("AC1 external tail-jump self-test: startup adapter followed; local, indirect, conditional, interior, and non-code cases rejected")
 
 
 def run_ac1_sse_width_selftest(lifter, md, read_va) -> None:
@@ -1924,6 +2007,14 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
             if tail_target not in results and tail_target not in queued:
                 queued.add(tail_target)
                 queue.append((tail_target, depth + 1))
+        for target in terminal_external_direct_jump_targets(function):
+            if target == tail_target:
+                continue
+            if not validate_callback_code_entry(target, dis, info, iat, instruction_spans):
+                continue
+            if target not in results and target not in queued:
+                queued.add(target)
+                queue.append((target, depth + 1))
         for call_edge in ac1_array_constructor_call_edges(function):
             for role in ("constructor", "cleanup"):
                 target = call_edge[role]
@@ -2302,6 +2393,7 @@ def main() -> int:
             parser.error("installed executable SHA-256 does not match config/ac1_dx9.json")
         run_selftest()
         run_ac1_switch_selftest(binary, pcrecomp)
+        run_terminal_external_direct_jump_selftest(binary, pcrecomp)
         return 0
     driver_path = Path(__file__).resolve()
     driver_hash = sha256(driver_path)
