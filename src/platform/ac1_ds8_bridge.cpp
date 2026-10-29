@@ -25,11 +25,15 @@ constexpr uint32_t kDeviceKind = 2u;
 constexpr uint32_t kBufferKind = 3u;
 constexpr uint32_t kListenerKind = 4u;
 constexpr uint32_t kBuffer8Kind = 5u;
+constexpr uint32_t k3DBufferKind = 6u;
+constexpr uint32_t kNotifyKind = 7u;
 constexpr uint32_t kUnknownSlots = 3u;
 constexpr uint32_t kDeviceSlots = 12u;
 constexpr uint32_t kBufferSlots = 21u;
 constexpr uint32_t kListenerSlots = 18u;
 constexpr uint32_t kBuffer8Slots = 24u;
+constexpr uint32_t k3DBufferSlots = 21u;
+constexpr uint32_t kNotifySlots = 4u;
 
 const GUID kIidUnknown =
     {0x00000000u, 0x0000u, 0x0000u, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
@@ -41,13 +45,19 @@ const GUID kIidDirectSoundBuffer8 =
     {0x6825A449u, 0x7524u, 0x4D82u, {0x92, 0x0F, 0x50, 0xE3, 0x6A, 0xB3, 0xAB, 0x1E}};
 const GUID kIidDirectSound3DListener =
     {0x279AFA84u, 0x4981u, 0x11CEu, {0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60}};
+const GUID kIidDirectSound3DBuffer =
+    {0x279AFA86u, 0x4981u, 0x11CEu, {0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60}};
+const GUID kIidDirectSoundNotify =
+    {0xB0210783u, 0x89CDu, 0x11D0u, {0xAF, 0x08, 0x00, 0xA0, 0xC9, 0x25, 0xCD, 0x16}};
 
 enum class ObjectKind : uint32_t {
     Unknown = kUnknownKind,
     Device = kDeviceKind,
     Buffer = kBufferKind,
     Listener = kListenerKind,
-    Buffer8 = kBuffer8Kind
+    Buffer8 = kBuffer8Kind,
+    Buffer3D = k3DBufferKind,
+    Notify = kNotifyKind
 };
 
 struct GuestObject {
@@ -129,6 +139,13 @@ bool guest_write(uint32_t address, const void *input, uint32_t size)
     return true;
 }
 
+float float_argument(uint32_t bits)
+{
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
 bool is_buffer_kind(ObjectKind kind)
 {
     return kind == ObjectKind::Buffer || kind == ObjectKind::Buffer8;
@@ -176,6 +193,8 @@ uint32_t slot_count(ObjectKind kind)
     case ObjectKind::Buffer: return kBufferSlots;
     case ObjectKind::Listener: return kListenerSlots;
     case ObjectKind::Buffer8: return kBuffer8Slots;
+    case ObjectKind::Buffer3D: return k3DBufferSlots;
+    case ObjectKind::Notify: return kNotifySlots;
     }
     return 0;
 }
@@ -183,12 +202,12 @@ uint32_t slot_count(ObjectKind kind)
 int token_argument_count(uint32_t token)
 {
     if (token < AC1_DS8_TOKEN_BASE + kKindStride ||
-        token >= AC1_DS8_TOKEN_BASE + 6u * kKindStride)
+        token >= AC1_DS8_TOKEN_BASE + 8u * kKindStride)
         return 0;
     const uint32_t offset = token - AC1_DS8_TOKEN_BASE;
     const uint32_t kind = offset / kKindStride;
     const uint32_t within_kind = offset % kKindStride;
-    if (kind < kUnknownKind || kind > kBuffer8Kind ||
+    if (kind < kUnknownKind || kind > kNotifyKind ||
         within_kind % kSlotStride)
         return -1;
 
@@ -204,6 +223,32 @@ int token_argument_count(uint32_t token)
         return 3; /* SetCooperativeLevel(this, HWND, priority). */
     if (object_kind == ObjectKind::Device && method == 8u)
         return 2; /* GetSpeakerConfig(this, DWORD*). */
+    if (object_kind == ObjectKind::Device && method == 4u) return 2;
+    if (object_kind == ObjectKind::Device && method == 5u) return 3;
+    if (object_kind == ObjectKind::Device && method == 7u) return 1;
+    if (object_kind == ObjectKind::Device && (method == 9u || method == 10u || method == 11u)) return 2;
+    if (is_buffer_kind(object_kind) && method == 3u) return 2;
+    if (is_buffer_kind(object_kind) && method == 5u) return 4;
+    if (is_buffer_kind(object_kind) && method >= 6u && method <= 9u) return 2;
+    if (is_buffer_kind(object_kind) && method == 10u) return 3;
+    if (is_buffer_kind(object_kind) && method == 13u) return 2;
+    if (is_buffer_kind(object_kind) && method == 17u) return 2;
+    if (is_buffer_kind(object_kind) && (method == 18u || method == 20u)) return 1;
+    if (object_kind == ObjectKind::Buffer8 && method == 21u) return 4;
+    if (object_kind == ObjectKind::Buffer8 && method == 22u) return 4;
+    if (object_kind == ObjectKind::Buffer8 && method == 23u) return 5;
+    if (object_kind == ObjectKind::Listener && (method == 3u || method == 4u || method == 5u || method == 7u || method == 8u || method == 9u)) return 2;
+    if (object_kind == ObjectKind::Listener && (method == 6u || method == 10u || method == 11u || method == 12u || method == 15u)) return 3;
+    if (object_kind == ObjectKind::Listener && method == 13u) return 8;
+    if (object_kind == ObjectKind::Listener && (method == 14u || method == 16u)) return 5;
+    if (object_kind == ObjectKind::Listener && method == 17u) return 1;
+    if (object_kind == ObjectKind::Buffer3D && method == 4u) return 3;
+    if (object_kind == ObjectKind::Buffer3D && (method == 12u || method == 15u || method == 16u || method == 17u || method == 18u)) return 3;
+    if (object_kind == ObjectKind::Buffer3D && method == 13u) return 4;
+    if (object_kind == ObjectKind::Buffer3D && method == 14u) return 5;
+    if (object_kind == ObjectKind::Buffer3D && (method == 19u || method == 20u)) return 5;
+    if (object_kind == ObjectKind::Buffer3D && method >= 3u && method <= 20u) return 2;
+    if (object_kind == ObjectKind::Notify && method == 3u) return 3;
     if (is_buffer_kind(object_kind) && method == 11u)
         return 8; /* Lock(this, offset, bytes, ptr1, size1, ptr2, size2, flags). */
     if (is_buffer_kind(object_kind) && method == 12u)
@@ -353,6 +398,8 @@ bool iid_kind(const GUID &iid, ObjectKind *kind)
     else if (IsEqualGUID(iid, kIidDirectSoundBuffer)) *kind = ObjectKind::Buffer;
     else if (IsEqualGUID(iid, kIidDirectSoundBuffer8)) *kind = ObjectKind::Buffer8;
     else if (IsEqualGUID(iid, kIidDirectSound3DListener)) *kind = ObjectKind::Listener;
+    else if (IsEqualGUID(iid, kIidDirectSound3DBuffer)) *kind = ObjectKind::Buffer3D;
+    else if (IsEqualGUID(iid, kIidDirectSoundNotify)) *kind = ObjectKind::Notify;
     else return false;
     return true;
 }
@@ -488,6 +535,41 @@ int invoke_create_sound_buffer(GuestObject &object, const uint32_t *args,
     if (!guest_buffer) return AC1_DS8_ERROR;
     *guest_output = guest_buffer;
     *result_out = static_cast<uint32_t>(result);
+    return AC1_DS8_HANDLED;
+}
+
+int invoke_buffer_initialize(GuestObject &object, const uint32_t *args,
+                             uint32_t *result_out)
+{
+    auto device = g_objects.find(args[1]);
+    if (device == g_objects.end() || device->second.kind != ObjectKind::Device) {
+        set_error("DirectSound Buffer::Initialize device is not a live guest DirectSound proxy");
+        return AC1_DS8_ERROR;
+    }
+    GuestDsBufferDesc guest_desc{};
+    if (!guest_read(args[2], &guest_desc, sizeof(guest_desc))) {
+        set_error("DirectSound Buffer::Initialize descriptor is not readable in guest memory");
+        return AC1_DS8_ERROR;
+    }
+    if (guest_desc.size != sizeof(guest_desc)) {
+        set_error("DirectSound Buffer::Initialize descriptor does not use the observed 36-byte x86 ABI");
+        return AC1_DS8_METHOD_UNSUPPORTED;
+    }
+    DSBUFFERDESC native_desc{};
+    native_desc.dwSize = sizeof(native_desc);
+    native_desc.dwFlags = guest_desc.flags;
+    native_desc.dwBufferBytes = guest_desc.buffer_bytes;
+    native_desc.dwReserved = guest_desc.reserved;
+    native_desc.guid3DAlgorithm = guest_desc.algorithm;
+    std::vector<uint8_t> format_bytes;
+    if (guest_desc.wave_format) {
+        if (!copy_guest_wave_format(guest_desc.wave_format, &format_bytes, "Buffer::Initialize"))
+            return AC1_DS8_ERROR;
+        native_desc.lpwfxFormat = reinterpret_cast<LPWAVEFORMATEX>(format_bytes.data());
+    }
+    HRESULT hr = native_buffer(object)->Initialize(
+        reinterpret_cast<IDirectSound *>(device->second.native), &native_desc);
+    *result_out = static_cast<uint32_t>(hr);
     return AC1_DS8_HANDLED;
 }
 
@@ -756,10 +838,21 @@ extern "C" int ac1_ds8_dispatch(uint32_t token, const uint32_t *args,
     if (expected_arguments == 0) return AC1_DS8_UNSUPPORTED;
     if (expected_arguments == -2) {
         std::lock_guard<std::mutex> lock(g_mutex);
-        std::ostringstream message;
-        message << "DirectSound COM token 0x" << std::hex << token
-                << " names an unsupported method/profile";
-        set_error(message.str());
+        const uint32_t offset = token - AC1_DS8_TOKEN_BASE;
+        const uint32_t kind = offset / kKindStride;
+        const uint32_t method = (offset % kKindStride) / kSlotStride;
+        if (kind == kNotifyKind && method == 3u)
+            set_error("IDirectSoundNotify::SetNotificationPositions is unsupported: guest event handles have no host-handle translation callback");
+        else if (kind == kBuffer8Kind && method == 21u)
+            set_error("IDirectSoundBuffer8::SetFX is unsupported: DSFX descriptors and per-effect results require effect-object proxy marshalling");
+        else if (kind == kBuffer8Kind && method == 23u)
+            set_error("IDirectSoundBuffer8::GetObjectInPath is unsupported: returned effect object requires a COM proxy");
+        else {
+            std::ostringstream message;
+            message << "DirectSound COM token 0x" << std::hex << token
+                    << " names an unsupported method/profile";
+            set_error(message.str());
+        }
         return AC1_DS8_METHOD_UNSUPPORTED;
     }
     if (expected_arguments < 0) {
@@ -778,6 +871,18 @@ extern "C" int ac1_ds8_dispatch(uint32_t token, const uint32_t *args,
     const uint32_t offset = token - AC1_DS8_TOKEN_BASE;
     const ObjectKind kind = static_cast<ObjectKind>(offset / kKindStride);
     const uint32_t method = (offset % kKindStride) / kSlotStride;
+    if (kind == ObjectKind::Notify && method == 3u) {
+        set_error("IDirectSoundNotify::SetNotificationPositions is unsupported: guest event handles have no host-handle translation callback");
+        return AC1_DS8_METHOD_UNSUPPORTED;
+    }
+    if (kind == ObjectKind::Buffer8 && method == 21u) {
+        set_error("IDirectSoundBuffer8::SetFX is unsupported: DSFX descriptors and per-effect results require effect-object proxy marshalling");
+        return AC1_DS8_METHOD_UNSUPPORTED;
+    }
+    if (kind == ObjectKind::Buffer8 && method == 23u) {
+        set_error("IDirectSoundBuffer8::GetObjectInPath is unsupported: returned effect object requires a COM proxy");
+        return AC1_DS8_METHOD_UNSUPPORTED;
+    }
     auto found = g_objects.find(args[0]);
     if (found == g_objects.end() || found->second.kind != kind) {
         set_error("DirectSound COM token called with an unknown guest proxy/interface");
@@ -799,6 +904,30 @@ extern "C" int ac1_ds8_dispatch(uint32_t token, const uint32_t *args,
 
     if (kind == ObjectKind::Device && method == 3u)
         return invoke_create_sound_buffer(object, args, result_out);
+    if (kind == ObjectKind::Device && method == 5u) {
+        auto *output = static_cast<uint32_t *>(guest_memory(args[2], 4, AC1_DS8_GUEST_WRITE));
+        uint32_t source_address = args[1];
+        auto source = g_objects.find(source_address);
+        if (!output || source == g_objects.end() || !is_buffer_kind(source->second.kind)) {
+            set_error("DirectSound DuplicateSoundBuffer received an invalid buffer/output"); return AC1_DS8_ERROR;
+        }
+        LPDIRECTSOUNDBUFFER duplicate = nullptr;
+        HRESULT hr = reinterpret_cast<IDirectSound8 *>(object.native)->DuplicateSoundBuffer(
+            native_buffer(source->second), &duplicate);
+        if (SUCCEEDED(hr) && duplicate) { uint32_t wrapped=wrap_native(duplicate,ObjectKind::Buffer); if (!wrapped) return AC1_DS8_ERROR; *output=wrapped; }
+        else if (FAILED(hr)) *output=0;
+        *result_out=static_cast<uint32_t>(hr); return AC1_DS8_HANDLED;
+    }
+    if (kind == ObjectKind::Device && method == 4u) {
+        DSCAPS caps{}; if (!guest_read(args[1], &caps.dwSize, 4) || caps.dwSize != sizeof(caps)) { set_error("DirectSound GetCaps requires a correctly sized guest DSCAPS"); return AC1_DS8_ERROR; }
+        caps.dwSize=sizeof(caps); HRESULT hr=reinterpret_cast<IDirectSound8 *>(object.native)->GetCaps(&caps);
+        if (SUCCEEDED(hr) && !guest_write(args[1],&caps,sizeof(caps))) { set_error("DirectSound GetCaps output is not writable"); return AC1_DS8_ERROR; }
+        *result_out=static_cast<uint32_t>(hr); return AC1_DS8_HANDLED;
+    }
+    if (kind == ObjectKind::Device && method == 7u) { HRESULT hr=reinterpret_cast<IDirectSound8 *>(object.native)->Compact(); *result_out=static_cast<uint32_t>(hr); return AC1_DS8_HANDLED; }
+    if (kind == ObjectKind::Device && method == 9u) { HRESULT hr=reinterpret_cast<IDirectSound8 *>(object.native)->SetSpeakerConfig(args[1]); *result_out=static_cast<uint32_t>(hr); return AC1_DS8_HANDLED; }
+    if (kind == ObjectKind::Device && method == 10u) { GUID guid{}; LPCGUID gp=nullptr; if(args[1]){if(!guest_read(args[1],&guid,sizeof(guid)))return AC1_DS8_ERROR;gp=&guid;} HRESULT hr=reinterpret_cast<IDirectSound8 *>(object.native)->Initialize(gp); *result_out=static_cast<uint32_t>(hr); return AC1_DS8_HANDLED; }
+    if (kind == ObjectKind::Device && method == 11u) { DWORD cert=0; HRESULT hr=reinterpret_cast<IDirectSound8 *>(object.native)->VerifyCertification(&cert); if(SUCCEEDED(hr)&&!guest_write(args[1],&cert,sizeof(cert))){set_error("VerifyCertification output is not writable");return AC1_DS8_ERROR;} *result_out=static_cast<uint32_t>(hr); return AC1_DS8_HANDLED; }
     if (kind == ObjectKind::Device && method == 6u) {
         const uintptr_t window = g_callbacks.guest_hwnd_to_host(g_context, args[1]);
         if (!window) {
@@ -826,6 +955,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t token, const uint32_t *args,
     }
     if (is_buffer_kind(kind) && method == 11u)
         return invoke_buffer_lock(object, args, result_out);
+    if (is_buffer_kind(kind) && method == 3u) { DSBCAPS caps{}; if (!guest_read(args[1],&caps.dwSize,4)||caps.dwSize!=sizeof(caps)) { set_error("DirectSound GetCaps requires a correctly sized guest DSBCAPS"); return AC1_DS8_ERROR; } HRESULT hr=native_buffer(object)->GetCaps(&caps); if(SUCCEEDED(hr)&&!guest_write(args[1],&caps,sizeof(caps)))return AC1_DS8_ERROR; *result_out=static_cast<uint32_t>(hr);return AC1_DS8_HANDLED; }
     if (is_buffer_kind(kind) && method == 12u) {
         const HRESULT result = native_buffer(object)->Play(args[1], args[2], args[3]);
         *result_out = static_cast<uint32_t>(result);
@@ -851,6 +981,10 @@ extern "C" int ac1_ds8_dispatch(uint32_t token, const uint32_t *args,
         *result_out = static_cast<uint32_t>(result);
         return AC1_DS8_HANDLED;
     }
+    if (is_buffer_kind(kind) && method == 5u) { DWORD bytes=args[3]; if(bytes>65536u){set_error("DirectSound GetFormat size exceeds bridge limit");return AC1_DS8_ERROR;} std::vector<uint8_t> fmt(bytes); DWORD written=0; HRESULT hr=native_buffer(object)->GetFormat(bytes?reinterpret_cast<LPWAVEFORMATEX>(fmt.data()):nullptr,bytes,&written); if(SUCCEEDED(hr)){ if(bytes&&!guest_write(args[1],fmt.data(),std::min(bytes,written)))return AC1_DS8_ERROR; if(!guest_write(args[2],&written,4))return AC1_DS8_ERROR;} *result_out=static_cast<uint32_t>(hr);return AC1_DS8_HANDLED; }
+    if (is_buffer_kind(kind) && method >= 6u && method <= 9u) { DWORD v=0; HRESULT hr=S_OK; if(method==6u){LONG x=0;hr=native_buffer(object)->GetVolume(&x);v=static_cast<DWORD>(x);} if(method==7u){LONG x=0;hr=native_buffer(object)->GetPan(&x);v=static_cast<DWORD>(x);} if(method==8u)hr=native_buffer(object)->GetFrequency(&v); if(method==9u)hr=native_buffer(object)->GetStatus(&v); if(SUCCEEDED(hr)&&!guest_write(args[1],&v,4))return AC1_DS8_ERROR; *result_out=static_cast<uint32_t>(hr);return AC1_DS8_HANDLED; }
+    if (is_buffer_kind(kind) && method == 10u)
+        return invoke_buffer_initialize(object, args, result_out);
     if (is_buffer_kind(kind) && method == 14u)
         return invoke_buffer_set_format(object, args, result_out);
     if (is_buffer_kind(kind) && method == 15u) {
@@ -865,8 +999,80 @@ extern "C" int ac1_ds8_dispatch(uint32_t token, const uint32_t *args,
         *result_out = static_cast<uint32_t>(result);
         return AC1_DS8_HANDLED;
     }
+    if (is_buffer_kind(kind) && method == 13u) { HRESULT hr=native_buffer(object)->SetCurrentPosition(args[1]); *result_out=static_cast<uint32_t>(hr);return AC1_DS8_HANDLED; }
+    if (is_buffer_kind(kind) && method == 17u) { HRESULT hr=native_buffer(object)->SetFrequency(args[1]); *result_out=static_cast<uint32_t>(hr);return AC1_DS8_HANDLED; }
+    if (is_buffer_kind(kind) && method == 18u) { HRESULT hr=native_buffer(object)->Stop(); *result_out=static_cast<uint32_t>(hr);return AC1_DS8_HANDLED; }
     if (is_buffer_kind(kind) && method == 19u)
         return invoke_buffer_unlock(object, args, result_out);
+    if (is_buffer_kind(kind) && method == 20u) { HRESULT hr=native_buffer(object)->Restore(); *result_out=static_cast<uint32_t>(hr);return AC1_DS8_HANDLED; }
+    if (kind == ObjectKind::Listener) {
+        auto *p = reinterpret_cast<IDirectSound3DListener *>(object.native);
+        HRESULT hr = E_NOTIMPL;
+        if (method == 3u) {
+            DS3DLISTENER x{};
+            if (!guest_read(args[1], &x.dwSize, sizeof(x.dwSize)) || x.dwSize != sizeof(x)) { set_error("GetAllParameters requires a correctly sized guest DS3DLISTENER"); return AC1_DS8_ERROR; }
+            hr = p->GetAllParameters(&x);
+            if (SUCCEEDED(hr) && !guest_write(args[1], &x, sizeof(x))) return AC1_DS8_ERROR;
+        } else if (method == 4u || method == 5u || method == 8u) {
+            float x = 0.0f;
+            hr = method == 4u ? p->GetDistanceFactor(&x) : method == 5u ? p->GetDopplerFactor(&x) : p->GetRolloffFactor(&x);
+            if (SUCCEEDED(hr) && !guest_write(args[1], &x, sizeof(x))) return AC1_DS8_ERROR;
+        } else if (method == 6u) {
+            D3DVECTOR front{}, top{}; hr = p->GetOrientation(&front, &top);
+            if (SUCCEEDED(hr) && (!guest_write(args[1], &front, sizeof(front)) || !guest_write(args[2], &top, sizeof(top)))) return AC1_DS8_ERROR;
+        } else if (method == 7u || method == 9u) {
+            D3DVECTOR v{}; hr = method == 7u ? p->GetPosition(&v) : p->GetVelocity(&v);
+            if (SUCCEEDED(hr) && !guest_write(args[1], &v, sizeof(v))) return AC1_DS8_ERROR;
+        } else if (method == 10u) {
+            DS3DLISTENER x{}; if (!guest_read(args[1], &x, sizeof(x)) || x.dwSize != sizeof(x)) { set_error("SetAllParameters requires a correctly sized guest DS3DLISTENER"); return AC1_DS8_ERROR; }
+            hr = p->SetAllParameters(&x, args[2]);
+        } else if (method == 11u) hr = p->SetDistanceFactor(float_argument(args[1]), args[2]);
+        else if (method == 12u) hr = p->SetDopplerFactor(float_argument(args[1]), args[2]);
+        else if (method == 13u) hr = p->SetOrientation(float_argument(args[1]), float_argument(args[2]), float_argument(args[3]), float_argument(args[4]), float_argument(args[5]), float_argument(args[6]), args[7]);
+        else if (method == 14u) hr = p->SetPosition(float_argument(args[1]), float_argument(args[2]), float_argument(args[3]), args[4]);
+        else if (method == 15u) hr = p->SetRolloffFactor(float_argument(args[1]), args[2]);
+        else if (method == 16u) hr = p->SetVelocity(float_argument(args[1]), float_argument(args[2]), float_argument(args[3]), args[4]);
+        else if (method == 17u) hr = p->CommitDeferredSettings();
+        *result_out = static_cast<uint32_t>(hr); return AC1_DS8_HANDLED;
+    }
+    if (kind == ObjectKind::Buffer3D) {
+        auto *p = reinterpret_cast<IDirectSound3DBuffer *>(object.native);
+        HRESULT hr = E_NOTIMPL;
+        if (method == 3u) {
+            DS3DBUFFER x{}; if (!guest_read(args[1], &x.dwSize, 4) || x.dwSize != sizeof(x)) { set_error("GetAllParameters requires a correctly sized guest DS3DBUFFER"); return AC1_DS8_ERROR; }
+            hr = p->GetAllParameters(&x); if (SUCCEEDED(hr) && !guest_write(args[1], &x, sizeof(x))) return AC1_DS8_ERROR;
+        } else if (method == 4u) {
+            DWORD a=0,b=0; hr=p->GetConeAngles(&a,&b); if(SUCCEEDED(hr)&&(!guest_write(args[1],&a,4)||!guest_write(args[2],&b,4)))return AC1_DS8_ERROR;
+        } else if (method == 5u) {
+            D3DVECTOR v{}; hr=p->GetConeOrientation(&v); if(SUCCEEDED(hr)&&!guest_write(args[1],&v,sizeof(v)))return AC1_DS8_ERROR;
+        } else if (method == 6u) { LONG v=0;hr=p->GetConeOutsideVolume(&v);if(SUCCEEDED(hr)&&!guest_write(args[1],&v,4))return AC1_DS8_ERROR;
+        } else if (method == 7u || method == 8u) { float v=0;hr=method==7u?p->GetMaxDistance(&v):p->GetMinDistance(&v);if(SUCCEEDED(hr)&&!guest_write(args[1],&v,4))return AC1_DS8_ERROR;
+        } else if (method == 9u) { DWORD v=0;hr=p->GetMode(&v);if(SUCCEEDED(hr)&&!guest_write(args[1],&v,4))return AC1_DS8_ERROR;
+        } else if (method == 10u || method == 11u) { D3DVECTOR v{};hr=method==10u?p->GetPosition(&v):p->GetVelocity(&v);if(SUCCEEDED(hr)&&!guest_write(args[1],&v,sizeof(v)))return AC1_DS8_ERROR;
+        } else if (method == 12u) { DS3DBUFFER x{};if(!guest_read(args[1],&x,sizeof(x))||x.dwSize!=sizeof(x))return AC1_DS8_ERROR;hr=p->SetAllParameters(&x,args[2]);
+        } else if (method == 13u) hr=p->SetConeAngles(args[1],args[2],args[3]);
+        else if (method == 14u) hr=p->SetConeOrientation(float_argument(args[1]),float_argument(args[2]),float_argument(args[3]),args[4]);
+        else if (method == 15u) hr=p->SetConeOutsideVolume(static_cast<LONG>(args[1]),args[2]);
+        else if (method == 16u) hr=p->SetMaxDistance(float_argument(args[1]),args[2]);
+        else if (method == 17u) hr=p->SetMinDistance(float_argument(args[1]),args[2]);
+        else if (method == 18u) hr=p->SetMode(args[1],args[2]);
+        else if (method == 19u) hr=p->SetPosition(float_argument(args[1]),float_argument(args[2]),float_argument(args[3]),args[4]);
+        else if (method == 20u) hr=p->SetVelocity(float_argument(args[1]),float_argument(args[2]),float_argument(args[3]),args[4]);
+        *result_out=static_cast<uint32_t>(hr);return AC1_DS8_HANDLED;
+    }
+    if(kind==ObjectKind::Notify && method==3u){set_error("IDirectSoundNotify::SetNotificationPositions is unsupported: guest event handles have no host-handle translation callback");return AC1_DS8_METHOD_UNSUPPORTED;}
+    if(kind==ObjectKind::Buffer8 && method==22u){
+        if(args[2]>4096u){set_error("AcquireResources effects count exceeds bridge limit");return AC1_DS8_ERROR;}
+        const uint32_t bytes=args[2]*static_cast<uint32_t>(sizeof(DWORD));
+        auto *guest_codes=static_cast<DWORD *>(guest_memory(args[3],bytes?bytes:sizeof(DWORD),AC1_DS8_GUEST_WRITE));
+        if(!guest_codes){set_error("AcquireResources result codes are not writable in guest memory");return AC1_DS8_ERROR;}
+        std::vector<DWORD> codes(args[2]);
+        HRESULT hr=reinterpret_cast<IDirectSoundBuffer8 *>(object.native)->AcquireResources(args[1],args[2],codes.data());
+        if(SUCCEEDED(hr)&&bytes)std::memcpy(guest_codes,codes.data(),bytes);
+        *result_out=static_cast<uint32_t>(hr);return AC1_DS8_HANDLED;
+    }
+    if(kind==ObjectKind::Buffer8 && method==21u){set_error("IDirectSoundBuffer8::SetFX is unsupported: DSFX descriptors and per-effect results require effect-object proxy marshalling");return AC1_DS8_METHOD_UNSUPPORTED;}
+    if(kind==ObjectKind::Buffer8 && method==23u){set_error("IDirectSoundBuffer8::GetObjectInPath is unsupported: returned effect object requires a COM proxy");return AC1_DS8_METHOD_UNSUPPORTED;}
 
     set_error("DirectSound method reached an unsupported implementation path");
     return AC1_DS8_METHOD_UNSUPPORTED;
