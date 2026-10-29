@@ -14,6 +14,12 @@ The main-module exact-address lookup cache in `ac1_lookup_cache.h` follows the 1
 2026 veritr1x, MIT. Its full MIT permission and warranty notice is retained in
 the provider source and `LICENSE.recomp-kit.txt`.
 
+`ac1_win32_compat.inc` adapts the portable locale table, environment isolation
+and FILETIME approach from recomp-kit `runtime/kernel32.cpp` and its Win32
+service interfaces (`runtime/kernel32_internal.h`, `runtime/user32.cpp`,
+`runtime/misc.cpp`, `dx/xinput.cpp`), copyright 2026 veritr1x, MIT.
+The full permission and warranty notice is in `LICENSE.recomp-kit.txt`.
+
 Native Bink decoding links FFmpeg 8.1 (official n8.1 commit
 9047fa1b084f76b1b4d065af2d743df1b40dfb56), copyright the FFmpeg developers and
 individual source authors, under LGPL version 2.1 or later. The selected build

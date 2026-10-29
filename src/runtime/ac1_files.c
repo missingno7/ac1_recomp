@@ -82,6 +82,9 @@ struct ac1_files {
     char root[AC1_FILE_PATH_CAPACITY];
     char guest_root[AC1_FILE_PATH_CAPACITY];
     ac1_host_file slots[AC1_FILE_HANDLE_SLOTS];
+    uint8_t writable[AC1_FILE_HANDLE_SLOTS];
+    void *compat_state;
+    void (*destroy_compat_state)(void *);
     ac1_file_async_operation async_operations[AC1_FILE_ASYNC_SLOTS];
 #ifndef _WIN32
     int root_fd;
@@ -133,6 +136,7 @@ static uint32_t error_from_errno(int error)
 {
     switch (error) {
     case ENOENT: return AC1_ERROR_FILE_NOT_FOUND;
+    case EEXIST: return 80u; /* ERROR_FILE_EXISTS */
     case ENOTDIR: return AC1_ERROR_PATH_NOT_FOUND;
     case EACCES:
     case EPERM: return AC1_ERROR_ACCESS_DENIED;
@@ -228,6 +232,8 @@ ac1_files *ac1_files_create(const char *game_root)
 void ac1_files_destroy(ac1_files *files)
 {
     if (!files) return;
+    if (files->destroy_compat_state)
+        files->destroy_compat_state(files->compat_state);
     for (size_t i = 0; i < AC1_FILE_HANDLE_SLOTS; ++i) {
         if (files->slots[i] == AC1_HOST_FILE_INVALID) continue;
         cancel_file_operations(files,
@@ -723,6 +729,7 @@ int ac1_files_open(ac1_files *files, const char *guest_path,
 #endif
 
     files->slots[slot_index] = host;
+    files->writable[slot_index] = 0;
     *guest_handle_out = AC1_FILE_HANDLE_BASE + (uint32_t)(slot_index * 4u);
     *error_out = 0u;
     return AC1_FILES_HANDLED;
@@ -1171,4 +1178,280 @@ int ac1_files_seek(ac1_files *files, uint32_t guest_handle,
     *position_low_out = (uint32_t)position;
     *error_out = 0u;
     return AC1_FILES_HANDLED;
+}
+
+
+void **ac1_files_compat_state(ac1_files *files, void (*destroy)(void *))
+{
+    if (!files)
+        return NULL;
+    files->destroy_compat_state = destroy;
+    return &files->compat_state;
+}
+
+static size_t compat_root_length(const char *root)
+{
+    size_t n = strlen(root);
+    while (n > 1 && (root[n - 1] == '/' || root[n - 1] == '\\') &&
+           !(n == 3 && root[1] == ':'))
+        --n;
+    return n;
+}
+
+static int compat_path_prefix(const char *path, const char *root)
+{
+    size_t n = compat_root_length(root);
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char a = (unsigned char)path[i], b = (unsigned char)root[i];
+        if (!a)
+            return 0;
+        if (a == '\\')
+            a = '/';
+        if (b == '\\')
+            b = '/';
+        if (ascii_path_fold(a) != ascii_path_fold(b))
+            return 0;
+    }
+    return (n && (root[n - 1] == '/' || root[n - 1] == '\\')) ||
+           !path[n] || path[n] == '/' || path[n] == '\\';
+}
+
+int ac1_files_resolve(ac1_files *files, const char *userdata_root, const char *guest_path,
+                      int writing, int missing_leaf, char *host_path, uint32_t capacity,
+                      uint32_t *error_out)
+{
+    char relative[AC1_FILE_PATH_CAPACITY], root[AC1_FILE_PATH_CAPACITY];
+    *error_out = 5u;
+    if (!files || !guest_path || !*guest_path || !capacity)
+        return 0;
+    int user = userdata_root && *userdata_root && compat_path_prefix(guest_path, userdata_root);
+    if (writing && !user)
+        return 0;
+    if (user) {
+        /* Userdata must never be an alias for the original install. */
+        if (!normalize_root(root, sizeof(root), userdata_root) ||
+            compat_path_prefix(root, files->root))
+            return 0;
+        const char *suffix = guest_path + compat_root_length(userdata_root);
+        while (*suffix == '/' || *suffix == '\\')
+            ++suffix;
+        if (!*suffix)
+            relative[0] = 0;
+        else if (!normalize_guest_components(suffix, relative, sizeof(relative)))
+            return 0;
+    } else {
+        memcpy(root, files->root, strlen(files->root) + 1);
+        if (!strcmp(guest_path, ".") ||
+            (files->guest_root[0] && compat_path_prefix(guest_path, files->guest_root) &&
+             strlen(guest_path) == strlen(files->guest_root)))
+            relative[0] = 0;
+        else if (!guest_path_to_relative(files, guest_path, relative, sizeof(relative)))
+            return 0;
+    }
+    if (strlen(root) + strlen(relative) + 2 > capacity) {
+        *error_out = 206;
+        return 0;
+    }
+    /* The installation stays read only even if a misconfigured userdata
+     * root is an ancestor of it (for example an entire drive). */
+    snprintf(host_path, capacity, "%s/%s", root, relative);
+    if (writing && compat_path_prefix(host_path, files->root))
+        return 0;
+    strcpy(host_path, root);
+    /* Check every component, including root ancestors, before exposing a path.
+     * In particular, never follow a userdata junction/symlink into the install. */
+    size_t root_len = strlen(host_path);
+#ifdef _WIN32
+    for (size_t i = 0; i < root_len; ++i)
+        if (host_path[i] == '/')
+            host_path[i] = '\\';
+    for (size_t i = 3; i <= root_len; ++i) {
+        if (host_path[i] && host_path[i] != '\\')
+            continue;
+        char save = host_path[i];
+        host_path[i] = 0;
+        DWORD attr = GetFileAttributesA(host_path);
+        host_path[i] = save;
+        if (attr == INVALID_FILE_ATTRIBUTES) {
+            *error_out = GetLastError();
+            return 0;
+        }
+        if (attr & FILE_ATTRIBUTE_REPARSE_POINT)
+            return 0;
+    }
+#else
+    for (size_t i = 1; i <= root_len; ++i) {
+        if (host_path[i] && host_path[i] != '/')
+            continue;
+        char save = host_path[i];
+        host_path[i] = 0;
+        struct stat st;
+        int rc = lstat(host_path, &st);
+        host_path[i] = save;
+        if (rc) {
+            *error_out = error_from_errno(errno);
+            return 0;
+        }
+        if (S_ISLNK(st.st_mode))
+            return 0;
+    }
+#endif
+    char *part = relative;
+    while (*part) {
+        char *slash = strchr(part, '/');
+        if (slash)
+            *slash = 0;
+        size_t used = strlen(host_path);
+        host_path[used++] = '/';
+        host_path[used] = 0;
+#ifndef _WIN32
+        /* Resolve Win32 case-insensitivity without following links. */
+        DIR *d = opendir(host_path);
+        if (!d) {
+            *error_out = error_from_errno(errno);
+            return 0;
+        }
+        struct dirent *e;
+        char actual[AC1_FILE_PATH_CAPACITY];
+        int found = 0;
+        while ((e = readdir(d)))
+            if (ascii_path_equal(e->d_name, part)) {
+                if (found) {
+                    closedir(d);
+                    *error_out = 123;
+                    return 0;
+                }
+                strcpy(actual, e->d_name);
+                found = 1;
+            }
+        closedir(d);
+        strcat(host_path, found ? actual : part);
+        struct stat st;
+        if (lstat(host_path, &st)) {
+            if (!slash && missing_leaf && errno == ENOENT) {
+                *error_out = 0;
+                return 1;
+            }
+            *error_out = error_from_errno(errno);
+            return 0;
+        }
+        if (S_ISLNK(st.st_mode) || (writing && S_ISREG(st.st_mode) && st.st_nlink > 1))
+            return 0;
+        if (slash && !S_ISDIR(st.st_mode)) {
+            *error_out = 3;
+            return 0;
+        }
+#else
+        strcat(host_path, part);
+        DWORD attr = GetFileAttributesA(host_path);
+        if (attr == INVALID_FILE_ATTRIBUTES) {
+            *error_out = GetLastError();
+            if (!slash && missing_leaf && *error_out == 2) {
+                *error_out = 0;
+                return 1;
+            }
+            return 0;
+        }
+        if (attr & FILE_ATTRIBUTE_REPARSE_POINT)
+            return 0;
+        if (slash && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            *error_out = 3;
+            return 0;
+        }
+        if (writing && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            HANDLE h = CreateFileA(host_path, FILE_READ_ATTRIBUTES, 7, NULL, OPEN_EXISTING,
+                                   FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+            BY_HANDLE_FILE_INFORMATION info;
+            if (h == INVALID_HANDLE_VALUE) {
+                *error_out = GetLastError();
+                return 0;
+            }
+            int ok = GetFileInformationByHandle(h, &info);
+            CloseHandle(h);
+            if (!ok || info.nNumberOfLinks > 1)
+                return 0;
+        }
+#endif
+        if (!slash)
+            break;
+        part = slash + 1;
+    }
+    *error_out = 0;
+    return 1;
+}
+
+int ac1_files_native(ac1_files *files, uint32_t handle, int writing, intptr_t *native,
+                     uint32_t *error)
+{
+    *error = 6;
+    if (!files || handle < AC1_FILE_HANDLE_BASE || (handle & 3))
+        return 0;
+    unsigned slot = (handle - AC1_FILE_HANDLE_BASE) / 4;
+    if (slot >= AC1_FILE_HANDLE_SLOTS || files->slots[slot] == AC1_HOST_FILE_INVALID)
+        return 0;
+    if (writing && !files->writable[slot]) {
+        *error = 5;
+        return 0;
+    }
+    *native = (intptr_t)files->slots[slot];
+    *error = 0;
+    return 1;
+}
+
+int ac1_files_open_userdata(ac1_files *files, const char *userdata_root, const char *guest_path,
+                            uint32_t access, uint32_t share, uint32_t disposition, uint32_t flags,
+                            uint32_t *handle, uint32_t *error)
+{
+    *handle = UINT32_MAX;
+    char path[AC1_FILE_PATH_CAPACITY];
+    int writing = (access & (0x40000000u | 0x100u)) || disposition != 3;
+    if (!ac1_files_resolve(files, userdata_root, guest_path, writing,
+                           disposition != 3 && disposition != 5, path, sizeof(path), error))
+        return 0;
+    if (access & ~(0xc0000000u | 0x80u | 0x100u) || share & ~7u || disposition < 1 ||
+        disposition > 5 || flags & ~(0x08000000u | 0x10000000u | 0x80u | 1u)) {
+        *error = 87;
+        return 0;
+    }
+    size_t slot;
+    if (!allocate_slot(files, &slot)) {
+        *error = 4;
+        return 0;
+    }
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path, access, share, NULL, disposition,
+                           flags | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    *error = GetLastError();
+    if (h == INVALID_HANDLE_VALUE)
+        return 0;
+    BY_HANDLE_FILE_INFORMATION info;
+    if (!GetFileInformationByHandle(h, &info) ||
+        info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) {
+        CloseHandle(h);
+        *error = 5;
+        return 0;
+    }
+#else
+    int oflags = access & 0x40000000u ? (access & 0x80000000u ? O_RDWR : O_WRONLY) : O_RDONLY;
+    if (disposition == 1)
+        oflags |= O_CREAT | O_EXCL;
+    if (disposition == 2)
+        oflags |= O_CREAT | O_TRUNC;
+    if (disposition == 4)
+        oflags |= O_CREAT;
+    if (disposition == 5)
+        oflags |= O_TRUNC;
+    struct stat before;
+    int existed = !lstat(path, &before);
+    int h = open(path, oflags | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (h < 0) {
+        *error = error_from_errno(errno);
+        return 0;
+    }
+    *error = (disposition == 2 || disposition == 4) && existed ? 183 : 0;
+#endif
+    files->slots[slot] = h;
+    files->writable[slot] = (access & (0x40000000u | 0x100u)) != 0;
+    *handle = AC1_FILE_HANDLE_BASE + (uint32_t)slot * 4;
+    return 1;
 }
