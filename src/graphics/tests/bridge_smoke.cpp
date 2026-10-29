@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <windows.h>
 #include <d3d9.h>
@@ -17,11 +18,13 @@ constexpr uint32_t kGuestLimit = 0x00050000u;
 constexpr uint32_t kGuestObjectPool = 0x00020000u;
 std::array<uint8_t, kGuestLimit - kGuestBase> guest_memory{};
 uint32_t next_guest_address = kGuestObjectPool;
+std::unordered_set<uint32_t> live_guest_allocations;
 bool fail_next_guest_allocation = false;
 HWND hidden_window = nullptr;
 std::array<void *, 17> fake_d3d_vtable{};
 std::array<void *, 119> fake_device_vtable{};
 std::array<void *, 17> fake_surface_vtable{};
+std::array<void *, 14> fake_vertex_buffer_vtable{};
 std::array<void *, 22> fake_cube_texture_vtable{};
 std::array<void *, 5> fake_pixel_shader_vtable{};
 std::array<void *, 5> fake_vertex_shader_vtable{};
@@ -100,6 +103,186 @@ bool run_native_shader_smoke(uint32_t device, const char *source,
         return false;
     }
     std::printf("native DXVK %s-shader create/bind/unbind/release passed\n", label);
+    return true;
+}
+
+bool run_native_indexed_triangle_smoke(uint32_t device, uint32_t vertex_buffer,
+                                      uint32_t index_buffer, uint32_t texture)
+{
+    uint32_t result = 0;
+    auto call = [&](uint32_t slot, const uint32_t *args, uint32_t count,
+                    const char *name) {
+        if (ac1_d3d9_argument_count(object_slot(device, slot)) !=
+                static_cast<int>(count) ||
+            ac1_d3d9_dispatch(object_slot(device, slot), args, count, &result) != 1 ||
+            FAILED(static_cast<HRESULT>(result))) {
+            std::fprintf(stderr, "synthetic triangle %s failed: hr=0x%08x %s\n",
+                         name, result, ac1_d3d9_last_error());
+            return false;
+        }
+        return true;
+    };
+    struct Vertex { float x, y, z; uint32_t color; };
+    const Vertex vertices[] = {
+        {-0.70f, -0.70f, 0.5f, 0xffff2020u},
+        { 0.00f,  0.70f, 0.5f, 0xffff2020u},
+        { 0.70f, -0.70f, 0.5f, 0xffff2020u}
+    };
+    const uint16_t indices[] = {0, 1, 2};
+    const uint32_t vertex_lock_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t vertex_lock[] = {
+        vertex_buffer, 0u, sizeof(vertices), vertex_lock_output, D3DLOCK_DISCARD
+    };
+    if (ac1_d3d9_dispatch(object_slot(vertex_buffer, 11), vertex_lock, 5,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result))) {
+        std::fprintf(stderr, "synthetic triangle VB Lock failed: 0x%08x %s\n",
+                     result, ac1_d3d9_last_error());
+        return false;
+    }
+    const uint32_t vertex_guest = guest_word(vertex_lock_output);
+    void *vertex_data = resolve_guest(nullptr, vertex_guest, sizeof(vertices),
+                                      AC1_D3D9_GUEST_WRITE);
+    if (!vertex_data) return false;
+    std::memcpy(vertex_data, vertices, sizeof(vertices));
+    const uint32_t vertex_unlock[] = {vertex_buffer};
+    if (ac1_d3d9_dispatch(object_slot(vertex_buffer, 12), vertex_unlock, 1,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result))) {
+        std::fprintf(stderr, "synthetic triangle VB Unlock failed: 0x%08x %s\n",
+                     result, ac1_d3d9_last_error());
+        return false;
+    }
+    const uint32_t index_lock_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t index_lock[] = {
+        index_buffer, 0u, sizeof(indices), index_lock_output, D3DLOCK_DISCARD
+    };
+    if (ac1_d3d9_dispatch(object_slot(index_buffer, 11), index_lock, 5,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result))) {
+        std::fprintf(stderr, "synthetic triangle IB Lock failed: 0x%08x %s\n",
+                     result, ac1_d3d9_last_error());
+        return false;
+    }
+    const uint32_t index_guest = guest_word(index_lock_output);
+    void *index_data = resolve_guest(nullptr, index_guest, sizeof(indices),
+                                     AC1_D3D9_GUEST_WRITE);
+    if (!index_data) return false;
+    std::memcpy(index_data, indices, sizeof(indices));
+    const uint32_t index_unlock[] = {index_buffer};
+    if (ac1_d3d9_dispatch(object_slot(index_buffer, 12), index_unlock, 1,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result))) {
+        std::fprintf(stderr, "synthetic triangle IB Unlock failed: 0x%08x %s\n",
+                     result, ac1_d3d9_last_error());
+        return false;
+    }
+
+    const D3DVERTEXELEMENT9 elements[] = {
+        {0, 0, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT,
+         D3DDECLUSAGE_POSITION, 0},
+        {0, 12, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT,
+         D3DDECLUSAGE_COLOR, 0},
+        D3DDECL_END()
+    };
+    const uint32_t elements_guest = allocate_guest(nullptr, sizeof(elements), 4);
+    const uint32_t declaration_output = allocate_guest(nullptr, 4, 4);
+    std::memcpy(resolve_guest(nullptr, elements_guest, sizeof(elements),
+                              AC1_D3D9_GUEST_WRITE), elements, sizeof(elements));
+    const uint32_t create_declaration[] = {device, elements_guest, declaration_output};
+    if (!call(86, create_declaration, 3, "CreateVertexDeclaration")) return false;
+    const uint32_t declaration = guest_word(declaration_output);
+    if (!declaration) return false;
+
+    uint32_t cube_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t create_cube[] = {
+        device, 4u, 1u, 0u, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, cube_output, 0u
+    };
+    if (!call(25, create_cube, 8, "CreateCubeTexture")) return false;
+    const uint32_t cube = guest_word(cube_output);
+    const uint32_t set_2d_texture[] = {device, 0u, texture};
+    const uint32_t set_cube_texture[] = {device, 1u, cube};
+    const uint32_t clear_2d_texture[] = {device, 0u, 0u};
+    const uint32_t clear_cube_texture[] = {device, 1u, 0u};
+    if (!call(65, set_2d_texture, 3, "SetTexture(2D proxy)") ||
+        !call(65, clear_2d_texture, 3, "SetTexture(2D unbind)") ||
+        !call(65, set_cube_texture, 3, "SetTexture(cube proxy)") ||
+        !call(65, clear_cube_texture, 3, "SetTexture(cube unbind)")) return false;
+
+    const uint32_t query_probe[] = {device, D3DQUERYTYPE_OCCLUSION, 0u};
+    if (ac1_d3d9_argument_count(object_slot(device, 118)) != 3 ||
+        ac1_d3d9_dispatch(object_slot(device, 118), query_probe, 3, &result) != 1 ||
+        FAILED(static_cast<HRESULT>(result))) {
+        std::fprintf(stderr, "native DXVK occlusion CreateQuery capability probe failed: 0x%08x %s\n",
+                     result, ac1_d3d9_last_error());
+        return false;
+    }
+    const uint32_t query_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t create_query[] = {device, D3DQUERYTYPE_OCCLUSION, query_output};
+    if (!call(118, create_query, 3, "CreateQuery(occlusion)")) return false;
+    const uint32_t query = guest_word(query_output);
+    if (!query || ac1_d3d9_argument_count(object_slot(query, 6)) != 2 ||
+        ac1_d3d9_argument_count(object_slot(query, 7)) != 4 ||
+        ac1_d3d9_dispatch(object_slot(query, 4), &query, 1, &result) != 1 ||
+        result != D3DQUERYTYPE_OCCLUSION ||
+        ac1_d3d9_dispatch(object_slot(query, 5), &query, 1, &result) != 1 ||
+        result != sizeof(DWORD)) {
+        std::fprintf(stderr, "native occlusion query proxy metadata/ABI failed: %s\n",
+                     ac1_d3d9_last_error());
+        return false;
+    }
+
+    const uint32_t bind_stream[] = {device, 0u, vertex_buffer, 0u, sizeof(Vertex)};
+    const uint32_t bind_indices[] = {device, index_buffer};
+    const uint32_t bind_declaration[] = {device, declaration};
+    const uint32_t unbind_stream[] = {device, 0u, 0u, 0u, 0u};
+    const uint32_t unbind_indices[] = {device, 0u};
+    const uint32_t unbind_declaration[] = {device, 0u};
+    const uint32_t disable_depth[] = {device, D3DRS_ZENABLE, FALSE};
+    const uint32_t disable_cull[] = {device, D3DRS_CULLMODE, D3DCULL_NONE};
+    const uint32_t diffuse_op[] = {device, 0u, D3DTSS_COLOROP, D3DTOP_SELECTARG1};
+    const uint32_t diffuse_arg[] = {device, 0u, D3DTSS_COLORARG1, D3DTA_DIFFUSE};
+    if (!call(57, disable_depth, 3, "SetRenderState(ZENABLE)") ||
+        !call(57, disable_cull, 3, "SetRenderState(CULLMODE)") ||
+        !call(67, diffuse_op, 4, "SetTextureStageState(COLOROP)") ||
+        !call(67, diffuse_arg, 4, "SetTextureStageState(COLORARG1)") ||
+        !call(100, bind_stream, 5, "SetStreamSource") ||
+        !call(104, bind_indices, 2, "SetIndices") ||
+        !call(87, bind_declaration, 2, "SetVertexDeclaration")) return false;
+
+    const uint32_t begin[] = {device};
+    const uint32_t query_begin[] = {query, D3DISSUE_BEGIN};
+    const uint32_t query_end[] = {query, D3DISSUE_END};
+    const uint32_t draw[] = {device, D3DPT_TRIANGLELIST, 0u, 1u};
+    const uint32_t draw_indexed[] = {device, D3DPT_TRIANGLELIST, 0u, 0u, 3u, 0u, 1u};
+    const uint32_t end[] = {device};
+    const uint32_t present[] = {device, 0u, 0u, 0u, 0u};
+    if (!call(41, begin, 1, "BeginScene") ||
+        ac1_d3d9_dispatch(object_slot(query, 6), query_begin, 2, &result) != 1 ||
+        FAILED(static_cast<HRESULT>(result)) ||
+        !call(81, draw, 4, "DrawPrimitive") ||
+        !call(82, draw_indexed, 7, "DrawIndexedPrimitive") ||
+        ac1_d3d9_dispatch(object_slot(query, 6), query_end, 2, &result) != 1 ||
+        FAILED(static_cast<HRESULT>(result)) ||
+        !call(42, end, 1, "EndScene") ||
+        !call(17, present, 5, "Present")) return false;
+
+    const uint32_t query_poll[] = {query, 0u, 0u, D3DGETDATA_FLUSH};
+    if (ac1_d3d9_dispatch(object_slot(query, 7), query_poll, 4, &result) != 1 ||
+        (static_cast<HRESULT>(result) != S_OK &&
+         static_cast<HRESULT>(result) != S_FALSE)) {
+        std::fprintf(stderr, "native occlusion query GetData(NULL,0,FLUSH) failed: 0x%08x %s\n",
+                     result, ac1_d3d9_last_error());
+        return false;
+    }
+
+    call(87, unbind_declaration, 2, "SetVertexDeclaration(null)");
+    call(104, unbind_indices, 2, "SetIndices(null)");
+    call(100, unbind_stream, 5, "SetStreamSource(null)");
+    call(65, clear_2d_texture, 3, "SetTexture(null)");
+    const uint32_t release_decl[] = {declaration};
+    const uint32_t release_cube[] = {cube};
+    const uint32_t release_query[] = {query};
+    ac1_d3d9_dispatch(object_slot(declaration, 2), release_decl, 1, &result);
+    ac1_d3d9_dispatch(object_slot(cube, 2), release_cube, 1, &result);
+    ac1_d3d9_dispatch(object_slot(query, 2), release_query, 1, &result);
+    std::printf("native DXVK synthetic indexed-triangle and occlusion-query path passed (no readback)\n");
     return true;
 }
 
@@ -264,6 +447,11 @@ FakeComObject fake_d3d{};
 FakeComObject fake_device{};
 FakeComObject fake_render_target{};
 FakeComObject fake_depth_surface{};
+FakeComObject fake_vertex_buffer{};
+std::array<uint8_t, 64> fake_vertex_buffer_bytes{};
+uint32_t fake_vertex_buffer_size = 64;
+bool fake_vertex_buffer_locked = false;
+IDirect3DVertexBuffer9 *fake_bound_vertex_buffer = nullptr;
 FakeComObject fake_cube_texture{};
 FakeComObject fake_pixel_shader{};
 FakeComObject fake_vertex_shader{};
@@ -290,6 +478,24 @@ HRESULT fake_cube_create_result = S_OK;
 uint32_t fake_cube_create_calls = 0;
 std::array<uint32_t, 6> fake_cube_create_args{};
 std::vector<uint32_t> freed_guest_allocations;
+uint32_t fake_begin_scene_calls = 0;
+uint32_t fake_end_scene_calls = 0;
+uint32_t fake_present_calls = 0;
+uint32_t fake_draw_primitive_calls = 0;
+uint32_t fake_draw_indexed_calls = 0;
+uint32_t fake_set_depth_surface_calls = 0;
+bool fake_depth_surface_was_null = false;
+uint32_t fake_set_render_target_calls = 0;
+uint32_t fake_render_target_index = UINT32_MAX;
+bool fake_render_target_was_null = false;
+HRESULT fake_present_result = S_OK;
+bool fake_present_had_source = false;
+bool fake_present_had_destination = false;
+uintptr_t fake_present_hwnd = 0;
+uint32_t fake_present_region_count = UINT32_MAX;
+RECT fake_present_source{};
+RECT fake_present_destination{};
+RECT fake_present_first_dirty_rect{};
 
 HRESULT STDMETHODCALLTYPE fake_query_interface(IUnknown *self, REFIID iid, void **output)
 {
@@ -325,6 +531,64 @@ HRESULT STDMETHODCALLTYPE fake_create_device(
     return S_OK;
 }
 
+HRESULT STDMETHODCALLTYPE fake_create_vertex_buffer(IDirect3DDevice9 *, UINT length,
+    DWORD, DWORD, D3DPOOL, IDirect3DVertexBuffer9 **output, HANDLE *shared_handle)
+{
+    if (!output || shared_handle || !length || length > fake_vertex_buffer_bytes.size())
+        return D3DERR_INVALIDCALL;
+    fake_vertex_buffer.references = 1;
+    fake_vertex_buffer_size = length;
+    fake_vertex_buffer_locked = false;
+    fake_vertex_buffer_bytes.fill(0);
+    *output = reinterpret_cast<IDirect3DVertexBuffer9 *>(&fake_vertex_buffer);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE fake_vertex_buffer_lock(IDirect3DVertexBuffer9 *self,
+    UINT offset, UINT size, void **data, DWORD)
+{
+    if (self != reinterpret_cast<IDirect3DVertexBuffer9 *>(&fake_vertex_buffer) ||
+        !data || fake_vertex_buffer_locked || !size ||
+        offset > fake_vertex_buffer_size || size > fake_vertex_buffer_size - offset)
+        return D3DERR_INVALIDCALL;
+    fake_vertex_buffer_locked = true;
+    *data = fake_vertex_buffer_bytes.data() + offset;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE fake_vertex_buffer_unlock(IDirect3DVertexBuffer9 *self)
+{
+    if (self != reinterpret_cast<IDirect3DVertexBuffer9 *>(&fake_vertex_buffer) ||
+        !fake_vertex_buffer_locked) return D3DERR_INVALIDCALL;
+    fake_vertex_buffer_locked = false;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE fake_vertex_buffer_get_desc(IDirect3DVertexBuffer9 *self,
+    D3DVERTEXBUFFER_DESC *description)
+{
+    if (self != reinterpret_cast<IDirect3DVertexBuffer9 *>(&fake_vertex_buffer) ||
+        !description) return D3DERR_INVALIDCALL;
+    std::memset(description, 0, sizeof(*description));
+    description->Format = D3DFMT_VERTEXDATA;
+    description->Type = D3DRTYPE_VERTEXBUFFER;
+    description->Usage = D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY;
+    description->Pool = D3DPOOL_DEFAULT;
+    description->Size = fake_vertex_buffer_size;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE fake_set_stream_source(IDirect3DDevice9 *, UINT stream,
+    IDirect3DVertexBuffer9 *buffer, UINT, UINT)
+{
+    if (stream != 0u || (buffer && buffer != reinterpret_cast<IDirect3DVertexBuffer9 *>(
+            &fake_vertex_buffer))) return D3DERR_INVALIDCALL;
+    if (buffer) buffer->AddRef();
+    if (fake_bound_vertex_buffer) fake_bound_vertex_buffer->Release();
+    fake_bound_vertex_buffer = buffer;
+    return S_OK;
+}
+
 HRESULT STDMETHODCALLTYPE fake_create_cube_texture(
     IDirect3DDevice9 *, UINT edge_length, UINT levels, DWORD usage,
     D3DFORMAT format, D3DPOOL pool, IDirect3DCubeTexture9 **output,
@@ -357,12 +621,33 @@ HRESULT STDMETHODCALLTYPE fake_get_render_target(
     return S_OK;
 }
 
+HRESULT STDMETHODCALLTYPE fake_set_render_target(IDirect3DDevice9 *, DWORD index,
+                                                   IDirect3DSurface9 *surface)
+{
+    ++fake_set_render_target_calls;
+    fake_render_target_index = index;
+    fake_render_target_was_null = surface == nullptr;
+    if (surface && surface != reinterpret_cast<IDirect3DSurface9 *>(&fake_render_target))
+        return E_INVALIDARG;
+    return S_OK;
+}
+
 HRESULT STDMETHODCALLTYPE fake_get_depth_surface(
     IDirect3DDevice9 *, IDirect3DSurface9 **output)
 {
     if (!output) return E_POINTER;
     ++fake_depth_surface.references;
     *output = reinterpret_cast<IDirect3DSurface9 *>(&fake_depth_surface);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE fake_set_depth_surface(IDirect3DDevice9 *,
+                                                   IDirect3DSurface9 *surface)
+{
+    ++fake_set_depth_surface_calls;
+    fake_depth_surface_was_null = surface == nullptr;
+    if (surface && surface != reinterpret_cast<IDirect3DSurface9 *>(&fake_depth_surface))
+        return E_INVALIDARG;
     return S_OK;
 }
 
@@ -378,6 +663,50 @@ HRESULT STDMETHODCALLTYPE fake_set_render_state(IDirect3DDevice9 *,
 HRESULT STDMETHODCALLTYPE fake_test_cooperative_level(IDirect3DDevice9 *)
 {
     return D3DERR_DEVICELOST;
+}
+
+HRESULT STDMETHODCALLTYPE fake_begin_scene(IDirect3DDevice9 *)
+{
+    ++fake_begin_scene_calls;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE fake_end_scene(IDirect3DDevice9 *)
+{
+    ++fake_end_scene_calls;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE fake_present(IDirect3DDevice9 *, const RECT *source,
+                                        const RECT *destination, HWND window,
+                                        const RGNDATA *dirty_region)
+{
+    ++fake_present_calls;
+    fake_present_had_source = source != nullptr;
+    fake_present_had_destination = destination != nullptr;
+    if (source) fake_present_source = *source;
+    if (destination) fake_present_destination = *destination;
+    fake_present_hwnd = reinterpret_cast<uintptr_t>(window);
+    fake_present_region_count = dirty_region ? dirty_region->rdh.nCount : UINT32_MAX;
+    if (dirty_region && dirty_region->rdh.nCount) {
+        std::memcpy(&fake_present_first_dirty_rect, dirty_region->Buffer,
+                    sizeof(fake_present_first_dirty_rect));
+    }
+    return fake_present_result;
+}
+
+HRESULT STDMETHODCALLTYPE fake_draw_primitive(IDirect3DDevice9 *, D3DPRIMITIVETYPE,
+                                                UINT, UINT)
+{
+    ++fake_draw_primitive_calls;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE fake_draw_indexed_primitive(IDirect3DDevice9 *,
+    D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT)
+{
+    ++fake_draw_indexed_calls;
+    return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE fake_get_device_caps(IDirect3DDevice9 *, D3DCAPS9 *output)
@@ -533,6 +862,7 @@ void initialize_fake_com()
     fake_d3d_vtable.fill(nullptr);
     fake_device_vtable.fill(nullptr);
     fake_surface_vtable.fill(nullptr);
+    fake_vertex_buffer_vtable.fill(nullptr);
     fake_cube_texture_vtable.fill(nullptr);
     fake_pixel_shader_vtable.fill(nullptr);
     fake_vertex_shader_vtable.fill(nullptr);
@@ -548,15 +878,30 @@ void initialize_fake_com()
     fake_device_vtable[1] = reinterpret_cast<void *>(&fake_add_ref);
     fake_device_vtable[2] = reinterpret_cast<void *>(&fake_release);
     fake_device_vtable[3] = reinterpret_cast<void *>(&fake_test_cooperative_level);
+    fake_device_vtable[17] = reinterpret_cast<void *>(&fake_present);
+    fake_device_vtable[41] = reinterpret_cast<void *>(&fake_begin_scene);
+    fake_device_vtable[42] = reinterpret_cast<void *>(&fake_end_scene);
+    fake_device_vtable[81] = reinterpret_cast<void *>(&fake_draw_primitive);
+    fake_device_vtable[82] = reinterpret_cast<void *>(&fake_draw_indexed_primitive);
     fake_pixel_shader_vtable[0] = reinterpret_cast<void *>(&fake_query_interface);
     fake_pixel_shader_vtable[1] = reinterpret_cast<void *>(&fake_add_ref);
     fake_pixel_shader_vtable[2] = reinterpret_cast<void *>(&fake_release);
     fake_vertex_shader_vtable[0] = reinterpret_cast<void *>(&fake_query_interface);
     fake_vertex_shader_vtable[1] = reinterpret_cast<void *>(&fake_add_ref);
     fake_vertex_shader_vtable[2] = reinterpret_cast<void *>(&fake_release);
+    fake_vertex_buffer_vtable[0] = reinterpret_cast<void *>(&fake_query_interface);
+    fake_vertex_buffer_vtable[1] = reinterpret_cast<void *>(&fake_add_ref);
+    fake_vertex_buffer_vtable[2] = reinterpret_cast<void *>(&fake_release);
+    fake_vertex_buffer_vtable[11] = reinterpret_cast<void *>(&fake_vertex_buffer_lock);
+    fake_vertex_buffer_vtable[12] = reinterpret_cast<void *>(&fake_vertex_buffer_unlock);
+    fake_vertex_buffer_vtable[13] = reinterpret_cast<void *>(&fake_vertex_buffer_get_desc);
     fake_d3d_vtable[16] = reinterpret_cast<void *>(&fake_create_device);
     fake_device_vtable[25] = reinterpret_cast<void *>(&fake_create_cube_texture);
+    fake_device_vtable[26] = reinterpret_cast<void *>(&fake_create_vertex_buffer);
+    fake_device_vtable[100] = reinterpret_cast<void *>(&fake_set_stream_source);
     fake_device_vtable[38] = reinterpret_cast<void *>(&fake_get_render_target);
+    fake_device_vtable[37] = reinterpret_cast<void *>(&fake_set_render_target);
+    fake_device_vtable[39] = reinterpret_cast<void *>(&fake_set_depth_surface);
     fake_device_vtable[40] = reinterpret_cast<void *>(&fake_get_depth_surface);
     fake_device_vtable[57] = reinterpret_cast<void *>(&fake_set_render_state);
     fake_device_vtable[7] = reinterpret_cast<void *>(&fake_get_device_caps);
@@ -577,6 +922,11 @@ void initialize_fake_com()
 
     fake_d3d = {fake_d3d_vtable.data(), 1, {}};
     fake_device = {fake_device_vtable.data(), 0, {}};
+    fake_vertex_buffer = {fake_vertex_buffer_vtable.data(), 0, {}};
+    fake_vertex_buffer_size = static_cast<uint32_t>(fake_vertex_buffer_bytes.size());
+    fake_vertex_buffer_bytes.fill(0);
+    fake_vertex_buffer_locked = false;
+    fake_bound_vertex_buffer = nullptr;
     fake_pixel_shader = {fake_pixel_shader_vtable.data(), 0, {}};
     fake_vertex_shader = {fake_vertex_shader_vtable.data(), 0, {}};
     fake_query_calls = 0;
@@ -608,6 +958,21 @@ void initialize_fake_com()
     fake_cube_create_result = S_OK;
     fake_cube_create_calls = 0;
     fake_cube_create_args.fill(UINT32_MAX);
+    fake_begin_scene_calls = 0;
+    fake_end_scene_calls = 0;
+    fake_draw_primitive_calls = 0;
+    fake_draw_indexed_calls = 0;
+    fake_set_depth_surface_calls = 0;
+    fake_set_render_target_calls = 0;
+    fake_present_calls = 0;
+    fake_present_result = S_OK;
+    fake_present_had_source = false;
+    fake_present_had_destination = false;
+    fake_present_hwnd = UINTPTR_MAX;
+    fake_present_region_count = UINT32_MAX;
+    fake_present_source = {};
+    fake_present_destination = {};
+    fake_present_first_dirty_rect = {};
 }
 
 bool run_fake_surface_smoke(ac1_d3d9_callbacks callbacks)
@@ -653,6 +1018,123 @@ bool run_fake_surface_smoke(ac1_d3d9_callbacks callbacks)
         static_cast<HRESULT>(result) != D3DERR_DEVICELOST) {
         std::fprintf(stderr, "fake TestCooperativeLevel HRESULT forwarding failed: 0x%08x %s\n",
                      result, ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    const uint32_t scene_args[] = {device};
+    const uint32_t null_present_args[] = {device, 0u, 0u, 0u, 0u};
+    if (ac1_d3d9_argument_count(object_slot(device, 17)) != 5 ||
+        ac1_d3d9_argument_count(object_slot(device, 41)) != 1 ||
+        ac1_d3d9_argument_count(object_slot(device, 42)) != 1 ||
+        ac1_d3d9_dispatch(object_slot(device, 41), scene_args, 1, &result) != 1 ||
+        FAILED(static_cast<HRESULT>(result)) ||
+        ac1_d3d9_dispatch(object_slot(device, 42), scene_args, 1, &result) != 1 ||
+        FAILED(static_cast<HRESULT>(result)) ||
+        fake_begin_scene_calls != 1 || fake_end_scene_calls != 1) {
+        std::fprintf(stderr, "fake BeginScene/EndScene ABI forwarding failed: %s\n",
+                     ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    fake_present_result = D3DERR_DEVICELOST;
+    if (ac1_d3d9_dispatch(object_slot(device, 17), null_present_args, 5,
+                          &result) != 1 ||
+        result != static_cast<uint32_t>(D3DERR_DEVICELOST) ||
+        fake_present_calls != 1 || fake_present_had_source ||
+        fake_present_had_destination || fake_present_hwnd != 0 ||
+        fake_present_region_count != UINT32_MAX) {
+        std::fprintf(stderr, "fake Present null arguments/HRESULT forwarding failed\n");
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    const uint32_t fake_draw_args[] = {device, D3DPT_TRIANGLELIST, 0u, 1u};
+    const uint32_t fake_draw_indexed_args[] = {
+        device, D3DPT_TRIANGLELIST, 0u, 0u, 3u, 0u, 1u
+    };
+    if (ac1_d3d9_dispatch(object_slot(device, 81), fake_draw_args, 4,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result)) ||
+        ac1_d3d9_dispatch(object_slot(device, 82), fake_draw_indexed_args, 7,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result)) ||
+        fake_draw_primitive_calls != 1 || fake_draw_indexed_calls != 1) {
+        std::fprintf(stderr, "fake DrawPrimitive/DrawIndexedPrimitive forwarding failed\n");
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    static_assert(sizeof(RGNDATAHEADER) == 32,
+                  "guest RGNDATAHEADER must match the PE32 ABI");
+    const RECT fake_source_rect{1, 2, 30, 40};
+    const RECT fake_destination_rect{5, 6, 70, 80};
+    const uint32_t source_rect_address = allocate_guest(nullptr, sizeof(RECT), 4);
+    const uint32_t destination_rect_address = allocate_guest(nullptr, sizeof(RECT), 4);
+    const uint32_t dirty_region_address = allocate_guest(
+        nullptr, sizeof(RGNDATAHEADER) + 2u * sizeof(RECT), 4);
+    RGNDATAHEADER dirty_header{};
+    dirty_header.dwSize = sizeof(RGNDATAHEADER);
+    dirty_header.iType = RDH_RECTANGLES;
+    dirty_header.nCount = 2;
+    dirty_header.nRgnSize = 2u * sizeof(RECT);
+    dirty_header.rcBound = RECT{1, 2, 30, 40};
+    const RECT dirty_rects[] = {{1, 2, 10, 11}, {12, 13, 30, 40}};
+    std::memcpy(resolve_guest(nullptr, source_rect_address, sizeof(RECT),
+                              AC1_D3D9_GUEST_WRITE),
+                &fake_source_rect, sizeof(RECT));
+    std::memcpy(resolve_guest(nullptr, destination_rect_address, sizeof(RECT),
+                              AC1_D3D9_GUEST_WRITE),
+                &fake_destination_rect, sizeof(RECT));
+    auto *dirty_guest = static_cast<uint8_t *>(resolve_guest(
+        nullptr, dirty_region_address,
+        sizeof(RGNDATAHEADER) + sizeof(dirty_rects), AC1_D3D9_GUEST_WRITE));
+    std::memcpy(dirty_guest, &dirty_header, sizeof(dirty_header));
+    std::memcpy(dirty_guest + sizeof(dirty_header), dirty_rects,
+                sizeof(dirty_rects));
+    const uint32_t mapped_present_args[] = {
+        device, source_rect_address, destination_rect_address, 0x1234u,
+        dirty_region_address
+    };
+    fake_present_result = S_OK;
+    if (ac1_d3d9_dispatch(object_slot(device, 17), mapped_present_args, 5,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result)) ||
+        fake_present_calls != 2 || !fake_present_had_source ||
+        !fake_present_had_destination || fake_present_hwnd != 1u ||
+        fake_present_region_count != 2 ||
+        std::memcmp(&fake_present_source, &fake_source_rect, sizeof(RECT)) != 0 ||
+        std::memcmp(&fake_present_destination, &fake_destination_rect,
+                    sizeof(RECT)) != 0 ||
+        std::memcmp(&fake_present_first_dirty_rect, &dirty_rects[0],
+                    sizeof(RECT)) != 0) {
+        std::fprintf(stderr, "fake Present rectangle/region/HWND marshalling failed: %s\n",
+                     ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    const uint32_t unmapped_present_rect_args[] = {
+        device, 0xfffffff0u, 0u, 0u, 0u
+    };
+    const uint32_t unmapped_present_region_args[] = {
+        device, 0u, 0u, 0u, 0xfffffff0u
+    };
+    const uint32_t unmapped_present_window_args[] = {
+        device, 0u, 0u, 0x5678u, 0u
+    };
+    if (ac1_d3d9_dispatch(object_slot(device, 17), unmapped_present_rect_args,
+                          5, &result) != 1 ||
+        result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
+        ac1_d3d9_dispatch(object_slot(device, 17), unmapped_present_region_args,
+                          5, &result) != 1 ||
+        result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
+        ac1_d3d9_dispatch(object_slot(device, 17), unmapped_present_window_args,
+                          5, &result) != 1 ||
+        result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
+        fake_present_calls != 2) {
+        std::fprintf(stderr, "fake Present accepted an unmapped pointer/HWND\n");
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    dirty_header.iType = 0xdeadbeefu;
+    std::memcpy(dirty_guest, &dirty_header, sizeof(dirty_header));
+    if (ac1_d3d9_dispatch(object_slot(device, 17), mapped_present_args, 5,
+                          &result) != -2 || fake_present_calls != 2) {
+        std::fprintf(stderr, "Present did not reject an unsupported dirty-region type\n");
         ac1_d3d9_shutdown();
         return false;
     }
@@ -876,11 +1358,91 @@ bool run_fake_surface_smoke(ac1_d3d9_callbacks callbacks)
         ac1_d3d9_shutdown();
         return false;
     }
+    /* Releasing a still-locked guest buffer proxy must write its staging bytes
+       back before native Unlock, even while the device retains a native ref. */
+    const uint32_t cleanup_buffer_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t cleanup_create_buffer[] = {
+        device, 64u, 0x208u, 0u, D3DPOOL_DEFAULT, cleanup_buffer_output, 0u
+    };
+    uint32_t cleanup_buffer = 0;
+    const uint32_t cleanup_data[4] = {0x12345678u, 0x90abcdefu,
+                                      0x0badf00du, 0x55aa33ccu};
+    const uint32_t cleanup_lock_output = allocate_guest(nullptr, 4, 4);
+    if (ac1_d3d9_dispatch(object_slot(device, 26), cleanup_create_buffer, 7,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result)) ||
+        !(cleanup_buffer = guest_word(cleanup_buffer_output))) {
+        std::fprintf(stderr, "fake cleanup VB creation failed: %s\n",
+                     ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    const uint32_t cleanup_lock[] = {
+        cleanup_buffer, 0u, sizeof(cleanup_data), cleanup_lock_output,
+        D3DLOCK_DISCARD
+    };
+    if (ac1_d3d9_dispatch(object_slot(cleanup_buffer, 11), cleanup_lock, 5,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result))) {
+        std::fprintf(stderr, "fake cleanup VB Lock failed: %s\n",
+                     ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    const uint32_t cleanup_staging = guest_word(cleanup_lock_output);
+    void *cleanup_guest_bytes = resolve_guest(nullptr, cleanup_staging,
+        sizeof(cleanup_data), AC1_D3D9_GUEST_WRITE);
+    if (!cleanup_guest_bytes) {
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    std::memcpy(cleanup_guest_bytes, cleanup_data, sizeof(cleanup_data));
+    const uint32_t cleanup_bind[] = {
+        device, 0u, cleanup_buffer, 0u, sizeof(cleanup_data)
+    };
+    if (ac1_d3d9_dispatch(object_slot(device, 100), cleanup_bind, 5,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result)) ||
+        fake_vertex_buffer.references != 2 || !fake_bound_vertex_buffer) {
+        std::fprintf(stderr, "fake cleanup VB bind failed: %s\n",
+                     ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    const uint32_t cleanup_release[] = {cleanup_buffer};
+    if (ac1_d3d9_dispatch(object_slot(cleanup_buffer, 2), cleanup_release, 1,
+                          &result) != 1 || result != 0 ||
+        fake_vertex_buffer.references != 1 || fake_vertex_buffer_locked ||
+        std::memcmp(fake_vertex_buffer_bytes.data(), cleanup_data,
+                    sizeof(cleanup_data)) != 0) {
+        std::fprintf(stderr, "locked VB release did not write staged bytes before Unlock: %s\n",
+                     ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    const uint32_t cleanup_unbind[] = {device, 0u, 0u, 0u, 0u};
+    if (ac1_d3d9_dispatch(object_slot(device, 100), cleanup_unbind, 5,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result)) ||
+        fake_vertex_buffer.references != 0 || fake_bound_vertex_buffer) {
+        std::fprintf(stderr, "fake cleanup VB native binding reference did not release\n");
+        ac1_d3d9_shutdown();
+        return false;
+    }
+
     const uint32_t unregistered_texture_args[] = {device, 0u, 0x76543210u};
     const uint32_t unregistered_shader_args[] = {device, 0x76543210u};
+    const uint32_t unregistered_declaration_args[] = {device, 0x76543210u};
+    const uint32_t unregistered_stream_args[] = {device, 0u, 0x76543210u, 0u, 16u};
+    const uint32_t unregistered_indices_args[] = {device, 0x76543210u};
+    const uint32_t unsupported_query_args[] = {device, D3DQUERYTYPE_EVENT, 0u};
     if (ac1_d3d9_dispatch(object_slot(device, 65), unregistered_texture_args, 3,
                           &result) != -2 ||
         ac1_d3d9_dispatch(object_slot(device, 92), unregistered_shader_args, 2,
+                          &result) != -2 ||
+        ac1_d3d9_dispatch(object_slot(device, 87), unregistered_declaration_args, 2,
+                          &result) != -2 ||
+        ac1_d3d9_dispatch(object_slot(device, 100), unregistered_stream_args, 5,
+                          &result) != -2 ||
+        ac1_d3d9_dispatch(object_slot(device, 104), unregistered_indices_args, 2,
+                          &result) != -2 ||
+        ac1_d3d9_dispatch(object_slot(device, 118), unsupported_query_args, 3,
                           &result) != -2) {
         std::fprintf(stderr, "non-null unregistered D3D resource was not rejected\n");
         ac1_d3d9_shutdown();
@@ -966,6 +1528,38 @@ bool run_fake_surface_smoke(ac1_d3d9_callbacks callbacks)
         ac1_d3d9_dispatch(object_slot(device, 40), depth_args, 2, &result) != 1 ||
         FAILED(static_cast<HRESULT>(result))) {
         std::fprintf(stderr, "fake surface getter failed: 0x%08x %s\n", result,
+                     ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    const uint32_t bind_depth_args[] = {device, guest_word(depth_output)};
+    const uint32_t unbind_depth_args[] = {device, 0u};
+    const uint32_t bad_depth_args[] = {device, 0x76543210u};
+    if (ac1_d3d9_argument_count(object_slot(device, 39)) != 2 ||
+        ac1_d3d9_dispatch(object_slot(device, 39), bind_depth_args, 2, &result) != 1 ||
+        FAILED(static_cast<HRESULT>(result)) ||
+        ac1_d3d9_dispatch(object_slot(device, 39), unbind_depth_args, 2, &result) != 1 ||
+        FAILED(static_cast<HRESULT>(result)) || !fake_depth_surface_was_null ||
+        fake_set_depth_surface_calls != 2 ||
+        ac1_d3d9_dispatch(object_slot(device, 39), bad_depth_args, 2, &result) != -2) {
+        std::fprintf(stderr, "fake SetDepthStencilSurface typed/null forwarding failed: %s\n",
+                     ac1_d3d9_last_error());
+        ac1_d3d9_shutdown();
+        return false;
+    }
+    const uint32_t bind_render_target_args[] = {device, 0u, guest_word(render_output)};
+    const uint32_t clear_additional_target_args[] = {device, 1u, 0u};
+    const uint32_t bad_render_target_args[] = {device, 1u, 0x76543210u};
+    if (ac1_d3d9_argument_count(object_slot(device, 37)) != 3 ||
+        ac1_d3d9_dispatch(object_slot(device, 37), bind_render_target_args, 3,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result)) ||
+        ac1_d3d9_dispatch(object_slot(device, 37), clear_additional_target_args, 3,
+                          &result) != 1 || FAILED(static_cast<HRESULT>(result)) ||
+        fake_set_render_target_calls != 2 || fake_render_target_index != 1 ||
+        !fake_render_target_was_null ||
+        ac1_d3d9_dispatch(object_slot(device, 37), bad_render_target_args, 3,
+                          &result) != -2) {
+        std::fprintf(stderr, "fake SetRenderTarget typed/null forwarding failed: %s\n",
                      ac1_d3d9_last_error());
         ac1_d3d9_shutdown();
         return false;
@@ -1106,12 +1700,19 @@ uint32_t allocate_guest(void *, uint32_t size, uint32_t alignment)
         return 0;
     uint32_t result = next_guest_address;
     next_guest_address += size;
+    live_guest_allocations.insert(result);
     return result;
 }
 
 void free_guest(void *, uint32_t address)
 {
     freed_guest_allocations.push_back(address);
+    live_guest_allocations.erase(address);
+}
+
+bool guest_allocation_live(uint32_t address)
+{
+    return live_guest_allocations.find(address) != live_guest_allocations.end();
 }
 
 uintptr_t translate_window(void *, uint32_t guest_hwnd)
@@ -1246,6 +1847,9 @@ int main(int argc, char **argv)
         ac1_d3d9_argument_count(0x7e002260u) != 3 ||
         ac1_d3d9_argument_count(0x7e002390u) != 3 ||
         ac1_d3d9_argument_count(0x7e002280u) != 2 ||
+        ac1_d3d9_argument_count(0x7e002110u) != 5 ||
+        ac1_d3d9_argument_count(0x7e002290u) != 1 ||
+        ac1_d3d9_argument_count(0x7e0022a0u) != 1 ||
         ac1_d3d9_argument_count(0x7e003000u) != 3 ||
         ac1_d3d9_argument_count(0x7e0030c0u) != 2 ||
         ac1_d3d9_argument_count(0x7e0030b0u) != -2 ||
@@ -1263,8 +1867,17 @@ int main(int argc, char **argv)
         ac1_d3d9_argument_count(0x7e00b140u) != 3 ||
         ac1_d3d9_argument_count(0x7e00b030u) != -2 ||
         ac1_d3d9_argument_count(0x7e00b160u) != -1 ||
+        ac1_d3d9_argument_count(0x7e002510u) != 4 ||
+        ac1_d3d9_argument_count(0x7e002520u) != 7 ||
+        ac1_d3d9_argument_count(0x7e002570u) != 2 ||
+        ac1_d3d9_argument_count(0x7e002640u) != 5 ||
+        ac1_d3d9_argument_count(0x7e002680u) != 2 ||
+        ac1_d3d9_argument_count(0x7e002760u) != 3 ||
+        ac1_d3d9_argument_count(0x7e00c000u) != 3 ||
+        ac1_d3d9_argument_count(0x7e00c060u) != 2 ||
+        ac1_d3d9_argument_count(0x7e00c070u) != 4 ||
         ac1_d3d9_dispatch(0x7e0030b0u, nullptr, 0, nullptr) != -2 ||
-        ac1_d3d9_dispatch(0x7e00c000u, nullptr, 0, nullptr) != 0) {
+        ac1_d3d9_dispatch(0x7e00c000u, nullptr, 0, nullptr) != -1) {
         std::fprintf(stderr, "COM method-arity classification failed\n");
         ac1_d3d9_shutdown();
         return 3;
@@ -1345,6 +1958,26 @@ int main(int argc, char **argv)
         DestroyWindow(hidden_window);
         return fake_passed ? 0 : 19;
     }
+
+    const uint32_t frame_this[] = {device};
+    const uint32_t null_present[] = {device, 0u, 0u, 0u, 0u};
+    uint32_t frame_result = 0;
+    if (ac1_d3d9_dispatch(object_slot(device, 41), frame_this, 1,
+                          &frame_result) != 1 ||
+        FAILED(static_cast<HRESULT>(frame_result)) ||
+        ac1_d3d9_dispatch(object_slot(device, 42), frame_this, 1,
+                          &frame_result) != 1 ||
+        FAILED(static_cast<HRESULT>(frame_result)) ||
+        ac1_d3d9_dispatch(object_slot(device, 17), null_present, 5,
+                          &frame_result) != 1 ||
+        FAILED(static_cast<HRESULT>(frame_result))) {
+        std::fprintf(stderr, "native DXVK BeginScene/EndScene/Present failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), frame_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 73;
+    }
+    std::printf("native DXVK BeginScene/EndScene/Present passed without draw submission\n");
 
     const uint32_t cube_output = allocate_guest(nullptr, sizeof(uint32_t), 4);
     const uint32_t cube_create_args[] = {
@@ -1824,6 +2457,355 @@ int main(int argc, char **argv)
         return 22;
     }
 
+    /* Exercise real guest32 staging through native dynamic vertex/index
+     * buffers. Read back with a second game-style NOOVERWRITE lock. */
+    const uint32_t vertex_lock_output = allocate_guest(nullptr, 4, 4);
+    uint8_t vertex_pattern[32];
+    for (uint32_t i = 0; i < sizeof(vertex_pattern); ++i)
+        vertex_pattern[i] = static_cast<uint8_t>(0x31u + i * 7u);
+    const uint32_t vertex_discard_lock[] = {
+        vertex_buffer, 0u, sizeof(vertex_pattern), vertex_lock_output, D3DLOCK_DISCARD
+    };
+    if (ac1_d3d9_argument_count(object_slot(vertex_buffer, 11)) != 5 ||
+        ac1_d3d9_argument_count(object_slot(vertex_buffer, 12)) != 1 ||
+        ac1_d3d9_dispatch(object_slot(vertex_buffer, 11), vertex_discard_lock, 5,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "native vertex buffer DISCARD Lock failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 28;
+    }
+    const uint32_t vertex_lock_guest_address = guest_word(vertex_lock_output);
+    if (!vertex_lock_guest_address || vertex_lock_guest_address == 0xFFFFFFFFu ||
+        !resolve_guest(nullptr, vertex_lock_guest_address, sizeof(vertex_pattern),
+                       AC1_D3D9_GUEST_WRITE)) {
+        std::fprintf(stderr, "vertex Lock did not return a checked guest staging span\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 29;
+    }
+    const uint32_t rejected_lock_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t rejected_lock_sentinel = 0x6a6a6a6au;
+    std::memcpy(resolve_guest(nullptr, rejected_lock_output, 4, AC1_D3D9_GUEST_WRITE),
+                &rejected_lock_sentinel, sizeof(rejected_lock_sentinel));
+    const size_t allocations_with_first_lock = live_guest_allocations.size();
+    const uint32_t second_vertex_lock[] = {
+        vertex_buffer, 0u, sizeof(vertex_pattern), rejected_lock_output, 0u
+    };
+    if (ac1_d3d9_dispatch(object_slot(vertex_buffer, 11), second_vertex_lock, 5,
+                          &getter_result) != -2 ||
+        guest_word(rejected_lock_output) != rejected_lock_sentinel ||
+        live_guest_allocations.size() != allocations_with_first_lock) {
+        std::fprintf(stderr, "second outstanding Lock was not rejected as unsupported\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 57;
+    }
+    std::memcpy(resolve_guest(nullptr, vertex_lock_guest_address, sizeof(vertex_pattern),
+                              AC1_D3D9_GUEST_WRITE), vertex_pattern,
+                sizeof(vertex_pattern));
+    const uint32_t vertex_this[] = {vertex_buffer};
+    if (ac1_d3d9_dispatch(object_slot(vertex_buffer, 12), vertex_this, 1,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "native vertex buffer Unlock/writeback failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 30;
+    }
+    const size_t allocations_after_unlock = live_guest_allocations.size();
+    const uint32_t unsupported_lock_flags[] = {
+        vertex_buffer, 0u, sizeof(vertex_pattern), rejected_lock_output, D3DLOCK_NOSYSLOCK
+    };
+    if (ac1_d3d9_dispatch(object_slot(vertex_buffer, 11), unsupported_lock_flags, 5,
+                          &getter_result) != -2 ||
+        guest_word(rejected_lock_output) != rejected_lock_sentinel ||
+        live_guest_allocations.size() != allocations_after_unlock) {
+        std::fprintf(stderr, "unsupported Lock flags were not reported as unsupported\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 58;
+    }
+    const uint32_t vertex_readback_lock[] = {
+        vertex_buffer, 0u, sizeof(vertex_pattern), vertex_lock_output, D3DLOCK_NOOVERWRITE
+    };
+    if (ac1_d3d9_dispatch(object_slot(vertex_buffer, 11), vertex_readback_lock, 5,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "native vertex buffer NOOVERWRITE readback Lock failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 31;
+    }
+    const uint32_t vertex_readback_address = guest_word(vertex_lock_output);
+    void *vertex_readback = resolve_guest(nullptr, vertex_readback_address,
+        sizeof(vertex_pattern), AC1_D3D9_GUEST_READ);
+    if (!vertex_readback || std::memcmp(vertex_readback, vertex_pattern,
+                                        sizeof(vertex_pattern)) != 0 ||
+        ac1_d3d9_dispatch(object_slot(vertex_buffer, 12), vertex_this, 1,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "native vertex buffer write/readback mismatch: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 32;
+    }
+
+    /* Invalid ranges must fail before allocating staging or leaving a lock
+     * active; a following valid zero-size lock must still work. */
+    const uint32_t invalid_range_output = allocate_guest(nullptr, 4, 4);
+    const size_t live_before_bad_ranges = live_guest_allocations.size();
+    const uint32_t sentinel = 0xa5a5a5a5u;
+    std::memcpy(resolve_guest(nullptr, invalid_range_output, 4, AC1_D3D9_GUEST_WRITE),
+                &sentinel, sizeof(sentinel));
+    const uint32_t past_end_lock[] = {
+        vertex_buffer, 0xfff8u, 16u, invalid_range_output, 0u
+    };
+    const uint32_t wrapping_range_lock[] = {
+        vertex_buffer, 0xfffffff0u, 0x40u, invalid_range_output, 0u
+    };
+    if (ac1_d3d9_dispatch(object_slot(vertex_buffer, 11), past_end_lock, 5,
+                          &getter_result) != 1 ||
+        getter_result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
+        guest_word(invalid_range_output) != sentinel ||
+        live_guest_allocations.size() != live_before_bad_ranges ||
+        ac1_d3d9_dispatch(object_slot(vertex_buffer, 11), wrapping_range_lock, 5,
+                          &getter_result) != 1 ||
+        getter_result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
+        guest_word(invalid_range_output) != sentinel ||
+        live_guest_allocations.size() != live_before_bad_ranges) {
+        std::fprintf(stderr, "out-of-bounds/wrapping VB Lock was not rejected atomically: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 38;
+    }
+    const uint32_t vertex_zero_size_lock[] = {
+        vertex_buffer, 0xfff0u, 0u, invalid_range_output, 0u
+    };
+    if (ac1_d3d9_dispatch(object_slot(vertex_buffer, 11), vertex_zero_size_lock, 5,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "zero-size VB Lock at tail did not lock the remaining range: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 39;
+    }
+    const uint32_t zero_size_guest = guest_word(invalid_range_output);
+    void *zero_size_tail = resolve_guest(nullptr, zero_size_guest, 16, AC1_D3D9_GUEST_WRITE);
+    if (!zero_size_tail) {
+        std::fprintf(stderr, "zero-size VB Lock did not stage the full remaining tail\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 40;
+    }
+    static_cast<uint8_t *>(zero_size_tail)[15] = 0x6du;
+    if (ac1_d3d9_dispatch(object_slot(vertex_buffer, 12), vertex_this, 1,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "zero-size VB Lock tail Unlock failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 41;
+    }
+
+    /* READONLY must expose a staging copy without writing guest modifications
+     * back to a real managed buffer. */
+    const uint32_t readonly_buffer_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t create_readonly_buffer_args[] = {
+        device, 64u, 0u, 0u, D3DPOOL_MANAGED, readonly_buffer_output, 0u
+    };
+    if (ac1_d3d9_dispatch(object_slot(device, 26), create_readonly_buffer_args, 7,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "managed test VB creation failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 42;
+    }
+    const uint32_t readonly_buffer = guest_word(readonly_buffer_output);
+    const uint32_t readonly_lock_output = allocate_guest(nullptr, 4, 4);
+    uint8_t readonly_original[64];
+    uint8_t readonly_modified[64];
+    for (uint32_t i = 0; i < sizeof(readonly_original); ++i) {
+        readonly_original[i] = static_cast<uint8_t>(0x5bu + i * 3u);
+        readonly_modified[i] = static_cast<uint8_t>(0xc3u - i * 5u);
+    }
+    const uint32_t readonly_init_lock[] = {
+        readonly_buffer, 0u, sizeof(readonly_original), readonly_lock_output, 0u
+    };
+    if (ac1_d3d9_dispatch(object_slot(readonly_buffer, 11), readonly_init_lock, 5,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "managed test VB initialization Lock failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 43;
+    }
+    std::memcpy(resolve_guest(nullptr, guest_word(readonly_lock_output), sizeof(readonly_original),
+                              AC1_D3D9_GUEST_WRITE), readonly_original,
+                sizeof(readonly_original));
+    const uint32_t readonly_buffer_this[] = {readonly_buffer};
+    if (ac1_d3d9_dispatch(object_slot(readonly_buffer, 12), readonly_buffer_this, 1,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "managed test VB initialization Unlock failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 44;
+    }
+    const uint32_t readonly_lock[] = {
+        readonly_buffer, 0u, sizeof(readonly_modified), readonly_lock_output, D3DLOCK_READONLY
+    };
+    if (ac1_d3d9_dispatch(object_slot(readonly_buffer, 11), readonly_lock, 5,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "managed test VB READONLY Lock failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 45;
+    }
+    std::memcpy(resolve_guest(nullptr, guest_word(readonly_lock_output), sizeof(readonly_modified),
+                              AC1_D3D9_GUEST_WRITE), readonly_modified,
+                sizeof(readonly_modified));
+    if (ac1_d3d9_dispatch(object_slot(readonly_buffer, 12), readonly_buffer_this, 1,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "managed test VB READONLY Unlock failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 46;
+    }
+    if (ac1_d3d9_dispatch(object_slot(readonly_buffer, 11), readonly_init_lock, 5,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result)) ||
+        std::memcmp(resolve_guest(nullptr, guest_word(readonly_lock_output), sizeof(readonly_original),
+                                 AC1_D3D9_GUEST_READ), readonly_original,
+                    sizeof(readonly_original)) != 0 ||
+        ac1_d3d9_dispatch(object_slot(readonly_buffer, 12), readonly_buffer_this, 1,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "READONLY staging modification changed native VB contents: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 47;
+    }
+    uint32_t readonly_release_count = 0;
+    if (ac1_d3d9_dispatch(object_slot(readonly_buffer, 2), readonly_buffer_this, 1,
+                          &readonly_release_count) != 1 || readonly_release_count != 0) {
+        std::fprintf(stderr, "managed READONLY test VB release failed\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 48;
+    }
+
+    /* Last proxy Release must Unlock the native buffer and free its staging. */
+    const uint32_t abandoned_release_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t create_abandoned_release_args[] = {
+        device, 256u, 0x208u, 0u, D3DPOOL_DEFAULT, abandoned_release_output, 0u
+    };
+    if (ac1_d3d9_dispatch(object_slot(device, 26), create_abandoned_release_args, 7,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "abandoned Release test VB creation failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 49;
+    }
+    const uint32_t abandoned_release_buffer = guest_word(abandoned_release_output);
+    const uint32_t abandoned_release_lock_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t abandoned_release_lock[] = {
+        abandoned_release_buffer, 0u, 32u, abandoned_release_lock_output, D3DLOCK_DISCARD
+    };
+    if (ac1_d3d9_dispatch(object_slot(abandoned_release_buffer, 11),
+                          abandoned_release_lock, 5, &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "abandoned Release test Lock failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 50;
+    }
+    const uint32_t abandoned_release_staging = guest_word(abandoned_release_lock_output);
+    if (!guest_allocation_live(abandoned_release_staging)) {
+        std::fprintf(stderr, "abandoned Release test staging was not tracked\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 51;
+    }
+    const uint32_t abandoned_release_this[] = {abandoned_release_buffer};
+    uint32_t abandoned_release_count = UINT32_MAX;
+    if (ac1_d3d9_dispatch(object_slot(abandoned_release_buffer, 2),
+                          abandoned_release_this, 1, &abandoned_release_count) != 1 ||
+        abandoned_release_count != 0 || guest_allocation_live(abandoned_release_staging)) {
+        std::fprintf(stderr, "final Release did not clean the locked buffer/staging: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 52;
+    }
+
+    const uint32_t index_lock_output = allocate_guest(nullptr, 4, 4);
+    uint16_t index_pattern[8] = {0, 1, 3, 7, 15, 31, 63, 127};
+    const uint32_t index_discard_lock[] = {
+        index_buffer, 0u, sizeof(index_pattern), index_lock_output, D3DLOCK_DISCARD
+    };
+    if (ac1_d3d9_argument_count(object_slot(index_buffer, 11)) != 5 ||
+        ac1_d3d9_argument_count(object_slot(index_buffer, 12)) != 1 ||
+        ac1_d3d9_dispatch(object_slot(index_buffer, 11), index_discard_lock, 5,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "native index buffer DISCARD Lock failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 33;
+    }
+    const uint32_t index_lock_guest_address = guest_word(index_lock_output);
+    if (!index_lock_guest_address ||
+        !resolve_guest(nullptr, index_lock_guest_address, sizeof(index_pattern),
+                       AC1_D3D9_GUEST_WRITE)) {
+        std::fprintf(stderr, "index Lock did not return a checked guest staging span\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 34;
+    }
+    std::memcpy(resolve_guest(nullptr, index_lock_guest_address, sizeof(index_pattern),
+                              AC1_D3D9_GUEST_WRITE), index_pattern,
+                sizeof(index_pattern));
+    const uint32_t index_this[] = {index_buffer};
+    if (ac1_d3d9_dispatch(object_slot(index_buffer, 12), index_this, 1,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "native index buffer Unlock/writeback failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 35;
+    }
+    const uint32_t index_readback_lock[] = {
+        index_buffer, 0u, sizeof(index_pattern), index_lock_output, D3DLOCK_NOOVERWRITE
+    };
+    if (ac1_d3d9_dispatch(object_slot(index_buffer, 11), index_readback_lock, 5,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "native index buffer NOOVERWRITE readback Lock failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 36;
+    }
+    const uint32_t index_readback_address = guest_word(index_lock_output);
+    void *index_readback = resolve_guest(nullptr, index_readback_address,
+        sizeof(index_pattern), AC1_D3D9_GUEST_READ);
+    if (!index_readback || std::memcmp(index_readback, index_pattern,
+                                       sizeof(index_pattern)) != 0 ||
+        ac1_d3d9_dispatch(object_slot(index_buffer, 12), index_this, 1,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "native index buffer write/readback mismatch: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 37;
+    }
+    std::printf("native DXVK dynamic VB/IB staging writeback/readback passed\n");
     const uint32_t declaration_output = allocate_guest(nullptr, 4, 4);
     const D3DVERTEXELEMENT9 declaration_elements[] = {
         {0, 0, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT,
@@ -1963,6 +2945,11 @@ int main(int argc, char **argv)
         ac1_d3d9_shutdown();
         return 33;
     }
+    if (!run_native_indexed_triangle_smoke(device, vertex_buffer, index_buffer, texture)) {
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 74;
+    }
 
     const uint32_t get_render_target = object_slot(device, 38);
     const uint32_t get_depth_stencil = object_slot(device, 40);
@@ -1972,6 +2959,8 @@ int main(int argc, char **argv)
     const uint32_t depth_args[] = {device, depth_output};
     if (ac1_d3d9_argument_count(get_render_target) != 3 ||
         ac1_d3d9_argument_count(get_depth_stencil) != 2 ||
+        ac1_d3d9_argument_count(object_slot(device, 37)) != 3 ||
+        ac1_d3d9_argument_count(object_slot(device, 39)) != 2 ||
         ac1_d3d9_argument_count(object_slot(device, 3)) != 1 ||
         ac1_d3d9_dispatch(get_render_target, render_args, 3, &getter_result) != 1 ||
         FAILED(static_cast<HRESULT>(getter_result)) || !guest_word(render_output) ||
@@ -1982,6 +2971,36 @@ int main(int argc, char **argv)
         DestroyWindow(hidden_window);
         ac1_d3d9_shutdown();
         return 11;
+    }
+
+    const uint32_t bind_render_target_args[] = {device, 0u, guest_word(render_output)};
+    const uint32_t clear_additional_target_args[] = {device, 1u, 0u};
+    if (ac1_d3d9_dispatch(object_slot(device, 37), bind_render_target_args, 3,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result)) ||
+        ac1_d3d9_dispatch(object_slot(device, 37), clear_additional_target_args, 3,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "native SetRenderTarget proxy/null forwarding failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 76;
+    }
+
+    const uint32_t bind_depth_args[] = {device, guest_word(depth_output)};
+    const uint32_t unbind_depth_args[] = {device, 0u};
+    if (ac1_d3d9_dispatch(object_slot(device, 39), bind_depth_args, 2,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result)) ||
+        ac1_d3d9_dispatch(object_slot(device, 39), unbind_depth_args, 2,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "native SetDepthStencilSurface proxy/null forwarding failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 75;
     }
 
     const uint32_t surface = guest_word(render_output);
@@ -2139,6 +3158,38 @@ int main(int argc, char **argv)
         ac1_d3d9_shutdown();
         return 16;
     }
+    const uint32_t shutdown_buffer_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t create_shutdown_buffer_args[] = {
+        device, 256u, 0x208u, 0u, D3DPOOL_DEFAULT, shutdown_buffer_output, 0u
+    };
+    if (ac1_d3d9_dispatch(object_slot(device, 26), create_shutdown_buffer_args, 7,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "shutdown cleanup test VB creation failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 53;
+    }
+    const uint32_t shutdown_buffer = guest_word(shutdown_buffer_output);
+    const uint32_t shutdown_lock_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t shutdown_lock[] = {
+        shutdown_buffer, 0u, 32u, shutdown_lock_output, D3DLOCK_DISCARD
+    };
+    if (ac1_d3d9_dispatch(object_slot(shutdown_buffer, 11), shutdown_lock, 5,
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result))) {
+        std::fprintf(stderr, "shutdown cleanup test Lock failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 54;
+    }
+    const uint32_t shutdown_staging = guest_word(shutdown_lock_output);
+    if (!guest_allocation_live(shutdown_staging)) {
+        std::fprintf(stderr, "shutdown cleanup test staging was not tracked\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 55;
+    }
     const uint32_t device_release = object_slot(device, 2);
     const uint32_t device_this[] = {device};
     const uint32_t vertex_release_this[] = {vertex_buffer};
@@ -2186,6 +3237,10 @@ int main(int argc, char **argv)
                   shutdown_cube_locked.bits) == freed_guest_allocations.end()) {
         std::fprintf(stderr, "bridge shutdown did not free locked cube staging\n");
         return 72;
+    }
+    if (guest_allocation_live(shutdown_staging)) {
+        std::fprintf(stderr, "bridge shutdown did not free locked buffer staging\n");
+        return 56;
     }
     std::printf("native D3D9 bridge smoke passed; adapters=%u, windowed device surface=%ux%u\n",
                 adapter_count, surface_width, surface_height);
