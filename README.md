@@ -26,6 +26,17 @@ The current configuration uses the actual local DukeMP pcrecomp checkout and its
 .\tools\build_android.ps1
 ```
 
+The current Windows Vulkan test uses the separately staged official DXVK x64 DLL through an explicit absolute path. With that local dependency present:
+
+```powershell
+$env:AC1_D3D9_LIBRARY = (Resolve-Path work\d3d9_dxvk_probe\d3d9.dll).Path
+New-Item -ItemType Directory -Force work\host_dxvk_run | Out-Null
+$env:DXVK_LOG_PATH = (Resolve-Path work\host_dxvk_run).Path
+.\tools\build.ps1 -BuildType RelWithDebInfo -Jobs 16 -Run
+```
+
+An explicit DLL load/export failure stops with its diagnostic; it does not fall back. Without `AC1_D3D9_LIBRARY`, the bridge uses System32 D3D9. This host DLL is separate from the Android DXVK Native build.
+
 Host tools: MSYS2 MinGW64 GCC and the Android SDK's CMake 3.22.1/Ninja. Python dependencies are in `requirements.txt`. Android uses NDK 28.2.13676358, SDK 35 and JDK 17 or 21. See [Android instructions](docs/android.md) for installation and user-supplied game data.
 
 `-Jobs` controls native compilation parallelism and defaults to 8; the optimized example uses 16 for this host's 16 physical cores. It does not change guest-thread scheduling.
@@ -61,7 +72,7 @@ The exact DX9 SHA-256 is `2fa8d50c60398cc249c6d908de46b15f48e445dd0c605b5956e94f
 
 The host trace confirms original entry execution, C/C++ initialization, and the CRT's handoff to the game's WinMain thunk at `0x00401375` (original return address `0x00F9F3DC`). The original worker entry at `0x00FA3B17` also executes on a native host thread with a separate guest CPU, stack, TIB and TLS. Guest execution is currently serialized for correctness; this is not yet parallel execution across CPU cores. A same-process repeat-run check passes through worker cleanup and runtime reinitialization. Game startup remains incomplete. The APK's library is ELF64 AArch64; no Android device execution has been verified.
 
-The worker task now executes original window initialization: `RegisterClassExA`, `CreateWindowExA`, and `Direct3DCreate9` succeed in `work/startup_9e51f0_window_d3d.log`. One debugger run also created the native HAL device and reached `SetRenderState` at `0x00AA6083`; later System32 D3D9 runs reject device creation, then original code dereferences its null device at `0x00AA6078`. Independent native probes reproduce unavailable HAL capabilities and failed device creation. An isolated official DXVK v3.1 Windows x64 probe succeeds through Vulkan on the RTX 4090 for both fullscreen and windowed requests; that probe is not a game frame. The bridge now covers the bounded `0x00AA5F90` state-initialization method family, with fake-COM ABI checks; actual game execution through the full batch is pending. See [graphics evidence](docs/graphics.md).
+The worker task now executes original window initialization: `RegisterClassExA`, `CreateWindowExA`, and `Direct3DCreate9` succeed in `work/startup_9e51f0_window_d3d.log`. One debugger run also created the native HAL device and reached `SetRenderState` at `0x00AA6083`; later System32 D3D9 runs reject device creation, then original code dereferences its null device at `0x00AA6078`. Independent native probes reproduce unavailable HAL capabilities and failed device creation. An isolated official DXVK v3.1 Windows x64 probe succeeds through Vulkan on the RTX 4090. With that DLL explicitly selected, the actual game also creates a real device, passes the bounded `0x00AA5F90` state-initialization method family, and reaches `CreateVertexBuffer` at `0x00AA5362`. `work/startup_dxvk_device_created.log` preserves this normal host run. No game frame is verified. See [graphics evidence](docs/graphics.md).
 
 The original audio initialization now reads and writes `DARE.INI` through the profile APIs. Host configuration writes are restricted to `work/userdata/`; Android uses the application's private userdata directory. The GOG installation remains read-only. The lifter also bounds two-level switches using their guarded byte lookup tables, preventing lookup bytes from being mistaken for executable targets. `-Run` saves its complete diagnostics to `work/startup.log`.
 

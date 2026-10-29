@@ -24,4 +24,10 @@ if(AC1_D3D9_BUILD_SMOKE)
   add_executable(ac1_d3d9_bridge_smoke tests/bridge_smoke.cpp)
   target_link_libraries(ac1_d3d9_bridge_smoke PRIVATE ac1_d3d9_bridge user32)
   add_test(NAME ac1_d3d9_bridge_smoke COMMAND ac1_d3d9_bridge_smoke)
+  add_test(NAME ac1_d3d9_provider_relative_rejected
+           COMMAND ac1_d3d9_bridge_smoke --provider-relative)
+  add_test(NAME ac1_d3d9_provider_missing_does_not_fallback
+           COMMAND ac1_d3d9_bridge_smoke --provider-missing)
+  add_test(NAME ac1_d3d9_provider_without_factory_rejected
+           COMMAND ac1_d3d9_bridge_smoke --provider-no-export)
 endif()

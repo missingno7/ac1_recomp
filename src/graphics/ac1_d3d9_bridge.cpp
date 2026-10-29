@@ -17,12 +17,15 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -117,6 +120,7 @@ std::mutex g_mutex;
 thread_local char g_last_error[1024]{};
 #if defined(_WIN32)
 HMODULE g_d3d9_module = nullptr;
+std::string g_d3d9_provider_path;
 #endif
 
 void set_error(const std::string &message)
@@ -137,6 +141,112 @@ void clear_error()
 {
     g_last_error[0] = '\0';
 }
+
+#if defined(_WIN32)
+bool is_absolute_windows_path(const std::wstring &path)
+{
+    const auto separator = [](wchar_t value) {
+        return value == L'\\' || value == L'/';
+    };
+    if (path.size() >= 3 &&
+        ((path[0] >= L'A' && path[0] <= L'Z') ||
+         (path[0] >= L'a' && path[0] <= L'z')) &&
+        path[1] == L':' && separator(path[2]))
+        return true;
+    /* UNC and Win32 device paths are fully qualified; a single rooted slash
+     * and drive-relative `C:foo` are not absolute and must be rejected. */
+    return path.size() >= 3 && separator(path[0]) && separator(path[1]) &&
+           !separator(path[2]);
+}
+
+std::string windows_path_utf8(const std::wstring &path)
+{
+    const int required = WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1,
+                                              nullptr, 0, nullptr, nullptr);
+    if (required <= 1) return std::string();
+    std::string result(static_cast<size_t>(required), '\0');
+    if (!WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, result.data(),
+                             required, nullptr, nullptr))
+        return std::string();
+    result.resize(static_cast<size_t>(required - 1));
+    return result;
+}
+
+bool selected_d3d9_module_path(std::wstring *path, bool *explicit_path)
+{
+    if (!path || !explicit_path) return false;
+    *explicit_path = false;
+    SetLastError(ERROR_SUCCESS);
+    const DWORD required = GetEnvironmentVariableW(L"AC1_D3D9_LIBRARY", nullptr, 0);
+    const DWORD environment_error = GetLastError();
+    if (required != 0 || environment_error != ERROR_ENVVAR_NOT_FOUND) {
+        *explicit_path = true;
+        if (!required) {
+            set_error(environment_error == ERROR_SUCCESS
+                ? "AC1_D3D9_LIBRARY is explicitly set but empty"
+                : "failed to read AC1_D3D9_LIBRARY");
+            return false;
+        }
+        std::vector<wchar_t> value(required);
+        const DWORD copied = GetEnvironmentVariableW(
+            L"AC1_D3D9_LIBRARY", value.data(), static_cast<DWORD>(value.size()));
+        if (!copied || copied >= value.size()) {
+            set_error("AC1_D3D9_LIBRARY changed while it was being read");
+            return false;
+        }
+        path->assign(value.data(), copied);
+        if (!is_absolute_windows_path(*path)) {
+            set_error("AC1_D3D9_LIBRARY must be an absolute Windows DLL path: " +
+                      windows_path_utf8(*path));
+            return false;
+        }
+        return true;
+    }
+
+    wchar_t system_directory[MAX_PATH]{};
+    const UINT length = GetSystemDirectoryW(system_directory, MAX_PATH);
+    if (!length || length >= MAX_PATH - 10) {
+        set_error("GetSystemDirectoryW failed while locating the default system D3D9");
+        return false;
+    }
+    path->assign(system_directory, length);
+    *path += L"\\d3d9.dll";
+    return true;
+}
+
+bool ensure_d3d9_module()
+{
+    if (g_d3d9_module) return true;
+    std::wstring path;
+    bool explicit_path = false;
+    if (!selected_d3d9_module_path(&path, &explicit_path)) return false;
+    const std::string selected_utf8 = windows_path_utf8(path);
+    HMODULE module = LoadLibraryExW(path.c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!module) {
+        const DWORD error = GetLastError();
+        std::ostringstream message;
+        if (explicit_path)
+            message << "LoadLibraryExW failed for AC1_D3D9_LIBRARY " << selected_utf8
+                    << " (Win32 error " << error << ')';
+        else
+            message << "LoadLibraryExW failed for the system d3d9.dll (Win32 error "
+                    << error << ')';
+        set_error(message.str());
+        return false;
+    }
+    g_d3d9_module = module;
+    g_d3d9_provider_path = selected_utf8;
+    std::vector<wchar_t> loaded_path(32768);
+    const DWORD loaded_length = GetModuleFileNameW(
+        g_d3d9_module, loaded_path.data(), static_cast<DWORD>(loaded_path.size()));
+    if (loaded_length && loaded_length < loaded_path.size()) {
+        g_d3d9_provider_path = windows_path_utf8(
+            std::wstring(loaded_path.data(), loaded_length));
+    }
+    return true;
+}
+#endif
 
 void *guest_memory(uint32_t address, uint32_t width, uint32_t access)
 {
@@ -189,6 +299,11 @@ int token_argument_count(uint32_t token)
 
     if (kind == kDeviceKind) {
         if (method < 3) return method == 0 ? 3 : 1;
+        if (method == 65 || method == 92 || method == 107) return method == 65 ? 3 : 2;
+        if (method == 67 || method == 69) return 4;
+        if (method == 94 || method == 96 || method == 98 ||
+            method == 109 || method == 111 || method == 113) return 4;
+        if (method == 57) return 3;
         if (method == 38) return 3;
         if (method == 40) return 2;
         return -2;
@@ -300,6 +415,80 @@ bool require_count(uint32_t got, uint32_t expected, const char *method)
     message << method << " received " << got << " guest arguments; expected " << expected;
     set_error(message.str());
     return false;
+}
+
+enum class ShaderConstantData : uint8_t {
+    VertexFloat,
+    VertexInt,
+    VertexBool,
+    PixelFloat,
+    PixelInt,
+    PixelBool
+};
+
+HRESULT checked_shader_constant_data(IDirect3DDevice9 *device,
+                                     ShaderConstantData kind,
+                                     uint32_t start_register,
+                                     uint32_t guest_data,
+                                     uint32_t register_count,
+                                     const void **data)
+{
+    if (!device || !data) return D3DERR_INVALIDCALL;
+    D3DCAPS9 caps{};
+    HRESULT status = device->GetDeviceCaps(&caps);
+    if (FAILED(status)) {
+        set_error("shader constant validation could not query device caps");
+        return status;
+    }
+
+    uint32_t maximum_registers = 16u;
+    switch (kind) {
+    case ShaderConstantData::VertexFloat:
+        maximum_registers = caps.MaxVertexShaderConst;
+        break;
+    case ShaderConstantData::PixelFloat: {
+        const uint32_t major = (caps.PixelShaderVersion >> 8u) & 0xffu;
+        maximum_registers = major >= 3u ? 224u : major == 2u ? 32u : major == 1u ? 8u : 0u;
+        break;
+    }
+    case ShaderConstantData::VertexInt:
+    case ShaderConstantData::VertexBool:
+    case ShaderConstantData::PixelInt:
+    case ShaderConstantData::PixelBool:
+        /* D3D9 shader-model-3 integer and boolean register files are 16 wide. */
+        maximum_registers = 16u;
+        break;
+    }
+    if (start_register > maximum_registers ||
+        register_count > maximum_registers - start_register) {
+        set_error("shader constant register range exceeds D3D9 device limits");
+        return D3DERR_INVALIDCALL;
+    }
+
+    uint32_t bytes_per_register = 16u;
+    if (kind == ShaderConstantData::VertexBool ||
+        kind == ShaderConstantData::PixelBool)
+        bytes_per_register = sizeof(BOOL);
+    const uint64_t byte_count = static_cast<uint64_t>(register_count) * bytes_per_register;
+    if (byte_count > UINT32_MAX) {
+        set_error("shader constant guest buffer size overflows the 32-bit guest ABI");
+        return D3DERR_INVALIDCALL;
+    }
+    if (!register_count) {
+        *data = guest_data ? guest_memory(guest_data, 1u, AC1_D3D9_GUEST_READ) : nullptr;
+        if (guest_data && !*data) {
+            set_error("zero-count shader constant pointer is unmapped");
+            return D3DERR_INVALIDCALL;
+        }
+        return D3D_OK;
+    }
+    *data = guest_memory(guest_data, static_cast<uint32_t>(byte_count),
+                         AC1_D3D9_GUEST_READ);
+    if (!*data) {
+        set_error("shader constant guest array is unmapped");
+        return D3DERR_INVALIDCALL;
+    }
+    return D3D_OK;
 }
 
 bool bridge_supports_iid(ObjectKind kind, const GUID &iid)
@@ -452,9 +641,77 @@ HRESULT create_device(IDirect3D9 *d3d, const uint32_t *args)
 
     D3DPRESENT_PARAMETERS host = host_present_parameters(guest, present_window);
     IDirect3DDevice9 *device = nullptr;
+#if defined(_WIN32)
+    const bool trace_create_device =
+        std::getenv("AC1_D3D9_TRACE_CREATEDEVICE") != nullptr;
+    if (trace_create_device) {
+        const HWND focus_hwnd = reinterpret_cast<HWND>(focus);
+        const HWND present_hwnd = host.hDeviceWindow;
+        DWORD focus_owner_thread = focus_hwnd
+            ? GetWindowThreadProcessId(focus_hwnd, nullptr) : 0;
+        DWORD present_owner_thread = present_hwnd
+            ? GetWindowThreadProcessId(present_hwnd, nullptr) : 0;
+        STARTUPINFOA startup_info{};
+        startup_info.cb = static_cast<DWORD>(sizeof(startup_info));
+        GetStartupInfoA(&startup_info);
+        RECT client{};
+        const BOOL has_client = focus_hwnd && GetClientRect(focus_hwnd, &client);
+        std::fprintf(stderr,
+            "AC1 D3D9 CreateDevice input: provider=%s caller_tid=%lu adapter=%u type=%u "
+            "behavior=0x%08x guest_focus=0x%08x focus=%p focus_valid=%d "
+            "client_valid=%d visible=%d iconic=%d foreground=%d style=0x%08lx "
+            "focus_owner_tid=%lu client=%ld,%ld..%ld,%ld guest_present_hwnd=0x%08x "
+            "present=%p present_valid=%d present_owner_tid=%lu "
+            "startup_flags=0x%08lx startup_show=%u\n"
+            "AC1 D3D9 CreateDevice PP guest: %ux%u format=%u count=%u ms=%u/%u "
+            "swap=%u windowed=%d auto_depth=%d depth_fmt=%u flags=0x%08x "
+            "refresh=%u interval=0x%08x\n",
+            g_d3d9_provider_path.empty() ? "<platform callback>" : g_d3d9_provider_path.c_str(),
+            static_cast<unsigned long>(GetCurrentThreadId()), args[1], args[2], args[4],
+            args[3], reinterpret_cast<void *>(focus),
+            focus_hwnd ? static_cast<int>(IsWindow(focus_hwnd)) : 0,
+            has_client ? 1 : 0,
+            focus_hwnd ? static_cast<int>(IsWindowVisible(focus_hwnd)) : 0,
+            focus_hwnd ? static_cast<int>(IsIconic(focus_hwnd)) : 0,
+            focus_hwnd && GetForegroundWindow() == focus_hwnd ? 1 : 0,
+            focus_hwnd ? static_cast<unsigned long>(GetWindowLongPtrW(focus_hwnd, GWL_STYLE)) : 0ul,
+            static_cast<unsigned long>(focus_owner_thread),
+            static_cast<long>(client.left), static_cast<long>(client.top),
+            static_cast<long>(client.right), static_cast<long>(client.bottom),
+            guest.device_window, reinterpret_cast<void *>(present_hwnd),
+            present_hwnd ? static_cast<int>(IsWindow(present_hwnd)) : 0,
+            static_cast<unsigned long>(present_owner_thread),
+            static_cast<unsigned long>(startup_info.dwFlags),
+            static_cast<unsigned>(startup_info.wShowWindow),
+            guest.back_buffer_width, guest.back_buffer_height,
+            guest.back_buffer_format, guest.back_buffer_count,
+            guest.multi_sample_type, guest.multi_sample_quality,
+            guest.swap_effect, guest.windowed, guest.enable_auto_depth_stencil,
+            guest.auto_depth_stencil_format, guest.flags,
+            guest.fullscreen_refresh_rate, guest.presentation_interval);
+    }
+#endif
     HRESULT status = d3d->CreateDevice(args[1], static_cast<D3DDEVTYPE>(args[2]),
                                        reinterpret_cast<HWND>(focus), args[4],
                                        &host, &device);
+#if defined(_WIN32)
+    if (trace_create_device) {
+        std::fprintf(stderr,
+            "AC1 D3D9 CreateDevice native result: hr=0x%08x device=%p "
+            "PP=%ux%u format=%u count=%u ms=%u/%lu swap=%u windowed=%d "
+            "auto_depth=%d depth_fmt=%u flags=0x%08lx refresh=%u interval=0x%08x\n",
+            static_cast<unsigned>(status), static_cast<void *>(device),
+            host.BackBufferWidth, host.BackBufferHeight,
+            static_cast<unsigned>(host.BackBufferFormat), host.BackBufferCount,
+            static_cast<unsigned>(host.MultiSampleType),
+            static_cast<unsigned long>(host.MultiSampleQuality),
+            static_cast<unsigned>(host.SwapEffect), host.Windowed,
+            host.EnableAutoDepthStencil,
+            static_cast<unsigned>(host.AutoDepthStencilFormat),
+            static_cast<unsigned long>(host.Flags),
+            host.FullScreen_RefreshRateInHz, host.PresentationInterval);
+    }
+#endif
     GuestPresentParameters updated = guest_present_parameters(host, guest.device_window);
     if (!guest_write(args[5], &updated, sizeof(updated))) {
         if (device) device->Release();
@@ -695,6 +952,92 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
         return hresult(get_device_surface(static_cast<IDirect3DDevice9 *>(object.native),
                                           args, true));
     }
+    if (method == 57) {
+        if (!require_count(argc, 3, "IDirect3DDevice9::SetRenderState"))
+            return hresult(D3DERR_INVALIDCALL);
+        return hresult(static_cast<IDirect3DDevice9 *>(object.native)->SetRenderState(
+            static_cast<D3DRENDERSTATETYPE>(args[1]), args[2]));
+    }
+    auto *device = static_cast<IDirect3DDevice9 *>(object.native);
+    if (method == 65) {
+        if (!require_count(argc, 3, "IDirect3DDevice9::SetTexture"))
+            return hresult(D3DERR_INVALIDCALL);
+        /* Non-null texture handles are rejected as unsupported before dispatch. */
+        return hresult(device->SetTexture(args[1], nullptr));
+    }
+    if (method == 67) {
+        if (!require_count(argc, 4, "IDirect3DDevice9::SetTextureStageState"))
+            return hresult(D3DERR_INVALIDCALL);
+        return hresult(device->SetTextureStageState(args[1],
+            static_cast<D3DTEXTURESTAGESTATETYPE>(args[2]), args[3]));
+    }
+    if (method == 69) {
+        if (!require_count(argc, 4, "IDirect3DDevice9::SetSamplerState"))
+            return hresult(D3DERR_INVALIDCALL);
+        return hresult(device->SetSamplerState(args[1],
+            static_cast<D3DSAMPLERSTATETYPE>(args[2]), args[3]));
+    }
+    if (method == 92) {
+        if (!require_count(argc, 2, "IDirect3DDevice9::SetVertexShader"))
+            return hresult(D3DERR_INVALIDCALL);
+        /* Non-null shader handles are rejected as unsupported before dispatch. */
+        return hresult(device->SetVertexShader(nullptr));
+    }
+    if (method == 107) {
+        if (!require_count(argc, 2, "IDirect3DDevice9::SetPixelShader"))
+            return hresult(D3DERR_INVALIDCALL);
+        /* Non-null shader handles are rejected as unsupported before dispatch. */
+        return hresult(device->SetPixelShader(nullptr));
+    }
+    if (method == 94 || method == 96 || method == 98 ||
+        method == 109 || method == 111 || method == 113) {
+        const char *method_name = nullptr;
+        ShaderConstantData data_kind = ShaderConstantData::VertexFloat;
+        if (method == 94) {
+            method_name = "IDirect3DDevice9::SetVertexShaderConstantF";
+            data_kind = ShaderConstantData::VertexFloat;
+        } else if (method == 96) {
+            method_name = "IDirect3DDevice9::SetVertexShaderConstantI";
+            data_kind = ShaderConstantData::VertexInt;
+        } else if (method == 98) {
+            method_name = "IDirect3DDevice9::SetVertexShaderConstantB";
+            data_kind = ShaderConstantData::VertexBool;
+        } else if (method == 109) {
+            method_name = "IDirect3DDevice9::SetPixelShaderConstantF";
+            data_kind = ShaderConstantData::PixelFloat;
+        } else if (method == 111) {
+            method_name = "IDirect3DDevice9::SetPixelShaderConstantI";
+            data_kind = ShaderConstantData::PixelInt;
+        } else {
+            method_name = "IDirect3DDevice9::SetPixelShaderConstantB";
+            data_kind = ShaderConstantData::PixelBool;
+        }
+        if (!require_count(argc, 4, method_name)) return hresult(D3DERR_INVALIDCALL);
+        const void *data = nullptr;
+        HRESULT status = checked_shader_constant_data(device, data_kind,
+            args[1], args[2], args[3], &data);
+        if (FAILED(status)) return hresult(status);
+        switch (method) {
+        case 94:
+            return hresult(device->SetVertexShaderConstantF(args[1],
+                static_cast<const float *>(data), args[3]));
+        case 96:
+            return hresult(device->SetVertexShaderConstantI(args[1],
+                static_cast<const int *>(data), args[3]));
+        case 98:
+            return hresult(device->SetVertexShaderConstantB(args[1],
+                static_cast<const BOOL *>(data), args[3]));
+        case 109:
+            return hresult(device->SetPixelShaderConstantF(args[1],
+                static_cast<const float *>(data), args[3]));
+        case 111:
+            return hresult(device->SetPixelShaderConstantI(args[1],
+                static_cast<const int *>(data), args[3]));
+        case 113:
+            return hresult(device->SetPixelShaderConstantB(args[1],
+                static_cast<const BOOL *>(data), args[3]));
+        }
+    }
     std::ostringstream message;
     message << "IDirect3DDevice9 method " << method
             << " is not implemented; no guest device/frame success is implied";
@@ -793,21 +1136,7 @@ extern "C" AC1_D3D9_API uint32_t ac1_d3d9_create9(uint32_t sdk_version)
         native = static_cast<IDirect3D9 *>(g_callbacks.factory(g_context, sdk_version));
     } else {
 #if defined(_WIN32)
-        if (!g_d3d9_module) {
-            wchar_t system_directory[MAX_PATH]{};
-            UINT length = GetSystemDirectoryW(system_directory, MAX_PATH);
-            if (!length || length >= MAX_PATH - 10) {
-                set_error("GetSystemDirectoryW failed while loading native D3D9");
-                return 0;
-            }
-            std::wstring path(system_directory, length);
-            path += L"\\d3d9.dll";
-            g_d3d9_module = LoadLibraryW(path.c_str());
-            if (!g_d3d9_module) {
-                set_error("failed to load the system d3d9.dll");
-                return 0;
-            }
-        }
+        if (!ensure_d3d9_module()) return 0;
         using Factory = IDirect3D9 *(WINAPI *)(UINT);
         FARPROC raw_factory = GetProcAddress(g_d3d9_module, "Direct3DCreate9");
         static_assert(sizeof(Factory) == sizeof(raw_factory),
@@ -815,7 +1144,8 @@ extern "C" AC1_D3D9_API uint32_t ac1_d3d9_create9(uint32_t sdk_version)
         Factory factory = nullptr;
         std::memcpy(&factory, &raw_factory, sizeof(factory));
         if (!factory) {
-            set_error("system d3d9.dll has no Direct3DCreate9 export");
+            set_error("selected D3D9 provider has no Direct3DCreate9 export: " +
+                      g_d3d9_provider_path);
             return 0;
         }
         native = factory(sdk_version);
@@ -825,7 +1155,9 @@ extern "C" AC1_D3D9_API uint32_t ac1_d3d9_create9(uint32_t sdk_version)
 #endif
     }
     if (!native) {
-        set_error("Direct3DCreate9 returned null");
+        set_error("Direct3DCreate9 returned null from provider: " +
+                  (g_d3d9_provider_path.empty() ? std::string("platform callback")
+                                                : g_d3d9_provider_path));
         return 0;
     }
     uint32_t address = wrap_native(native, ObjectKind::D3D9, true);
@@ -867,6 +1199,12 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
     if (!object) {
         set_error("COM token called with an unknown guest object or interface kind");
         return -1;
+    }
+    if (object->kind == ObjectKind::Device &&
+        ((method == 65 && args[2] != 0u) ||
+         ((method == 92 || method == 107) && args[1] != 0u))) {
+        set_error("non-null texture/shader guest object has no registered AC1 proxy kind");
+        return -2;
     }
     if (method == 0) {
         GUID iid{};
@@ -911,6 +1249,7 @@ extern "C" AC1_D3D9_API void ac1_d3d9_shutdown(void)
         FreeLibrary(g_d3d9_module);
         g_d3d9_module = nullptr;
     }
+    g_d3d9_provider_path.clear();
 #endif
 }
 
