@@ -1771,7 +1771,67 @@ static int handle_d3d9_import(CPU *cpu, const import_record *import)
     return_stdcall(cpu, 4u);
     return 1;
 }
+#endif
 
+static int handle_d3dx_texture_requirements_import(
+    CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal ||
+        !equal_ascii_fold(import->dll, "d3dx9_36.dll") ||
+        strcmp(import->name, "D3DXCheckTextureRequirements"))
+        return 0;
+
+#if defined(AC1_HOST_D3D9)
+    if (!d3d9_ensure_configured())
+        stop_guest(ac1_d3d9_last_error(), import->token);
+    if (!guest_memory_try_ptr(cpu->esp + 4u, 7u * 4u))
+        stop_guest("D3DXCheckTextureRequirements arguments are unmapped",
+                   import->token);
+
+    uint32_t args[7];
+    for (unsigned i = 0u; i < 7u; ++i)
+        args[i] = rd32(cpu->esp + 4u + i * 4u);
+
+    uint32_t native_hresult = 0u;
+    int status = ac1_d3d9_check_texture_requirements(
+        args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+        &native_hresult);
+    if (status != 1) {
+        last_error = status == -2 ? 120u : 87u;
+        stop_guest(ac1_d3d9_last_error()[0]
+                   ? ac1_d3d9_last_error()
+                   : (status == -2
+                      ? "D3DXCheckTextureRequirements is unavailable"
+                      : "D3DXCheckTextureRequirements rejected its guest arguments"),
+                   import->token);
+    }
+
+    cpu->eax = native_hresult;
+    if (trace_imports) {
+        uint32_t width = args[1] && guest_memory_try_ptr(args[1], 4u)
+            ? rd32(args[1]) : 0u;
+        uint32_t height = args[2] && guest_memory_try_ptr(args[2], 4u)
+            ? rd32(args[2]) : 0u;
+        uint32_t mip_levels = args[3] && guest_memory_try_ptr(args[3], 4u)
+            ? rd32(args[3]) : 0u;
+        uint32_t format = args[5] && guest_memory_try_ptr(args[5], 4u)
+            ? rd32(args[5]) : 0u;
+        fprintf(stderr,
+                "AC1 D3DXCheckTextureRequirements: device=0x%08x width=0x%08x:%u height=0x%08x:%u mips=0x%08x:%u usage=0x%08x format=0x%08x:%u pool=%u HRESULT=0x%08x\n",
+                args[0], args[1], width, args[2], height, args[3],
+                mip_levels, args[4], args[5], format, args[6], native_hresult);
+    }
+    return_stdcall(cpu, 7u * 4u);
+    scheduler_checkpoint();
+    return 1;
+#else
+    stop_guest("D3DXCheckTextureRequirements has no portable implementation",
+               import->token);
+    return 1;
+#endif
+}
+
+#if defined(AC1_HOST_D3D9)
 static int dispatch_d3d9_method(CPU *cpu, uint32_t target)
 {
     int argument_count = ac1_d3d9_argument_count(target);
@@ -5307,6 +5367,7 @@ void dispatch(CPU *cpu, uint32_t target)
 #if defined(AC1_HOST_D3D9)
                       handle_d3d9_import(cpu, import) ||
 #endif
+                      handle_d3dx_texture_requirements_import(cpu, import) ||
                       handle_module_import(cpu, import) ||
                       handle_profile_import(cpu, import) ||
                       handle_heap_import(cpu, import) ||

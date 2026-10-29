@@ -742,10 +742,12 @@ int main(int argc, char **argv)
         ac1_d3d9_argument_count(0x7e004000u) != 3 ||
         ac1_d3d9_argument_count(0x7e005000u) != 3 ||
         ac1_d3d9_argument_count(0x7e006000u) != 3 ||
+        ac1_d3d9_argument_count(0x7e007000u) != 3 ||
         ac1_d3d9_argument_count(0x7e002560u) != 3 ||
+        ac1_d3d9_argument_count(0x7e002170u) != 9 ||
         ac1_d3d9_dispatch(0x7e002030u, nullptr, 0, nullptr) != -2 ||
         ac1_d3d9_dispatch(0x7e0030b0u, nullptr, 0, nullptr) != -2 ||
-        ac1_d3d9_dispatch(0x7e007000u, nullptr, 0, nullptr) != 0) {
+        ac1_d3d9_dispatch(0x7e008000u, nullptr, 0, nullptr) != 0) {
         std::fprintf(stderr, "COM method-arity classification failed\n");
         ac1_d3d9_shutdown();
         return 3;
@@ -828,6 +830,106 @@ int main(int argc, char **argv)
     }
 
     uint32_t getter_result = 0;
+    const uint32_t width_address = allocate_guest(nullptr, 4, 4);
+    const uint32_t height_address = allocate_guest(nullptr, 4, 4);
+    const uint32_t mip_address = allocate_guest(nullptr, 4, 4);
+    const uint32_t format_address = allocate_guest(nullptr, 4, 4);
+    const uint32_t requested_width = 4, requested_height = 4, requested_mips = 1;
+    const uint32_t requested_format = D3DFMT_A8R8G8B8;
+    std::memcpy(resolve_guest(nullptr, width_address, 4, AC1_D3D9_GUEST_WRITE),
+                &requested_width, 4);
+    std::memcpy(resolve_guest(nullptr, height_address, 4, AC1_D3D9_GUEST_WRITE),
+                &requested_height, 4);
+    std::memcpy(resolve_guest(nullptr, mip_address, 4, AC1_D3D9_GUEST_WRITE),
+                &requested_mips, 4);
+    std::memcpy(resolve_guest(nullptr, format_address, 4, AC1_D3D9_GUEST_WRITE),
+                &requested_format, 4);
+    uint32_t d3dx_hresult = 0;
+    if (ac1_d3d9_check_texture_requirements(
+            device, width_address, height_address, mip_address, 0,
+            format_address, D3DPOOL_DEFAULT, &d3dx_hresult) != 1 ||
+        FAILED(static_cast<HRESULT>(d3dx_hresult))) {
+        std::fprintf(stderr, "D3DXCheckTextureRequirements failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), d3dx_hresult);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 38;
+    }
+    std::printf("native System32 D3DXCheckTextureRequirements hr=0x%08x corrected=%ux%u mip=%u format=%u\n",
+                d3dx_hresult, guest_word(width_address), guest_word(height_address),
+                guest_word(mip_address), guest_word(format_address));
+    if (ac1_d3d9_check_texture_requirements(
+            device, 0xfffffff0u, height_address, mip_address, 0,
+            format_address, D3DPOOL_DEFAULT, &d3dx_hresult) != -1) {
+        std::fprintf(stderr, "D3DX helper accepted an unmapped guest in/out pointer\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 39;
+    }
+    const uint32_t texture_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t create_texture_args[] = {
+        device, guest_word(width_address), guest_word(height_address),
+        guest_word(mip_address), 0u, guest_word(format_address),
+        D3DPOOL_DEFAULT, texture_output, 0u
+    };
+    if (ac1_d3d9_dispatch(object_slot(device, 23), create_texture_args, 9,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result)) || !guest_word(texture_output)) {
+        std::fprintf(stderr, "native CreateTexture failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 40;
+    }
+    std::printf("native CreateTexture hr=0x%08x proxy=0x%08x\n",
+                getter_result, guest_word(texture_output));
+    const uint32_t texture = guest_word(texture_output);
+    if (ac1_d3d9_argument_count(object_slot(texture, 2)) != 1) {
+        std::fprintf(stderr, "created D3D9 texture did not receive a texture proxy kind\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 41;
+    }
+    const uint32_t texture_iid_bytes[4] = {
+        0x85c31227u, 0x4f003de5u, 0x1af13a9bu, 0xb5188cc3u
+    };
+    const uint32_t texture_iid_address = allocate_guest(nullptr, 16, 4);
+    const uint32_t texture_query_output = allocate_guest(nullptr, 4, 4);
+    std::memcpy(resolve_guest(nullptr, texture_iid_address, 16, AC1_D3D9_GUEST_WRITE),
+                texture_iid_bytes, 16);
+    const uint32_t texture_query_args[] = {
+        texture, texture_iid_address, texture_query_output
+    };
+    if (ac1_d3d9_dispatch(object_slot(texture, 0), texture_query_args, 3,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result)) ||
+        guest_word(texture_query_output) != texture) {
+        std::fprintf(stderr, "texture QueryInterface identity failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 42;
+    }
+    const uint32_t texture_this[] = {texture};
+    if (ac1_d3d9_dispatch(object_slot(texture, 2), texture_this, 1,
+                          &references) != 1 || references != 1) {
+        std::fprintf(stderr, "texture QueryInterface reference balance failed\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 43;
+    }
+    const uint32_t unsupported_texture_shared_args[] = {
+        device, guest_word(width_address), guest_word(height_address),
+        guest_word(mip_address), 0u, guest_word(format_address),
+        D3DPOOL_DEFAULT, texture_output, 1u
+    };
+    if (ac1_d3d9_dispatch(object_slot(device, 23),
+                          unsupported_texture_shared_args, 9, &getter_result) != -2) {
+        std::fprintf(stderr, "non-null shared texture handle was not trapped explicitly\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 44;
+    }
     const uint32_t vertex_buffer_output = allocate_guest(nullptr, 4, 4);
     const uint32_t index_buffer_output = allocate_guest(nullptr, 4, 4);
     const uint32_t create_vertex_buffer_args[] = {
@@ -1203,6 +1305,13 @@ int main(int argc, char **argv)
         DestroyWindow(hidden_window);
         ac1_d3d9_shutdown();
         return 34;
+    }
+    if (ac1_d3d9_dispatch(object_slot(texture, 2), texture_this, 1,
+                          &references) != 1 || references != 0) {
+        std::fprintf(stderr, "texture Release failed: %s\n", ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 45;
     }
     if (ac1_d3d9_dispatch(device_release, device_this, 1, &references) != 1) {
         std::fprintf(stderr, "device release smoke failed: %s\n", ac1_d3d9_last_error());

@@ -58,6 +58,15 @@ AC1_D3D9_API int ac1_d3d9_configure(const ac1_d3d9_callbacks *callbacks,
  * or zero with ac1_d3d9_last_error() populated. */
 AC1_D3D9_API uint32_t ac1_d3d9_create9(uint32_t sdk_version);
 
+/* Native Windows adapter for the observed D3DXCheckTextureRequirements import.
+ * Guest in/out pointers are nullable; return values are 1 when native D3DX ran,
+ * -1 for invalid guest/device ABI, and -2 when the platform or required export
+ * is unavailable. Only return 1 makes native_hresult_out valid. */
+AC1_D3D9_API int ac1_d3d9_check_texture_requirements(
+    uint32_t guest_device, uint32_t guest_width, uint32_t guest_height,
+    uint32_t guest_mip_levels, uint32_t usage, uint32_t guest_format,
+    uint32_t pool, uint32_t *native_hresult_out);
+
 /* Return the exact number of x86 stack words, including guest `this`, for a
  * supported token. Returns 0 for a foreign token, -1 for a malformed owned
  * token/slot, and -2 for an owned but unsupported COM method. */

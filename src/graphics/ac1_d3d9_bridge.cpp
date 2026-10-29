@@ -39,6 +39,7 @@ constexpr uint32_t kSurfaceKind = 3u;
 constexpr uint32_t kVertexBufferKind = 4u;
 constexpr uint32_t kIndexBufferKind = 5u;
 constexpr uint32_t kVertexDeclarationKind = 6u;
+constexpr uint32_t kTextureKind = 7u;
 constexpr uint32_t kD3D9VtableSlots = 17u;
 constexpr uint32_t kDeviceVtableSlots = 119u;
 constexpr uint32_t kSurfaceVtableSlots = 17u;
@@ -57,6 +58,10 @@ constexpr GUID kIidIDirect3DIndexBuffer9 =
     {0x7c9dd65eu, 0xd3f7u, 0x4529u, {0xac, 0xee, 0x78, 0x58, 0x30, 0xac, 0xde, 0x35}};
 constexpr GUID kIidIDirect3DVertexDeclaration9 =
     {0xdd13c59cu, 0x36fau, 0x4098u, {0xa8, 0xfb, 0xc7, 0xed, 0x39, 0xdc, 0x85, 0x46}};
+constexpr GUID kIidIDirect3DBaseTexture9 =
+    {0x580ca87eu, 0x1d3cu, 0x4d54u, {0x99, 0x1d, 0xb7, 0xd3, 0xe3, 0xc2, 0x98, 0xce}};
+constexpr GUID kIidIDirect3DTexture9 =
+    {0x85c31227u, 0x3de5u, 0x4f00u, {0x9b, 0x3a, 0xf1, 0x1a, 0xc3, 0x8c, 0x18, 0xb5}};
 
 enum class ObjectKind : uint32_t {
     D3D9 = kD3D9Kind,
@@ -64,7 +69,8 @@ enum class ObjectKind : uint32_t {
     Surface = kSurfaceKind,
     VertexBuffer = kVertexBufferKind,
     IndexBuffer = kIndexBufferKind,
-    VertexDeclaration = kVertexDeclarationKind
+    VertexDeclaration = kVertexDeclarationKind,
+    Texture = kTextureKind
 };
 
 struct GuestObject {
@@ -136,6 +142,10 @@ thread_local char g_last_error[1024]{};
 std::string g_d3d9_provider_path;
 #if defined(_WIN32)
 HMODULE g_d3d9_module = nullptr;
+HMODULE g_d3dx9_module = nullptr;
+using D3DXCheckTextureRequirementsFn = HRESULT (WINAPI *)(
+    IDirect3DDevice9 *, UINT *, UINT *, UINT *, DWORD, D3DFORMAT *, D3DPOOL);
+D3DXCheckTextureRequirementsFn g_d3dx_check_texture_requirements = nullptr;
 #endif
 
 void set_error(const std::string &message)
@@ -261,6 +271,41 @@ bool ensure_d3d9_module()
     }
     return true;
 }
+
+bool ensure_d3dx9_module()
+{
+    if (g_d3dx_check_texture_requirements) return true;
+    wchar_t system_directory[MAX_PATH]{};
+    const UINT length = GetSystemDirectoryW(system_directory, MAX_PATH);
+    if (!length || length >= MAX_PATH - 16) {
+        set_error("GetSystemDirectoryW failed while locating d3dx9_36.dll");
+        return false;
+    }
+    std::wstring path(system_directory, length);
+    path += L"\\d3dx9_36.dll";
+    g_d3dx9_module = LoadLibraryExW(path.c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!g_d3dx9_module) {
+        std::ostringstream message;
+        message << "LoadLibraryExW failed for absolute System32 d3dx9_36.dll (Win32 error "
+                << GetLastError() << ')';
+        set_error(message.str());
+        return false;
+    }
+    FARPROC raw_function = GetProcAddress(g_d3dx9_module,
+                                           "D3DXCheckTextureRequirements");
+    static_assert(sizeof(D3DXCheckTextureRequirementsFn) == sizeof(raw_function),
+                  "Windows function-pointer ABI mismatch");
+    std::memcpy(&g_d3dx_check_texture_requirements, &raw_function,
+                sizeof(g_d3dx_check_texture_requirements));
+    if (!g_d3dx_check_texture_requirements) {
+        set_error("System32 d3dx9_36.dll has no D3DXCheckTextureRequirements export");
+        FreeLibrary(g_d3dx9_module);
+        g_d3dx9_module = nullptr;
+        return false;
+    }
+    return true;
+}
 #endif
 
 void *guest_memory(uint32_t address, uint32_t width, uint32_t access)
@@ -300,17 +345,18 @@ uint32_t slot_count(ObjectKind kind)
     case ObjectKind::VertexBuffer: return 14u;
     case ObjectKind::IndexBuffer: return 14u;
     case ObjectKind::VertexDeclaration: return 5u;
+    case ObjectKind::Texture: return 22u;
     }
     return 0;
 }
 
 int token_argument_count(uint32_t token)
 {
-    if (token < kTokenBase || token >= kTokenBase + 7 * kKindStride) return 0;
+    if (token < kTokenBase || token >= kTokenBase + 8 * kKindStride) return 0;
     const uint32_t offset = token - kTokenBase;
     const uint32_t kind = offset / kKindStride;
     const uint32_t within_kind = offset % kKindStride;
-    if (kind < kD3D9Kind || kind > kVertexDeclarationKind) return 0;
+    if (kind < kD3D9Kind || kind > kTextureKind) return 0;
     if (within_kind % kSlotStride) return -1;
     const uint32_t method = within_kind / kSlotStride;
     if (method >= slot_count(static_cast<ObjectKind>(kind))) return -1;
@@ -320,6 +366,7 @@ int token_argument_count(uint32_t token)
         if (method == 35) return 4;
         if (method == 47) return 2;
         if (method == 86) return 3;
+        if (method == 23) return 9;
         if (method == 26 || method == 27) return 7;
         if (method == 65 || method == 92 || method == 107) return method == 65 ? 3 : 2;
         if (method == 67 || method == 69) return 4;
@@ -342,6 +389,10 @@ int token_argument_count(uint32_t token)
     if (kind == kVertexDeclarationKind) {
         if (method < 3) return method == 0 ? 3 : 1;
         if (method == 4) return 3;
+        return -2;
+    }
+    if (kind == kTextureKind) {
+        if (method < 3) return method == 0 ? 3 : 1;
         return -2;
     }
 
@@ -533,9 +584,12 @@ bool bridge_supports_iid(ObjectKind kind, const GUID &iid)
     case ObjectKind::VertexBuffer: supported = &kIidIDirect3DVertexBuffer9; break;
     case ObjectKind::IndexBuffer: supported = &kIidIDirect3DIndexBuffer9; break;
     case ObjectKind::VertexDeclaration: supported = &kIidIDirect3DVertexDeclaration9; break;
+    case ObjectKind::Texture: supported = &kIidIDirect3DTexture9; break;
     }
     return std::memcmp(&iid, &kIidIUnknown, sizeof(iid)) == 0 ||
-           std::memcmp(&iid, supported, sizeof(iid)) == 0;
+           std::memcmp(&iid, supported, sizeof(iid)) == 0 ||
+           (kind == ObjectKind::Texture &&
+            std::memcmp(&iid, &kIidIDirect3DBaseTexture9, sizeof(iid)) == 0);
 }
 
 const char *interface_name(ObjectKind kind)
@@ -547,6 +601,7 @@ const char *interface_name(ObjectKind kind)
     case ObjectKind::VertexBuffer: return "IDirect3DVertexBuffer9";
     case ObjectKind::IndexBuffer: return "IDirect3DIndexBuffer9";
     case ObjectKind::VertexDeclaration: return "IDirect3DVertexDeclaration9";
+    case ObjectKind::Texture: return "IDirect3DTexture9";
     }
     return "IUnknown";
 }
@@ -853,6 +908,36 @@ HRESULT create_guest_buffer(IDirect3DDevice9 *device, const uint32_t *args,
     const uint32_t guest_buffer = wrap_native(static_cast<IUnknown *>(buffer), kind, true);
     if (!guest_buffer) return E_OUTOFMEMORY;
     *output = guest_buffer;
+    return status;
+}
+
+HRESULT create_guest_texture(IDirect3DDevice9 *device, const uint32_t *args)
+{
+    if (!args[7]) {
+        return device->CreateTexture(args[1], args[2], args[3], args[4],
+            static_cast<D3DFORMAT>(args[5]), static_cast<D3DPOOL>(args[6]),
+            nullptr, nullptr);
+    }
+    auto *output = static_cast<uint32_t *>(guest_memory(
+        args[7], sizeof(uint32_t), AC1_D3D9_GUEST_WRITE));
+    if (!output) {
+        set_error("IDirect3DDevice9::CreateTexture output pointer is unmapped");
+        return D3DERR_INVALIDCALL;
+    }
+    *output = 0;
+    IDirect3DTexture9 *texture = nullptr;
+    const HRESULT status = device->CreateTexture(args[1], args[2], args[3], args[4],
+        static_cast<D3DFORMAT>(args[5]), static_cast<D3DPOOL>(args[6]),
+        &texture, nullptr);
+    if (FAILED(status)) return status;
+    if (!texture) {
+        set_error("native CreateTexture succeeded without returning an object");
+        return E_FAIL;
+    }
+    const uint32_t guest_texture = wrap_native(
+        static_cast<IUnknown *>(texture), ObjectKind::Texture, true);
+    if (!guest_texture) return E_OUTOFMEMORY;
+    *output = guest_texture;
     return status;
 }
 
@@ -1190,6 +1275,12 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
             : create_guest_buffer<IDirect3DIndexBuffer9>(
                 static_cast<IDirect3DDevice9 *>(object.native), args, true));
     }
+    if (method == 23) {
+        if (!require_count(argc, 9, "IDirect3DDevice9::CreateTexture"))
+            return hresult(D3DERR_INVALIDCALL);
+        return hresult(create_guest_texture(
+            static_cast<IDirect3DDevice9 *>(object.native), args));
+    }
     if (method == 57) {
         if (!require_count(argc, 3, "IDirect3DDevice9::SetRenderState"))
             return hresult(D3DERR_INVALIDCALL);
@@ -1445,6 +1536,43 @@ uint32_t invoke_vertex_declaration(GuestObject &object, uint32_t method,
     return hresult(D3DERR_NOTAVAILABLE);
 }
 
+uint32_t invoke_texture(GuestObject &object, uint32_t method,
+                        const uint32_t *args, uint32_t argc)
+{
+    if (method == 0) {
+        if (!require_count(argc, 3, "IDirect3DTexture9::QueryInterface"))
+            return hresult(D3DERR_INVALIDCALL);
+        uint32_t output = 0;
+        return hresult(do_query_interface(object, args, &output));
+    }
+    if (method == 1) {
+        if (!require_count(argc, 1, "IDirect3DTexture9::AddRef")) return 0;
+        ++object.guest_references;
+        object.native->AddRef();
+        return object.guest_references;
+    }
+    if (method == 2) {
+        if (!require_count(argc, 1, "IDirect3DTexture9::Release")) return 0;
+        if (!object.guest_references) {
+            set_error("IDirect3DTexture9::Release called with zero guest references");
+            return 0;
+        }
+        IUnknown *native = object.native;
+        const uint32_t guest_address = args[0];
+        native->Release();
+        const uint32_t guest_count = --object.guest_references;
+        if (!guest_count) {
+            GuestObject retired = object;
+            g_guest_by_native.erase(native);
+            g_objects.erase(guest_address);
+            free_guest_object(guest_address, retired);
+        }
+        return guest_count;
+    }
+    set_error("IDirect3DTexture9 method is not implemented");
+    return hresult(D3DERR_NOTAVAILABLE);
+}
+
 } // namespace
 
 extern "C" AC1_D3D9_API int ac1_d3d9_configure(
@@ -1509,6 +1637,89 @@ extern "C" AC1_D3D9_API uint32_t ac1_d3d9_create9(uint32_t sdk_version)
     return address;
 }
 
+extern "C" AC1_D3D9_API int ac1_d3d9_check_texture_requirements(
+    uint32_t guest_device, uint32_t guest_width, uint32_t guest_height,
+    uint32_t guest_mip_levels, uint32_t usage, uint32_t guest_format,
+    uint32_t pool, uint32_t *native_hresult_out)
+{
+    if (!native_hresult_out) {
+        set_error("D3DXCheckTextureRequirements bridge result pointer is null");
+        return -1;
+    }
+    *native_hresult_out = 0;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    clear_error();
+#if defined(_WIN32)
+    GuestObject *device_object = find_object(guest_device, ObjectKind::Device);
+    if (!device_object) {
+        set_error("D3DXCheckTextureRequirements received an unknown guest D3D9 device");
+        return -1;
+    }
+    if (!ensure_d3dx9_module()) return -2;
+
+    const uint32_t guest_addresses[4] = {
+        guest_width, guest_height, guest_mip_levels, guest_format
+    };
+    uint32_t staged_values[4]{};
+    uint32_t *native_values[4]{};
+    for (size_t i = 0; i < 4; ++i) {
+        const uint32_t address = guest_addresses[i];
+        if (!address) continue;
+        size_t alias = i;
+        for (size_t j = 0; j < i; ++j) {
+            if (guest_addresses[j] == address) {
+                alias = j;
+                break;
+            }
+        }
+        if (alias != i) {
+            native_values[i] = native_values[alias];
+            continue;
+        }
+        if (!guest_read(address, &staged_values[i], sizeof(uint32_t)) ||
+            !guest_memory(address, sizeof(uint32_t), AC1_D3D9_GUEST_WRITE)) {
+            set_error("D3DXCheckTextureRequirements guest in/out pointer is unmapped");
+            return -1;
+        }
+        native_values[i] = &staged_values[i];
+    }
+
+    const HRESULT status = g_d3dx_check_texture_requirements(
+        static_cast<IDirect3DDevice9 *>(device_object->native),
+        reinterpret_cast<UINT *>(native_values[0]),
+        reinterpret_cast<UINT *>(native_values[1]),
+        reinterpret_cast<UINT *>(native_values[2]), usage,
+        reinterpret_cast<D3DFORMAT *>(native_values[3]), static_cast<D3DPOOL>(pool));
+    for (size_t i = 0; i < 4; ++i) {
+        if (!guest_addresses[i]) continue;
+        bool already_written = false;
+        for (size_t j = 0; j < i; ++j) {
+            if (guest_addresses[j] == guest_addresses[i]) {
+                already_written = true;
+                break;
+            }
+        }
+        if (!already_written &&
+            !guest_write(guest_addresses[i], &staged_values[i], sizeof(uint32_t))) {
+            set_error("D3DXCheckTextureRequirements could not write an in/out value back to guest memory");
+            return -1;
+        }
+    }
+    *native_hresult_out = hresult(status);
+    return 1;
+#else
+    (void)guest_device;
+    (void)guest_width;
+    (void)guest_height;
+    (void)guest_mip_levels;
+    (void)usage;
+    (void)guest_format;
+    (void)pool;
+    set_error("D3DXCheckTextureRequirements is not supported by this platform bridge");
+    return -2;
+#endif
+}
+
 extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
                                                const uint32_t *args,
                                                uint32_t arg_count,
@@ -1555,6 +1766,10 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
         set_error("D3D9 shared buffer handles are unsupported by the guest bridge");
         return -2;
     }
+    if (object->kind == ObjectKind::Device && method == 23 && args[8] != 0u) {
+        set_error("D3D9 shared texture handles are unsupported by the guest bridge");
+        return -2;
+    }
     if (method == 0) {
         GUID iid{};
         if (guest_read(args[1], &iid, sizeof(iid)) &&
@@ -1580,6 +1795,9 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
     case ObjectKind::VertexDeclaration:
         *result_out = invoke_vertex_declaration(*object, method, args, arg_count);
         break;
+    case ObjectKind::Texture:
+        *result_out = invoke_texture(*object, method, args, arg_count);
+        break;
     }
     return 1;
 }
@@ -1604,6 +1822,11 @@ extern "C" AC1_D3D9_API void ac1_d3d9_shutdown(void)
     if (g_d3d9_module) {
         FreeLibrary(g_d3d9_module);
         g_d3d9_module = nullptr;
+    }
+    if (g_d3dx9_module) {
+        FreeLibrary(g_d3dx9_module);
+        g_d3dx9_module = nullptr;
+        g_d3dx_check_texture_requirements = nullptr;
     }
 #endif
     g_d3d9_provider_path.clear();
