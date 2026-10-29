@@ -40,7 +40,10 @@ bool compile_native_smoke_shader(const char *source, const char *profile,
     if (!source || !profile || !bytecode) return false;
     HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
     if (!compiler) return false;
-    auto compile = reinterpret_cast<pD3DCompile>(GetProcAddress(compiler, "D3DCompile"));
+    const FARPROC symbol = GetProcAddress(compiler, "D3DCompile");
+    pD3DCompile compile = nullptr;
+    static_assert(sizeof(compile)==sizeof(symbol),"Windows function pointer ABI");
+    std::memcpy(&compile,&symbol,sizeof(compile));
     if (!compile) {
         FreeLibrary(compiler);
         return false;
@@ -489,6 +492,9 @@ uint32_t fake_set_render_target_calls = 0;
 uint32_t fake_render_target_index = UINT32_MAX;
 bool fake_render_target_was_null = false;
 HRESULT fake_present_result = S_OK;
+HRESULT fake_reset_result = S_OK;
+D3DPRESENT_PARAMETERS fake_reset_input{};
+uint32_t fake_reset_calls = 0;
 bool fake_present_had_source = false;
 bool fake_present_had_destination = false;
 uintptr_t fake_present_hwnd = 0;
@@ -663,6 +669,14 @@ HRESULT STDMETHODCALLTYPE fake_set_render_state(IDirect3DDevice9 *,
 HRESULT STDMETHODCALLTYPE fake_test_cooperative_level(IDirect3DDevice9 *)
 {
     return D3DERR_DEVICELOST;
+}
+
+HRESULT STDMETHODCALLTYPE fake_reset(IDirect3DDevice9 *, D3DPRESENT_PARAMETERS *parameters)
+{
+    ++fake_reset_calls;
+    fake_reset_input = *parameters;
+    parameters->BackBufferWidth = 641;
+    return fake_reset_result;
 }
 
 HRESULT STDMETHODCALLTYPE fake_begin_scene(IDirect3DDevice9 *)
@@ -878,6 +892,7 @@ void initialize_fake_com()
     fake_device_vtable[1] = reinterpret_cast<void *>(&fake_add_ref);
     fake_device_vtable[2] = reinterpret_cast<void *>(&fake_release);
     fake_device_vtable[3] = reinterpret_cast<void *>(&fake_test_cooperative_level);
+    fake_device_vtable[16] = reinterpret_cast<void *>(&fake_reset);
     fake_device_vtable[17] = reinterpret_cast<void *>(&fake_present);
     fake_device_vtable[41] = reinterpret_cast<void *>(&fake_begin_scene);
     fake_device_vtable[42] = reinterpret_cast<void *>(&fake_end_scene);
@@ -964,6 +979,8 @@ void initialize_fake_com()
     fake_draw_indexed_calls = 0;
     fake_set_depth_surface_calls = 0;
     fake_set_render_target_calls = 0;
+    fake_reset_calls = 0;
+    fake_reset_result = S_OK;
     fake_present_calls = 0;
     fake_present_result = S_OK;
     fake_present_had_source = false;
@@ -1012,6 +1029,22 @@ bool run_fake_surface_smoke(ac1_d3d9_callbacks callbacks)
         return false;
     }
     const uint32_t device = guest_word(device_output);
+    const uint32_t reset_args[] = {device,pp_address};
+    const uint32_t refs_before_reset = fake_device.references;
+    for (HRESULT status : {D3DERR_DEVICELOST,D3DERR_INVALIDCALL,S_OK}) {
+        fake_reset_result = status;
+        std::memcpy(resolve_guest(nullptr,pp_address,sizeof(pp),AC1_D3D9_GUEST_WRITE),&pp,sizeof(pp));
+        if (ac1_d3d9_dispatch(object_slot(device,16),reset_args,2,&result)!=1 ||
+            result!=static_cast<uint32_t>(status) || fake_device.references!=refs_before_reset ||
+            fake_reset_input.hDeviceWindow!=reinterpret_cast<HWND>(uintptr_t{1}) ||
+            fake_reset_input.BackBufferWidth!=640 || fake_reset_input.BackBufferHeight!=480 ||
+            fake_reset_input.Windowed!=TRUE || fake_reset_input.AutoDepthStencilFormat!=D3DFMT_D24S8 ||
+            guest_word(pp_address)!=641 || guest_word(pp_address+28)!=0x1234) {
+            std::fprintf(stderr,"fake Reset lost-device/invalid-call/success HRESULT or PE32 mapping failed\n");
+            ac1_d3d9_shutdown(); return false;
+        }
+    }
+    std::puts("fake Reset preserves DEVICELOST/INVALIDCALL and native parameter writeback");
     const uint32_t cooperative_args[] = {device};
     if (ac1_d3d9_argument_count(object_slot(device, 3)) != 1 ||
         ac1_d3d9_dispatch(object_slot(device, 3), cooperative_args, 1, &result) != 1 ||
@@ -1200,12 +1233,12 @@ bool run_fake_surface_smoke(ac1_d3d9_callbacks callbacks)
         cube_texture, D3DCUBEMAP_FACE_POSITIVE_X, 0u, cube_output, 1u, 0u
     };
     if (!cube_texture || object_slot(cube_texture, 0) != 0x7e00b000u ||
-        ac1_d3d9_argument_count(object_slot(cube_texture, 3)) != -2 ||
+        ac1_d3d9_argument_count(object_slot(cube_texture, 3)) != 2 ||
         ac1_d3d9_argument_count(object_slot(cube_texture, 19)) != 6 ||
         ac1_d3d9_argument_count(object_slot(cube_texture, 20)) != 3 ||
         ac1_d3d9_argument_count(0x7e00b160u) != -1 ||
         ac1_d3d9_dispatch(object_slot(cube_texture, 19), fake_cube_lock_args, 6,
-                          &result) != -2 ||
+                          &result) != -1 ||
         ac1_d3d9_dispatch(object_slot(cube_texture, 2), cube_release_args, 1,
                           &result) != 1 || result != 0 ||
         fake_cube_texture.references != 0) {
@@ -1308,7 +1341,7 @@ bool run_fake_surface_smoke(ac1_d3d9_callbacks callbacks)
         ac1_d3d9_shutdown();
         return false;
     }
-    const uint32_t unsupported_shader_version = D3DPS_VERSION(2, 0);
+    const uint32_t unsupported_shader_version = D3DPS_VERSION(4, 0);
     std::memcpy(resolve_guest(nullptr, shader_code, sizeof(unsupported_shader_version),
                               AC1_D3D9_GUEST_WRITE),
                 &unsupported_shader_version, sizeof(unsupported_shader_version));
@@ -1317,7 +1350,7 @@ bool run_fake_surface_smoke(ac1_d3d9_callbacks callbacks)
     };
     result = 0xdeadbeefu;
     if (ac1_d3d9_dispatch(object_slot(device, 106), unsupported_profile_args, 3,
-                          &result) != -2 || result != 0xdeadbeefu ||
+                          &result) != 1 || result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
         fake_pixel_shader_create_calls != 1) {
         std::fprintf(stderr, "unsupported shader profile was not explicitly classified\n");
         ac1_d3d9_shutdown();
@@ -1431,7 +1464,6 @@ bool run_fake_surface_smoke(ac1_d3d9_callbacks callbacks)
     const uint32_t unregistered_declaration_args[] = {device, 0x76543210u};
     const uint32_t unregistered_stream_args[] = {device, 0u, 0x76543210u, 0u, 16u};
     const uint32_t unregistered_indices_args[] = {device, 0x76543210u};
-    const uint32_t unsupported_query_args[] = {device, D3DQUERYTYPE_EVENT, 0u};
     if (ac1_d3d9_dispatch(object_slot(device, 65), unregistered_texture_args, 3,
                           &result) != -2 ||
         ac1_d3d9_dispatch(object_slot(device, 92), unregistered_shader_args, 2,
@@ -1441,8 +1473,6 @@ bool run_fake_surface_smoke(ac1_d3d9_callbacks callbacks)
         ac1_d3d9_dispatch(object_slot(device, 100), unregistered_stream_args, 5,
                           &result) != -2 ||
         ac1_d3d9_dispatch(object_slot(device, 104), unregistered_indices_args, 2,
-                          &result) != -2 ||
-        ac1_d3d9_dispatch(object_slot(device, 118), unsupported_query_args, 3,
                           &result) != -2) {
         std::fprintf(stderr, "non-null unregistered D3D resource was not rejected\n");
         ac1_d3d9_shutdown();
@@ -1852,7 +1882,7 @@ int main(int argc, char **argv)
         ac1_d3d9_argument_count(0x7e0022a0u) != 1 ||
         ac1_d3d9_argument_count(0x7e003000u) != 3 ||
         ac1_d3d9_argument_count(0x7e0030c0u) != 2 ||
-        ac1_d3d9_argument_count(0x7e0030b0u) != -2 ||
+        ac1_d3d9_argument_count(0x7e0030b0u) != 3 ||
         ac1_d3d9_argument_count(0x7e0021a0u) != 7 ||
         ac1_d3d9_argument_count(0x7e0021b0u) != 7 ||
         ac1_d3d9_argument_count(0x7e004000u) != 3 ||
@@ -1865,7 +1895,7 @@ int main(int argc, char **argv)
         ac1_d3d9_argument_count(0x7e00b000u) != 3 ||
         ac1_d3d9_argument_count(0x7e00b130u) != 6 ||
         ac1_d3d9_argument_count(0x7e00b140u) != 3 ||
-        ac1_d3d9_argument_count(0x7e00b030u) != -2 ||
+        ac1_d3d9_argument_count(0x7e00b030u) != 2 ||
         ac1_d3d9_argument_count(0x7e00b160u) != -1 ||
         ac1_d3d9_argument_count(0x7e002510u) != 4 ||
         ac1_d3d9_argument_count(0x7e002520u) != 7 ||
@@ -1876,7 +1906,7 @@ int main(int argc, char **argv)
         ac1_d3d9_argument_count(0x7e00c000u) != 3 ||
         ac1_d3d9_argument_count(0x7e00c060u) != 2 ||
         ac1_d3d9_argument_count(0x7e00c070u) != 4 ||
-        ac1_d3d9_dispatch(0x7e0030b0u, nullptr, 0, nullptr) != -2 ||
+        ac1_d3d9_dispatch(0x7e0030b0u, nullptr, 0, nullptr) != -1 ||
         ac1_d3d9_dispatch(0x7e00c000u, nullptr, 0, nullptr) != -1) {
         std::fprintf(stderr, "COM method-arity classification failed\n");
         ac1_d3d9_shutdown();
@@ -2015,12 +2045,13 @@ int main(int argc, char **argv)
     if (!cube_texture || object_slot(cube_texture, 0) != 0x7e00b000u ||
         ac1_d3d9_argument_count(cube_lock) != 6 ||
         ac1_d3d9_argument_count(cube_unlock) != 3 ||
-        ac1_d3d9_dispatch(cube_lock, cube_bad_output_args, 6, &cube_result) != 1 ||
-        cube_result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
+        ac1_d3d9_dispatch(cube_lock, cube_bad_output_args, 6, &cube_result) != -1 ||
         ac1_d3d9_dispatch(cube_lock, cube_bad_face_args, 6, &cube_result) != 1 ||
         cube_result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
-        ac1_d3d9_dispatch(cube_lock, cube_bad_rect_args, 6, &cube_result) != -2 ||
-        ac1_d3d9_dispatch(cube_lock, cube_bad_flags_args, 6, &cube_result) != -2) {
+        ac1_d3d9_dispatch(cube_lock, cube_bad_rect_args, 6, &cube_result) != -1 ||
+        ac1_d3d9_dispatch(cube_lock, cube_bad_flags_args, 6, &cube_result) != 1 ||
+        FAILED(static_cast<HRESULT>(cube_result)) ||
+        ac1_d3d9_dispatch(cube_unlock, std::array<uint32_t,3>{cube_texture,0,0}.data(), 3, &cube_result) != 1) {
         std::fprintf(stderr, "native cube LockRect ABI/profile validation failed: %s\n",
                      ac1_d3d9_last_error());
         DestroyWindow(hidden_window);
@@ -2155,7 +2186,7 @@ int main(int argc, char **argv)
                 sizeof(release_locked));
     const uint32_t cube_release_args[] = {cube_texture};
     if (!cube_texture || object_slot(cube_texture, 0) != 0x7e00b000u ||
-        ac1_d3d9_argument_count(object_slot(cube_texture, 3)) != -2 ||
+        ac1_d3d9_argument_count(object_slot(cube_texture, 3)) != 2 ||
         ac1_d3d9_dispatch(object_slot(cube_texture, 2), cube_release_args, 1,
                           &cube_result) != 1 || cube_result != 0) {
         std::fprintf(stderr, "native DXVK cube-texture proxy release failed: %s\n",
@@ -2397,10 +2428,12 @@ int main(int argc, char **argv)
         texture, 0u, locked_rect_output, 0u, D3DLOCK_READONLY
     };
     if (ac1_d3d9_dispatch(object_slot(texture, 19), unsupported_rect_lock_args, 5,
-                          &getter_result) != -2 ||
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result)) ||
+        ac1_d3d9_dispatch(object_slot(texture, 20), unlock_texture_args, 2, &getter_result) != 1 ||
         ac1_d3d9_dispatch(object_slot(texture, 19), unsupported_flags_lock_args, 5,
-                          &getter_result) != -2) {
-        std::fprintf(stderr, "unsupported texture LockRect profile was not trapped\n");
+                          &getter_result) != 1 || FAILED(static_cast<HRESULT>(getter_result)) ||
+        ac1_d3d9_dispatch(object_slot(texture, 20), unlock_texture_args, 2, &getter_result) != 1) {
+        std::fprintf(stderr, "texture RECT/READONLY LockRect round-trip failed\n");
         DestroyWindow(hidden_window);
         ac1_d3d9_shutdown();
         return 51;
@@ -2516,7 +2549,7 @@ int main(int argc, char **argv)
     }
     const size_t allocations_after_unlock = live_guest_allocations.size();
     const uint32_t unsupported_lock_flags[] = {
-        vertex_buffer, 0u, sizeof(vertex_pattern), rejected_lock_output, D3DLOCK_NOSYSLOCK
+        vertex_buffer, 0u, sizeof(vertex_pattern), rejected_lock_output, 0x80000000u
     };
     if (ac1_d3d9_dispatch(object_slot(vertex_buffer, 11), unsupported_lock_flags, 5,
                           &getter_result) != -2 ||

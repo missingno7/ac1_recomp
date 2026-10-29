@@ -43,7 +43,10 @@ enum {
     AC1_GENERIC_READ = 0x80000000u,
     AC1_OPEN_EXISTING = 3u,
     AC1_FILE_FLAG_RANDOM_ACCESS = 0x10000000u,
-    AC1_GEAR_STREAM_FLAGS = 0x70000001u
+    AC1_GEAR_STREAM_FLAGS = 0x70000001u,
+    /* Bink's synchronous reader: FILE_FLAG_SEQUENTIAL_SCAN | NORMAL, a
+     * caching hint with the same read-only semantics as random access. */
+    AC1_BINK_STREAM_FLAGS = 0x08000080u
 };
 
 #define AC1_STATUS_END_OF_FILE UINT32_C(0xC0000011)
@@ -655,7 +658,8 @@ int ac1_files_open(ac1_files *files, const char *guest_path,
     }
     if (share_mode & ~7u || security_attributes_present ||
         (flags_and_attributes != AC1_FILE_FLAG_RANDOM_ACCESS &&
-         flags_and_attributes != AC1_GEAR_STREAM_FLAGS) || template_handle)
+         flags_and_attributes != AC1_GEAR_STREAM_FLAGS &&
+         flags_and_attributes != AC1_BINK_STREAM_FLAGS) || template_handle)
         return AC1_FILES_UNSUPPORTED;
 
     if (!guest_path || !guest_path[0]) {

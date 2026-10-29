@@ -85,7 +85,9 @@ AC1_D3D9_API int ac1_d3d9_argument_count(uint32_t token);
  * arguments in source order. Returns 1 for a handled native call (including
  * ordinary native HRESULT failure), 0 for a foreign token, -1 for invalid
  * object/ABI state, and -2 for an unsupported method. Only return code 1
- * makes result_out a valid guest EAX value. */
+ * makes result_out a valid guest EAX value. GetNPatchMode is the sole
+ * floating-point return: result_out contains IEEE-754 float bits, which the
+ * guest CPU adapter must place in x87 ST(0), rather than EAX. */
 AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token, const uint32_t *args,
                                    uint32_t arg_count,
                                    uint32_t *result_out);

@@ -47,6 +47,10 @@ constexpr uint32_t kVertexShaderKind = 9u;
 constexpr uint32_t kConstantTableKind = 10u;
 constexpr uint32_t kCubeTextureKind = 11u;
 constexpr uint32_t kQueryKind = 12u;
+constexpr uint32_t kVolumeTextureKind = 13u;
+constexpr uint32_t kVolumeKind = 14u;
+constexpr uint32_t kStateBlockKind = 15u;
+constexpr uint32_t kSwapChainKind = 16u;
 constexpr uint32_t kD3D9VtableSlots = 17u;
 constexpr uint32_t kDeviceVtableSlots = 119u;
 constexpr uint32_t kSurfaceVtableSlots = 17u;
@@ -86,6 +90,12 @@ constexpr GUID kIidIDirect3DVertexShader9 =
 constexpr GUID kIidID3DXConstantTable36 =
     {0x9dca3190u, 0x38b9u, 0x4fc3u, {0x92, 0xe3, 0x39, 0xc6, 0xdd, 0xfb, 0x35, 0x8b}};
 
+constexpr GUID kIidIDirect3DResource9 = {0x05eec05du,0x8f7du,0x4362u,{0xb9,0x99,0xd1,0xba,0xf3,0x57,0xc7,0x04}};
+constexpr GUID kIidIDirect3DVolumeTexture9 = {0x2518526cu,0xe789u,0x4111u,{0xa7,0xb9,0x47,0xef,0x32,0x8d,0x13,0xe6}};
+constexpr GUID kIidIDirect3DVolume9 = {0x24f416e6u,0x1f67u,0x4aa7u,{0xb8,0x8e,0xd3,0x3f,0x6f,0x31,0x28,0xa1}};
+constexpr GUID kIidIDirect3DStateBlock9 = {0xb07c4fe5u,0x310du,0x4ba8u,{0xa2,0x3c,0x4f,0x0f,0x20,0x6f,0x21,0x8b}};
+constexpr GUID kIidIDirect3DSwapChain9 = {0x794950f2u,0xadfcu,0x458au,{0x90,0x5e,0x10,0xa1,0x0b,0x0b,0x50,0x3b}};
+
 enum class ObjectKind : uint32_t {
     D3D9 = kD3D9Kind,
     Device = kDeviceKind,
@@ -98,7 +108,11 @@ enum class ObjectKind : uint32_t {
     VertexShader = kVertexShaderKind,
     ConstantTable = kConstantTableKind,
     CubeTexture = kCubeTextureKind,
-    Query = kQueryKind
+    Query = kQueryKind,
+    VolumeTexture = kVolumeTextureKind,
+    Volume = kVolumeKind,
+    StateBlock = kStateBlockKind,
+    SwapChain = kSwapChainKind
 };
 
 struct GuestObject {
@@ -106,6 +120,10 @@ struct GuestObject {
     ObjectKind kind = ObjectKind::D3D9;
     uint32_t guest_vtable = 0;
     uint32_t guest_references = 1;
+    uint32_t guest_focus = 0;
+    uint32_t guest_window = 0;
+    bool forced_windowed = false;
+    uint32_t fullscreen_refresh = 0;
     uint32_t buffer_lock_guest_address = 0;
     uint32_t buffer_lock_offset = 0;
     uint32_t buffer_lock_size = 0;
@@ -118,7 +136,13 @@ struct GuestLockedRect {
     int32_t pitch;
     uint32_t bits;
 };
+struct GuestLockedBox {
+    int32_t row_pitch;
+    int32_t slice_pitch;
+    uint32_t bits;
+};
 #pragma pack(pop)
+static_assert(sizeof(GuestLockedBox) == 12, "guest D3DLOCKED_BOX must match PE32 ABI");
 static_assert(sizeof(GuestLockedRect) == 8,
               "guest D3DLOCKED_RECT must match PE32 ABI");
 
@@ -147,17 +171,6 @@ static_assert(sizeof(GuestD3DXConstantTableDesc) == 12,
               "guest D3DXCONSTANTTABLE_DESC must match PE32 ABI");
 static_assert(sizeof(GuestD3DXConstantDesc) == 48,
               "guest D3DXCONSTANT_DESC must match PE32 ABI");
-
-struct TextureLock {
-    void *native_bits = nullptr;
-    uint32_t guest_bits = 0;
-    uint32_t allocation_size = 0;
-    uint32_t pitch = 0;
-    uint32_t row_bytes = 0;
-    uint32_t rows = 0;
-    uint32_t face = 0;
-    uint32_t level = 0;
-};
 
 struct TextureLockKey {
     uint32_t guest_texture;
@@ -222,6 +235,10 @@ static_assert(sizeof(D3DCAPS9) == 304,
               "D3DCAPS9 guest/host ABI mismatch");
 static_assert(sizeof(D3DSURFACE_DESC) == 32,
               "D3DSURFACE_DESC guest/host ABI mismatch");
+static_assert(sizeof(D3DMATRIX) == 64 && sizeof(D3DMATERIAL9) == 68 &&
+              sizeof(D3DLIGHT9) == 104 && sizeof(D3DVOLUME_DESC) == 28 &&
+              sizeof(D3DBOX) == 24 && sizeof(RECT) == 16,
+              "D3D9 structure sizes must match the guest ABI");
 static_assert(sizeof(D3DVERTEXELEMENT9) == 8,
               "guest D3DVERTEXELEMENT9 must remain 8 bytes");
 
@@ -229,7 +246,6 @@ ac1_d3d9_callbacks g_callbacks{};
 void *g_context = nullptr;
 std::map<uint32_t, GuestObject> g_objects;
 std::map<IUnknown *, uint32_t> g_guest_by_native;
-std::map<TextureLockKey, TextureLock> g_texture_locks;
 struct GuestConstantHandle {
     uint32_t table = 0;
     const char *native = nullptr;
@@ -309,67 +325,6 @@ void set_error(const std::string &message)
 void clear_error()
 {
     g_last_error[0] = '\0';
-}
-
-TextureLockKey texture_lock_key(uint32_t guest_texture, uint32_t face,
-                                uint32_t level)
-{
-    return {guest_texture, face, level};
-}
-
-bool copyback_texture_lock(const TextureLock &lock)
-{
-    auto *staging = g_callbacks.guest_resolve
-        ? static_cast<const uint8_t *>(g_callbacks.guest_resolve(
-            g_context, lock.guest_bits, lock.allocation_size,
-            AC1_D3D9_GUEST_READ)) : nullptr;
-    if (!staging) {
-        set_error("texture release could not read its guest lock staging buffer");
-        return false;
-    }
-    for (uint32_t row = 0; row < lock.rows; ++row) {
-        std::memcpy(static_cast<uint8_t *>(lock.native_bits) +
-                        static_cast<size_t>(row) * lock.pitch,
-                    staging + static_cast<size_t>(row) * lock.pitch,
-                    lock.row_bytes);
-    }
-    return true;
-}
-
-void discard_texture_locks(uint32_t guest_texture, IDirect3DTexture9 *texture)
-{
-    auto it = g_texture_locks.lower_bound(texture_lock_key(guest_texture, 0, 0));
-    while (it != g_texture_locks.end() &&
-           it->first.guest_texture == guest_texture) {
-        if (texture) {
-            copyback_texture_lock(it->second);
-            const HRESULT status = texture->UnlockRect(it->second.level);
-            if (FAILED(status))
-                set_error("texture release encountered a native UnlockRect failure");
-        }
-        if (g_callbacks.guest_free && it->second.guest_bits)
-            g_callbacks.guest_free(g_context, it->second.guest_bits);
-        it = g_texture_locks.erase(it);
-    }
-}
-
-void discard_cube_texture_locks(uint32_t guest_texture,
-                               IDirect3DCubeTexture9 *texture)
-{
-    auto it = g_texture_locks.lower_bound(texture_lock_key(guest_texture, 0, 0));
-    while (it != g_texture_locks.end() &&
-           it->first.guest_texture == guest_texture) {
-        if (texture) {
-            copyback_texture_lock(it->second);
-            const HRESULT status = texture->UnlockRect(
-                static_cast<D3DCUBEMAP_FACES>(it->second.face), it->second.level);
-            if (FAILED(status))
-                set_error("cube texture release encountered native UnlockRect failure");
-        }
-        if (g_callbacks.guest_free && it->second.guest_bits)
-            g_callbacks.guest_free(g_context, it->second.guest_bits);
-        it = g_texture_locks.erase(it);
-    }
 }
 
 #if defined(_WIN32)
@@ -574,103 +529,45 @@ uint32_t slot_count(ObjectKind kind)
     case ObjectKind::ConstantTable: return kConstantTableVtableSlots;
     case ObjectKind::CubeTexture: return kCubeTextureVtableSlots;
     case ObjectKind::Query: return kQueryVtableSlots;
+    case ObjectKind::VolumeTexture: return 22u;
+    case ObjectKind::Volume: return 11u;
+    case ObjectKind::StateBlock: return 6u;
+    case ObjectKind::SwapChain: return 10u;
     }
     return 0;
 }
 
 int token_argument_count(uint32_t token)
 {
-    if (token < kTokenBase || token >= kTokenBase + 13 * kKindStride) return 0;
+    if (token < kTokenBase || token >= kTokenBase + 17 * kKindStride) return 0;
     const uint32_t offset = token - kTokenBase;
     const uint32_t kind = offset / kKindStride;
     const uint32_t within_kind = offset % kKindStride;
-    if (kind < kD3D9Kind || kind > kQueryKind) return 0;
+    if (kind < kD3D9Kind || kind > kSwapChainKind) return 0;
     if (within_kind % kSlotStride) return -1;
     const uint32_t method = within_kind / kSlotStride;
     if (method >= slot_count(static_cast<ObjectKind>(kind))) return -1;
-
-    if (kind == kDeviceKind) {
-        if (method < 3) return method == 0 ? 3 : 1;
-        if (method == 3) return 1;
-        if (method == 17) return 5;
-        if (method == 41 || method == 42) return 1;
-        if (method == 35) return 4;
-        if (method == 47) return 2;
-        if (method == 37) return 3;
-        if (method == 86) return 3;
-        if (method == 106) return 3;
-        if (method == 91) return 3;
-        if (method == 23) return 9;
-        if (method == 25) return 8;
-        if (method == 26 || method == 27) return 7;
-        if (method == 118) return 3;
-        if (method == 65) return 3;
-        if (method == 81) return 4;
-        if (method == 82) return 7;
-        if (method == 87 || method == 92 || method == 104) return 2;
-        if (method == 100) return 5;
-        if (method == 107) return 2;
-        if (method == 67 || method == 69) return 4;
-        if (method == 94 || method == 96 || method == 98 ||
-            method == 109 || method == 111 || method == 113) return 4;
-        if (method == 57) return 3;
-        if (method == 38) return 3;
-        if (method == 39) return 2;
-        if (method == 40) return 2;
-        return -2;
-    }
-    if (kind == kSurfaceKind) {
-        if (method < 3) return method == 0 ? 3 : 1;
-        if (method == 3) return 2;
-        return method == 12 ? 2 : -2;
-    }
-    if (kind == kVertexBufferKind || kind == kIndexBufferKind) {
-        if (method < 3) return method == 0 ? 3 : 1;
-        if (method == 11) return 5;
-        if (method == 12) return 1;
-        return -2;
-    }
-    if (kind == kVertexDeclarationKind) {
-        if (method < 3) return method == 0 ? 3 : 1;
-        if (method == 4) return 3;
-        return -2;
-    }
-    if (kind == kTextureKind) {
-        if (method < 3) return method == 0 ? 3 : 1;
-        if (method == 19) return 5;
-        if (method == 20) return 2;
-        return -2;
-    }
-    if (kind == kCubeTextureKind) {
-        if (method < 3) return method == 0 ? 3 : 1;
-        if (method == 19) return 6;
-        if (method == 20) return 3;
-        return -2;
-    }
-    if (kind == kPixelShaderKind || kind == kVertexShaderKind) {
-        if (method < 3) return method == 0 ? 3 : 1;
-        return -2;
-    }
-    if (kind == kConstantTableKind) {
-        if (method < 3) return method == 0 ? 3 : 1;
-        if (method == 5) return 2;
-        if (method == 6) return 4;
-        if (method == 8) return 3;
-        return -2;
-    }
-    if (kind == kQueryKind) {
-        if (method < 3) return method == 0 ? 3 : 1;
-        if (method == 4 || method == 5) return 1;
-        if (method == 6) return 2;
-        if (method == 7) return 4;
-        return -2;
-    }
-
-    /* IDirect3D9 slots 0..16. Values include the COM `this` stack word. */
-    static constexpr int arities[kD3D9VtableSlots] = {
-        3, 1, 1, -2, 1, 4, 3, 5, 3, 6, 7, 7, 6, 5, 4, 2, 7
-    };
-    return arities[method];
+    static constexpr int arity1[] = {3, 1, 1, -2, 1, 4, 3, 5, 3, 6, 7, 7, 6, 5, 4, 2, 7}; // IDirect3D9
+    static constexpr int arity2[] = {3, 1, 1, 1, 1, 1, 2, 2, 3, 2, 4, 4, 2, 3, 3, 1, 2, 5, 5, 3, 2, 4, 3, 9, 10, 8, 7, 7, 9, 9, 5, 3, 3, 3, 6, 4, 7, 3, 3, 2, 2, 1, 1, 7, 3, 3, 3, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1, 2, 2, 2, 3, 3, 4, 4, 4, 4, 2, 3, 3, 2, 2, 2, 2, 2, 1, 2, 1, 4, 7, 5, 9, 7, 3, 2, 2, 2, 2, 3, 2, 2, 4, 4, 4, 4, 4, 4, 5, 5, 3, 3, 2, 2, 3, 2, 2, 4, 4, 4, 4, 4, 4, 4, 4, 2, 3}; // IDirect3DDevice9
+    static constexpr int arity3[] = {3, 1, 1, 2, 5, 4, 2, 2, 1, 1, 1, 3, 2, 4, 1, 2, 2}; // IDirect3DSurface9
+    static constexpr int arity4[] = {3, 1, 1, 2, 5, 4, 2, 2, 1, 1, 1, 5, 1, 2}; // IDirect3DVertexBuffer9
+    static constexpr int arity5[] = {3, 1, 1, 2, 5, 4, 2, 2, 1, 1, 1, 5, 1, 2}; // IDirect3DIndexBuffer9
+    static constexpr int arity6[] = {3, 1, 1, 2, 3}; // IDirect3DVertexDeclaration9
+    static constexpr int arity7[] = {3, 1, 1, 2, 5, 4, 2, 2, 1, 1, 1, 2, 1, 1, 2, 1, 1, 3, 3, 5, 2, 2}; // IDirect3DTexture9
+    static constexpr int arity8[] = {3, 1, 1, 2, 3}; // IDirect3DPixelShader9
+    static constexpr int arity9[] = {3, 1, 1, 2, 3}; // IDirect3DVertexShader9
+    static constexpr int arity11[] = {3, 1, 1, 2, 5, 4, 2, 2, 1, 1, 1, 2, 1, 1, 2, 1, 1, 3, 4, 6, 3, 3}; // IDirect3DCubeTexture9
+    static constexpr int arity12[] = {3, 1, 1, 2, 1, 1, 2, 4}; // IDirect3DQuery9
+    static constexpr int arity13[] = {3, 1, 1, 2, 5, 4, 2, 2, 1, 1, 1, 2, 1, 1, 2, 1, 1, 3, 3, 5, 2, 2}; // IDirect3DVolumeTexture9
+    static constexpr int arity14[] = {3, 1, 1, 2, 5, 4, 2, 3, 2, 4, 1}; // IDirect3DVolume9
+    static constexpr int arity15[] = {3, 1, 1, 2, 1, 1}; // IDirect3DStateBlock9
+    static constexpr int arity16[] = {3, 1, 1, 6, 2, 4, 2, 2, 2, 2}; // IDirect3DSwapChain9
+    // D3DX constant tables retain their separately validated observed profile.
+    static constexpr int arity10[] = {3,1,1,-2,-2,2,4,-2,3,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2,-2};
+    const int *const tables[] = {nullptr, arity1, arity2, arity3, arity4,
+        arity5, arity6, arity7, arity8, arity9, arity10, arity11, arity12,
+        arity13, arity14, arity15, arity16};
+    return tables[kind][method];
 }
 
 bool write_guest_word(uint32_t address, uint32_t value)
@@ -846,8 +743,9 @@ HRESULT checked_shader_constant_data(IDirect3DDevice9 *device,
 
 bool supports_guest_buffer_lock_flags(uint32_t flags)
 {
-    return flags == 0u || flags == D3DLOCK_NOOVERWRITE ||
-        flags == D3DLOCK_DISCARD || flags == D3DLOCK_READONLY;
+    constexpr uint32_t known = D3DLOCK_NOOVERWRITE | D3DLOCK_DISCARD |
+        D3DLOCK_READONLY | D3DLOCK_NOSYSLOCK | D3DLOCK_DONOTWAIT | D3DLOCK_NO_DIRTY_UPDATE;
+    return (flags & ~known) == 0;
 }
 
 bool bridge_supports_iid(ObjectKind kind, const GUID &iid)
@@ -865,12 +763,21 @@ bool bridge_supports_iid(ObjectKind kind, const GUID &iid)
     case ObjectKind::Query: supported = &kIidIDirect3DQuery9; break;
     case ObjectKind::PixelShader: supported = &kIidIDirect3DPixelShader9; break;
     case ObjectKind::VertexShader: supported = &kIidIDirect3DVertexShader9; break;
+    case ObjectKind::VolumeTexture: supported = &kIidIDirect3DVolumeTexture9; break;
+    case ObjectKind::Volume: supported = &kIidIDirect3DVolume9; break;
+    case ObjectKind::StateBlock: supported = &kIidIDirect3DStateBlock9; break;
+    case ObjectKind::SwapChain: supported = &kIidIDirect3DSwapChain9; break;
     case ObjectKind::ConstantTable: supported = &kIidID3DXConstantTable36; break;
     }
     return std::memcmp(&iid, &kIidIUnknown, sizeof(iid)) == 0 ||
            std::memcmp(&iid, supported, sizeof(iid)) == 0 ||
-           ((kind == ObjectKind::Texture || kind == ObjectKind::CubeTexture) &&
-            std::memcmp(&iid, &kIidIDirect3DBaseTexture9, sizeof(iid)) == 0);
+           ((kind == ObjectKind::Texture || kind == ObjectKind::CubeTexture ||
+             kind == ObjectKind::VolumeTexture) &&
+            std::memcmp(&iid, &kIidIDirect3DBaseTexture9, sizeof(iid)) == 0) ||
+           ((kind == ObjectKind::Surface || kind == ObjectKind::VertexBuffer ||
+             kind == ObjectKind::IndexBuffer || kind == ObjectKind::Texture ||
+             kind == ObjectKind::CubeTexture || kind == ObjectKind::VolumeTexture) &&
+            std::memcmp(&iid, &kIidIDirect3DResource9, sizeof(iid)) == 0);
 }
 
 const char *interface_name(ObjectKind kind)
@@ -888,6 +795,10 @@ const char *interface_name(ObjectKind kind)
     case ObjectKind::PixelShader: return "IDirect3DPixelShader9";
     case ObjectKind::VertexShader: return "IDirect3DVertexShader9";
     case ObjectKind::ConstantTable: return "ID3DXConstantTable";
+    case ObjectKind::VolumeTexture: return "IDirect3DVolumeTexture9";
+    case ObjectKind::Volume: return "IDirect3DVolume9";
+    case ObjectKind::StateBlock: return "IDirect3DStateBlock9";
+    case ObjectKind::SwapChain: return "IDirect3DSwapChain9";
     }
     return "IUnknown";
 }
@@ -1125,6 +1036,11 @@ HRESULT create_device(IDirect3D9 *d3d, const uint32_t *args)
 
     uint32_t guest_device = wrap_native(device, ObjectKind::Device, true);
     if (!guest_device) return E_OUTOFMEMORY;
+    auto &metadata = g_objects.at(guest_device);
+    metadata.guest_focus = args[3];
+    metadata.guest_window = guest.device_window ? guest.device_window : args[3];
+    metadata.forced_windowed = force_windowed;
+    metadata.fullscreen_refresh = guest.fullscreen_refresh_rate;
     if (!guest_write(args[6], &guest_device, sizeof(guest_device))) {
         GuestObject *wrapped = find_object(guest_device, ObjectKind::Device);
         if (wrapped) {
@@ -1307,265 +1223,6 @@ HRESULT create_guest_query(IDirect3DDevice9 *device, const uint32_t *args)
     return status;
 }
 
-HRESULT lock_texture_rect(uint32_t guest_texture, IDirect3DTexture9 *texture,
-                          const uint32_t *args)
-{
-    if (!args[2]) {
-        set_error("IDirect3DTexture9::LockRect output pointer is null");
-        return D3DERR_INVALIDCALL;
-    }
-    auto *guest_output = static_cast<GuestLockedRect *>(guest_memory(
-        args[2], sizeof(GuestLockedRect), AC1_D3D9_GUEST_WRITE));
-    if (!guest_output) {
-        set_error("IDirect3DTexture9::LockRect output structure is unmapped");
-        return D3DERR_INVALIDCALL;
-    }
-    if (args[3] || args[4]) {
-        set_error("texture LockRect RECT/flags profile is not implemented");
-        return D3DERR_INVALIDCALL;
-    }
-
-    const TextureLockKey key = texture_lock_key(guest_texture, 0, args[1]);
-    if (g_texture_locks.find(key) != g_texture_locks.end()) {
-        set_error("IDirect3DTexture9::LockRect called twice for the same mip level");
-        return D3DERR_INVALIDCALL;
-    }
-
-    D3DSURFACE_DESC description{};
-    HRESULT status = texture->GetLevelDesc(args[1], &description);
-    if (FAILED(status)) return status;
-    if (description.Format != D3DFMT_A8R8G8B8) {
-        set_error("texture LockRect supports only the observed A8R8G8B8 format");
-        return D3DERR_NOTAVAILABLE;
-    }
-    const uint64_t row_bytes_64 = static_cast<uint64_t>(description.Width) * 4u;
-    if (!description.Width || !description.Height || row_bytes_64 > UINT32_MAX) {
-        set_error("texture LockRect dimensions exceed the guest staging ABI");
-        return D3DERR_INVALIDCALL;
-    }
-
-    D3DLOCKED_RECT native{};
-    status = texture->LockRect(args[1], &native, nullptr, 0);
-    if (FAILED(status)) return status;
-    if (!native.pBits || native.Pitch <= 0 ||
-        static_cast<uint32_t>(native.Pitch) < row_bytes_64) {
-        texture->UnlockRect(args[1]);
-        set_error("native texture LockRect returned an unsupported pitch or null bits");
-        return D3DERR_INVALIDCALL;
-    }
-
-    const uint64_t size_64 = static_cast<uint64_t>(native.Pitch) * description.Height;
-    if (size_64 > UINT32_MAX || !size_64) {
-        texture->UnlockRect(args[1]);
-        set_error("native texture LockRect span overflows 32-bit guest memory");
-        return D3DERR_INVALIDCALL;
-    }
-    const uint32_t allocation_size = static_cast<uint32_t>(size_64);
-    const uint32_t guest_bits = g_callbacks.guest_alloc
-        ? g_callbacks.guest_alloc(g_context, allocation_size, 4) : 0;
-    if (!guest_bits) {
-        texture->UnlockRect(args[1]);
-        set_error("guest allocation failed for the locked texture staging buffer");
-        return E_OUTOFMEMORY;
-    }
-    auto *staging = static_cast<uint8_t *>(guest_memory(
-        guest_bits, allocation_size, AC1_D3D9_GUEST_WRITE));
-    if (!staging) {
-        g_callbacks.guest_free(g_context, guest_bits);
-        texture->UnlockRect(args[1]);
-        set_error("allocated texture staging buffer is not writable in guest memory");
-        return D3DERR_INVALIDCALL;
-    }
-    std::memset(staging, 0, allocation_size);
-    const uint32_t pitch = static_cast<uint32_t>(native.Pitch);
-    const uint32_t row_bytes = static_cast<uint32_t>(row_bytes_64);
-    for (uint32_t row = 0; row < description.Height; ++row) {
-        std::memcpy(staging + static_cast<size_t>(row) * pitch,
-                    static_cast<const uint8_t *>(native.pBits) +
-                        static_cast<size_t>(row) * pitch,
-                    row_bytes);
-    }
-
-    try {
-        g_texture_locks.emplace(key, TextureLock{
-            native.pBits, guest_bits, allocation_size, pitch, row_bytes,
-            description.Height, 0, args[1]});
-    } catch (...) {
-        g_callbacks.guest_free(g_context, guest_bits);
-        texture->UnlockRect(args[1]);
-        set_error("failed to register the guest texture lock");
-        return E_OUTOFMEMORY;
-    }
-
-    const GuestLockedRect locked{native.Pitch, guest_bits};
-    std::memcpy(guest_output, &locked, sizeof(locked));
-    return status;
-}
-
-HRESULT unlock_texture_rect(uint32_t guest_texture, IDirect3DTexture9 *texture,
-                            uint32_t level)
-{
-    const TextureLockKey key = texture_lock_key(guest_texture, 0, level);
-    auto it = g_texture_locks.find(key);
-    if (it == g_texture_locks.end()) {
-        set_error("IDirect3DTexture9::UnlockRect has no matching guest LockRect");
-        return D3DERR_INVALIDCALL;
-    }
-    TextureLock &locked = it->second;
-    auto *staging = static_cast<const uint8_t *>(guest_memory(
-        locked.guest_bits, locked.allocation_size, AC1_D3D9_GUEST_READ));
-    if (!staging) {
-        set_error("locked texture staging buffer became unreadable in guest memory");
-        return D3DERR_INVALIDCALL;
-    }
-    for (uint32_t row = 0; row < locked.rows; ++row) {
-        std::memcpy(static_cast<uint8_t *>(locked.native_bits) +
-                        static_cast<size_t>(row) * locked.pitch,
-                    staging + static_cast<size_t>(row) * locked.pitch,
-                    locked.row_bytes);
-    }
-    const HRESULT status = texture->UnlockRect(level);
-    if (FAILED(status)) return status;
-    if (g_callbacks.guest_free)
-        g_callbacks.guest_free(g_context, locked.guest_bits);
-    g_texture_locks.erase(it);
-    return status;
-}
-
-HRESULT lock_cube_texture_rect(uint32_t guest_texture,
-                               IDirect3DCubeTexture9 *texture,
-                               const uint32_t *args)
-{
-    if (args[1] > D3DCUBEMAP_FACE_NEGATIVE_Z) {
-        set_error("IDirect3DCubeTexture9::LockRect face is outside the six cube faces");
-        return D3DERR_INVALIDCALL;
-    }
-    if (!args[3]) {
-        set_error("IDirect3DCubeTexture9::LockRect output pointer is null");
-        return D3DERR_INVALIDCALL;
-    }
-    auto *guest_output = static_cast<GuestLockedRect *>(guest_memory(
-        args[3], sizeof(GuestLockedRect), AC1_D3D9_GUEST_WRITE));
-    if (!guest_output) {
-        set_error("IDirect3DCubeTexture9::LockRect output structure is unmapped");
-        return D3DERR_INVALIDCALL;
-    }
-
-    const TextureLockKey key = texture_lock_key(guest_texture, args[1], args[2]);
-    if (g_texture_locks.find(key) != g_texture_locks.end()) {
-        set_error("IDirect3DCubeTexture9::LockRect face/level is already locked");
-        return D3DERR_INVALIDCALL;
-    }
-
-    D3DSURFACE_DESC description{};
-    HRESULT status = texture->GetLevelDesc(args[2], &description);
-    if (FAILED(status)) return status;
-    if (description.Format != D3DFMT_A8R8G8B8) {
-        set_error("cube LockRect supports only the observed A8R8G8B8 format");
-        return D3DERR_NOTAVAILABLE;
-    }
-    const uint64_t row_bytes_64 = static_cast<uint64_t>(description.Width) * 4u;
-    if (!description.Width || !description.Height ||
-        description.Width != description.Height || row_bytes_64 > UINT32_MAX) {
-        set_error("cube LockRect dimensions exceed the square guest staging ABI");
-        return D3DERR_INVALIDCALL;
-    }
-
-    D3DLOCKED_RECT native{};
-    status = texture->LockRect(static_cast<D3DCUBEMAP_FACES>(args[1]), args[2],
-                               &native, nullptr, 0);
-    if (FAILED(status)) return status;
-    if (!native.pBits || native.Pitch <= 0 ||
-        static_cast<uint32_t>(native.Pitch) < row_bytes_64) {
-        texture->UnlockRect(static_cast<D3DCUBEMAP_FACES>(args[1]), args[2]);
-        set_error("native cube LockRect returned an unsupported pitch or null bits");
-        return D3DERR_INVALIDCALL;
-    }
-
-    const uint64_t size_64 = static_cast<uint64_t>(native.Pitch) * description.Height;
-    if (size_64 > UINT32_MAX || !size_64) {
-        texture->UnlockRect(static_cast<D3DCUBEMAP_FACES>(args[1]), args[2]);
-        set_error("native cube LockRect span overflows 32-bit guest memory");
-        return D3DERR_INVALIDCALL;
-    }
-    const uint32_t allocation_size = static_cast<uint32_t>(size_64);
-    const uint32_t guest_bits = g_callbacks.guest_alloc
-        ? g_callbacks.guest_alloc(g_context, allocation_size, 4) : 0;
-    if (!guest_bits) {
-        texture->UnlockRect(static_cast<D3DCUBEMAP_FACES>(args[1]), args[2]);
-        set_error("guest allocation failed for the locked cube staging buffer");
-        return E_OUTOFMEMORY;
-    }
-    auto *staging = static_cast<uint8_t *>(guest_memory(
-        guest_bits, allocation_size, AC1_D3D9_GUEST_WRITE));
-    if (!staging) {
-        g_callbacks.guest_free(g_context, guest_bits);
-        texture->UnlockRect(static_cast<D3DCUBEMAP_FACES>(args[1]), args[2]);
-        set_error("allocated cube staging buffer is not writable in guest memory");
-        return D3DERR_INVALIDCALL;
-    }
-    std::memset(staging, 0, allocation_size);
-    const uint32_t pitch = static_cast<uint32_t>(native.Pitch);
-    const uint32_t row_bytes = static_cast<uint32_t>(row_bytes_64);
-    for (uint32_t row = 0; row < description.Height; ++row) {
-        std::memcpy(staging + static_cast<size_t>(row) * pitch,
-                    static_cast<const uint8_t *>(native.pBits) +
-                        static_cast<size_t>(row) * pitch,
-                    row_bytes);
-    }
-
-    try {
-        g_texture_locks.emplace(key, TextureLock{
-            native.pBits, guest_bits, allocation_size, pitch, row_bytes,
-            description.Height, args[1], args[2]});
-    } catch (...) {
-        g_callbacks.guest_free(g_context, guest_bits);
-        texture->UnlockRect(static_cast<D3DCUBEMAP_FACES>(args[1]), args[2]);
-        set_error("failed to register the guest cube lock");
-        return E_OUTOFMEMORY;
-    }
-
-    const GuestLockedRect locked{native.Pitch, guest_bits};
-    std::memcpy(guest_output, &locked, sizeof(locked));
-    return status;
-}
-
-HRESULT unlock_cube_texture_rect(uint32_t guest_texture,
-                                IDirect3DCubeTexture9 *texture,
-                                uint32_t face, uint32_t level)
-{
-    if (face > D3DCUBEMAP_FACE_NEGATIVE_Z) {
-        set_error("IDirect3DCubeTexture9::UnlockRect face is outside the six cube faces");
-        return D3DERR_INVALIDCALL;
-    }
-    const TextureLockKey key = texture_lock_key(guest_texture, face, level);
-    auto it = g_texture_locks.find(key);
-    if (it == g_texture_locks.end()) {
-        set_error("IDirect3DCubeTexture9::UnlockRect has no matching face/level lock");
-        return D3DERR_INVALIDCALL;
-    }
-    TextureLock &locked = it->second;
-    auto *staging = static_cast<const uint8_t *>(guest_memory(
-        locked.guest_bits, locked.allocation_size, AC1_D3D9_GUEST_READ));
-    if (!staging) {
-        set_error("locked cube staging buffer became unreadable in guest memory");
-        return D3DERR_INVALIDCALL;
-    }
-    for (uint32_t row = 0; row < locked.rows; ++row) {
-        std::memcpy(static_cast<uint8_t *>(locked.native_bits) +
-                        static_cast<size_t>(row) * locked.pitch,
-                    staging + static_cast<size_t>(row) * locked.pitch,
-                    locked.row_bytes);
-    }
-    const HRESULT status = texture->UnlockRect(
-        static_cast<D3DCUBEMAP_FACES>(face), level);
-    if (FAILED(status)) return status;
-    if (g_callbacks.guest_free)
-        g_callbacks.guest_free(g_context, locked.guest_bits);
-    g_texture_locks.erase(it);
-    return status;
-}
-
 HRESULT create_vertex_declaration(IDirect3DDevice9 *device, const uint32_t *args)
 {
     if (!args[1]) {
@@ -1618,7 +1275,7 @@ HRESULT create_vertex_declaration(IDirect3DDevice9 *device, const uint32_t *args
     return status;
 }
 
-bool read_shader_model_3(uint32_t guest_bytecode, DWORD expected_version,
+bool read_shader_bytecode(uint32_t guest_bytecode, DWORD expected_version,
                          const char *shader_kind, std::vector<DWORD> *staged)
 {
     constexpr uint32_t kMaxShaderWords = 1u << 20; /* 4 MiB hard guest-read cap. */
@@ -1632,13 +1289,13 @@ bool read_shader_model_3(uint32_t guest_bytecode, DWORD expected_version,
         set_error("D3D shader version token is unmapped");
         return false;
     }
-    /* The observed asset is pixel shader 3.0. Reject other profiles until a
-     * parser for their different instruction-length rules is evidenced. */
-    if (token != expected_version) {
-        std::ostringstream message;
-        message << "Create" << shader_kind
-                << " only supports the observed shader model 3.0 token format";
-        set_error(message.str());
+    const uint32_t major = (token >> 8) & 0xff;
+    const uint32_t minor = token & 0xff;
+    const bool pixel = (expected_version >> 16) == 0xffff;
+    if ((token >> 16) != (expected_version >> 16) || major < 1 || major > 3 ||
+        (major == 1 && (pixel ? minor > 4 : minor != 1)) ||
+        (major >= 2 && minor != 0)) {
+        set_error(std::string("Create") + shader_kind + " has an invalid D3D9 shader version token");
         return false;
     }
     staged->clear();
@@ -1666,8 +1323,35 @@ bool read_shader_model_3(uint32_t guest_bytecode, DWORD expected_version,
         uint32_t payload_words = 0;
         if (opcode == D3DSIO_COMMENT) {
             payload_words = (token & D3DSI_COMMENTSIZE_MASK) >> D3DSI_COMMENTSIZE_SHIFT;
-        } else {
+        } else if (major >= 2) {
             payload_words = (token & D3DSI_INSTLENGTH_MASK) >> D3DSI_INSTLENGTH_SHIFT;
+        } else {
+            // SM1 lengths include destination/source operands but no encoded
+            // instruction length. Immediate DEF data may contain an END value.
+            switch (opcode) {
+            case D3DSIO_NOP: case D3DSIO_PHASE: payload_words = 0; break;
+            case D3DSIO_TEXCOORD: case D3DSIO_TEX: payload_words = minor == 4 && pixel ? 2 : 1; break;
+            case D3DSIO_TEXKILL: case D3DSIO_TEXDEPTH: payload_words = 1; break;
+            case D3DSIO_MOV: case D3DSIO_RCP: case D3DSIO_RSQ: case D3DSIO_EXP:
+            case D3DSIO_LOG: case D3DSIO_LIT: case D3DSIO_FRC: case D3DSIO_EXPP:
+            case D3DSIO_LOGP: case D3DSIO_TEXBEM: case D3DSIO_TEXBEML:
+            case D3DSIO_TEXREG2AR: case D3DSIO_TEXREG2GB: case D3DSIO_TEXM3x2PAD:
+            case D3DSIO_TEXM3x2TEX: case D3DSIO_TEXM3x3PAD: case D3DSIO_TEXM3x3TEX:
+            case D3DSIO_TEXM3x3VSPEC: case D3DSIO_TEXREG2RGB: case D3DSIO_TEXDP3TEX:
+            case D3DSIO_TEXM3x2DEPTH: case D3DSIO_TEXDP3: case D3DSIO_TEXM3x3:
+                payload_words = 2; break;
+            case D3DSIO_ADD: case D3DSIO_SUB: case D3DSIO_MUL: case D3DSIO_DP3:
+            case D3DSIO_DP4: case D3DSIO_MIN: case D3DSIO_MAX: case D3DSIO_SLT:
+            case D3DSIO_SGE: case D3DSIO_DST: case D3DSIO_M4x4: case D3DSIO_M4x3:
+            case D3DSIO_M3x4: case D3DSIO_M3x3: case D3DSIO_M3x2: case D3DSIO_TEXM3x3SPEC:
+                payload_words = 3; break;
+            case D3DSIO_MAD: case D3DSIO_LRP: case D3DSIO_CND: case D3DSIO_CMP:
+            case D3DSIO_DP2ADD: payload_words = 4; break;
+            case D3DSIO_DEF: payload_words = 5; break;
+            default:
+                set_error("unknown SM1 shader opcode " + std::to_string(opcode));
+                return false;
+            }
         }
         if (payload_words > kMaxShaderWords - cursor) {
             set_error("D3D shader instruction length exceeds the bounded token stream");
@@ -1711,7 +1395,7 @@ HRESULT create_guest_shader(IDirect3DDevice9 *device, const uint32_t *args,
     std::vector<DWORD> bytecode;
     const DWORD expected_version = pixel_shader ? D3DPS_VERSION(3, 0)
                                                 : D3DVS_VERSION(3, 0);
-    if (!read_shader_model_3(args[1], expected_version, shader_kind, &bytecode))
+    if (!read_shader_bytecode(args[1], expected_version, shader_kind, &bytecode))
         return D3DERR_INVALIDCALL;
 
     IUnknown *native_shader = nullptr;
@@ -2003,7 +1687,7 @@ int scan_shader_for_d3dx(uint32_t guest_bytecode, std::vector<DWORD> *bytecode)
         set_error("D3DXGetShaderConstantTable only supports observed shader-model-3 profiles");
         return -2;
     }
-    if (!read_shader_model_3(guest_bytecode, version,
+    if (!read_shader_bytecode(guest_bytecode, version,
             version == pixel ? "PixelShader" : "VertexShader", bytecode))
         return -1;
     return 1;
@@ -2196,7 +1880,8 @@ uint32_t invoke_d3d9(GuestObject &object, uint32_t method,
     return hresult(D3DERR_NOTAVAILABLE);
 }
 
-HRESULT present_device(IDirect3DDevice9 *device, const uint32_t *args)
+HRESULT present_device(IDirect3DDevice9 *device, const uint32_t *args,
+                       IDirect3DSwapChain9 *swap = nullptr, DWORD flags = 0)
 {
     static_assert(sizeof(RECT) == 16, "guest RECT must remain 16 bytes");
     static_assert(sizeof(RGNDATAHEADER) == 32,
@@ -2270,7 +1955,321 @@ HRESULT present_device(IDirect3DDevice9 *device, const uint32_t *args)
         dirty_region = reinterpret_cast<const RGNDATA *>(region_storage.data());
     }
 
-    return device->Present(source, destination, host_hwnd, dirty_region);
+    return swap ? swap->Present(source, destination, host_hwnd, dirty_region, flags)
+                : device->Present(source, destination, host_hwnd, dirty_region);
+}
+
+
+// All pointer-bearing ABI boundaries pass through these checked adapters. No
+// native interface, HWND, lock pointer, or private-data pointer is copied to PE32.
+struct MarshalError {};
+[[noreturn]] void marshal_error(const std::string &message)
+{
+    set_error(message);
+    throw MarshalError{};
+}
+
+template <typename T>
+T *mapped(uint32_t address, uint32_t access, uint64_t count = 1, bool optional = false)
+{
+    if (!address && optional) return nullptr;
+    const uint64_t bytes = count * sizeof(T);
+    if (!count) return nullptr;
+    if (count > UINT32_MAX / sizeof(T) ||
+        static_cast<uint64_t>(address) + bytes > uint64_t{UINT32_MAX} + 1)
+        marshal_error("guest data span overflows the 32-bit ABI");
+    auto *value = static_cast<T *>(guest_memory(address, static_cast<uint32_t>(bytes), access));
+    if (!value) {
+        std::ostringstream message;
+        message << "unmapped guest " << (access == AC1_D3D9_GUEST_READ ? "input" : "output")
+                << " at 0x" << std::hex << address << " (" << std::dec << bytes << " bytes)";
+        marshal_error(message.str());
+    }
+    return value;
+}
+template <typename T> const T *input(uint32_t address, uint64_t count = 1, bool optional = false)
+{ return mapped<T>(address, AC1_D3D9_GUEST_READ, count, optional); }
+template <typename T> T *output(uint32_t address, uint64_t count = 1)
+{ return mapped<T>(address, AC1_D3D9_GUEST_WRITE, count); }
+
+// Structure pointers are staged in naturally aligned storage. Guest x86 code
+// may supply unaligned addresses even when the provider runs on ARM64.
+template <typename T, typename Call>
+HRESULT copied_input(uint32_t address, Call call, uint32_t count = 1, bool optional = false)
+{
+    const T *source = input<T>(address,count,optional);
+    if (!source) return call(static_cast<T *>(nullptr));
+    std::vector<T> values(count);
+    std::memcpy(values.data(),source,size_t{count}*sizeof(T));
+    return call(values.data());
+}
+template <typename T, typename Call>
+HRESULT copied_output(uint32_t address, Call call, uint32_t count = 1)
+{
+    void *destination = output<uint8_t>(address,uint64_t{count}*sizeof(T));
+    std::vector<T> values(count);
+    const HRESULT hr = call(count ? values.data() : nullptr);
+    if (SUCCEEDED(hr) && count) std::memcpy(destination,values.data(),size_t{count}*sizeof(T));
+    return hr;
+}
+
+template <typename T> T *native_object(uint32_t address, ObjectKind kind, bool optional = false)
+{
+    if (!address && optional) return nullptr;
+    GuestObject *object = find_object(address, kind);
+    if (!object) marshal_error(std::string("expected registered ") + interface_name(kind) + " guest proxy");
+    return static_cast<T *>(object->native);
+}
+IDirect3DBaseTexture9 *native_texture(uint32_t address, bool optional = false)
+{
+    if (!address && optional) return nullptr;
+    auto it = g_objects.find(address);
+    if (it == g_objects.end() || (it->second.kind != ObjectKind::Texture &&
+        it->second.kind != ObjectKind::CubeTexture && it->second.kind != ObjectKind::VolumeTexture))
+        marshal_error("expected registered base/2D/cube/volume texture guest proxy");
+    return static_cast<IDirect3DBaseTexture9 *>(it->second.native);
+}
+
+template <typename T, typename Call>
+HRESULT interface_output(uint32_t address, ObjectKind kind, Call call)
+{
+    auto *destination = output<uint32_t>(address);
+    *destination = 0;
+    T *native = nullptr;
+    const HRESULT status = call(&native);
+    if (FAILED(status)) { if (native) native->Release(); return status; }
+    if (!native) return status; // Null getters (unbound textures/shaders) are valid.
+    const uint32_t guest = wrap_native(native, kind, true);
+    if (!guest) return E_OUTOFMEMORY;
+    *destination = guest;
+    return status;
+}
+
+ObjectKind texture_kind(IDirect3DBaseTexture9 *texture)
+{
+    switch (texture->GetType()) {
+    case D3DRTYPE_TEXTURE: return ObjectKind::Texture;
+    case D3DRTYPE_CUBETEXTURE: return ObjectKind::CubeTexture;
+    case D3DRTYPE_VOLUMETEXTURE: return ObjectKind::VolumeTexture;
+    default: marshal_error("native GetTexture returned an unknown resource type");
+    }
+}
+
+bool force_windowed_request(const GuestPresentParameters &guest)
+{
+    const char *value = std::getenv("AC1_D3D9_FORCE_WINDOWED");
+    return !guest.windowed && value && std::strcmp(value, "0") != 0;
+}
+HRESULT reset_or_swapchain(GuestObject &object, const uint32_t *args, bool reset)
+{
+    auto *device = static_cast<IDirect3DDevice9 *>(object.native);
+    GuestPresentParameters requested{};
+    std::memcpy(&requested,input<GuestPresentParameters>(args[1]),sizeof(requested));
+    auto *destination = output<GuestPresentParameters>(args[1]);
+    if (!reset) output<uint32_t>(args[2]);
+    bool ok = false;
+    const uintptr_t window = host_window(requested.device_window, &ok);
+    if (!ok) return D3DERR_INVALIDCALL;
+    auto host = host_present_parameters(requested, window);
+    const bool forced = force_windowed_request(requested);
+    if (forced) { host.Windowed = TRUE; host.FullScreen_RefreshRateInHz = 0; }
+    // Default-pool guest references and outstanding locks remain live. The
+    // provider decides Reset success / DEVICELOST / INVALIDCALL; never fake it.
+    HRESULT status;
+    if (reset) status = device->Reset(&host);
+    else status = interface_output<IDirect3DSwapChain9>(args[2], ObjectKind::SwapChain,
+        [&](auto **out) { return device->CreateAdditionalSwapChain(&host, out); });
+    auto updated = guest_present_parameters(host, requested.device_window);
+    if (forced) { updated.windowed = requested.windowed; updated.fullscreen_refresh_rate = requested.fullscreen_refresh_rate; }
+    std::memcpy(destination,&updated,sizeof(updated));
+    if (SUCCEEDED(status)) {
+        GuestObject *metadata = &object;
+        if (!reset) metadata = find_object(*output<uint32_t>(args[2]), ObjectKind::SwapChain);
+        if (metadata) {
+            metadata->guest_focus = object.guest_focus;
+            metadata->guest_window = requested.device_window ? requested.device_window : object.guest_focus;
+            metadata->forced_windowed = forced;
+            metadata->fullscreen_refresh = requested.fullscreen_refresh_rate;
+        }
+    }
+    return status;
+}
+
+uint64_t primitive_vertices(uint32_t type, uint32_t count)
+{
+    if (!count) return 0;
+    switch (type) {
+    case D3DPT_POINTLIST: return count;
+    case D3DPT_LINELIST: return uint64_t{count} * 2;
+    case D3DPT_LINESTRIP: return uint64_t{count} + 1;
+    case D3DPT_TRIANGLELIST: return uint64_t{count} * 3;
+    case D3DPT_TRIANGLESTRIP: case D3DPT_TRIANGLEFAN: return uint64_t{count} + 2;
+    default: marshal_error("user-pointer draw has an invalid primitive type");
+    }
+}
+float guest_float(uint32_t bits) { float value; std::memcpy(&value, &bits, 4); return value; }
+uint32_t float_bits(float value) { uint32_t bits; std::memcpy(&bits, &value, 4); return bits; }
+
+uint32_t invoke_remaining_device(GuestObject &object, uint32_t method, const uint32_t *a)
+{
+    auto *d = static_cast<IDirect3DDevice9 *>(object.native);
+    switch (method) {
+    case 4: return d->GetAvailableTextureMem();
+    case 5: return hresult(d->EvictManagedResources());
+    case 6: return hresult(interface_output<IDirect3D9>(a[1], ObjectKind::D3D9, [&](auto **p) { return d->GetDirect3D(p); }));
+    case 7: return hresult(copied_output<D3DCAPS9>(a[1],[&](auto *p) { return d->GetDeviceCaps(p); }));
+    case 8: return hresult(copied_output<D3DDISPLAYMODE>(a[2],[&](auto *p) { return d->GetDisplayMode(a[1],p); }));
+    case 9: {
+        auto *out = output<uint32_t>(a[1], 4);
+        D3DDEVICE_CREATION_PARAMETERS native{};
+        const HRESULT hr = d->GetCreationParameters(&native);
+        if (SUCCEEDED(hr)) {
+            bool ok;
+            const auto hwnd = host_window(object.guest_focus, &ok);
+            if (!ok || reinterpret_cast<uintptr_t>(native.hFocusWindow) != hwnd)
+                marshal_error("GetCreationParameters cannot map the native focus HWND to a guest handle");
+            const uint32_t guest[] = {native.AdapterOrdinal, static_cast<uint32_t>(native.DeviceType), object.guest_focus, native.BehaviorFlags};
+            std::memcpy(out, guest, sizeof(guest));
+        }
+        return hresult(hr);
+    }
+    case 10: return hresult(d->SetCursorProperties(a[1], a[2], native_object<IDirect3DSurface9>(a[3], ObjectKind::Surface)));
+    case 11: d->SetCursorPosition(static_cast<int32_t>(a[1]), static_cast<int32_t>(a[2]), a[3]); return 0;
+    case 12: return static_cast<uint32_t>(d->ShowCursor(a[1]));
+    case 13: return hresult(reset_or_swapchain(object, a, false));
+    case 14: {
+        const HRESULT hr = interface_output<IDirect3DSwapChain9>(a[2], ObjectKind::SwapChain, [&](auto **p) { return d->GetSwapChain(a[1], p); });
+        if (SUCCEEDED(hr)) {
+            auto *swap = find_object(*output<uint32_t>(a[2]), ObjectKind::SwapChain);
+            if (swap && a[1] == 0) {
+                swap->guest_window = object.guest_window;
+                swap->forced_windowed = object.forced_windowed;
+                swap->fullscreen_refresh = object.fullscreen_refresh;
+            }
+        }
+        return hresult(hr);
+    }
+    case 15: return d->GetNumberOfSwapChains();
+    case 16: return hresult(reset_or_swapchain(object, a, true));
+    case 18: return hresult(interface_output<IDirect3DSurface9>(a[4], ObjectKind::Surface, [&](auto **p) { return d->GetBackBuffer(a[1], a[2], static_cast<D3DBACKBUFFER_TYPE>(a[3]), p); }));
+    case 19: return hresult(copied_output<D3DRASTER_STATUS>(a[2],[&](auto *p) { return d->GetRasterStatus(a[1],p); }));
+    case 20: return hresult(d->SetDialogBoxMode(a[1]));
+    case 21: return hresult(copied_input<D3DGAMMARAMP>(a[3],[&](auto *p) { d->SetGammaRamp(a[1],a[2],p); return S_OK; }));
+    case 22: return hresult(copied_output<D3DGAMMARAMP>(a[2],[&](auto *p) { d->GetGammaRamp(a[1],p); return S_OK; }));
+    case 24:
+        if (a[9]) marshal_error("CreateVolumeTexture shared HANDLE translation is unavailable");
+        return hresult(interface_output<IDirect3DVolumeTexture9>(a[8], ObjectKind::VolumeTexture, [&](auto **p) { return d->CreateVolumeTexture(a[1], a[2], a[3], a[4], a[5], static_cast<D3DFORMAT>(a[6]), static_cast<D3DPOOL>(a[7]), p, nullptr); }));
+    case 28: case 29:
+        if (a[8]) marshal_error("CreateRenderTarget/CreateDepthStencilSurface shared HANDLE translation is unavailable");
+        return hresult(interface_output<IDirect3DSurface9>(a[7], ObjectKind::Surface, [&](auto **p) {
+            return method == 28 ? d->CreateRenderTarget(a[1], a[2], static_cast<D3DFORMAT>(a[3]), static_cast<D3DMULTISAMPLE_TYPE>(a[4]), a[5], a[6], p, nullptr)
+                : d->CreateDepthStencilSurface(a[1], a[2], static_cast<D3DFORMAT>(a[3]), static_cast<D3DMULTISAMPLE_TYPE>(a[4]), a[5], a[6], p, nullptr); }));
+    case 30: return hresult(d->UpdateSurface(native_object<IDirect3DSurface9>(a[1], ObjectKind::Surface), input<RECT>(a[2], 1, true), native_object<IDirect3DSurface9>(a[3], ObjectKind::Surface), input<POINT>(a[4], 1, true)));
+    case 31: return hresult(d->UpdateTexture(native_texture(a[1]), native_texture(a[2])));
+    case 32: return hresult(d->GetRenderTargetData(native_object<IDirect3DSurface9>(a[1], ObjectKind::Surface), native_object<IDirect3DSurface9>(a[2], ObjectKind::Surface)));
+    case 33: return hresult(d->GetFrontBufferData(a[1], native_object<IDirect3DSurface9>(a[2], ObjectKind::Surface)));
+    case 34: return hresult(d->StretchRect(native_object<IDirect3DSurface9>(a[1], ObjectKind::Surface), input<RECT>(a[2], 1, true), native_object<IDirect3DSurface9>(a[3], ObjectKind::Surface), input<RECT>(a[4], 1, true), static_cast<D3DTEXTUREFILTERTYPE>(a[5])));
+    case 36:
+        if (a[6]) marshal_error("CreateOffscreenPlainSurface shared HANDLE translation is unavailable");
+        return hresult(interface_output<IDirect3DSurface9>(a[5], ObjectKind::Surface, [&](auto **p) { return d->CreateOffscreenPlainSurface(a[1], a[2], static_cast<D3DFORMAT>(a[3]), static_cast<D3DPOOL>(a[4]), p, nullptr); }));
+    case 43: return hresult(d->Clear(a[1], input<D3DRECT>(a[2], a[1]), a[3], a[4], guest_float(a[5]), a[6]));
+    case 44: return hresult(copied_input<D3DMATRIX>(a[2],[&](auto *p) { return d->SetTransform(static_cast<D3DTRANSFORMSTATETYPE>(a[1]),p); }));
+    case 45: return hresult(copied_output<D3DMATRIX>(a[2],[&](auto *p) { return d->GetTransform(static_cast<D3DTRANSFORMSTATETYPE>(a[1]),p); }));
+    case 46: return hresult(copied_input<D3DMATRIX>(a[2],[&](auto *p) { return d->MultiplyTransform(static_cast<D3DTRANSFORMSTATETYPE>(a[1]),p); }));
+    case 48: return hresult(copied_output<D3DVIEWPORT9>(a[1],[&](auto *p) { return d->GetViewport(p); }));
+    case 49: return hresult(copied_input<D3DMATERIAL9>(a[1],[&](auto *p) { return d->SetMaterial(p); }));
+    case 50: return hresult(copied_output<D3DMATERIAL9>(a[1],[&](auto *p) { return d->GetMaterial(p); }));
+    case 51: return hresult(copied_input<D3DLIGHT9>(a[2],[&](auto *p) { return d->SetLight(a[1],p); }));
+    case 52: return hresult(copied_output<D3DLIGHT9>(a[2],[&](auto *p) { return d->GetLight(a[1],p); }));
+    case 53: return hresult(d->LightEnable(a[1], a[2]));
+    case 54: return hresult(d->GetLightEnable(a[1], output<BOOL>(a[2])));
+    case 55: return hresult(copied_input<float>(a[2],[&](auto *p) { return d->SetClipPlane(a[1],p); },4));
+    case 56: return hresult(copied_output<float>(a[2],[&](auto *p) { return d->GetClipPlane(a[1],p); },4));
+    case 58: return hresult(d->GetRenderState(static_cast<D3DRENDERSTATETYPE>(a[1]), output<DWORD>(a[2])));
+    case 59: return hresult(interface_output<IDirect3DStateBlock9>(a[2], ObjectKind::StateBlock, [&](auto **p) { return d->CreateStateBlock(static_cast<D3DSTATEBLOCKTYPE>(a[1]), p); }));
+    case 60: return hresult(d->BeginStateBlock());
+    case 61: return hresult(interface_output<IDirect3DStateBlock9>(a[1], ObjectKind::StateBlock, [&](auto **p) { return d->EndStateBlock(p); }));
+    case 62: return hresult(copied_input<D3DCLIPSTATUS9>(a[1],[&](auto *p) { return d->SetClipStatus(p); }));
+    case 63: return hresult(copied_output<D3DCLIPSTATUS9>(a[1],[&](auto *p) { return d->GetClipStatus(p); }));
+    case 64: {
+        auto *out = output<uint32_t>(a[2]); *out = 0;
+        IDirect3DBaseTexture9 *texture = nullptr;
+        const HRESULT hr = d->GetTexture(a[1], &texture);
+        if (FAILED(hr)) { if (texture) texture->Release(); return hresult(hr); }
+        if (texture) { *out = wrap_native(texture, texture_kind(texture), true); if (!*out) return hresult(E_OUTOFMEMORY); }
+        return hresult(hr);
+    }
+    case 66: return hresult(d->GetTextureStageState(a[1], static_cast<D3DTEXTURESTAGESTATETYPE>(a[2]), output<DWORD>(a[3])));
+    case 68: return hresult(d->GetSamplerState(a[1], static_cast<D3DSAMPLERSTATETYPE>(a[2]), output<DWORD>(a[3])));
+    case 70: return hresult(d->ValidateDevice(output<DWORD>(a[1])));
+    // Palette entries contain four bytes, not native pointers or GDI handles.
+    case 71: return hresult(copied_input<PALETTEENTRY>(a[2],[&](auto *p) { return d->SetPaletteEntries(a[1],p); },256));
+    case 72: return hresult(copied_output<PALETTEENTRY>(a[2],[&](auto *p) { return d->GetPaletteEntries(a[1],p); },256));
+    case 73: return hresult(d->SetCurrentTexturePalette(a[1]));
+    case 74: return hresult(d->GetCurrentTexturePalette(output<UINT>(a[1])));
+    case 75: return hresult(copied_input<RECT>(a[1],[&](auto *p) { return d->SetScissorRect(p); }));
+    case 76: return hresult(copied_output<RECT>(a[1],[&](auto *p) { return d->GetScissorRect(p); }));
+    case 77: return hresult(d->SetSoftwareVertexProcessing(a[1]));
+    case 78: return static_cast<uint32_t>(d->GetSoftwareVertexProcessing());
+    case 79: return hresult(d->SetNPatchMode(guest_float(a[1])));
+    case 80: return float_bits(d->GetNPatchMode());
+    case 83: {
+        const uint64_t vertices = primitive_vertices(a[1], a[2]);
+        if (vertices && !a[4]) marshal_error("DrawPrimitiveUP has zero vertex stride");
+        if (a[4] && vertices > UINT32_MAX / a[4])
+            marshal_error("DrawPrimitiveUP vertex count times stride exceeds the PE32 ABI");
+        const HRESULT hr = d->DrawPrimitiveUP(static_cast<D3DPRIMITIVETYPE>(a[1]), a[2], input<uint8_t>(a[3], vertices * a[4]), a[4]);
+        if (SUCCEEDED(hr)) trace_frame_success(false, "DrawPrimitiveUP");
+        return hresult(hr);
+    }
+    case 84: {
+        const uint64_t indices = primitive_vertices(a[1], a[4]);
+        if (a[6] != D3DFMT_INDEX16 && a[6] != D3DFMT_INDEX32) marshal_error("DrawIndexedPrimitiveUP requires INDEX16 or INDEX32 indices");
+        const uint32_t index_bytes = a[6] == D3DFMT_INDEX16 ? 2 : 4;
+        const auto *index_data = input<uint8_t>(a[5], indices * index_bytes);
+        const uint64_t end_vertex = uint64_t{a[2]} + a[3];
+        if (end_vertex > UINT32_MAX || (indices && (!a[8] || !a[3]))) marshal_error("DrawIndexedPrimitiveUP vertex range/stride is invalid");
+        for (uint64_t i = 0; i < indices; ++i) {
+            uint32_t index = 0; std::memcpy(&index, index_data + i * index_bytes, index_bytes);
+            if (index < a[2] || index >= end_vertex) marshal_error("DrawIndexedPrimitiveUP index lies outside MinVertexIndex/NumVertices");
+        }
+        const auto *data = input<uint8_t>(a[7], end_vertex * a[8]);
+        const HRESULT hr = d->DrawIndexedPrimitiveUP(static_cast<D3DPRIMITIVETYPE>(a[1]), a[2], a[3], a[4], index_data, static_cast<D3DFORMAT>(a[6]), data, a[8]);
+        if (SUCCEEDED(hr)) trace_frame_success(false, "DrawIndexedPrimitiveUP");
+        return hresult(hr);
+    }
+    case 85: return hresult(d->ProcessVertices(a[1], a[2], a[3], native_object<IDirect3DVertexBuffer9>(a[4], ObjectKind::VertexBuffer), native_object<IDirect3DVertexDeclaration9>(a[5], ObjectKind::VertexDeclaration, true), a[6]));
+    case 88: return hresult(interface_output<IDirect3DVertexDeclaration9>(a[1], ObjectKind::VertexDeclaration, [&](auto **p) { return d->GetVertexDeclaration(p); }));
+    case 89: return hresult(d->SetFVF(a[1]));
+    case 90: return hresult(d->GetFVF(output<DWORD>(a[1])));
+    case 93: return hresult(interface_output<IDirect3DVertexShader9>(a[1], ObjectKind::VertexShader, [&](auto **p) { return d->GetVertexShader(p); }));
+    case 95: case 97: case 99: case 110: case 112: case 114: {
+        const bool boolean = method == 99 || method == 114;
+        // Native register validation is retained; mapping a checked span first
+        // ensures even an invalid native request cannot access guest host memory.
+        void *data = output<uint32_t>(a[2], uint64_t{a[3]} * (boolean ? 1 : 4));
+        switch (method) {
+        case 95: return hresult(d->GetVertexShaderConstantF(a[1], static_cast<float *>(data), a[3]));
+        case 97: return hresult(d->GetVertexShaderConstantI(a[1], static_cast<int *>(data), a[3]));
+        case 99: return hresult(d->GetVertexShaderConstantB(a[1], static_cast<BOOL *>(data), a[3]));
+        case 110: return hresult(d->GetPixelShaderConstantF(a[1], static_cast<float *>(data), a[3]));
+        case 112: return hresult(d->GetPixelShaderConstantI(a[1], static_cast<int *>(data), a[3]));
+        default: return hresult(d->GetPixelShaderConstantB(a[1], static_cast<BOOL *>(data), a[3]));
+        }
+    }
+    case 101: {
+        auto *offset = output<UINT>(a[3]); auto *stride = output<UINT>(a[4]);
+        return hresult(interface_output<IDirect3DVertexBuffer9>(a[2], ObjectKind::VertexBuffer, [&](auto **p) { return d->GetStreamSource(a[1], p, offset, stride); }));
+    }
+    case 102: return hresult(d->SetStreamSourceFreq(a[1], a[2]));
+    case 103: return hresult(d->GetStreamSourceFreq(a[1], output<UINT>(a[2])));
+    case 105: return hresult(interface_output<IDirect3DIndexBuffer9>(a[1], ObjectKind::IndexBuffer, [&](auto **p) { return d->GetIndices(p); }));
+    case 108: return hresult(interface_output<IDirect3DPixelShader9>(a[1], ObjectKind::PixelShader, [&](auto **p) { return d->GetPixelShader(p); }));
+    case 115: return hresult(d->DrawRectPatch(a[1], input<float>(a[2], 4), input<D3DRECTPATCH_INFO>(a[3], 1, true)));
+    case 116: return hresult(d->DrawTriPatch(a[1], input<float>(a[2], 3), input<D3DTRIPATCH_INFO>(a[3], 1, true)));
+    case 117: return hresult(d->DeletePatch(a[1]));
+    default: marshal_error("unrecognized IDirect3DDevice9 slot " + std::to_string(method));
+    }
 }
 
 uint32_t invoke_device(GuestObject &object, uint32_t method,
@@ -2468,6 +2467,7 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
             GuestObject *texture_object = find_object(args[2], ObjectKind::Texture);
             if (!texture_object)
                 texture_object = find_object(args[2], ObjectKind::CubeTexture);
+            if (!texture_object) texture_object = find_object(args[2], ObjectKind::VolumeTexture);
             if (!texture_object) {
                 set_error("SetTexture received an unregistered 2D/cube texture proxy");
                 return hresult(D3DERR_INVALIDCALL);
@@ -2475,7 +2475,7 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
             if (texture_object->kind == ObjectKind::Texture)
                 texture = static_cast<IDirect3DTexture9 *>(texture_object->native);
             else
-                texture = static_cast<IDirect3DCubeTexture9 *>(texture_object->native);
+                texture = static_cast<IDirect3DBaseTexture9 *>(texture_object->native);
         }
         return hresult(device->SetTexture(args[1], texture));
     }
@@ -2629,129 +2629,7 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
                 static_cast<const BOOL *>(data), args[3]));
         }
     }
-    std::ostringstream message;
-    message << "IDirect3DDevice9 method " << method
-            << " is not implemented; no guest device/frame success is implied";
-    set_error(message.str());
-    return hresult(D3DERR_NOTAVAILABLE);
-}
-
-uint32_t invoke_pixel_shader(GuestObject &object, uint32_t method,
-                             const uint32_t *args, uint32_t argc)
-{
-    const std::string prefix = interface_name(object.kind);
-    if (method == 0) {
-        if (!require_count(argc, 3, (prefix + "::QueryInterface").c_str()))
-            return hresult(D3DERR_INVALIDCALL);
-        uint32_t output = 0;
-        return hresult(do_query_interface(object, args, &output));
-    }
-    if (method == 1) {
-        if (!require_count(argc, 1, (prefix + "::AddRef").c_str())) return 0;
-        ++object.guest_references;
-        object.native->AddRef();
-        return object.guest_references;
-    }
-    if (method == 2) {
-        if (!require_count(argc, 1, (prefix + "::Release").c_str())) return 0;
-        if (!object.guest_references) {
-            set_error(prefix + "::Release called with zero guest references");
-            return 0;
-        }
-        IUnknown *native = object.native;
-        const uint32_t guest_address = args[0];
-        native->Release();
-        const uint32_t guest_count = --object.guest_references;
-        if (!guest_count) {
-            GuestObject retired = object;
-            g_guest_by_native.erase(native);
-            g_objects.erase(guest_address);
-            free_guest_object(guest_address, retired);
-        }
-        return guest_count;
-    }
-    set_error(prefix + " method is not implemented");
-    return hresult(D3DERR_NOTAVAILABLE);
-}
-
-uint32_t invoke_surface(GuestObject &object, uint32_t method,
-                        const uint32_t *args, uint32_t argc)
-{
-    if (method == 0) {
-        if (!require_count(argc, 3, "IDirect3DSurface9::QueryInterface"))
-            return hresult(D3DERR_INVALIDCALL);
-        uint32_t output = 0;
-        return hresult(do_query_interface(object, args, &output));
-    }
-    if (method == 3) {
-        if (!require_count(argc, 2, "IDirect3DSurface9::GetDevice"))
-            return hresult(D3DERR_INVALIDCALL);
-        auto *output = static_cast<uint32_t *>(guest_memory(
-            args[1], sizeof(uint32_t), AC1_D3D9_GUEST_WRITE));
-        if (!output) {
-            set_error("IDirect3DSurface9::GetDevice output pointer is unmapped");
-            return hresult(D3DERR_INVALIDCALL);
-        }
-        *output = 0;
-        IDirect3DDevice9 *native_device = nullptr;
-        const HRESULT status = static_cast<IDirect3DSurface9 *>(object.native)->GetDevice(
-            &native_device);
-        if (FAILED(status)) return hresult(status);
-        if (!native_device) {
-            set_error("IDirect3DSurface9::GetDevice succeeded without returning a device");
-            return hresult(E_FAIL);
-        }
-        const uint32_t guest_device = wrap_native(
-            static_cast<IUnknown *>(native_device), ObjectKind::Device, true);
-        if (!guest_device) return hresult(E_OUTOFMEMORY);
-        *output = guest_device;
-        return hresult(status);
-    }
-    if (method == 1) {
-        if (!require_count(argc, 1, "IDirect3DSurface9::AddRef")) return 0;
-        ++object.guest_references;
-        object.native->AddRef();
-        return object.guest_references;
-    }
-    if (method == 2) {
-        if (!require_count(argc, 1, "IDirect3DSurface9::Release")) return 0;
-        if (!object.guest_references) {
-            set_error("IDirect3DSurface9::Release called with zero guest references");
-            return 0;
-        }
-        IUnknown *native = object.native;
-        const uint32_t guest_address = args[0];
-        native->Release();
-        const uint32_t guest_count = --object.guest_references;
-        if (guest_count == 0) {
-            GuestObject retired = object;
-            g_guest_by_native.erase(native);
-            g_objects.erase(guest_address);
-            free_guest_object(guest_address, retired);
-        }
-        return guest_count;
-    }
-    if (method == 12) {
-        if (!require_count(argc, 2, "IDirect3DSurface9::GetDesc"))
-            return hresult(D3DERR_INVALIDCALL);
-        auto *output = static_cast<D3DSURFACE_DESC *>(guest_memory(
-            args[1], sizeof(D3DSURFACE_DESC), AC1_D3D9_GUEST_WRITE));
-        if (!output) {
-            set_error("IDirect3DSurface9::GetDesc output is unmapped");
-            return hresult(D3DERR_INVALIDCALL);
-        }
-        D3DSURFACE_DESC description{};
-        const HRESULT status = static_cast<IDirect3DSurface9 *>(object.native)->GetDesc(
-            &description);
-        if (SUCCEEDED(status)) std::memcpy(output, &description, sizeof(description));
-        return hresult(status);
-    }
-
-    std::ostringstream message;
-    message << "IDirect3DSurface9 method " << method
-            << " is not implemented; no surface success is implied";
-    set_error(message.str());
-    return hresult(D3DERR_NOTAVAILABLE);
+    return invoke_remaining_device(object, method, args);
 }
 
 void clear_buffer_lock(GuestObject &object)
@@ -2784,7 +2662,7 @@ void abandon_buffer_lock(GuestObject &object)
         return;
     if (object.buffer_lock_native_pointer && object.buffer_lock_guest_address &&
         object.buffer_lock_size &&
-        object.buffer_lock_flags != D3DLOCK_READONLY) {
+        (object.buffer_lock_flags & D3DLOCK_READONLY) == 0) {
         void *staging = guest_memory(object.buffer_lock_guest_address,
                                      object.buffer_lock_size,
                                      AC1_D3D9_GUEST_READ);
@@ -2855,13 +2733,11 @@ HRESULT lock_guest_buffer(GuestObject &object, const uint32_t *args, uint32_t ar
     }
 
     const uint32_t flags = args[4];
-    const bool discard = flags == D3DLOCK_DISCARD;
-    const bool read_only = flags == D3DLOCK_READONLY;
-    if (flags != 0u && flags != D3DLOCK_NOOVERWRITE &&
-        !discard && !read_only) {
+    const bool discard = (flags & D3DLOCK_DISCARD) != 0;
+    if (!supports_guest_buffer_lock_flags(flags)) {
         std::ostringstream message;
         message << name << " flags 0x" << std::hex << flags
-                << " are outside the supported none/NOOVERWRITE/DISCARD/READONLY profile";
+                << " are outside the D3D9 lock flag mask";
         set_error(message.str());
         return D3DERR_INVALIDCALL;
     }
@@ -2929,7 +2805,7 @@ HRESULT unlock_guest_buffer(GuestObject &object, uint32_t argc)
         return D3DERR_INVALIDCALL;
     }
 
-    const bool read_only = object.buffer_lock_flags == D3DLOCK_READONLY;
+    const bool read_only = (object.buffer_lock_flags & D3DLOCK_READONLY) != 0;
     if (!read_only) {
         void *staging = guest_memory(object.buffer_lock_guest_address,
                                      object.buffer_lock_size,
@@ -3039,38 +2915,19 @@ uint32_t invoke_query(GuestObject &object, uint32_t method,
         if (!require_count(argc, 2, "IDirect3DQuery9::Issue"))
             return hresult(D3DERR_INVALIDCALL);
         if (args[1] != D3DISSUE_BEGIN && args[1] != D3DISSUE_END) {
-            set_error("IDirect3DQuery9::Issue supports only observed BEGIN/END flags");
+            set_error("IDirect3DQuery9::Issue requires BEGIN or END flags");
             return hresult(D3DERR_INVALIDCALL);
         }
         return hresult(query->Issue(args[1]));
     }
     if (method == 7) {
-        if (!require_count(argc, 4, "IDirect3DQuery9::GetData"))
-            return hresult(D3DERR_INVALIDCALL);
-        if (args[3] != 0u && args[3] != D3DGETDATA_FLUSH) {
-            set_error("IDirect3DQuery9::GetData supports only the observed no-flush/FLUSH flags");
-            return hresult(D3DERR_INVALIDCALL);
-        }
-        DWORD data = 0;
-        void *native_output = nullptr;
-        if (args[1]) {
-            if (args[2] != sizeof(data)) {
-                set_error("occlusion query GetData supports only one checked DWORD result");
-                return hresult(D3DERR_INVALIDCALL);
-            }
-            if (!guest_memory(args[1], sizeof(data), AC1_D3D9_GUEST_WRITE)) {
-                set_error("IDirect3DQuery9::GetData output DWORD is unmapped");
-                return hresult(D3DERR_INVALIDCALL);
-            }
-            native_output = &data;
-        }
-        const HRESULT status = query->GetData(native_output, args[2], args[3]);
-        if (status == S_OK && args[1] &&
-            !guest_write(args[1], &data, sizeof(data))) {
-            set_error("IDirect3DQuery9::GetData output became unmapped");
+        const uint32_t expected = query->GetDataSize();
+        if (args[1] && args[2] != expected) {
+            set_error("IDirect3DQuery9::GetData size differs from native GetDataSize");
             return hresult(D3DERR_INVALIDCALL);
         }
-        return hresult(status);
+        void *data = args[1] ? output<uint8_t>(args[1], args[2]) : nullptr;
+        return hresult(query->GetData(data,args[2],args[3]));
     }
     set_error("IDirect3DQuery9 method is not implemented");
     return hresult(D3DERR_NOTAVAILABLE);
@@ -3119,77 +2976,439 @@ uint32_t invoke_vertex_declaration(GuestObject &object, uint32_t method,
     return hresult(D3DERR_NOTAVAILABLE);
 }
 
-uint32_t invoke_texture(GuestObject &object, uint32_t method,
-                        const uint32_t *args, uint32_t argc)
+struct UnsupportedMarshal : MarshalError {};
+[[noreturn]] void unsupported(const std::string &message)
 {
-    const char *name = interface_name(object.kind);
-    if (method == 0) {
-        if (!require_count(argc, 3, "IDirect3D texture::QueryInterface"))
-            return hresult(D3DERR_INVALIDCALL);
-        uint32_t output = 0;
-        return hresult(do_query_interface(object, args, &output));
+    set_error(message);
+    throw UnsupportedMarshal{};
+}
+struct StagedLock {
+    void *native_bits = nullptr;
+    uint32_t guest_bits = 0, size = 0, pitch = 0, slice = 0;
+    uint32_t row_bytes = 0, rows = 0, slices = 0, flags = 0;
+};
+std::map<TextureLockKey, StagedLock> g_staged_locks;
+// The native private-data store owns its IUnknown references. This table only
+// remembers the interface ABI needed to translate their pointer-sized payloads.
+std::map<IUnknown *, std::map<std::string, ObjectKind>> g_private_interfaces;
+
+struct FormatLayout { uint32_t width, height, bytes; };
+FormatLayout format_layout(D3DFORMAT format)
+{
+    switch (format) {
+    case D3DFMT_DXT1: return {4,4,8};
+    case D3DFMT_DXT2: case D3DFMT_DXT3: case D3DFMT_DXT4: case D3DFMT_DXT5: return {4,4,16};
+    case D3DFMT_UYVY: case D3DFMT_YUY2: case D3DFMT_R8G8_B8G8: case D3DFMT_G8R8_G8B8: return {2,1,4};
+    case D3DFMT_R3G3B2: case D3DFMT_A8: case D3DFMT_P8: case D3DFMT_L8: case D3DFMT_A4L4: return {1,1,1};
+    case D3DFMT_R5G6B5: case D3DFMT_X1R5G5B5: case D3DFMT_A1R5G5B5:
+    case D3DFMT_A4R4G4B4: case D3DFMT_A8R3G3B2: case D3DFMT_X4R4G4B4:
+    case D3DFMT_A8P8: case D3DFMT_A8L8: case D3DFMT_V8U8: case D3DFMT_L6V5U5:
+    case D3DFMT_L16: case D3DFMT_R16F: case D3DFMT_CxV8U8:
+    case D3DFMT_D16: case D3DFMT_D16_LOCKABLE: case D3DFMT_D15S1: return {1,1,2};
+    case D3DFMT_R8G8B8: return {1,1,3};
+    case D3DFMT_A8R8G8B8: case D3DFMT_X8R8G8B8: case D3DFMT_A8B8G8R8:
+    case D3DFMT_X8B8G8R8: case D3DFMT_A2B10G10R10: case D3DFMT_A2R10G10B10:
+    case D3DFMT_G16R16: case D3DFMT_Q8W8V8U8: case D3DFMT_V16U16:
+    case D3DFMT_X8L8V8U8: case D3DFMT_A2W10V10U10: case D3DFMT_G16R16F:
+    case D3DFMT_R32F: case D3DFMT_D32: case D3DFMT_D24S8: case D3DFMT_D24X8:
+    case D3DFMT_D24X4S4: case D3DFMT_D32F_LOCKABLE: case D3DFMT_D24FS8: return {1,1,4};
+    case D3DFMT_A16B16G16R16: case D3DFMT_Q16W16V16U16:
+    case D3DFMT_A16B16G16R16F: case D3DFMT_G32R32F: return {1,1,8};
+    case D3DFMT_A32B32G32R32F: return {1,1,16};
+    default: unsupported("lock staging cannot derive the byte layout of D3DFORMAT " + std::to_string(static_cast<uint32_t>(format)));
     }
-    if (method == 1) {
-        if (!require_count(argc, 1, "IDirect3D texture::AddRef")) return 0;
-        ++object.guest_references;
-        object.native->AddRef();
-        return object.guest_references;
+}
+
+HRESULT unlock_staged_native(GuestObject &object, const TextureLockKey &key)
+{
+    switch (object.kind) {
+    case ObjectKind::Surface: return static_cast<IDirect3DSurface9 *>(object.native)->UnlockRect();
+    case ObjectKind::Texture: return static_cast<IDirect3DTexture9 *>(object.native)->UnlockRect(key.level);
+    case ObjectKind::CubeTexture: return static_cast<IDirect3DCubeTexture9 *>(object.native)->UnlockRect(static_cast<D3DCUBEMAP_FACES>(key.face), key.level);
+    case ObjectKind::VolumeTexture: return static_cast<IDirect3DVolumeTexture9 *>(object.native)->UnlockBox(key.level);
+    case ObjectKind::Volume: return static_cast<IDirect3DVolume9 *>(object.native)->UnlockBox();
+    default: return D3DERR_INVALIDCALL;
     }
-    if (method == 2) {
-        if (!require_count(argc, 1, "IDirect3D texture::Release")) return 0;
-        if (!object.guest_references) {
-            set_error(std::string(name) + "::Release called with zero guest references");
-            return 0;
+}
+bool copy_staged(const StagedLock &lock, bool to_native)
+{
+    if (to_native && (lock.flags & D3DLOCK_READONLY)) return true;
+    auto *guest = static_cast<uint8_t *>(guest_memory(lock.guest_bits, lock.size,
+        to_native ? AC1_D3D9_GUEST_READ : AC1_D3D9_GUEST_WRITE));
+    if (!guest) { set_error("lock staging buffer is unmapped during copy"); return false; }
+    for (uint32_t z = 0; z < lock.slices; ++z)
+        for (uint32_t y = 0; y < lock.rows; ++y) {
+            const size_t offset = size_t{z} * lock.slice + size_t{y} * lock.pitch;
+            auto *native = static_cast<uint8_t *>(lock.native_bits) + offset;
+            if (to_native) std::memcpy(native, guest + offset, lock.row_bytes);
+            else std::memcpy(guest + offset, native, lock.row_bytes);
         }
-        IUnknown *native = object.native;
-        const uint32_t guest_address = args[0];
-        const uint32_t guest_count = object.guest_references - 1;
-        if (!guest_count && object.kind == ObjectKind::Texture)
-            discard_texture_locks(guest_address,
-                static_cast<IDirect3DTexture9 *>(object.native));
-        if (!guest_count && object.kind == ObjectKind::CubeTexture)
-            discard_cube_texture_locks(guest_address,
-                static_cast<IDirect3DCubeTexture9 *>(object.native));
-        native->Release();
-        object.guest_references = guest_count;
-        if (!guest_count) {
-            GuestObject retired = object;
-            g_guest_by_native.erase(native);
-            g_objects.erase(guest_address);
-            free_guest_object(guest_address, retired);
+    return true;
+}
+HRESULT unlock_staged(GuestObject &object, const TextureLockKey &key)
+{
+    const auto it = g_staged_locks.find(key);
+    if (it == g_staged_locks.end()) { set_error("UnlockRect/UnlockBox has no matching guest lock"); return D3DERR_INVALIDCALL; }
+    // Keep a lock available for retry when guest memory could not be read.
+    if (!copy_staged(it->second, true)) return D3DERR_INVALIDCALL;
+    const HRESULT hr = unlock_staged_native(object, key);
+    g_callbacks.guest_free(g_context, it->second.guest_bits);
+    g_staged_locks.erase(it);
+    return hr;
+}
+void discard_staged_locks(uint32_t address, GuestObject &object)
+{
+    auto it = g_staged_locks.lower_bound({address,0,0});
+    while (it != g_staged_locks.end() && it->first.guest_texture == address) {
+        copy_staged(it->second, true);
+        unlock_staged_native(object, it->first);
+        g_callbacks.guest_free(g_context, it->second.guest_bits);
+        it = g_staged_locks.erase(it);
+    }
+}
+
+HRESULT lock_staged(GuestObject &object, uint32_t address, uint32_t face,
+                    uint32_t level, uint32_t out_address, uint32_t region_address,
+                    uint32_t flags, bool volume)
+{
+    const TextureLockKey key{address, face, level};
+    if (g_staged_locks.count(key)) { set_error("duplicate LockRect/LockBox for the same subresource"); return D3DERR_INVALIDCALL; }
+    void *out = output<uint8_t>(out_address, volume ? sizeof(GuestLockedBox) : sizeof(GuestLockedRect));
+    // Validate guest pointers before invoking any provider method.
+    if (region_address) {
+        if (volume) input<D3DBOX>(region_address);
+        else input<RECT>(region_address);
+    }
+    if (object.kind == ObjectKind::CubeTexture && face > D3DCUBEMAP_FACE_NEGATIVE_Z)
+        return D3DERR_INVALIDCALL;
+    D3DFORMAT format;
+    uint32_t width, height, depth = 1;
+    HRESULT hr;
+    if (volume) {
+        D3DVOLUME_DESC desc{};
+        hr = object.kind == ObjectKind::Volume
+            ? static_cast<IDirect3DVolume9 *>(object.native)->GetDesc(&desc)
+            : static_cast<IDirect3DVolumeTexture9 *>(object.native)->GetLevelDesc(level, &desc);
+        format = desc.Format; width = desc.Width; height = desc.Height; depth = desc.Depth;
+    } else {
+        D3DSURFACE_DESC desc{};
+        if (object.kind == ObjectKind::Surface) hr = static_cast<IDirect3DSurface9 *>(object.native)->GetDesc(&desc);
+        else if (object.kind == ObjectKind::Texture) hr = static_cast<IDirect3DTexture9 *>(object.native)->GetLevelDesc(level, &desc);
+        else hr = static_cast<IDirect3DCubeTexture9 *>(object.native)->GetLevelDesc(level, &desc);
+        format = desc.Format; width = desc.Width; height = desc.Height;
+    }
+    if (FAILED(hr)) return hr;
+    const auto layout = format_layout(format);
+    RECT rect{}; D3DBOX box{};
+    const RECT *rect_ptr = nullptr; const D3DBOX *box_ptr = nullptr;
+    uint32_t left = 0, top = 0;
+    if (region_address) {
+        if (volume) {
+            std::memcpy(&box,input<D3DBOX>(region_address),sizeof(box)); box_ptr = &box;
+            if (box.Left >= box.Right || box.Top >= box.Bottom || box.Front >= box.Back ||
+                box.Right > width || box.Bottom > height || box.Back > depth)
+                marshal_error("LockBox region is outside its volume dimensions");
+            left = box.Left; top = box.Top;
+            width = box.Right - box.Left; height = box.Bottom - box.Top; depth = box.Back - box.Front;
+        } else {
+            std::memcpy(&rect,input<RECT>(region_address),sizeof(rect)); rect_ptr = &rect;
+            if (rect.left < 0 || rect.top < 0 || rect.right <= rect.left || rect.bottom <= rect.top ||
+                static_cast<uint32_t>(rect.right) > width || static_cast<uint32_t>(rect.bottom) > height)
+                marshal_error("LockRect region is outside its surface dimensions");
+            left = rect.left; top = rect.top;
+            width = rect.right - rect.left; height = rect.bottom - rect.top;
         }
-        return guest_count;
     }
-    if (object.kind == ObjectKind::CubeTexture) {
-        auto *cube = static_cast<IDirect3DCubeTexture9 *>(object.native);
-        if (method == 19) {
-            if (!require_count(argc, 6, "IDirect3DCubeTexture9::LockRect"))
-                return hresult(D3DERR_INVALIDCALL);
-            return hresult(lock_cube_texture_rect(args[0], cube, args));
+    if (left % layout.width || top % layout.height)
+        marshal_error("lock region origin is not aligned to its format block");
+    const uint64_t row_bytes = ((uint64_t{width} + layout.width - 1) / layout.width) * layout.bytes;
+    const uint32_t rows = static_cast<uint32_t>((uint64_t{height} + layout.height - 1) / layout.height);
+    D3DLOCKED_RECT lr{}; D3DLOCKED_BOX lb{};
+    if (volume) {
+        hr = object.kind == ObjectKind::Volume
+            ? static_cast<IDirect3DVolume9 *>(object.native)->LockBox(&lb, box_ptr, flags)
+            : static_cast<IDirect3DVolumeTexture9 *>(object.native)->LockBox(level, &lb, box_ptr, flags);
+    } else if (object.kind == ObjectKind::Surface)
+        hr = static_cast<IDirect3DSurface9 *>(object.native)->LockRect(&lr, rect_ptr, flags);
+    else if (object.kind == ObjectKind::Texture)
+        hr = static_cast<IDirect3DTexture9 *>(object.native)->LockRect(level, &lr, rect_ptr, flags);
+    else hr = static_cast<IDirect3DCubeTexture9 *>(object.native)->LockRect(static_cast<D3DCUBEMAP_FACES>(face), level, &lr, rect_ptr, flags);
+    if (FAILED(hr)) return hr;
+    uint32_t allocation = 0;
+    try {
+        const int pitch = volume ? lb.RowPitch : lr.Pitch;
+        const uint64_t slice = volume && lb.SlicePitch > 0 ? static_cast<uint32_t>(lb.SlicePitch) : uint64_t{static_cast<uint32_t>(pitch)} * rows;
+        void *bits = volume ? lb.pBits : lr.pBits;
+        const uint64_t size = slice * depth;
+        if (!bits || pitch <= 0 || row_bytes > static_cast<uint32_t>(pitch) ||
+            (volume && lb.SlicePitch <= 0) || slice < uint64_t{static_cast<uint32_t>(pitch)} * rows ||
+            !size || size > UINT32_MAX || slice > UINT32_MAX)
+            marshal_error("native lock returned null bits, invalid pitch, or a span exceeding the PE32 ABI");
+        allocation = g_callbacks.guest_alloc(g_context, static_cast<uint32_t>(size), 4);
+        if (!allocation) throw std::bad_alloc{};
+        StagedLock lock{bits, allocation, static_cast<uint32_t>(size), static_cast<uint32_t>(pitch),
+            static_cast<uint32_t>(slice), static_cast<uint32_t>(row_bytes), rows, depth, flags};
+        std::memset(output<uint8_t>(allocation, size), 0, static_cast<size_t>(size));
+        if (!(flags & D3DLOCK_DISCARD) && !copy_staged(lock, false)) marshal_error(g_last_error);
+        g_staged_locks.emplace(key, lock);
+        if (volume) {
+            const GuestLockedBox guest{pitch,static_cast<int32_t>(slice),allocation};
+            std::memcpy(out,&guest,sizeof(guest));
+        } else {
+            const GuestLockedRect guest{pitch,allocation};
+            std::memcpy(out,&guest,sizeof(guest));
         }
-        if (method == 20) {
-            if (!require_count(argc, 3, "IDirect3DCubeTexture9::UnlockRect"))
-                return hresult(D3DERR_INVALIDCALL);
-            return hresult(unlock_cube_texture_rect(args[0], cube,
-                                                     args[1], args[2]));
+    } catch (...) {
+        if (allocation) g_callbacks.guest_free(g_context, allocation);
+        unlock_staged_native(object, key);
+        throw;
+    }
+    return hr;
+}
+
+bool is_resource(ObjectKind kind)
+{
+    return kind == ObjectKind::Surface || kind == ObjectKind::Texture ||
+        kind == ObjectKind::CubeTexture || kind == ObjectKind::VolumeTexture ||
+        kind == ObjectKind::VertexBuffer || kind == ObjectKind::IndexBuffer;
+}
+
+// Container IUnknown/BaseTexture/Resource requests are probed for a concrete
+// supported interface before wrapping, so all paths preserve proxy identity.
+uint32_t wrap_container(IUnknown *native)
+{
+    auto existing = g_guest_by_native.find(native);
+    if (existing != g_guest_by_native.end())
+        return wrap_native(native, g_objects.at(existing->second).kind, true);
+    struct Candidate { const GUID *iid; ObjectKind kind; };
+    const Candidate candidates[] = {
+        {&kIidIDirect3DTexture9,ObjectKind::Texture}, {&kIidIDirect3DCubeTexture9,ObjectKind::CubeTexture},
+        {&kIidIDirect3DVolumeTexture9,ObjectKind::VolumeTexture}, {&kIidIDirect3DSwapChain9,ObjectKind::SwapChain},
+        {&kIidIDirect3DDevice9,ObjectKind::Device}, {&kIidIDirect3D9,ObjectKind::D3D9},
+        {&kIidIDirect3DSurface9,ObjectKind::Surface}, {&kIidIDirect3DVolume9,ObjectKind::Volume},
+        {&kIidIDirect3DVertexBuffer9,ObjectKind::VertexBuffer}, {&kIidIDirect3DIndexBuffer9,ObjectKind::IndexBuffer}
+    };
+    for (const auto &candidate : candidates) {
+        void *concrete = nullptr;
+        if (SUCCEEDED(native->QueryInterface(*candidate.iid, &concrete)) && concrete) {
+            native->Release();
+            return wrap_native(static_cast<IUnknown *>(concrete), candidate.kind, true);
         }
-        set_error("IDirect3DCubeTexture9 method is not implemented");
-        return hresult(D3DERR_NOTAVAILABLE);
     }
-    if (method == 19) {
-        if (!require_count(argc, 5, "IDirect3DTexture9::LockRect"))
-            return hresult(D3DERR_INVALIDCALL);
-        return hresult(lock_texture_rect(args[0],
-            static_cast<IDirect3DTexture9 *>(object.native), args));
+    native->Release();
+    unsupported("GetContainer returned a native interface with no supported guest proxy kind");
+}
+
+template <typename T>
+uint32_t private_data(T *native, uint32_t method, const uint32_t *a)
+{
+    GUID guid{}; std::memcpy(&guid,input<GUID>(a[1]),sizeof(guid));
+    const std::string key(reinterpret_cast<const char *>(&guid), sizeof(guid));
+    IUnknown *identity = native;
+    auto &records = g_private_interfaces[identity];
+    if (method == 4) {
+        const void *data;
+        uint32_t size = a[3];
+        ObjectKind kind = ObjectKind::D3D9;
+        if (a[4] & D3DSPD_IUNKNOWN) {
+            const auto it = g_objects.find(a[2]);
+            if (size != 4 || it == g_objects.end()) marshal_error("SetPrivateData IUNKNOWN requires a guest proxy and PE32 pointer size 4");
+            data = it->second.native; size = sizeof(IUnknown *); kind = it->second.kind;
+        } else data = input<uint8_t>(a[2], size);
+        const HRESULT hr = native->SetPrivateData(guid, data, size, a[4]);
+        if (SUCCEEDED(hr)) {
+            if (a[4] & D3DSPD_IUNKNOWN) records[key] = kind;
+            else records.erase(key);
+        }
+        return hresult(hr);
     }
-    if (method == 20) {
-        if (!require_count(argc, 2, "IDirect3DTexture9::UnlockRect"))
-            return hresult(D3DERR_INVALIDCALL);
-        return hresult(unlock_texture_rect(args[0],
-            static_cast<IDirect3DTexture9 *>(object.native), args[1]));
+    if (method == 6) {
+        const HRESULT hr = native->FreePrivateData(guid);
+        if (SUCCEEDED(hr)) records.erase(key);
+        return hresult(hr);
     }
-    set_error("IDirect3DTexture9 method is not implemented");
-    return hresult(D3DERR_NOTAVAILABLE);
+    const DWORD requested = *input<DWORD>(a[3]);
+    auto *size_out = output<DWORD>(a[3]);
+    const auto record = records.find(key);
+    if (record != records.end()) {
+        *size_out = 4;
+        if (!a[2] || requested < 4) return hresult(D3DERR_MOREDATA);
+        auto *out = output<uint32_t>(a[2]);
+        DWORD size = sizeof(IUnknown *); IUnknown *value = nullptr;
+        const HRESULT hr = native->GetPrivateData(guid, &value, &size);
+        if (SUCCEEDED(hr)) {
+            *out = wrap_native(value, record->second, true);
+            if (value && !*out) return hresult(E_OUTOFMEMORY);
+        }
+        return hresult(hr);
+    }
+    void *data = a[2] ? output<uint8_t>(a[2], requested) : nullptr;
+    DWORD size = requested;
+    const HRESULT hr = native->GetPrivateData(guid, data, &size);
+    *size_out = size;
+    return hresult(hr);
+}
+
+bool invoke_resource_extension(GuestObject &object, uint32_t method,
+                               const uint32_t *a, uint32_t *result)
+{
+    auto finish = [&](HRESULT status) { *result = hresult(status); return true; };
+    if (method == 3 && object.kind != ObjectKind::Device && object.kind != ObjectKind::D3D9 &&
+        object.kind != ObjectKind::ConstantTable && object.kind != ObjectKind::SwapChain) {
+        return finish(interface_output<IDirect3DDevice9>(a[1], ObjectKind::Device, [&](auto **out) {
+            switch (object.kind) {
+            case ObjectKind::VertexDeclaration: return static_cast<IDirect3DVertexDeclaration9 *>(object.native)->GetDevice(out);
+            case ObjectKind::PixelShader: return static_cast<IDirect3DPixelShader9 *>(object.native)->GetDevice(out);
+            case ObjectKind::VertexShader: return static_cast<IDirect3DVertexShader9 *>(object.native)->GetDevice(out);
+            case ObjectKind::Query: return static_cast<IDirect3DQuery9 *>(object.native)->GetDevice(out);
+            case ObjectKind::Volume: return static_cast<IDirect3DVolume9 *>(object.native)->GetDevice(out);
+            case ObjectKind::StateBlock: return static_cast<IDirect3DStateBlock9 *>(object.native)->GetDevice(out);
+            default: return static_cast<IDirect3DResource9 *>(object.native)->GetDevice(out);
+            }
+        }));
+    }
+    if (is_resource(object.kind) || object.kind == ObjectKind::Volume) {
+        if (method >= 4 && method <= 6) {
+            *result = object.kind == ObjectKind::Volume ? private_data(static_cast<IDirect3DVolume9 *>(object.native), method, a)
+                : private_data(static_cast<IDirect3DResource9 *>(object.native), method, a);
+            return true;
+        }
+        if (object.kind != ObjectKind::Volume && method >= 7 && method <= 10) {
+            auto *resource = static_cast<IDirect3DResource9 *>(object.native);
+            switch (method) {
+            case 7: *result = resource->SetPriority(a[1]); break;
+            case 8: *result = resource->GetPriority(); break;
+            case 9: resource->PreLoad(); *result = 0; break;
+            case 10: *result = static_cast<uint32_t>(resource->GetType()); break;
+            }
+            return true;
+        }
+    }
+    if ((object.kind == ObjectKind::Surface && method == 11) ||
+        (object.kind == ObjectKind::Volume && method == 7)) {
+        GUID guid{}; std::memcpy(&guid,input<GUID>(a[1]),sizeof(guid));
+        auto *out = output<uint32_t>(a[2]); *out = 0;
+        // An arbitrary provider extension cannot escape as a native pointer.
+        bool supported = false;
+        for (uint32_t kind = 1; kind <= kSwapChainKind; ++kind)
+            if (kind != kConstantTableKind && bridge_supports_iid(static_cast<ObjectKind>(kind), guid)) supported = true;
+        if (!supported) unsupported("GetContainer requested an IID with no supported guest proxy");
+        void *native = nullptr;
+        const HRESULT hr = object.kind == ObjectKind::Surface
+            ? static_cast<IDirect3DSurface9 *>(object.native)->GetContainer(guid, &native)
+            : static_cast<IDirect3DVolume9 *>(object.native)->GetContainer(guid, &native);
+        if (SUCCEEDED(hr) && native) { *out = wrap_container(static_cast<IUnknown *>(native)); if (!*out) return finish(E_OUTOFMEMORY); }
+        else if (native) static_cast<IUnknown *>(native)->Release();
+        return finish(hr);
+    }
+    if (object.kind == ObjectKind::Surface) {
+        if (method == 13) return finish(lock_staged(object,a[0],0,0,a[1],a[2],a[3],false));
+        if (method == 14) return finish(unlock_staged(object,{a[0],0,0}));
+        if (method == 15 || method == 16) unsupported("IDirect3DSurface9::GetDC/ReleaseDC requires a guest HDC mapping callback; none is defined in ac1_d3d9_callbacks");
+    }
+    if ((object.kind == ObjectKind::VertexBuffer || object.kind == ObjectKind::IndexBuffer) && method == 13) {
+        return finish(object.kind == ObjectKind::VertexBuffer
+            ? copied_output<D3DVERTEXBUFFER_DESC>(a[1],[&](auto *p) { return static_cast<IDirect3DVertexBuffer9 *>(object.native)->GetDesc(p); })
+            : copied_output<D3DINDEXBUFFER_DESC>(a[1],[&](auto *p) { return static_cast<IDirect3DIndexBuffer9 *>(object.native)->GetDesc(p); }));
+    }
+    if ((object.kind == ObjectKind::PixelShader || object.kind == ObjectKind::VertexShader) && method == 4) {
+        UINT size = *input<UINT>(a[2]); auto *size_out = output<UINT>(a[2]);
+        void *data = a[1] ? output<uint8_t>(a[1], size) : nullptr;
+        const HRESULT hr = object.kind == ObjectKind::PixelShader
+            ? static_cast<IDirect3DPixelShader9 *>(object.native)->GetFunction(data, &size)
+            : static_cast<IDirect3DVertexShader9 *>(object.native)->GetFunction(data, &size);
+        *size_out = size; return finish(hr);
+    }
+    if (object.kind == ObjectKind::Texture || object.kind == ObjectKind::CubeTexture || object.kind == ObjectKind::VolumeTexture) {
+        auto *base = static_cast<IDirect3DBaseTexture9 *>(object.native);
+        switch (method) {
+        case 11: *result = base->SetLOD(a[1]); return true;
+        case 12: *result = base->GetLOD(); return true;
+        case 13: *result = base->GetLevelCount(); return true;
+        case 14: return finish(base->SetAutoGenFilterType(static_cast<D3DTEXTUREFILTERTYPE>(a[1])));
+        case 15: *result = static_cast<uint32_t>(base->GetAutoGenFilterType()); return true;
+        case 16: base->GenerateMipSubLevels(); *result = 0; return true;
+        }
+        if (object.kind == ObjectKind::Texture) {
+            auto *texture = static_cast<IDirect3DTexture9 *>(object.native);
+            if (method == 17) return finish(copied_output<D3DSURFACE_DESC>(a[2],[&](auto *p) { return texture->GetLevelDesc(a[1],p); }));
+            if (method == 18) return finish(interface_output<IDirect3DSurface9>(a[2],ObjectKind::Surface,[&](auto **out) { return texture->GetSurfaceLevel(a[1],out); }));
+            if (method == 19) return finish(lock_staged(object,a[0],0,a[1],a[2],a[3],a[4],false));
+            if (method == 20) return finish(unlock_staged(object,{a[0],0,a[1]}));
+            if (method == 21) return finish(texture->AddDirtyRect(input<RECT>(a[1],1,true)));
+        } else if (object.kind == ObjectKind::CubeTexture) {
+            auto *texture = static_cast<IDirect3DCubeTexture9 *>(object.native);
+            if (method == 17) return finish(copied_output<D3DSURFACE_DESC>(a[2],[&](auto *p) { return texture->GetLevelDesc(a[1],p); }));
+            if (method == 18) return finish(interface_output<IDirect3DSurface9>(a[3],ObjectKind::Surface,[&](auto **out) { return texture->GetCubeMapSurface(static_cast<D3DCUBEMAP_FACES>(a[1]),a[2],out); }));
+            if (method == 19) return finish(lock_staged(object,a[0],a[1],a[2],a[3],a[4],a[5],false));
+            if (method == 20) return finish(unlock_staged(object,{a[0],a[1],a[2]}));
+            if (method == 21) return finish(texture->AddDirtyRect(static_cast<D3DCUBEMAP_FACES>(a[1]),input<RECT>(a[2],1,true)));
+        } else {
+            auto *texture = static_cast<IDirect3DVolumeTexture9 *>(object.native);
+            if (method == 17) return finish(copied_output<D3DVOLUME_DESC>(a[2],[&](auto *p) { return texture->GetLevelDesc(a[1],p); }));
+            if (method == 18) return finish(interface_output<IDirect3DVolume9>(a[2],ObjectKind::Volume,[&](auto **out) { return texture->GetVolumeLevel(a[1],out); }));
+            if (method == 19) return finish(lock_staged(object,a[0],0,a[1],a[2],a[3],a[4],true));
+            if (method == 20) return finish(unlock_staged(object,{a[0],0,a[1]}));
+            if (method == 21) return finish(texture->AddDirtyBox(input<D3DBOX>(a[1],1,true)));
+        }
+    }
+    if (object.kind == ObjectKind::Volume) {
+        auto *volume = static_cast<IDirect3DVolume9 *>(object.native);
+        if (method == 8) return finish(copied_output<D3DVOLUME_DESC>(a[1],[&](auto *p) { return volume->GetDesc(p); }));
+        if (method == 9) return finish(lock_staged(object,a[0],0,0,a[1],a[2],a[3],true));
+        if (method == 10) return finish(unlock_staged(object,{a[0],0,0}));
+    }
+    if (object.kind == ObjectKind::StateBlock) {
+        auto *block = static_cast<IDirect3DStateBlock9 *>(object.native);
+        if (method == 4) return finish(block->Capture());
+        if (method == 5) return finish(block->Apply());
+    }
+    if (object.kind == ObjectKind::SwapChain) {
+        auto *swap = static_cast<IDirect3DSwapChain9 *>(object.native);
+        switch (method) {
+        case 3: { const HRESULT hr = present_device(nullptr,a,swap,a[5]); if (SUCCEEDED(hr)) trace_frame_success(true,"SwapChain::Present"); return finish(hr); }
+        case 4: return finish(swap->GetFrontBufferData(native_object<IDirect3DSurface9>(a[1],ObjectKind::Surface)));
+        case 5: return finish(interface_output<IDirect3DSurface9>(a[3],ObjectKind::Surface,[&](auto **out) { return swap->GetBackBuffer(a[1],static_cast<D3DBACKBUFFER_TYPE>(a[2]),out); }));
+        case 6: return finish(copied_output<D3DRASTER_STATUS>(a[1],[&](auto *p) { return swap->GetRasterStatus(p); }));
+        case 7: return finish(copied_output<D3DDISPLAYMODE>(a[1],[&](auto *p) { return swap->GetDisplayMode(p); }));
+        case 8: return finish(interface_output<IDirect3DDevice9>(a[1],ObjectKind::Device,[&](auto **out) { return swap->GetDevice(out); }));
+        case 9: {
+            auto *out = output<GuestPresentParameters>(a[1]); D3DPRESENT_PARAMETERS host{};
+            const HRESULT hr = swap->GetPresentParameters(&host);
+            if (SUCCEEDED(hr)) {
+                bool ok;
+                const auto hwnd = host_window(object.guest_window,&ok);
+                if (!ok || reinterpret_cast<uintptr_t>(host.hDeviceWindow) != hwnd)
+                    unsupported("GetPresentParameters cannot map native HWND to a guest handle");
+                *out = guest_present_parameters(host,object.guest_window);
+                if (object.forced_windowed) { out->windowed = FALSE; out->fullscreen_refresh_rate = object.fullscreen_refresh; }
+            }
+            return finish(hr);
+        }
+        }
+    }
+    return false;
+}
+
+uint32_t invoke_unknown(GuestObject &object, uint32_t method, const uint32_t *a)
+{
+    if (method == 0) { uint32_t value = 0; return hresult(do_query_interface(object,a,&value)); }
+    if (method == 1) { object.native->AddRef(); return ++object.guest_references; }
+    const uint32_t refs = object.guest_references - 1;
+    if (!refs) {
+        discard_staged_locks(a[0],object);
+        if (object.kind == ObjectKind::VertexBuffer || object.kind == ObjectKind::IndexBuffer) abandon_buffer_lock(object);
+        if (object.kind == ObjectKind::ConstantTable) release_constant_table_allocations(a[0]);
+    }
+    IUnknown *native = object.native;
+    const ULONG native_refs = native->Release();
+    object.guest_references = refs;
+    if (!native_refs) g_private_interfaces.erase(native);
+    if (!refs) {
+        const GuestObject retired = object;
+        g_guest_by_native.erase(native); g_objects.erase(a[0]); free_guest_object(a[0],retired);
+    }
+    return refs;
 }
 
 } // namespace
@@ -3460,7 +3679,8 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
     }
     if (object->kind == ObjectKind::Device && method == 65 && args[2] != 0u &&
         !find_object(args[2], ObjectKind::Texture) &&
-        !find_object(args[2], ObjectKind::CubeTexture)) {
+        !find_object(args[2], ObjectKind::CubeTexture) &&
+        !find_object(args[2], ObjectKind::VolumeTexture)) {
         set_error("SetTexture received an unregistered 2D/cube texture proxy");
         return -2;
     }
@@ -3502,11 +3722,6 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
             return -2;
         }
     }
-    if (object->kind == ObjectKind::CubeTexture && method == 19 &&
-        (args[4] != 0u || args[5] != 0u)) {
-        set_error("cube LockRect only supports the observed null RECT and zero flags");
-        return -2;
-    }
     if (object->kind == ObjectKind::Device && method == 92 && args[1] != 0u &&
         !find_object(args[1], ObjectKind::VertexShader)) {
         set_error("SetVertexShader received an unregistered guest shader object");
@@ -3526,48 +3741,6 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
         set_error("D3D9 shared texture handles are unsupported by the guest bridge");
         return -2;
     }
-    if (object->kind == ObjectKind::Device && method == 118 &&
-        args[1] != D3DQUERYTYPE_OCCLUSION) {
-        set_error("IDirect3DDevice9::CreateQuery supports only observed OCCLUSION type 9");
-        return -2;
-    }
-    if (object->kind == ObjectKind::Query && method == 6 &&
-        args[1] != D3DISSUE_BEGIN && args[1] != D3DISSUE_END) {
-        set_error("IDirect3DQuery9::Issue supports only observed BEGIN/END flags");
-        return -2;
-    }
-    if (object->kind == ObjectKind::Query && method == 7 &&
-        ((args[3] != 0u && args[3] != D3DGETDATA_FLUSH) ||
-         (args[1] != 0u && args[2] != sizeof(DWORD)))) {
-        set_error("IDirect3DQuery9::GetData arguments are outside the observed occlusion-query profile");
-        return -2;
-    }
-    if (object->kind == ObjectKind::Device && (method == 91 || method == 106)) {
-        uint32_t version = 0;
-        if (guest_read(args[1], &version, sizeof(version))) {
-            const uint32_t expected = method == 106 ? D3DPS_VERSION(3, 0)
-                                                   : D3DVS_VERSION(3, 0);
-            if (version != expected) {
-                set_error(method == 106
-                    ? "CreatePixelShader only supports the observed pixel shader 3.0 profile"
-                    : "CreateVertexShader only supports the observed vertex shader 3.0 profile");
-                return -2;
-            }
-        }
-    }
-    if (object->kind == ObjectKind::Texture && method == 19) {
-        if (args[3] != 0u || args[4] != 0u) {
-            set_error("texture LockRect only supports the observed null RECT and zero flags");
-            return -2;
-        }
-        D3DSURFACE_DESC description{};
-        const HRESULT desc_status = static_cast<IDirect3DTexture9 *>(object->native)->GetLevelDesc(
-            args[1], &description);
-        if (SUCCEEDED(desc_status) && description.Format != D3DFMT_A8R8G8B8) {
-            set_error("texture LockRect format is outside the observed A8R8G8B8 profile");
-            return -2;
-        }
-    }
     if (method == 0) {
         GUID iid{};
         if (guest_read(args[1], &iid, sizeof(iid)) &&
@@ -3576,6 +3749,9 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
             return -2;
         }
     }
+    try {
+    if (method <= 2) { *result_out = invoke_unknown(*object,method,args); return 1; }
+    if (invoke_resource_extension(*object,method,args,result_out)) return 1;
     switch (object->kind) {
     case ObjectKind::D3D9:
         *result_out = invoke_d3d9(*object, method, args, arg_count);
@@ -3584,7 +3760,7 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
         *result_out = invoke_device(*object, method, args, arg_count);
         break;
     case ObjectKind::Surface:
-        *result_out = invoke_surface(*object, method, args, arg_count);
+        *result_out = hresult(copied_output<D3DSURFACE_DESC>(args[1],[&](auto *p) { return static_cast<IDirect3DSurface9 *>(object->native)->GetDesc(p); }));
         break;
     case ObjectKind::VertexBuffer:
     case ObjectKind::IndexBuffer:
@@ -3593,24 +3769,36 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
     case ObjectKind::VertexDeclaration:
         *result_out = invoke_vertex_declaration(*object, method, args, arg_count);
         break;
-    case ObjectKind::Texture:
-        *result_out = invoke_texture(*object, method, args, arg_count);
-        break;
-    case ObjectKind::CubeTexture:
-        *result_out = invoke_texture(*object, method, args, arg_count);
-        break;
-    case ObjectKind::PixelShader:
-        *result_out = invoke_pixel_shader(*object, method, args, arg_count);
-        break;
-    case ObjectKind::VertexShader:
-        *result_out = invoke_pixel_shader(*object, method, args, arg_count);
-        break;
+
     case ObjectKind::ConstantTable:
         *result_out = invoke_constant_table(*object, method, args, arg_count);
         break;
+    case ObjectKind::Texture:
+    case ObjectKind::CubeTexture:
+    case ObjectKind::PixelShader:
+    case ObjectKind::VertexShader:
+    case ObjectKind::VolumeTexture:
+    case ObjectKind::Volume:
+    case ObjectKind::StateBlock:
+    case ObjectKind::SwapChain:
+        marshal_error("unrecognized resource interface slot " + std::to_string(method));
     case ObjectKind::Query:
         *result_out = invoke_query(*object, method, args, arg_count);
         break;
+    }
+    } catch (const UnsupportedMarshal &) {
+        const std::string detail = g_last_error;
+        set_error(std::string(interface_name(object->kind)) + " slot " + std::to_string(method) + ": " + detail);
+        return -2;
+    } catch (const MarshalError &) {
+        const std::string detail = g_last_error;
+        set_error(std::string(interface_name(object->kind)) + " slot " +
+                  std::to_string(method) + ": " + detail);
+        return -1;
+    } catch (const std::bad_alloc &) {
+        set_error("D3D9 bridge staging allocation failed");
+        *result_out = hresult(E_OUTOFMEMORY);
+        return 1;
     }
     return 1;
 }
@@ -3624,17 +3812,12 @@ extern "C" AC1_D3D9_API void ac1_d3d9_shutdown(void)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     for (auto &entry : g_objects) {
+        discard_staged_locks(entry.first,entry.second);
         if (entry.second.kind == ObjectKind::VertexBuffer ||
             entry.second.kind == ObjectKind::IndexBuffer)
             abandon_buffer_lock(entry.second);
     }
     for (auto &entry : g_objects) {
-        if (entry.second.kind == ObjectKind::Texture)
-            discard_texture_locks(entry.first,
-                static_cast<IDirect3DTexture9 *>(entry.second.native));
-        if (entry.second.kind == ObjectKind::CubeTexture)
-            discard_cube_texture_locks(entry.first,
-                static_cast<IDirect3DCubeTexture9 *>(entry.second.native));
         if (entry.second.kind == ObjectKind::ConstantTable)
             release_constant_table_allocations(entry.first);
     }
@@ -3645,6 +3828,8 @@ extern "C" AC1_D3D9_API void ac1_d3d9_shutdown(void)
         free_guest_object(entry.first, object);
     }
     g_objects.clear();
+    g_staged_locks.clear();
+    g_private_interfaces.clear();
     g_guest_by_native.clear();
     g_constant_handles.clear();
     g_guest_handle_by_native.clear();

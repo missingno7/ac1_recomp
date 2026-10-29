@@ -112,6 +112,9 @@ struct ac1_guest_thread {
     int priority;
     int priority_boost_disabled;
     uint32_t wait_handle, wait_result;
+    /* WaitForMultipleObjects (wait-any): wait_count > 0 replaces wait_handle. */
+    uint32_t wait_handles[64];
+    uint32_t wait_count;
     uint64_t wait_deadline;
     uint64_t return_slice_deadline;
     unsigned return_slice_checks;
@@ -281,7 +284,8 @@ typedef struct {
     uint32_t handle;
     uint32_t count;
     uint32_t maximum;
-    uint8_t kind; /* 1 event, 2 semaphore */
+    uint32_t owner; /* mutex: owning guest thread id; count is recursion */
+    uint8_t kind; /* 1 event, 2 semaphore, 3 mutex */
     uint8_t manual_reset;
     uint8_t signaled;
     uint8_t io_backed;
@@ -3400,6 +3404,41 @@ static void sync_object_consume_event(sync_object *object)
     object->signaled = 0u;
 }
 
+/* Acquire a waitable object for one satisfied wait on behalf of thread_id. */
+static int sync_object_try_acquire(sync_object *object, uint32_t thread_id)
+{
+    if (object->kind == 1u) {
+        if (!sync_object_is_signaled(object)) return 0;
+        sync_object_consume_event(object);
+        return 1;
+    }
+    if (object->kind == 2u) {
+        if (!object->count) return 0;
+        --object->count;
+        return 1;
+    }
+    if (object->kind == 3u) {
+        if (object->count && object->owner != thread_id) return 0;
+        object->owner = thread_id;
+        ++object->count;
+        return 1;
+    }
+    return 0;
+}
+
+/* Satisfy one handle of a wait: a finished thread, or an acquirable object. */
+static int wait_handle_try_acquire(uint32_t handle, uint32_t thread_id, int *invalid)
+{
+    ac1_guest_thread *waited_thread = thread_for_handle(handle);
+    if (waited_thread) return waited_thread->finished;
+    sync_object *object = sync_object_for_handle(handle);
+    if (!object) {
+        if (invalid) *invalid = 1;
+        return 0;
+    }
+    return sync_object_try_acquire(object, thread_id);
+}
+
 static void scheduler_refresh_waits(ac1_scheduler *scheduler)
 {
     uint64_t now = guest_monotonic_ns();
@@ -3415,6 +3454,28 @@ static void scheduler_refresh_waits(ac1_scheduler *scheduler)
             continue;
         }
         if (thread->wait_kind != 1) continue;
+        if (thread->wait_count) {
+            uint32_t index = 0u;
+            while (index < thread->wait_count &&
+                   !wait_handle_try_acquire(thread->wait_handles[index], thread->id, NULL))
+                ++index;
+            if (index < thread->wait_count) {
+                thread->blocked = 0;
+                thread->wait_result = AC1_WAIT_OBJECT_0 + index;
+                thread->cpu.eax = AC1_WAIT_OBJECT_0 + index;
+                thread->wait_kind = 0;
+                thread->wait_count = 0u;
+                continue;
+            }
+            if (thread->wait_deadline && now >= thread->wait_deadline) {
+                thread->blocked = 0;
+                thread->wait_result = AC1_WAIT_TIMEOUT;
+                thread->cpu.eax = AC1_WAIT_TIMEOUT;
+                thread->wait_kind = 0;
+                thread->wait_count = 0u;
+            }
+            continue;
+        }
         ac1_guest_thread *waited_thread = thread_for_handle(thread->wait_handle);
         if (waited_thread && waited_thread->finished) {
             thread->blocked = 0;
@@ -3425,11 +3486,7 @@ static void scheduler_refresh_waits(ac1_scheduler *scheduler)
         }
         sync_object *object = sync_object_for_handle(thread->wait_handle);
         if (object) {
-            int signaled = object->kind == 1u
-                ? sync_object_is_signaled(object) : object->count != 0u;
-            if (signaled) {
-                if (object->kind == 1u) sync_object_consume_event(object);
-                if (object->kind == 2u) --object->count;
+            if (sync_object_try_acquire(object, thread->id)) {
                 thread->blocked = 0;
                 thread->wait_result = AC1_WAIT_OBJECT_0;
                 thread->cpu.eax = AC1_WAIT_OBJECT_0;
@@ -3456,12 +3513,15 @@ static uint32_t scheduler_next_timeout(ac1_scheduler *scheduler)
         for (unsigned i = 0; i < scheduler->count; ++i) {
             ac1_guest_thread *thread = &scheduler->threads[i];
             if (!thread->blocked || thread->wait_kind != 1) continue;
-            sync_object *object = sync_object_for_handle(thread->wait_handle);
-            if (object && object->kind == 1u && object->host_event &&
-                object->io_backed) {
-                poll_native_events = 1;
-                break;
+            uint32_t handles = thread->wait_count ? thread->wait_count : 1u;
+            for (uint32_t h = 0; h < handles && !poll_native_events; ++h) {
+                sync_object *object = sync_object_for_handle(
+                    thread->wait_count ? thread->wait_handles[h] : thread->wait_handle);
+                if (object && object->kind == 1u && object->host_event &&
+                    object->io_backed)
+                    poll_native_events = 1;
             }
+            if (poll_native_events) break;
         }
     }
 #endif
@@ -3579,6 +3639,45 @@ static int handle_sync_import(CPU *cpu, const import_record *import)
         return_stdcall(cpu, 16u);
         return 1;
     }
+    if (!strcmp(name, "CreateMutexA")) {
+        uint32_t attributes = rd32(cpu->esp + 4u);
+        uint32_t initial_owner = rd32(cpu->esp + 8u);
+        uint32_t name_address = rd32(cpu->esp + 12u);
+        if (attributes)
+            stop_guest("CreateMutexA security attributes are unsupported", import->token);
+        char object_name[256] = {0};
+        if (name_address && !copy_guest_string(name_address, object_name, sizeof(object_name)))
+            stop_guest("CreateMutexA object name is unmapped or too long", import->token);
+        sync_object *object = sync_object_named(object_name);
+        if (object && object->kind != 3u) { cpu->eax = 0u; last_error = 6u; }
+        else if (object) { cpu->eax = object->handle; last_error = 183u; }
+        else if (!(object = sync_object_create(3u))) { cpu->eax = 0u; last_error = 8u; }
+        else {
+            if (object_name[0]) memcpy(object->name, object_name, strlen(object_name) + 1u);
+            if (initial_owner) {
+                object->owner = current_host_thread_id();
+                object->count = 1u;
+            }
+            cpu->eax = object->handle;
+            last_error = 0u;
+        }
+        return_stdcall(cpu, 12u);
+        return 1;
+    }
+    if (!strcmp(name, "ReleaseMutex")) {
+        uint32_t handle = rd32(cpu->esp + 4u);
+        sync_object *object = sync_object_for_handle(handle);
+        if (!object || object->kind != 3u) {
+            cpu->eax = 0u; last_error = 6u;
+        } else if (!object->count || object->owner != current_host_thread_id()) {
+            cpu->eax = 0u; last_error = 288u; /* ERROR_NOT_OWNER */
+        } else {
+            if (!--object->count) object->owner = 0u;
+            cpu->eax = 1u;
+        }
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
     if (!strcmp(name, "SetEvent") || !strcmp(name, "ResetEvent")) {
         uint32_t handle = rd32(cpu->esp + 4u);
         sync_object *object = sync_object_for_handle(handle);
@@ -3644,17 +3743,14 @@ static int handle_sync_import(CPU *cpu, const import_record *import)
                 active_guest_thread->blocked = 1;
                 active_guest_thread->wait_kind = 1;
                 active_guest_thread->wait_handle = handle;
+                active_guest_thread->wait_count = 0u;
                 active_guest_thread->wait_deadline = timeout == UINT32_MAX ? 0u :
                     guest_monotonic_ns() + (uint64_t)timeout * 1000000u;
             }
         } else if (!object) {
             cpu->eax = UINT32_MAX; last_error = 6u;
         } else {
-            int signaled = object->kind == 1u
-                ? sync_object_is_signaled(object) : object->count != 0u;
-            if (signaled) {
-                if (object->kind == 1u) sync_object_consume_event(object);
-                if (object->kind == 2u) --object->count;
+            if (sync_object_try_acquire(object, current_host_thread_id())) {
                 cpu->eax = AC1_WAIT_OBJECT_0;
             } else if (!timeout) cpu->eax = AC1_WAIT_TIMEOUT;
             else if (!active_scheduler || !active_guest_thread)
@@ -3663,11 +3759,55 @@ static int handle_sync_import(CPU *cpu, const import_record *import)
                 active_guest_thread->blocked = 1;
                 active_guest_thread->wait_kind = 1;
                 active_guest_thread->wait_handle = handle;
+                active_guest_thread->wait_count = 0u;
                 active_guest_thread->wait_deadline = timeout == UINT32_MAX ? 0u :
                     guest_monotonic_ns() + (uint64_t)timeout * 1000000u;
             }
         }
         return_stdcall(cpu, 8u);
+        return 1;
+    }
+    if (!strcmp(name, "WaitForMultipleObjects")) {
+        uint32_t count = rd32(cpu->esp + 4u);
+        uint32_t handles_address = rd32(cpu->esp + 8u);
+        uint32_t wait_all = rd32(cpu->esp + 12u);
+        uint32_t timeout = rd32(cpu->esp + 16u);
+        if (!count || count > 64u) {
+            cpu->eax = UINT32_MAX; last_error = 87u;
+            return_stdcall(cpu, 16u);
+            return 1;
+        }
+        if (!guest_memory_try_ptr(handles_address, count * 4u))
+            stop_guest("WaitForMultipleObjects handle array is unmapped", import->token);
+        if (wait_all && count > 1u)
+            stop_guest("WaitForMultipleObjects wait-all over several handles is unsupported",
+                       import->token);
+        uint32_t handles[64];
+        for (uint32_t i = 0; i < count; ++i) handles[i] = rd32(handles_address + i * 4u);
+        int invalid = 0;
+        uint32_t index = 0u;
+        while (index < count &&
+               !wait_handle_try_acquire(handles[index], current_host_thread_id(), &invalid) &&
+               !invalid)
+            ++index;
+        if (invalid) {
+            cpu->eax = UINT32_MAX; last_error = 6u; /* WAIT_FAILED, invalid handle */
+        } else if (index < count) {
+            cpu->eax = AC1_WAIT_OBJECT_0 + index;
+        } else if (!timeout) {
+            cpu->eax = AC1_WAIT_TIMEOUT;
+        } else if (!active_scheduler || !active_guest_thread) {
+            stop_guest("WaitForMultipleObjects wait lacks scheduler state", import->token);
+        } else {
+            active_guest_thread->blocked = 1;
+            active_guest_thread->wait_kind = 1;
+            active_guest_thread->wait_handle = handles[0];
+            memcpy(active_guest_thread->wait_handles, handles, count * sizeof(handles[0]));
+            active_guest_thread->wait_count = count;
+            active_guest_thread->wait_deadline = timeout == UINT32_MAX ? 0u :
+                guest_monotonic_ns() + (uint64_t)timeout * 1000000u;
+        }
+        return_stdcall(cpu, 16u);
         return 1;
     }
     if (!strcmp(name, "CloseHandle")) {
@@ -4134,7 +4274,25 @@ static int handle_window_import(CPU *cpu, const import_record *import)
 
 static int handle_clock_import(CPU *cpu, const import_record *import)
 {
-    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
+    if (!import || import->by_ordinal) return 0;
+    if (equal_ascii_fold(import->dll, "WINMM.dll")) {
+        /* timeGetTime shares GetTickCount's guest clock. Timer-resolution
+         * requests are scheduling hints; valid periods report TIMERR_NOERROR
+         * and zero reports TIMERR_NOCANDO (97), as winmm does. */
+        if (!strcmp(import->name, "timeGetTime")) {
+            cpu->eax = (uint32_t)(guest_monotonic_ns() / UINT64_C(1000000));
+            return_stdcall(cpu, 0u);
+            return 1;
+        }
+        if (!strcmp(import->name, "timeBeginPeriod") ||
+            !strcmp(import->name, "timeEndPeriod")) {
+            cpu->eax = rd32(cpu->esp + 4u) ? 0u : 97u;
+            return_stdcall(cpu, 4u);
+            return 1;
+        }
+        return 0;
+    }
+    if (!equal_ascii_fold(import->dll, "KERNEL32.dll"))
         return 0;
     uint64_t value;
     if (!strcmp(import->name, "QueryPerformanceFrequency")) {
