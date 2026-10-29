@@ -5,6 +5,13 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#else
+#include <arpa/inet.h>
+#endif
+
 enum {
     GUEST_BASE = 0x00400000u,
     GUEST_DATA = GUEST_BASE + 0x100u,
@@ -58,11 +65,56 @@ static int fail(const char *message)
     return 1;
 }
 
+static int check_inet_addr_cases(uint8_t *guest_memory)
+{
+    static const char *const cases[] = {
+        "127.0.0.1",
+        "192.0.2.17",
+        "not-an-ip",
+        "255.255.255.255",
+        "127.1"
+    };
+    const uint32_t string_address = GUEST_BASE + 0x300u;
+    for (size_t i = 0u; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        size_t length = strlen(cases[i]) + 1u;
+        uint32_t arguments[1] = {string_address};
+        uint32_t result = 0u, stack_bytes = UINT32_MAX;
+        memcpy(guest_memory + (string_address - GUEST_BASE), cases[i], length);
+        int by_ordinal = (i & 1u) == 0u;
+        if (!import_call(by_ordinal ? NULL : "inet_addr",
+                         by_ordinal ? 11u : 0u, by_ordinal, arguments,
+                         &result, &stack_bytes))
+            return fail("inet_addr was not dispatched by name/ordinal");
+        if (stack_bytes != 4u)
+            return fail("inet_addr stdcall argument size");
+        if (result != (uint32_t)inet_addr(cases[i])) {
+            fprintf(stderr, "inet_addr mismatch for test case %zu\n", i);
+            return fail("inet_addr native result/network byte order");
+        }
+    }
+
+    uint32_t bad_arguments[1] = {GUEST_BASE + GUEST_MEMORY_SIZE};
+    uint32_t result = 0u, stack_bytes = UINT32_MAX;
+    if (import_call("inet_addr", 0u, 0, bad_arguments, &result, &stack_bytes))
+        return fail("inet_addr accepted an unmapped guest pointer");
+    if (stack_bytes != UINT32_MAX)
+        return fail("unhandled inet_addr modified the stack-byte output");
+
+    const uint32_t unterminated_address = GUEST_BASE + GUEST_MEMORY_SIZE - 16u;
+    memset(guest_memory + (unterminated_address - GUEST_BASE), '1', 16u);
+    bad_arguments[0] = unterminated_address;
+    if (import_call(NULL, 11u, 1, bad_arguments, &result, &stack_bytes))
+        return fail("inet_addr accepted an unterminated guest string");
+    return 0;
+}
+
 int main(void)
 {
     uint8_t guest_memory[GUEST_MEMORY_SIZE];
     memset(guest_memory, 0xa5, sizeof(guest_memory));
     guest_memory_bind(guest_memory, GUEST_BASE, sizeof(guest_memory));
+
+    if (check_inet_addr_cases(guest_memory)) return 1;
 
     const uint32_t startup_args[2] = {0x0101u, GUEST_DATA};
     uint32_t result = UINT32_MAX, stack_bytes = UINT32_MAX;
@@ -146,6 +198,6 @@ int main(void)
 
     ac1_network_reset();
     guest_memory_unbind();
-    puts("Winsock 1.1 startup, x86 WSADATA layout, error state, and refcount passed");
+    puts("Winsock inet_addr, startup, x86 WSADATA, error state, and refcount passed");
     return 0;
 }

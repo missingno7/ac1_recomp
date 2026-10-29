@@ -149,6 +149,7 @@ static int object_type_registry_traced;
 static unsigned object_type_parent_records;
 static unsigned object_type_descriptor_count;
 static int crt_handoff_logged;
+static int get_adapters_info_deferred_logged;
 static _Thread_local unsigned trace_import_count;
 static _Thread_local unsigned trace_callback_count;
 static _Thread_local unsigned trace_file_read_count;
@@ -5257,13 +5258,31 @@ static const import_record *find_import(uint32_t token)
 
 static int handle_network_import(CPU *cpu, const import_record *import)
 {
-    if (!import || !equal_ascii_fold(import->dll, "WS2_32.dll")) return 0;
+    if (!import) return 0;
+    if (!import->by_ordinal &&
+        equal_ascii_fold(import->dll, "iphlpapi.dll") &&
+        equal_ascii_fold(import->name, "GetAdaptersInfo")) {
+        if (!guest_memory_try_ptr(cpu->esp, 12u))
+            stop_guest("GetAdaptersInfo stack arguments are unmapped", import->token);
+        if (!get_adapters_info_deferred_logged) {
+            fprintf(stderr,
+                    "AC1 optional service deferred: iphlpapi.dll!GetAdaptersInfo returns ERROR_NOT_SUPPORTED (50); caller outputs and LastError are preserved\n");
+            get_adapters_info_deferred_logged = 1;
+        }
+        cpu->eax = 50u; /* ERROR_NOT_SUPPORTED; do not synthesize adapter data. */
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+    if (!equal_ascii_fold(import->dll, "WS2_32.dll")) return 0;
     uint32_t argument_count = 0u;
     if ((import->by_ordinal && import->ordinal == 115u) ||
         (!import->by_ordinal && equal_ascii_fold(import->name, "WSAStartup")))
         argument_count = 2u;
     else if ((import->by_ordinal && import->ordinal == 112u) ||
              (!import->by_ordinal && equal_ascii_fold(import->name, "WSASetLastError")))
+        argument_count = 1u;
+    else if ((import->by_ordinal && import->ordinal == 11u) ||
+             (!import->by_ordinal && equal_ascii_fold(import->name, "inet_addr")))
         argument_count = 1u;
     uint32_t arguments[2] = {0u, 0u};
     if (argument_count) {
@@ -6196,6 +6215,7 @@ int ac1_run(const char *exe_path)
     trace_callback_count = 0;
     trace_file_read_count = 0;
     crt_handoff_logged = 0;
+    get_adapters_info_deferred_logged = 0;
 #ifdef __ANDROID__
     if (!initialize_android_guest_paths(exe_path)) {
         snprintf(last_run_error, sizeof(last_run_error),

@@ -9,6 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #else
+#include <arpa/inet.h>
 #define AC1_WSAEFAULT 10014u
 #define AC1_WSAEINVAL 10022u
 #define AC1_WSAENOTINITIALISED 10093u
@@ -25,6 +26,8 @@ enum {
     AC1_GUEST_MAX_UDP_OFFSET = 392,
     AC1_GUEST_VENDOR_POINTER_OFFSET = 396
 };
+
+enum { AC1_INET_ADDR_MAX_STRING = 256u };
 
 #ifndef AC1_WSAENOTINITIALISED
 #define AC1_WSAENOTINITIALISED 10093u
@@ -203,6 +206,28 @@ int ac1_network_import(const char *dll_name, const char *name,
         if (!arguments) return 0;
         g_wsa_error = arguments[0];
         *eax_out = 0u;
+        *stack_bytes_out = 4u;
+        return 1;
+    }
+    if ((by_ordinal && ordinal == 11u) ||
+        (!by_ordinal && same_ascii_fold(name, "inet_addr"))) {
+        char address[AC1_INET_ADDR_MAX_STRING];
+        if (!arguments || !arguments[0]) return 0;
+        size_t length;
+        for (length = 0u; length < sizeof(address); ++length) {
+            uint64_t character_address = (uint64_t)arguments[0] + length;
+            const uint8_t *character;
+            if (character_address > UINT32_MAX) return 0;
+            character = (const uint8_t *)guest_memory_try_ptr(
+                (uint32_t)character_address, 1u);
+            if (!character) return 0;
+            address[length] = (char)*character;
+            if (!address[length]) break;
+        }
+        if (length == sizeof(address)) return 0;
+        /* Return the native IN_ADDR network-byte-order value, including
+         * INADDR_NONE for invalid text and the all-ones broadcast address. */
+        *eax_out = (uint32_t)inet_addr(address);
         *stack_bytes_out = 4u;
         return 1;
     }
