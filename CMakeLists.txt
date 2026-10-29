@@ -28,6 +28,7 @@ add_library(ac1_runtime STATIC
   src/runtime/ac1_runtime.c
   src/runtime/ac1_profile.c
   src/runtime/ac1_native.c
+  src/runtime/ac1_native_leaf.c
   src/runtime/ac1_network.c
   src/runtime/ac1_files.c
   src/runtime/ac1_crypto.c

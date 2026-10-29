@@ -48822,5 +48822,25 @@
     ]
   },
   "functions_per_translation_unit": 100,
-  "translation_unit_buckets": 1000
+  "translation_unit_buckets": 1000,
+  "native_overrides": [
+    {
+      "address": "0x01176DE0",
+      "implementation": "ac1_native_01176DE0",
+      "plan": "ac1_native_01176DE0_plan",
+      "instruction_sha256": "4d3d2c255823734854ec864d9de131ff6fa2096dbe93a074dbb386b22e7eee70"
+    },
+    {
+      "address": "0x00653400",
+      "implementation": "ac1_native_00653400",
+      "plan": "ac1_native_00653400_plan",
+      "instruction_sha256": "25d4d817b836f425f56d20f63d77b8573a3eda52d28cef5c8b93f23b8982e53b"
+    },
+    {
+      "address": "0x0042EE70",
+      "implementation": "ac1_native_0042EE70",
+      "plan": "ac1_native_0042EE70_plan",
+      "instruction_sha256": "6db8ebd07af41eb5eff20c2c586af68e7873989a96ba3a6caa8c7029a5ee2adf"
+    }
+  ]
 }
