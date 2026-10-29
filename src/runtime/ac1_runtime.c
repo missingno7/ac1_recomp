@@ -167,7 +167,36 @@ static const uint8_t *static_tls_template;
 static uint32_t static_tls_template_size;
 static uint32_t static_tls_zero_fill;
 static uint32_t static_tls_index_address;
+static uint32_t virtual_alloc_bases[GUEST_MEMORY_MAX_REGIONS];
 static ac1_scheduler *active_scheduler;
+
+static int virtual_allocation_contains(uint32_t base)
+{
+    for (size_t i = 0; i < GUEST_MEMORY_MAX_REGIONS; ++i)
+        if (virtual_alloc_bases[i] == base) return 1;
+    return 0;
+}
+
+static int virtual_allocation_add(uint32_t base)
+{
+    for (size_t i = 0; i < GUEST_MEMORY_MAX_REGIONS; ++i) {
+        if (virtual_alloc_bases[i] == base) return 1;
+        if (!virtual_alloc_bases[i]) {
+            virtual_alloc_bases[i] = base;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void virtual_allocation_remove(uint32_t base)
+{
+    for (size_t i = 0; i < GUEST_MEMORY_MAX_REGIONS; ++i)
+        if (virtual_alloc_bases[i] == base) {
+            virtual_alloc_bases[i] = 0u;
+            return;
+        }
+}
 
 static void scheduler_lock(ac1_scheduler *scheduler);
 static void scheduler_unlock(ac1_scheduler *scheduler);
@@ -4005,6 +4034,34 @@ static int handle_import(CPU *cpu, const import_record *import)
         return 1;
     }
 
+    if (!strcmp(import->name, "VirtualQuery")) {
+        if (!guest_memory_try_ptr(cpu->esp + 4u, 12u))
+            stop_guest("VirtualQuery arguments are unmapped", import->token);
+        const uint32_t query_address = rd32(cpu->esp + 4u);
+        const uint32_t information_address = rd32(cpu->esp + 8u);
+        const uint32_t information_length = rd32(cpu->esp + 12u);
+        const uint64_t region_size = guest_memory_region_size(query_address);
+        uint8_t *information = (uint8_t *)guest_memory_try_ptr(
+            information_address, 28u);
+        if (!information || information_length != 28u || !region_size ||
+            region_size > UINT32_MAX ||
+            !virtual_allocation_contains(query_address))
+            stop_guest("VirtualQuery supports only an exact base of a guest private allocation",
+                       import->token);
+        /* The observed MemSysPage request queries the exact base returned by
+         * VirtualAlloc. Guest allocations are committed private RW regions. */
+        wr32(information_address + 0u, query_address); /* BaseAddress */
+        wr32(information_address + 4u, query_address); /* AllocationBase */
+        wr32(information_address + 8u, 4u);            /* AllocationProtect */
+        wr32(information_address + 12u, (uint32_t)region_size); /* RegionSize */
+        wr32(information_address + 16u, 0x1000u);      /* MEM_COMMIT */
+        wr32(information_address + 20u, 4u);            /* PAGE_READWRITE */
+        wr32(information_address + 24u, 0x20000u);     /* MEM_PRIVATE */
+        cpu->eax = 28u;
+        return_stdcall(cpu, 12u);
+        return 1;
+    }
+
     if (!strcmp(import->name, "VirtualAlloc")) {
         uint32_t requested = rd32(cpu->esp + 4u);
         uint32_t size = rd32(cpu->esp + 8u);
@@ -4036,6 +4093,10 @@ static int handle_import(CPU *cpu, const import_record *import)
         if (!base || !guest_memory_allocate(base, rounded)) {
             cpu->eax = 0u;
             last_error = 8u; /* ERROR_NOT_ENOUGH_MEMORY */
+        } else if (!virtual_allocation_add(base)) {
+            guest_memory_release(base);
+            cpu->eax = 0u;
+            last_error = 8u; /* ERROR_NOT_ENOUGH_MEMORY */
         } else {
             cpu->eax = base;
             last_error = 0u;
@@ -4052,8 +4113,10 @@ static int handle_import(CPU *cpu, const import_record *import)
             fprintf(stderr, "AC1 VirtualFree: eip=0x%08x address=0x%08x size=0x%08x type=0x%08x\n",
                     cpu->eip, address, size, free_type);
         if (free_type == 0x8000u && address && size == 0u &&
+            virtual_allocation_contains(address) &&
             guest_memory_region_size(address) != 0u) {
             guest_memory_release(address);
+            virtual_allocation_remove(address);
             cpu->eax = 1u;
             last_error = 0u;
         } else if (free_type == 0x4000u) {
@@ -5427,6 +5490,7 @@ int ac1_run(const char *exe_path)
     memset(tls_values, 0, sizeof(tls_values));
     memset(private_heaps, 0, sizeof(private_heaps));
     memset(sync_objects, 0, sizeof(sync_objects));
+    memset(virtual_alloc_bases, 0, sizeof(virtual_alloc_bases));
     const char *trace_setting = getenv("AC1_TRACE_IMPORTS");
     trace_imports = trace_setting && *trace_setting && strcmp(trace_setting, "0");
     const char *type_trace_setting = getenv("AC1_TRACE_OBJECT_TYPES");

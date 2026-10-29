@@ -874,6 +874,33 @@ static ac1_file_async_operation *allocate_async_operation(ac1_files *files)
     return NULL;
 }
 
+static int refresh_pending_async_operation(ac1_files *files,
+                                           size_t file_slot_index,
+                                           ac1_file_async_operation *operation)
+{
+    if (!operation->pending) return 1;
+#ifdef _WIN32
+    DWORD bytes_transferred = 0;
+    if (GetOverlappedResult(files->slots[file_slot_index],
+                            &operation->native_overlapped,
+                            &bytes_transferred, FALSE)) {
+        operation->pending = 0;
+        operation->completion_error = 0u;
+        return 1;
+    }
+    DWORD native_error = GetLastError();
+    if (native_error == ERROR_IO_INCOMPLETE) return 0;
+    operation->pending = 0;
+    operation->completion_error = (uint32_t)native_error;
+    return 1;
+#else
+    (void)files;
+    (void)file_slot_index;
+    operation->pending = 0;
+    return 1;
+#endif
+}
+
 static void copy_overlapped_snapshot(
     const ac1_file_async_operation *operation,
     ac1_files_overlapped_snapshot *snapshot_out)
@@ -914,7 +941,8 @@ int ac1_files_read_overlapped(ac1_files *files, uint32_t guest_handle,
     }
     ac1_file_async_operation *operation = find_async_operation(
         files, guest_handle, guest_overlapped_address);
-    if (operation && operation->pending) {
+    if (operation && !refresh_pending_async_operation(files, slot_index,
+                                                       operation)) {
         *error_out = AC1_ERROR_INVALID_PARAMETER;
         return AC1_FILES_HANDLED;
     }

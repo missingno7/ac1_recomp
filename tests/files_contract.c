@@ -254,6 +254,24 @@ static int check_overlapped_read(ac1_files *files,
         ok = 0;
         goto close_file;
     }
+#ifdef _WIN32
+    if (WaitForSingleObject(native_event, 10000u) != WAIT_OBJECT_0) {
+        fprintf(stderr, "ReadFile completion did not signal its event\n");
+        ok = 0;
+        goto close_file;
+    }
+    ResetEvent(native_event);
+#endif
+    /* Reuse only after the native event confirms completion, with no
+     * intervening GetOverlappedResult call for the first operation. */
+    if (ac1_files_read_overlapped(files, handle, buffer, (uint32_t)size,
+            guest_overlapped, 0u, 0u, host_event, &error, &snapshot) !=
+            AC1_FILES_HANDLED || (error != 0u && error != 997u)) {
+        fprintf(stderr, "event-completed same-key reuse failed: error=%u\n",
+                error);
+        ok = 0;
+        goto close_file;
+    }
     uint32_t transferred = UINT32_MAX;
     for (unsigned attempt = 0; attempt < 10000u; ++attempt) {
         if (ac1_files_get_overlapped_result(files, handle,

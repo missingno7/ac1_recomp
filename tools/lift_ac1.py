@@ -85,6 +85,27 @@ static inline uint32_t ac1_rsqrtss_lane(uint32_t bits)
 """.strip()
 
 
+def rsqrtps_lanes_code(destination: int, source_expression: str) -> str:
+    """Emit packed RSQRTPS by applying the established scalar lane helper."""
+    return (
+        f"{{ XMM _s = {source_expression}; "
+        f"c->xmm[{destination}].u32[0] = ac1_rsqrtss_lane(_s.u32[0]); "
+        f"c->xmm[{destination}].u32[1] = ac1_rsqrtss_lane(_s.u32[1]); "
+        f"c->xmm[{destination}].u32[2] = ac1_rsqrtss_lane(_s.u32[2]); "
+        f"c->xmm[{destination}].u32[3] = ac1_rsqrtss_lane(_s.u32[3]); }}"
+    )
+
+
+def pmaxsw_lanes_code(destination: int, source_expression: str) -> str:
+    """Emit PMAXSW over eight signed 16-bit lanes without changing CPU flags."""
+    return (
+        f"{{ XMM _s = {source_expression}; XMM _d = c->xmm[{destination}]; "
+        f"for (unsigned _i = 0; _i < 8; ++_i) "
+        f"c->xmm[{destination}].i16[_i] = _d.i16[_i] > _s.i16[_i] "
+        f"? _d.i16[_i] : _s.i16[_i]; }}"
+    )
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -106,6 +127,20 @@ def entry_guard_lines(function_start: int, ordered_addresses: list[int]) -> list
     if ordered_addresses[0] == function_start:
         return []
     return [f"    goto L_{function_start:08X};"]
+
+
+def direct_tail_thunk_target(function) -> int | None:
+    """Return the exact target of a one-instruction direct unconditional thunk."""
+    blocks = list(function.blocks.values())
+    if len(blocks) != 1 or len(blocks[0].instructions) != 1:
+        return None
+    insn = blocks[0].instructions[0]
+    if insn.mnemonic != "jmp" or len(insn.operands) != 1:
+        return None
+    from capstone.x86 import X86_OP_IMM
+    if insn.operands[0].type != X86_OP_IMM:
+        return None
+    return insn.operands[0].imm & 0xFFFFFFFF
 
 
 def fallthrough_target(mnemonic: str, next_pc: int, next_decoded: int | None) -> int | None:
@@ -195,6 +230,197 @@ def run_selftest() -> None:
     assert fxam_cc(math.ldexp(1.0, -1074)) == 0x0400
     seed_sw = 0xA55F
     assert fxam_status(seed_sw, -0.0) == ((seed_sw & ~0x4700) | 0x4200)
+    # RSQRTPS uses a source snapshot so register aliasing is safe, and all
+    # four independent lanes go through the same edge-aware scalar helper.
+    from capstone import Cs, CS_ARCH_X86, CS_MODE_32
+    from capstone.x86 import X86_OP_MEM, X86_OP_REG
+    md = Cs(CS_ARCH_X86, CS_MODE_32)
+    md.detail = True
+    rsqrt_reg = next(md.disasm(bytes.fromhex("0f52c1"), 0x401000))
+    rsqrt_mem = next(md.disasm(bytes.fromhex("0f52542410"), 0x401000))
+    assert rsqrt_reg.mnemonic == rsqrt_mem.mnemonic == "rsqrtps"
+    assert rsqrt_reg.operands[0].type == X86_OP_REG and rsqrt_reg.operands[1].type == X86_OP_REG
+    assert rsqrt_mem.operands[0].type == X86_OP_REG and rsqrt_mem.operands[1].type == X86_OP_MEM
+    reg_code = rsqrtps_lanes_code(0, "c->xmm[1]")
+    mem_code = rsqrtps_lanes_code(2, "rdxm(0x1234u)")
+    for lane in range(4):
+        assert f"c->xmm[0].u32[{lane}] = ac1_rsqrtss_lane(_s.u32[{lane}])" in reg_code
+        assert f"c->xmm[2].u32[{lane}] = ac1_rsqrtss_lane(_s.u32[{lane}])" in mem_code
+    assert "XMM _s = c->xmm[1]" in reg_code and "XMM _s = rdxm(0x1234u)" in mem_code
+    pmax_reg = next(md.disasm(bytes.fromhex("660feec1"), 0x401100))
+    pmax_mem = next(md.disasm(bytes.fromhex("660fee542410"), 0x401100))
+    assert pmax_reg.mnemonic == pmax_mem.mnemonic == "pmaxsw"
+    assert pmax_reg.operands[0].type == X86_OP_REG and pmax_reg.operands[1].type == X86_OP_REG
+    assert pmax_mem.operands[0].type == X86_OP_REG and pmax_mem.operands[1].type == X86_OP_MEM
+    pmax_reg_code = pmaxsw_lanes_code(0, "c->xmm[1]")
+    pmax_mem_code = pmaxsw_lanes_code(2, "rdxm(0x1234u)")
+    pmax_alias_code = pmaxsw_lanes_code(3, "c->xmm[3]")
+    assert "XMM _s = c->xmm[1]; XMM _d = c->xmm[0]" in pmax_reg_code
+    assert "XMM _s = rdxm(0x1234u); XMM _d = c->xmm[2]" in pmax_mem_code
+    assert "XMM _s = c->xmm[3]; XMM _d = c->xmm[3]" in pmax_alias_code
+    assert "_d.i16[_i] > _s.i16[_i]" in pmax_reg_code
+    compiler = shutil.which("gcc")
+    if compiler:
+        with tempfile.TemporaryDirectory(prefix="pmaxsw_selftest_", dir=ROOT / "work") as temp_name:
+            temp_dir = Path(temp_name)
+            source = temp_dir / "pmaxsw_semantics.c"
+            executable = temp_dir / "pmaxsw_semantics.exe"
+            source.write_text(
+                "#include <stdint.h>\n#include <string.h>\n#include <emmintrin.h>\n"
+                "typedef union { int16_t i16[8]; uint16_t u16[8]; uint32_t u32[4]; } XMM;\n"
+                "typedef struct { uint32_t gpr[8]; uint32_t flags[8]; XMM xmm[8]; } CPU;\n"
+                "static XMM guest_vector;\n"
+                "static XMM rdxm(uint32_t address) { (void)address; return guest_vector; }\n"
+                "static void run_reg(CPU *c) { " + pmax_reg_code + " }\n"
+                "static void run_mem(CPU *c) { " + pmax_mem_code + " }\n"
+                "static void run_alias(CPU *c) { " + pmax_alias_code + " }\n"
+                + r"""
+static void native_max(const int16_t a[8], const int16_t b[8], int16_t out[8])
+{
+    __m128i va, vb, vo;
+    memcpy(&va, a, 16); memcpy(&vb, b, 16);
+    vo = _mm_max_epi16(va, vb);
+    memcpy(out, &vo, 16);
+}
+static int unchanged_except_xmm(CPU *after, const CPU *before, unsigned dst)
+{
+    if (memcmp(after->gpr, before->gpr, sizeof after->gpr) ||
+        memcmp(after->flags, before->flags, sizeof after->flags)) return 0;
+    for (unsigned i = 0; i < 8; ++i)
+        if (i != dst && memcmp(&after->xmm[i], &before->xmm[i], sizeof(XMM))) return 0;
+    return 1;
+}
+static int check(const int16_t a[8], const int16_t b[8])
+{
+    CPU reg = {0}, mem = {0}, alias = {0};
+    CPU reg_before, mem_before, alias_before;
+    int16_t expected[8];
+    native_max(a, b, expected);
+    for (unsigned i = 0; i < 8; ++i) {
+        reg.xmm[0].i16[i] = a[i]; reg.xmm[1].i16[i] = b[i];
+        mem.xmm[2].i16[i] = a[i]; guest_vector.i16[i] = b[i];
+        alias.xmm[3].i16[i] = a[i];
+    }
+    for (unsigned i = 0; i < 8; ++i) {
+        reg.gpr[i] = mem.gpr[i] = alias.gpr[i] = 0x12340000u + i;
+        reg.flags[i] = mem.flags[i] = alias.flags[i] = 0xA5A50000u + i;
+    }
+    reg_before = reg; mem_before = mem; alias_before = alias;
+    run_reg(&reg); run_mem(&mem); run_alias(&alias);
+    if (!unchanged_except_xmm(&reg, &reg_before, 0) ||
+        !unchanged_except_xmm(&mem, &mem_before, 2) ||
+        !unchanged_except_xmm(&alias, &alias_before, 3)) return 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        if (reg.xmm[0].i16[i] != expected[i] || mem.xmm[2].i16[i] != expected[i] ||
+            alias.xmm[3].i16[i] != a[i]) return 0;
+    }
+    return 1;
+}
+int main(void)
+{
+    static const int16_t a[8] = {INT16_MIN, INT16_MAX, -1, 0, -32767, 32766, 1, -2};
+    static const int16_t b[8] = {INT16_MAX, INT16_MIN, 0, -1, 32767, -32768, -1, 1};
+    static const int16_t c[8] = {-1, 1, INT16_MIN, INT16_MAX, 0, -20000, 20000, -32768};
+    return !(check(a, b) && check(b, c) && check(c, a));
+}
+""", encoding="utf-8")
+            build = subprocess.run(
+                [compiler, "-std=c11", "-O0", "-msse2", str(source), "-o", str(executable)],
+                text=True, capture_output=True)
+            if build.returncode:
+                raise AssertionError("PMAXSW native SSE2 self-test compile failed:\n" +
+                                     build.stdout + build.stderr)
+            result = subprocess.run([str(executable)], text=True, capture_output=True)
+            if result.returncode:
+                raise AssertionError("PMAXSW/native SSE2 comparison failed:\n" +
+                                     result.stdout + result.stderr)
+    else:
+        print("PMAXSW native SSE2 self-test skipped (gcc not found)")
+    from types import SimpleNamespace
+    def thunk_fixture(address: int, code: bytes):
+        instructions = list(md.disasm(code, address))
+        return SimpleNamespace(blocks={address: SimpleNamespace(instructions=instructions)})
+    def rel_jmp(address: int, target: int) -> bytes:
+        return b"\xE9" + ((target - (address + 5)) & 0xFFFFFFFF).to_bytes(4, "little")
+    thunk_a, thunk_b, final_target = 0x00401000, 0x00402000, 0x00403000
+    assert direct_tail_thunk_target(thunk_fixture(thunk_a, rel_jmp(thunk_a, thunk_b))) == thunk_b
+    assert direct_tail_thunk_target(thunk_fixture(thunk_b, rel_jmp(thunk_b, final_target))) == final_target
+    assert direct_tail_thunk_target(thunk_fixture(0x00404000, bytes.fromhex("ffe0"))) is None
+    assert direct_tail_thunk_target(thunk_fixture(0x00405000, bytes.fromhex("ff248578563412"))) is None
+    assert direct_tail_thunk_target(thunk_fixture(0x00406000, bytes.fromhex("0f8400000000"))) is None
+    assert direct_tail_thunk_target(thunk_fixture(
+        0x00407000, bytes.fromhex("50") + rel_jmp(0x00407001, 0x00408000))) is None
+    # The same depth+1 and queued-set policy used by discovery must visit a
+    # chain of two direct thunks exactly once.
+    thunk_graph = {
+        thunk_a: thunk_fixture(thunk_a, rel_jmp(thunk_a, thunk_b)),
+        thunk_b: thunk_fixture(thunk_b, rel_jmp(thunk_b, final_target)),
+        final_target: thunk_fixture(final_target, bytes.fromhex("c3")),
+    }
+    chain = collections.deque([(thunk_a, 0)])
+    chain_queued = {thunk_a}
+    chain_seen = []
+    while chain:
+        current, depth = chain.popleft()
+        chain_seen.append((current, depth))
+        target = direct_tail_thunk_target(thunk_graph[current])
+        if target is not None and target not in chain_queued:
+            chain_queued.add(target)
+            chain.append((target, depth + 1))
+    assert chain_seen == [(thunk_a, 0), (thunk_b, 1), (final_target, 2)]
+    compiler = shutil.which("gcc")
+    if compiler:
+        with tempfile.TemporaryDirectory(prefix="rsqrtps_selftest_", dir=ROOT / "work") as temp_name:
+            temp_dir = Path(temp_name)
+            source = temp_dir / "rsqrtps_semantics.c"
+            executable = temp_dir / "rsqrtps_semantics.exe"
+            source.write_text(
+                "#include <stdint.h>\n#include <string.h>\n#include <math.h>\n"
+                "typedef union { float f32[4]; uint32_t u32[4]; } XMM;\n"
+                "typedef struct { XMM xmm[8]; } CPU;\n"
+                "static XMM guest_vector;\n"
+                "static XMM rdxm(uint32_t address) { (void)address; return guest_vector; }\n"
+                + FP_ADAPTER_HELPERS + "\n"
+                + "static void run_reg(CPU *c) { " + reg_code + " }\n"
+                + "static void run_mem(CPU *c) { " + mem_code + " }\n"
+                + r"""
+static int check(const uint32_t input[4], const uint32_t expected[4])
+{
+    CPU reg = {0}, mem = {0};
+    for (unsigned i = 0; i < 4; ++i) {
+        reg.xmm[1].u32[i] = input[i];
+        mem.xmm[1].u32[i] = input[i];
+    }
+    guest_vector = mem.xmm[1];
+    run_reg(&reg);
+    run_mem(&mem);
+    for (unsigned i = 0; i < 4; ++i)
+        if (reg.xmm[0].u32[i] != expected[i] || mem.xmm[2].u32[i] != expected[i])
+            return 0;
+    return 1;
+}
+int main(void)
+{
+    static const uint32_t edges[4] = {0x00000000u, 0x80000000u, 0x00000001u, 0x7f812345u};
+    static const uint32_t edge_results[4] = {0x7f800000u, 0xff800000u, 0x7f800000u, 0x7fc12345u};
+    static const uint32_t finite[4] = {0x3f800000u, 0x40800000u, 0x3e800000u, 0x7f800000u};
+    static const uint32_t finite_results[4] = {0x3f800000u, 0x3f000000u, 0x40000000u, 0x00000000u};
+    static const uint32_t invalid[4] = {0xbf800000u, 0xff800000u, 0x7f800000u, 0x7fc12345u};
+    static const uint32_t invalid_results[4] = {0xffc00000u, 0xffc00000u, 0x00000000u, 0x7fc12345u};
+    return !(check(edges, edge_results) && check(finite, finite_results) &&
+             check(invalid, invalid_results));
+}
+""", encoding="utf-8")
+            build = subprocess.run(
+                [compiler, "-std=c11", "-O0", str(source), "-lm", "-o", str(executable)],
+                text=True, capture_output=True)
+            if build.returncode:
+                raise AssertionError("RSQRTPS self-test compile failed:\n" + build.stdout + build.stderr)
+            result = subprocess.run([str(executable)], text=True, capture_output=True)
+            if result.returncode:
+                raise AssertionError("RSQRTPS lane/edge self-test failed:\n" + result.stdout + result.stderr)
+    else:
+        print("RSQRTPS semantic self-test skipped (gcc not found)")
     # XLATB indexes EBX with unsigned AL, replaces only AL, and leaves flags.
     eax, ebx, flags = 0x123456FE, 0xFFFF0000, 0x8D7
     table = bytes((i * 7 + 3) & 0xFF for i in range(256))
@@ -204,9 +430,6 @@ def run_selftest() -> None:
     # Capstone exposes the implicit accumulator as a register operand on
     # STOS/LODS/SCAS. The AC1 string override must accept these while leaving
     # SSE MOVSD/CMPSD (XMM operands) to the donor translator.
-    from capstone import Cs, CS_ARCH_X86, CS_MODE_32
-    md = Cs(CS_ARCH_X86, CS_MODE_32)
-    md.detail = True
     string_fixtures = ("f3aa", "f3ab", "f3ac", "f3ad", "f2ae", "f2af",
                        "f3a4", "f3a5", "f3a6", "f3a7")
     for encoding in string_fixtures:
@@ -219,7 +442,6 @@ def run_selftest() -> None:
     # The callback scanner resolves arg4/arg5 at pre-call ESP+12/+16. Check
     # that aliasing stores, explicit ESP changes, and implicit stack ops do
     # not get mistaken for the five-argument push sequence.
-    from types import SimpleNamespace
     def f9fa43_fixture(middle: bytes = b"", tail: bytes = b""):
         start = 0x00401000
         code = bytearray()
@@ -265,6 +487,25 @@ def run_ac1_switch_selftest(binary: Path, pcrecomp: Path) -> None:
     code = binary.read_bytes()
     dis = Disassembler(code, info.image_base, info.sections)
     install_ac1_jump_table_bounds(dis)
+    thunk_iat = build_iat_map(info)
+    known_thunk = dis.disassemble_function(0x004C2B30, thunk_iat)
+    if not known_thunk or not known_thunk.blocks:
+        raise AssertionError("AC1 known direct thunk did not disassemble")
+    assert direct_tail_thunk_target(known_thunk) == 0x005DA560
+    assert validate_callback_code_entry(0x005DA560, dis, info, thunk_iat, {})
+    rdata = next(section for section in info.sections if section.name == ".rdata")
+    data_target = info.image_base + rdata.virtual_address
+    assert not validate_callback_code_entry(data_target, dis, info, thunk_iat, {})
+    assert not validate_callback_code_entry(0xFFFFFFFF, dis, info, thunk_iat, {})
+    from types import SimpleNamespace
+    synthetic_thunk_start = 0x00401000
+    rel = (data_target - (synthetic_thunk_start + 5)) & 0xFFFFFFFF
+    data_jump = next(dis.md.disasm(b"\xE9" + rel.to_bytes(4, "little"), synthetic_thunk_start))
+    data_thunk = SimpleNamespace(blocks={
+        synthetic_thunk_start: SimpleNamespace(instructions=[data_jump])
+    })
+    assert direct_tail_thunk_target(data_thunk) == data_target
+    assert not validate_callback_code_entry(data_target, dis, info, thunk_iat, {})
     function = dis.disassemble_function(0x0079F910, build_iat_map(info))
     if function is None or not function.blocks:
         raise AssertionError("AC1 jump-table regression function did not disassemble")
@@ -988,12 +1229,23 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
                 for block in sorted(function.blocks.values(), key=lambda item: item.start)
             ],
         }
+        tail_target = direct_tail_thunk_target(function)
+        if (tail_target is not None and
+                validate_callback_code_entry(tail_target, dis, info, iat, results)):
+            # Keep the exact architectural jump destination. Do not advance
+            # through alignment bytes or rewrite the target based on padding.
+            results[address]["is_thunk"] = True
+            results[address]["tail_thunk_target"] = tail_target
         if depth >= max_depth:
             continue
         for target in sorted(function.calls_to):
             if target not in results and target not in queued and info.code_start <= target < info.code_end:
                 queued.add(target)
                 queue.append((target, depth + 1))
+        if tail_target is not None and results[address].get("tail_thunk_target") == tail_target:
+            if tail_target not in results and tail_target not in queued:
+                queued.add(tail_target)
+                queue.append((tail_target, depth + 1))
         for call_edge in ac1_array_constructor_call_edges(function):
             for role in ("constructor", "cleanup"):
                 target = call_edge[role]
@@ -1073,6 +1325,10 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
                     f"c->xmm[{dst}].u64[0] = (uint64_t)_d.u32[0] * _s.u32[0]; "
                     f"c->xmm[{dst}].u64[1] = (uint64_t)_d.u32[2] * _s.u32[2]; }}"
                 ]
+            if insn.mnemonic == "pmaxsw":
+                dst = self._xi(insn.operands[0])
+                src = self._xm(insn, insn.operands[1])
+                return [pmaxsw_lanes_code(dst, src)]
             if insn.mnemonic == "rcpps":
                 dst = self._xi(insn.operands[0])
                 src = self._xm(insn, insn.operands[1])
@@ -1093,6 +1349,10 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
                     f"{{ uint32_t _src = {src_bits}; "
                     f"c->xmm[{dst}].u32[0] = ac1_rsqrtss_lane(_src); }}"
                 ]
+            if insn.mnemonic == "rsqrtps":
+                dst = self._xi(insn.operands[0])
+                src = self._xm(insn, insn.operands[1])
+                return [rsqrtps_lanes_code(dst, src)]
             return super().translate(insn, labels)
 
     pe = pefile.PE(str(binary), fast_load=True)
