@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "ac1_runtime.h"
 #include "ac1_virtual_query.h"
+#include "ac1_profile_int.h"
 #include "cpu.h"
 #include "guest_memory.h"
 #include "pe32_loader.h"
@@ -2883,8 +2884,49 @@ static int handle_profile_import(CPU *cpu, const import_record *import)
     if (!import || import->by_ordinal ||
         !equal_ascii_fold(import->dll, "KERNEL32.dll") ||
         (strcmp(import->name, "GetPrivateProfileStringA") &&
+         strcmp(import->name, "GetPrivateProfileIntA") &&
          strcmp(import->name, "WritePrivateProfileStringA")))
         return 0;
+
+    if (!strcmp(import->name, "GetPrivateProfileIntA")) {
+        const uint32_t *arguments = (const uint32_t *)guest_memory_try_ptr(cpu->esp + 4u, 16u);
+        if (!arguments)
+            stop_guest("GetPrivateProfileIntA arguments are unmapped", import->token);
+        char section[512] = "";
+        char key[512] = "";
+        char guest_path[32768] = "";
+        if (!arguments[0] || !arguments[1] || !arguments[3] ||
+            !copy_guest_string(arguments[0], section, sizeof(section)) ||
+            !copy_guest_string(arguments[1], key, sizeof(key)) ||
+            !copy_guest_string(arguments[3], guest_path, sizeof(guest_path)))
+            stop_guest("GetPrivateProfileIntA requires mapped section, key, and filename strings",
+                       import->token);
+        if (!profile_path_is_absolute(guest_path))
+            stop_guest("GetPrivateProfileIntA relative paths require Windows-directory lookup",
+                       import->token);
+
+        char host_path[32768];
+        if (!resolve_profile_path(guest_path, host_path, sizeof(host_path))) {
+            cpu->eax = arguments[2];
+            last_error = 87u; /* ERROR_INVALID_PARAMETER */
+            return_stdcall(cpu, 16u);
+            return 1;
+        }
+
+        char value[256];
+        int file_opened = 0;
+        int found = profile_get_value(host_path, section, key, "",
+                                      value, sizeof(value), &file_opened);
+        uint32_t result = ac1_profile_int_parse(value, found, arguments[2]);
+        cpu->eax = result;
+        last_error = file_opened ? 0u : ((errno == ENOENT) ? 2u : 5u);
+        if (trace_imports)
+            fprintf(stderr, "AC1 profile integer: section=\"%s\" key=\"%s\" value=\"%s\" found=%d file_opened=%d result=0x%08x file=\"%s\"\n",
+                    section, key, found ? value : "<default>", found, file_opened,
+                    result, guest_path);
+        return_stdcall(cpu, 16u);
+        return 1;
+    }
 
     if (!strcmp(import->name, "WritePrivateProfileStringA")) {
         const uint32_t *arguments = (const uint32_t *)guest_memory_try_ptr(cpu->esp + 4u, 16u);
