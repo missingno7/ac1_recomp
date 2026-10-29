@@ -99,6 +99,8 @@ struct ac1_guest_thread {
     int priority_boost_disabled;
     uint32_t wait_handle, wait_result;
     uint64_t wait_deadline;
+    uint64_t return_slice_deadline;
+    unsigned return_slice_checks;
 };
 
 struct ac1_scheduler {
@@ -140,6 +142,7 @@ static _Thread_local uint32_t last_guest_target;
 static _Thread_local uint64_t dispatch_count;
 static uint64_t dispatch_limit = AC1_DISPATCH_LIMIT_DEFAULT;
 static _Thread_local unsigned dispatch_depth;
+static uint64_t scheduler_return_slice_ns = UINT64_C(1000000);
 static pcrecomp_heap *process_heap;
 static ac1_files *guest_files;
 static char exe_path_copy[32768];
@@ -348,6 +351,9 @@ static void run_guest_thread(ac1_guest_thread *thread)
          * baton. The primary thread can still service imports while this worker
          * is waiting, including SetThreadAffinityMask. */
         active_guest_thread = thread;
+        thread->return_slice_deadline = scheduler_return_slice_ns
+            ? guest_monotonic_ns() + scheduler_return_slice_ns : 0u;
+        thread->return_slice_checks = 0u;
         guest_address_space_select(scheduler->space);
         static_tls_data_base = thread->static_tls_data;
         static_tls_vector_base = thread->static_tls_vector;
@@ -802,9 +808,33 @@ static void scheduler_checkpoint(void)
     char failure_reason[sizeof(scheduler->failure_reason)];
     snprintf(failure_reason, sizeof(failure_reason), "%s", scheduler->failure_reason);
     scheduler_unlock(scheduler);
+    if (scheduler_return_slice_ns) {
+        thread->return_slice_deadline = guest_monotonic_ns() + scheduler_return_slice_ns;
+        thread->return_slice_checks = 0u;
+    }
     if ((stopping || failed) && thread->slot != 0u)
         longjmp(thread->exit_env, 1);
     if (failed) stop_guest(failure_reason[0] ? failure_reason : "guest worker failed", target);
+}
+
+/* Generated-function returns are cooperative yield opportunities, not blocking
+ * API boundaries. Amortize their scheduler scan while keeping API checkpoints
+ * above immediate. A zero slice setting preserves the legacy every-return path. */
+static void scheduler_return_checkpoint(void)
+{
+    ac1_scheduler *scheduler = active_scheduler;
+    ac1_guest_thread *thread = active_guest_thread;
+    if (!scheduler || !thread || scheduler->count < 2u ||
+        scheduler_return_slice_ns == 0u) {
+        scheduler_checkpoint();
+        return;
+    }
+    if (!thread->return_slice_deadline)
+        thread->return_slice_deadline = guest_monotonic_ns() + scheduler_return_slice_ns;
+    if (++thread->return_slice_checks < 64u) return;
+    thread->return_slice_checks = 0u;
+    if (guest_monotonic_ns() < thread->return_slice_deadline) return;
+    scheduler_checkpoint();
 }
 
 const char *ac1_last_error(void) { return last_run_error; }
@@ -5806,7 +5836,7 @@ void dispatch(CPU *cpu, uint32_t target)
         }
     }
     last_guest_target = previous_target;
-    scheduler_checkpoint();
+    scheduler_return_checkpoint();
 }
 
 void dispatch_jmp(CPU *cpu, uint32_t target)
@@ -6007,6 +6037,20 @@ static int load_pinned_bink_module(char *error, size_t error_capacity)
     return 1;
 }
 
+static uint64_t read_scheduler_return_slice_ns(void)
+{
+    const char *setting = getenv("AC1_SCHEDULER_SLICE_US");
+    if (!setting || !*setting) return UINT64_C(1000000);
+    if (setting[0] == '-') return UINT64_C(1000000);
+    char *end = NULL;
+    errno = 0;
+    unsigned long long value = strtoull(setting, &end, 0);
+    if (errno == ERANGE || end == setting || *end != '\0' ||
+        value > UINT64_MAX / UINT64_C(1000))
+        return UINT64_C(1000000);
+    return (uint64_t)value * UINT64_C(1000);
+}
+
 static uint64_t read_dispatch_limit(void)
 {
     const char *setting = getenv("AC1_DISPATCH_LIMIT");
@@ -6042,6 +6086,7 @@ int ac1_run(const char *exe_path)
     }
     lock_ac1_run();
     dispatch_limit = read_dispatch_limit();
+    scheduler_return_slice_ns = read_scheduler_return_slice_ns();
 #ifdef _WIN32
     window_bridge = NULL;
     ds8_configured = 0;
@@ -6240,6 +6285,9 @@ int ac1_run(const char *exe_path)
     primary->static_tls_vector = static_tls_vector_base;
     primary->image_delta = image.load_base - image.preferred_base;
     active_guest_thread = primary;
+    primary->return_slice_deadline = scheduler_return_slice_ns
+        ? guest_monotonic_ns() + scheduler_return_slice_ns : 0u;
+    primary->return_slice_checks = 0u;
     wr32(AC1_TIB_BASE + 0x20u, 1u);
     wr32(AC1_TIB_BASE + 0x24u, primary->id);
     CPU *cpu = &primary->cpu;
