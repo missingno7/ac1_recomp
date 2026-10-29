@@ -341,6 +341,7 @@ int token_argument_count(uint32_t token)
     }
     if (kind == kVertexDeclarationKind) {
         if (method < 3) return method == 0 ? 3 : 1;
+        if (method == 4) return 3;
         return -2;
     }
 
@@ -907,6 +908,57 @@ HRESULT create_vertex_declaration(IDirect3DDevice9 *device, const uint32_t *args
     return status;
 }
 
+HRESULT get_vertex_declaration(IDirect3DVertexDeclaration9 *declaration,
+                               const uint32_t *args)
+{
+    if (!args[2]) {
+        set_error("IDirect3DVertexDeclaration9::GetDeclaration count output is null");
+        return D3DERR_INVALIDCALL;
+    }
+    auto *guest_count = static_cast<uint32_t *>(guest_memory(
+        args[2], sizeof(uint32_t), AC1_D3D9_GUEST_WRITE));
+    if (!guest_count) {
+        set_error("IDirect3DVertexDeclaration9::GetDeclaration count output is unmapped");
+        return D3DERR_INVALIDCALL;
+    }
+
+    /* pNumElements is output-only. A first call with a null element array
+     * obtains its exact size without trusting guest-provided capacity. */
+    UINT required = 0;
+    HRESULT status = declaration->GetDeclaration(nullptr, &required);
+    if (FAILED(status)) return status;
+    if (required == 0 || required > MAXD3DDECLLENGTH + 1u) {
+        set_error("native GetDeclaration returned an invalid element count");
+        return E_FAIL;
+    }
+    if (!args[1]) {
+        *guest_count = required;
+        return status;
+    }
+
+    const uint32_t byte_count = required * static_cast<uint32_t>(sizeof(D3DVERTEXELEMENT9));
+    auto *guest_elements = static_cast<D3DVERTEXELEMENT9 *>(guest_memory(
+        args[1], byte_count, AC1_D3D9_GUEST_WRITE));
+    if (!guest_elements) {
+        set_error("IDirect3DVertexDeclaration9::GetDeclaration element output is unmapped");
+        return D3DERR_INVALIDCALL;
+    }
+
+    D3DVERTEXELEMENT9 elements[MAXD3DDECLLENGTH + 1]{};
+    UINT returned = required;
+    status = declaration->GetDeclaration(elements, &returned);
+    if (FAILED(status)) return status;
+    if (returned == 0 || returned > required ||
+        returned > MAXD3DDECLLENGTH + 1u) {
+        set_error("native GetDeclaration changed its element count beyond the checked buffer");
+        return E_FAIL;
+    }
+    std::memcpy(guest_elements, elements,
+        returned * static_cast<uint32_t>(sizeof(D3DVERTEXELEMENT9)));
+    *guest_count = returned;
+    return status;
+}
+
 uint32_t invoke_d3d9(GuestObject &object, uint32_t method,
                     const uint32_t *args, uint32_t argc)
 {
@@ -1382,6 +1434,12 @@ uint32_t invoke_vertex_declaration(GuestObject &object, uint32_t method,
             free_guest_object(guest_address, retired);
         }
         return guest_count;
+    }
+    if (method == 4) {
+        if (!require_count(argc, 3, "IDirect3DVertexDeclaration9::GetDeclaration"))
+            return hresult(D3DERR_INVALIDCALL);
+        return hresult(get_vertex_declaration(
+            static_cast<IDirect3DVertexDeclaration9 *>(object.native), args));
     }
     set_error("IDirect3DVertexDeclaration9 method is not implemented");
     return hresult(D3DERR_NOTAVAILABLE);

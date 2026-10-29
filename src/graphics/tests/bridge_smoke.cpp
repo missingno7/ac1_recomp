@@ -917,7 +917,8 @@ int main(int argc, char **argv)
         return 30;
     }
     const uint32_t declaration = guest_word(declaration_output);
-    if (ac1_d3d9_argument_count(object_slot(declaration, 2)) != 1) {
+    if (ac1_d3d9_argument_count(object_slot(declaration, 2)) != 1 ||
+        ac1_d3d9_argument_count(object_slot(declaration, 4)) != 3) {
         std::fprintf(stderr, "vertex declaration proxy kind was not registered\n");
         DestroyWindow(hidden_window);
         ac1_d3d9_shutdown();
@@ -945,6 +946,58 @@ int main(int argc, char **argv)
         DestroyWindow(hidden_window);
         ac1_d3d9_shutdown();
         return 32;
+    }
+    const uint32_t declaration_count_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t declaration_elements_output = allocate_guest(
+        nullptr, sizeof(declaration_elements), 4);
+    const uint32_t zero_count = 0;
+    std::memcpy(resolve_guest(nullptr, declaration_count_output, sizeof(zero_count),
+                              AC1_D3D9_GUEST_WRITE), &zero_count, sizeof(zero_count));
+    const uint32_t get_declaration_args[] = {
+        declaration, declaration_elements_output, declaration_count_output
+    };
+    if (ac1_d3d9_dispatch(object_slot(declaration, 4), get_declaration_args, 3,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result)) ||
+        guest_word(declaration_count_output) !=
+            sizeof(declaration_elements) / sizeof(declaration_elements[0]) ||
+        std::memcmp(resolve_guest(nullptr, declaration_elements_output,
+                                  sizeof(declaration_elements), AC1_D3D9_GUEST_READ),
+                    declaration_elements, sizeof(declaration_elements)) != 0) {
+        std::fprintf(stderr, "GetDeclaration did not round-trip the declaration: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 35;
+    }
+    const uint32_t count_query_args[] = {declaration, 0u, declaration_count_output};
+    if (ac1_d3d9_dispatch(object_slot(declaration, 4), count_query_args, 3,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result)) ||
+        guest_word(declaration_count_output) !=
+            sizeof(declaration_elements) / sizeof(declaration_elements[0])) {
+        std::fprintf(stderr, "GetDeclaration count-only query failed: %s\n",
+                     ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 36;
+    }
+    const uint32_t unmapped_declaration_output[] = {
+        declaration, 0xfffffff8u, declaration_count_output
+    };
+    const uint32_t unmapped_declaration_count[] = {
+        declaration, declaration_elements_output, 0xfffffff0u
+    };
+    if (ac1_d3d9_dispatch(object_slot(declaration, 4),
+                          unmapped_declaration_output, 3, &getter_result) != 1 ||
+        getter_result != static_cast<uint32_t>(D3DERR_INVALIDCALL) ||
+        ac1_d3d9_dispatch(object_slot(declaration, 4),
+                          unmapped_declaration_count, 3, &getter_result) != 1 ||
+        getter_result != static_cast<uint32_t>(D3DERR_INVALIDCALL)) {
+        std::fprintf(stderr, "GetDeclaration accepted unmapped output memory\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 37;
     }
     const uint32_t declaration_this[] = {declaration};
     if (ac1_d3d9_dispatch(object_slot(declaration, 2), declaration_this, 1,
