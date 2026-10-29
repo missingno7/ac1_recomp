@@ -98,6 +98,7 @@ struct ac1_guest_thread {
     unsigned slot;
     uint32_t id, handle, start, parameter, exit_code, image_delta;
     uint64_t guest_dispatches;
+    ac1_call_state calls;
     uint32_t stack_base, stack_size, tib_base;
     uint32_t static_tls_data, static_tls_vector;
     uint32_t affinity_mask;
@@ -158,10 +159,19 @@ static int get_adapters_info_deferred_logged;
 static _Thread_local unsigned trace_import_count;
 static _Thread_local unsigned trace_callback_count;
 static _Thread_local unsigned trace_file_read_count;
-static _Thread_local uint32_t last_guest_target;
-static _Thread_local uint64_t dispatch_count;
-static uint64_t dispatch_limit = AC1_DISPATCH_LIMIT_DEFAULT;
-static _Thread_local unsigned dispatch_depth;
+/* Cold lifecycle/diagnostic code can still use the active thread. Dispatch
+ * and generated direct calls use CPU->calls and never read emulated TLS. */
+static _Thread_local ac1_call_state unbound_calls;
+static inline ac1_call_state *current_calls(void)
+{
+    return active_guest_thread ? &active_guest_thread->calls : &unbound_calls;
+}
+#define last_guest_target (current_calls()->last_target)
+#define dispatch_count (current_calls()->count)
+#define dispatch_depth (current_calls()->depth)
+uint64_t ac1_dispatch_limit = AC1_DISPATCH_LIMIT_DEFAULT;
+#define dispatch_limit ac1_dispatch_limit
+int ac1_direct_slow_mode;
 static uint64_t scheduler_return_slice_ns = UINT64_C(1000000);
 static pcrecomp_heap *process_heap;
 static ac1_files *guest_files;
@@ -798,10 +808,16 @@ static unsigned scheduler_next_runnable(ac1_scheduler *scheduler, unsigned after
     return best;
 }
 
-static void scheduler_checkpoint(void)
+static inline ac1_guest_thread *guest_thread_for_cpu(CPU *cpu)
 {
-    ac1_scheduler *scheduler = active_scheduler;
-    ac1_guest_thread *thread = active_guest_thread;
+    /* Runtime CPUs are embedded in their guest thread, including reentrant
+     * host callbacks (which snapshot the CPU, but execute with the original). */
+    return (ac1_guest_thread *)((char *)cpu - offsetof(ac1_guest_thread, cpu));
+}
+
+static void scheduler_checkpoint_for_thread(ac1_guest_thread *thread)
+{
+    ac1_scheduler *scheduler = thread ? thread->scheduler : NULL;
     if (!scheduler || !thread || scheduler->count < 2u) return;
     scheduler_lock(scheduler);
     for (;;) {
@@ -850,16 +866,21 @@ static void scheduler_checkpoint(void)
     if (failed) stop_guest(failure_reason[0] ? failure_reason : "guest worker failed", target);
 }
 
+static void scheduler_checkpoint(void)
+{
+    scheduler_checkpoint_for_thread(active_guest_thread);
+}
+
 /* Generated-function returns are cooperative yield opportunities, not blocking
  * API boundaries. Amortize their scheduler scan while keeping API checkpoints
  * above immediate. A zero slice setting preserves the legacy every-return path. */
-static void scheduler_return_checkpoint(void)
+void ac1_scheduler_return_checkpoint(CPU *cpu)
 {
-    ac1_scheduler *scheduler = active_scheduler;
-    ac1_guest_thread *thread = active_guest_thread;
+    ac1_guest_thread *thread = guest_thread_for_cpu(cpu);
+    ac1_scheduler *scheduler = thread->scheduler;
     if (!scheduler || !thread || scheduler->count < 2u ||
         scheduler_return_slice_ns == 0u) {
-        scheduler_checkpoint();
+        scheduler_checkpoint_for_thread(thread);
         return;
     }
     if (!thread->return_slice_deadline)
@@ -867,7 +888,7 @@ static void scheduler_return_checkpoint(void)
     if (++thread->return_slice_checks < 64u) return;
     thread->return_slice_checks = 0u;
     if (guest_monotonic_ns() < thread->return_slice_deadline) return;
-    scheduler_checkpoint();
+    scheduler_checkpoint_for_thread(thread);
 }
 
 const char *ac1_last_error(void) { return last_run_error; }
@@ -6155,19 +6176,34 @@ static int run_import_handlers(CPU *cpu, const import_record *import)
     return 0;
 }
 
-void dispatch(CPU *cpu, uint32_t target)
+/* Shared cold guard failure for inline, statically bound guest calls. */
+void ac1_dispatch_guard_failed(CPU *cpu, uint32_t target)
 {
-    AC1_PROFILE_COUNT(dispatches);
-    if (!cpu) stop_guest("null CPU state", target);
-    const uint32_t guest_callsite = cpu->eip;
-    ++dispatch_count;
-    if (dispatch_limit && dispatch_count > dispatch_limit) {
+    if (dispatch_limit && cpu->calls->count > dispatch_limit) {
         char reason[128];
         snprintf(reason, sizeof(reason), "guest dispatch budget exceeded (limit=%llu)",
                  (unsigned long long)dispatch_limit);
         stop_guest(reason, target);
     }
-    if (dispatch_depth >= AC1_DISPATCH_DEPTH)
+    stop_guest("guest call depth exceeded", target);
+}
+
+void dispatch(CPU *cpu, uint32_t target)
+{
+    AC1_PROFILE_COUNT(dispatches);
+    if (!cpu) stop_guest("null CPU state", target);
+    if (!cpu->calls) cpu->calls = &guest_thread_for_cpu(cpu)->calls;
+    ac1_call_state *calls = cpu->calls;
+    ac1_direct_slow_mode = trace_imports || trace_object_types;
+    const uint32_t guest_callsite = cpu->eip;
+    ++calls->count;
+    if (dispatch_limit && calls->count > dispatch_limit) {
+        char reason[128];
+        snprintf(reason, sizeof(reason), "guest dispatch budget exceeded (limit=%llu)",
+                 (unsigned long long)dispatch_limit);
+        stop_guest(reason, target);
+    }
+    if (calls->depth >= AC1_DISPATCH_DEPTH)
         stop_guest("guest call depth exceeded", target);
 
     if (trace_object_types && !object_type_registry_traced &&
@@ -6252,7 +6288,7 @@ void dispatch(CPU *cpu, uint32_t target)
                 rd32(cpu->ebp + 12u), rd32(cpu->ebp + 20u));
 
     if (trace_imports && target == 0x00933370u && cpu->eip == 0x00937546u &&
-        (dispatch_count <= 8u || dispatch_count % 100000u == 0u)) {
+        (calls->count <= 8u || calls->count % 100000u == 0u)) {
         uint32_t stack[4] = {0};
         uint32_t node = 0u, node_plus4 = 0u, node_plus7 = 0u, edi_value = 0u;
         uint32_t header[4] = {0};
@@ -6268,7 +6304,7 @@ void dispatch(CPU *cpu, uint32_t target)
         if (guest_memory_try_ptr(header_address, sizeof(header)))
             for (unsigned i = 0; i < 4u; ++i) header[i] = rd32(header_address + i * 4u);
         fprintf(stderr, "AC1 parser sample: dispatch=%llu esp=0x%08x eax=0x%08x ebx=0x%08x ecx=0x%08x edx=0x%08x esi=0x%08x edi=0x%08x args=%08x,%08x,%08x,%08x node=%08x,%08x,%08x edi0=%08x header=%08x,%08x,%08x,%08x\n",
-                (unsigned long long)dispatch_count, cpu->esp, cpu->eax,
+                (unsigned long long)calls->count, cpu->esp, cpu->eax,
                 cpu->ebx, cpu->ecx, cpu->edx, cpu->esi, cpu->edi,
                 stack[0], stack[1], stack[2], stack[3], node,
                 node_plus4, node_plus7, edi_value,
@@ -6308,7 +6344,7 @@ void dispatch(CPU *cpu, uint32_t target)
             import->ordinal == 115u && guest_memory_try_ptr(cpu->esp + 4u, 8u))
             snprintf(message, sizeof(message),
                      "unimplemented import WS2_32.dll!#115 (WSAStartup) version=0x%04x wsadata=0x%08x from 0x%08x",
-                     rd32(cpu->esp + 4u) & 0xffffu, rd32(cpu->esp + 8u), last_guest_target);
+                     rd32(cpu->esp + 4u) & 0xffffu, rd32(cpu->esp + 8u), calls->last_target);
         else if (!import->by_ordinal && !strcmp(import->name, "CreateFileA")) {
             uint32_t args[7] = {0};
             int args_mapped = guest_memory_try_ptr(cpu->esp + 4u, sizeof(args)) != NULL;
@@ -6323,7 +6359,7 @@ void dispatch(CPU *cpu, uint32_t target)
                      import->dll, path, args_mapped ? args[1] : 0u,
                      args_mapped ? args[2] : 0u,
                      args_mapped ? args[4] : 0u,
-                     args_mapped ? args[5] : 0u, last_guest_target);
+                     args_mapped ? args[5] : 0u, calls->last_target);
         }
         else if (!import->by_ordinal &&
                  equal_ascii_fold(import->dll, "DINPUT8.dll") &&
@@ -6340,7 +6376,7 @@ void dispatch(CPU *cpu, uint32_t target)
                      return_address,
                      args_mapped ? args[0] : 0u, args_mapped ? args[1] : 0u,
                      args_mapped ? args[2] : 0u, args_mapped ? args[3] : 0u,
-                     args_mapped ? args[4] : 0u, last_guest_target);
+                     args_mapped ? args[4] : 0u, calls->last_target);
         }
         else if (!import->by_ordinal && !strcmp(import->name, "SetCurrentDirectoryA")) {
             uint32_t path_address = guest_memory_try_ptr(cpu->esp + 4u, 4u)
@@ -6358,14 +6394,14 @@ void dispatch(CPU *cpu, uint32_t target)
             path[i < sizeof(path) ? i : sizeof(path) - 1u] = '\0';
             snprintf(message, sizeof(message),
                      "unimplemented import KERNEL32.dll!SetCurrentDirectoryA path=\"%s\" from 0x%08x",
-                     path, last_guest_target);
+                     path, calls->last_target);
         }
         else if (import->by_ordinal)
             snprintf(message, sizeof(message), "unimplemented import %s!#%u from 0x%08x",
-                     import->dll, import->ordinal, last_guest_target);
+                     import->dll, import->ordinal, calls->last_target);
         else
             snprintf(message, sizeof(message), "unimplemented import %s!%s from 0x%08x",
-                     import->dll, import->name, last_guest_target);
+                     import->dll, import->name, calls->last_target);
         stop_guest(message, target);
     }
 
@@ -6398,11 +6434,11 @@ void dispatch(CPU *cpu, uint32_t target)
                 rd32(cpu->esp + 12u), rd32(cpu->esp + 16u));
     }
 
-    uint32_t previous_target = last_guest_target;
-    last_guest_target = target;
-    ++dispatch_depth;
+    uint32_t previous_target = calls->last_target;
+    calls->last_target = target;
+    ++calls->depth;
     function(cpu);
-    --dispatch_depth;
+    --calls->depth;
     if (trace_object_types && guest_callsite == 0x0085B197u) {
         uint32_t descriptor = cpu->eax;
         unsigned descriptor_index = object_type_descriptor_count++;
@@ -6440,8 +6476,8 @@ void dispatch(CPU *cpu, uint32_t target)
             }
         }
     }
-    last_guest_target = previous_target;
-    scheduler_return_checkpoint();
+    calls->last_target = previous_target;
+    ac1_scheduler_return_checkpoint(cpu);
 }
 
 void dispatch_jmp(CPU *cpu, uint32_t target)

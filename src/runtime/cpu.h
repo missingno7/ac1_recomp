@@ -70,6 +70,11 @@ typedef union {
     int64_t  i64[2];
 } XMM;
 
+
+typedef struct ac1_call_state {
+    uint64_t count;
+    uint32_t depth, last_target;
+} ac1_call_state;
 typedef struct {
     uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
     uint32_t eip;
@@ -102,12 +107,44 @@ typedef struct {
     uint16_t fpu_cw, fpu_tw, fpu_opcode, fpu_cs, fpu_ds;
     uint32_t fpu_ip, fpu_dp, mxcsr;
     uint8_t fp_initialized, mmx_active, x87_dirty, mmx_physical;
+    ac1_call_state *calls;
 } CPU;
 
 /* Project-owned native dispatcher, called by generated code. */
 void dispatch(CPU *cpu, uint32_t target);
 void dispatch_jmp(CPU *cpu, uint32_t target);
 void ac1_unsupported_instruction(uint32_t guest_va, const char *reason);
+
+extern uint64_t ac1_dispatch_limit;
+extern int ac1_direct_slow_mode;
+void ac1_dispatch_guard_failed(CPU *c, uint32_t target);
+void ac1_scheduler_return_checkpoint(CPU *c);
+
+/* Tracing takes the original dispatcher, including its callsite-specific
+ * diagnostics. Unbound test CPUs also retain that path. The runtime binds
+ * calls on its first dispatch, without reading emulated TLS on later calls. */
+#if defined(AC1_NO_DIRECT_CALLS)
+#define AC1_CALL(c, fn, target) dispatch((c), (target))
+#else
+#define AC1_CALL(c, fn, target) do { \
+    CPU *_ac = (c); \
+    if (ac1_direct_slow_mode || !_ac->calls) { \
+        dispatch(_ac, (target)); \
+    } else { \
+        ac1_call_state *_as = _ac->calls; \
+        ++_as->count; \
+        if ((ac1_dispatch_limit && _as->count > ac1_dispatch_limit) || _as->depth >= 4096u) \
+            ac1_dispatch_guard_failed(_ac, (target)); \
+        uint32_t _ap = _as->last_target; \
+        _as->last_target = (target); \
+        ++_as->depth; \
+        fn(_ac); \
+        --_as->depth; \
+        _as->last_target = _ap; \
+        ac1_scheduler_return_checkpoint(_ac); \
+    } \
+} while (0)
+#endif
 
 static inline void ac1_fp_init(CPU *c) {
     if (!c->fp_initialized) {
