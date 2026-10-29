@@ -17,6 +17,10 @@
 #include "../platform/ac1_audio_win32.h"
 #if defined(AC1_HOST_D3D9)
 #include "../graphics/ac1_d3d9_bridge.h"
+#if defined(__ANDROID__)
+extern void *ac1_android_d3d9_factory(void *context, uint32_t sdk_version);
+extern uintptr_t ac1_android_d3d9_guest_hwnd(void *context, uint32_t guest_hwnd);
+#endif
 #endif
 
 #include <setjmp.h>
@@ -1749,6 +1753,9 @@ static int d3d9_ensure_configured(void)
     callbacks.guest_free = d3d9_guest_free;
 #ifdef _WIN32
     callbacks.guest_hwnd_to_host = d3d9_guest_hwnd_to_host;
+#elif defined(__ANDROID__)
+    callbacks.factory = ac1_android_d3d9_factory;
+    callbacks.guest_hwnd_to_host = ac1_android_d3d9_guest_hwnd;
 #endif
     if (!ac1_d3d9_configure(&callbacks, NULL)) return 0;
     d3d9_configured = 1;

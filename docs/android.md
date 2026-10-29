@@ -1,17 +1,28 @@
 # Android ARM64 startup build
 
-The current APK packages the real generated AC1 startup functions and the
-portable guest runtime for `arm64-v8a`. It attempts the original DX9 executable's
-entry path and reports the first unsupported startup boundary. D3D9, Vulkan
-presentation, game input, audio and gameplay are not implemented yet.
+The Android app packages real generated AC1 startup functions and the portable
+guest runtime for `arm64-v8a`. Its native layer connects an Android
+`SurfaceView` to DXVK Native WSI, provides the AC1 D3D9 COM bridge, and imports
+DXVK's `Direct3DCreate9` factory. This wiring has compile evidence only; there
+has been no Android device run.
 
 ## Build
 
-Install Android SDK platform 35, NDK 28.2.13676358, CMake 3.22.1 and JDK 17 or
-21. The configured original executable, its adjacent `binkw32.dll`, and the local
-pcrecomp checkout must be available; the script prepares or refreshes generated
-C in `work/lift_initial` and `work/lift_bink` before Gradle. From the repository
-root, run:
+Install Android SDK platform 35, NDK 28.2.13676358, CMake 3.22.1, Git, Python,
+and JDK 17 or 21. Build the pinned DXVK Native Android provider first; the
+script fetches DXVK Native if its ignored checkout is absent, prepares the
+compatibility headers and shaders, then writes the ARM64 library to
+`work/build/dxvk-android-arm64/libac1_dxvk_android.so`:
+
+```powershell
+.\ports\dxvk_android\build.ps1
+```
+
+The configured original executable, its adjacent `binkw32.dll`, and the local
+pcrecomp checkout must also be available. The Android build script prepares or
+refreshes generated C in `work/lift_initial` and `work/lift_bink` before Gradle.
+It preserves `AC1_GENERATED_DIR` as a CMake cache override for frozen generated
+inputs. From the repository root, run:
 
 ```powershell
 .\tools\build_android.ps1
@@ -49,6 +60,24 @@ The APK contains generated code from the proprietary executable, so this local
 diagnostic package is ignored by Git and must not be redistributed. No game
 executable or assets are packaged.
 
+## Current Android startup boundary
+
+Android now has the surface and DXVK factory wiring, but it cannot yet reach
+that factory from the original startup path. `handle_window_import` only routes
+ordinary USER32 calls through the Win32 window bridge under `_WIN32`; Android
+currently handles the special `SetWindowsHookExA` fallback but not normal
+window calls. The recorded host startup order begins `LoadCursorA`, then
+`RegisterClassExA`, `AdjustWindowRect`, and `CreateWindowExA`. `LoadCursorA` is
+therefore the first known Android blocker, before D3D9 initialization. The
+portable Android implementation of `D3DXCheckTextureRequirements` is also still
+missing; building the DXVK provider does not resolve either game-side service.
+
+The latest recorded host trace in `work/startup.log` is later progress on
+Windows: `IDirect3D9::CreateDevice` succeeded and
+`D3DXCheckTextureRequirements` returned `HRESULT=0`; a worker then stopped at
+missing generated guest target `0x00aa9e90`. This is host-only evidence and does
+not imply the Android USER32 path or rendering has run.
+
 ## Isolated ARM64 package checkpoint
 
 On 2026-10-29, a clean `assembleDebug` completed in 38.7 seconds with JDK 17,
@@ -67,7 +96,8 @@ build output byte-for-byte (SHA-256
 signature verification passed. The APK has no assets directory and contains no
 EXE, DLL, FORGE, BIK, or DataPC game files.
 
-The snapshot's latest recorded host startup boundary is the unsupported
-`KERNEL32.dll!GetPrivateProfileIntA` import at `0x009d9600`. Later canonical
-host progress is not included in this package. It has not been installed or
-run on a device.
+This is a historical package checkpoint from before the SurfaceView/DXVK
+integration described above. The snapshot's recorded host boundary was the
+unsupported `KERNEL32.dll!GetPrivateProfileIntA` import at `0x009d9600`; later
+host progress and the Android window/factory wiring are not included in that
+APK. It has not been installed or run on a device.

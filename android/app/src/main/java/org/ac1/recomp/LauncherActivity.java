@@ -9,8 +9,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import android.widget.Button;
 import android.widget.LinearLayout;
-import android.widget.ScrollView;
 import android.widget.TextView;
+import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -29,11 +31,15 @@ public final class LauncherActivity extends Activity {
     private Button choose;
     private Button run;
     private File exeFile;
+    private SurfaceView gameSurface;
+    private boolean surfaceReady;
+    private boolean busy;
 
     static { System.loadLibrary(LIB_NAME); }
 
     private static native int nativeRun(String exePath, String userdataPath);
     private static native String nativeLastError();
+    private static native boolean nativeSetSurface(Surface surface);
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -48,15 +54,39 @@ public final class LauncherActivity extends Activity {
         run.setText("Run original startup");
         run.setEnabled(false);
         run.setOnClickListener(v -> runGuest());
+        gameSurface = new SurfaceView(this);
+        gameSurface.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override public void surfaceCreated(SurfaceHolder holder) {
+                updateSurface(holder.getSurface());
+            }
+            @Override public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+                updateSurface(holder.getSurface());
+            }
+            @Override public void surfaceDestroyed(SurfaceHolder holder) {
+                surfaceReady = false;
+                nativeSetSurface(null);
+                refreshRunEnabled();
+            }
+        });
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         content.addView(status);
         content.addView(choose);
         content.addView(run);
-        ScrollView scroll = new ScrollView(this);
-        scroll.addView(content);
-        setContentView(scroll);
+        content.addView(gameSurface, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0f));
+        setContentView(content);
         restoreImportedExe();
+    }
+
+    private void updateSurface(Surface surface) {
+        surfaceReady = surface != null && surface.isValid() && nativeSetSurface(surface);
+        refreshRunEnabled();
+    }
+
+    private void refreshRunEnabled() {
+        run.setEnabled(!busy && exeFile != null && exeFile.isFile() && surfaceReady);
+        choose.setEnabled(!busy);
     }
 
     private void selectGameFolder() {
@@ -69,6 +99,7 @@ public final class LauncherActivity extends Activity {
         super.onActivityResult(request, result, data);
         if (request != PICK_GAME || result != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
+        busy = true;
         choose.setEnabled(false);
         run.setEnabled(false);
         status.setText("Copying game files into app-private storage…");
@@ -82,12 +113,12 @@ public final class LauncherActivity extends Activity {
                 if (!target.isFile() || target.length() < 1024 * 1024) throw new IllegalArgumentException("Selected folder must contain AssassinsCreed_Dx9.exe");
                 runOnUiThread(() -> {
                     exeFile = target;
-                    run.setEnabled(true);
-                    choose.setEnabled(true);
+                    busy = false;
+                    refreshRunEnabled();
                     status.setText("Original executable and game folder copied. Tap Run original startup to execute the lifted code.");
                 });
             } catch (Exception error) {
-                runOnUiThread(() -> { choose.setEnabled(true); run.setEnabled(false); status.setText("Import failed: " + error.getMessage()); });
+                runOnUiThread(() -> { busy = false; refreshRunEnabled(); status.setText("Import failed: " + error.getMessage()); });
             }
         });
     }
@@ -136,13 +167,14 @@ public final class LauncherActivity extends Activity {
         File candidate = new File(getGameDirectory(), EXE_NAME);
         if (candidate.isFile()) {
             exeFile = candidate;
-            run.setEnabled(true);
+            refreshRunEnabled();
             status.setText("Original DX9 executable and game folder are in app-private storage.");
         }
     }
 
     private void runGuest() {
-        if (exeFile == null || !exeFile.isFile()) return;
+        if (busy || !surfaceReady || exeFile == null || !exeFile.isFile()) return;
+        busy = true;
         run.setEnabled(false);
         choose.setEnabled(false);
         status.setText("Calling the original executable through the native startup harness…");
@@ -157,18 +189,19 @@ public final class LauncherActivity extends Activity {
                 detail = nativeLastError();
             }
             catch (Throwable error) {
-                runOnUiThread(() -> { status.setText("Native startup failed: " + error); run.setEnabled(true); choose.setEnabled(true); });
+                runOnUiThread(() -> { busy = false; status.setText("Native startup failed: " + error); refreshRunEnabled(); });
                 return;
             }
             runOnUiThread(() -> {
                 status.setText("Native startup returned " + result + (detail == null || detail.isEmpty() ? "" : "\n" + detail));
-                run.setEnabled(true);
-                choose.setEnabled(true);
+                busy = false;
+                refreshRunEnabled();
             });
         });
     }
 
     @Override protected void onDestroy() {
+        nativeSetSurface(null);
         worker.shutdownNow();
         super.onDestroy();
     }
