@@ -45,6 +45,8 @@ try {
         Write-Host ('Native inputs prepared in {0:N2} s' -f $Timer.Elapsed.TotalSeconds)
         return
     }
+    $InputSeconds = $Timer.Elapsed.TotalSeconds
+    $NativeBuildTimer = [System.Diagnostics.Stopwatch]::StartNew()
     $CMake = Join-Path $Sdk 'cmake/3.22.1/bin/cmake.exe'
     $Ninja = Join-Path $Sdk 'cmake/3.22.1/bin/ninja.exe'
     $BuildDir = "build/$($Target.ToLower())"
@@ -60,7 +62,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
     & $CMake --build $BuildDir --parallel $Jobs
     if ($LASTEXITCODE -ne 0) { throw 'Native build failed' }
-    Write-Host ('Native build completed in {0:N2} s' -f $Timer.Elapsed.TotalSeconds)
+    Write-Host ('Native build completed in {0:N2} s (input preparation {1:N2} s; configure/compile/link {2:N2} s)' -f
+        $Timer.Elapsed.TotalSeconds, $InputSeconds, $NativeBuildTimer.Elapsed.TotalSeconds)
     if ($CheckRepeat) {
         if ($Target -ne 'Host') { throw '-CheckRepeat applies to Host' }
         & $CMake --build $BuildDir --target ac1_repeat_run --parallel $Jobs
