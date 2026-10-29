@@ -74,7 +74,8 @@ if(WIN32)
     src/platform/ac1_window_win32.c
     src/platform/ac1_audio_win32.c
     src/platform/ac1_ds8_bridge.cpp
-    src/platform/ac1_dinput8_bridge.cpp)
+    src/platform/ac1_dinput8_bridge.cpp
+    src/platform/ac1_input_script.cpp)
   target_compile_features(ac1_runtime PRIVATE cxx_std_17)
   target_include_directories(ac1_runtime PRIVATE src/platform)
   target_link_libraries(ac1_runtime PRIVATE ws2_32 user32 gdi32 advapi32)
@@ -147,6 +148,21 @@ if(NOT ANDROID)
     target_link_libraries(ac1_crypto_contract PRIVATE advapi32)
   endif()
   if(WIN32)
+    add_executable(ac1_input_dinput_contract EXCLUDE_FROM_ALL
+      tests/input_dinput_contract.cpp src/platform/ac1_input_script.cpp)
+    target_compile_features(ac1_input_dinput_contract PRIVATE cxx_std_17)
+    target_link_libraries(ac1_input_dinput_contract PRIVATE user32)
+    add_executable(ac1_input_window_contract EXCLUDE_FROM_ALL
+      tests/input_window_contract.c src/platform/ac1_window_win32.c
+      src/platform/ac1_input_script.cpp src/runtime/guest_memory.c)
+    target_include_directories(ac1_input_window_contract PRIVATE src/platform src/runtime)
+    target_compile_features(ac1_input_window_contract PRIVATE cxx_std_17)
+    target_link_libraries(ac1_input_window_contract PRIVATE user32 gdi32)
+    add_executable(ac1_input_script_contract EXCLUDE_FROM_ALL
+      tests/input_script_contract.cpp src/platform/ac1_input_script.cpp)
+    target_include_directories(ac1_input_script_contract PRIVATE src/platform)
+    target_compile_features(ac1_input_script_contract PRIVATE cxx_std_17)
+    target_link_libraries(ac1_input_script_contract PRIVATE user32)
     add_executable(ac1_window_smoke EXCLUDE_FROM_ALL tests/ac1_window_win32_smoke.c)
     target_include_directories(ac1_window_smoke PRIVATE src/platform)
     target_link_libraries(ac1_window_smoke PRIVATE ac1_runtime)
@@ -154,7 +170,7 @@ if(NOT ANDROID)
     target_compile_features(ac1_dinput8_smoke PRIVATE cxx_std_17)
     target_link_libraries(ac1_dinput8_smoke PRIVATE ac1_runtime)
     add_executable(ac1_dinput8_state_contract EXCLUDE_FROM_ALL
-      src/platform/tests/dinput8_get_device_state_contract.cpp)
+      src/platform/tests/dinput8_get_device_state_contract.cpp src/platform/ac1_input_script.cpp)
     target_compile_features(ac1_dinput8_state_contract PRIVATE cxx_std_17)
     target_link_libraries(ac1_dinput8_state_contract PRIVATE user32)
   endif()

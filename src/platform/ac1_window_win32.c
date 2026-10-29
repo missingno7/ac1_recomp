@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include "ac1_window_win32.h"
+#include "ac1_input_script.h"
 
 #ifndef _WIN32
 #error ac1_window_win32.c is Windows-only
@@ -58,6 +59,7 @@ typedef struct ac1_window_record {
     uint32_t guest_instance, guest_menu, guest_parent, guest_param;
     int32_t x, y, width, height;
     int destroying;
+    int script_activated;
 } ac1_window_record;
 
 typedef struct ac1_queued_message {
@@ -65,6 +67,8 @@ typedef struct ac1_queued_message {
     uint32_t guest_thread_id;
     LRESULT native_default_result;
     int removed;
+    int scripted;
+    ac1_input_message input;
 } ac1_queued_message;
 
 struct ac1_window_win32 {
@@ -221,6 +225,11 @@ static LRESULT CALLBACK ac1_native_wndproc(HWND hwnd, UINT message,
     }
     if (message == WM_CREATE) return 0;
     if (!record || !record->owner) return DefWindowProcW(hwnd, message, wparam, lparam);
+    if (ac1_input_replaying() &&
+        ((message >= WM_KEYFIRST && message <= WM_KEYLAST) ||
+         (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) ||
+         message == WM_ACTIVATE || message == WM_ACTIVATEAPP))
+        return DefWindowProcW(hwnd, message, wparam, lparam);
     if (message == WM_CLOSE) {
         (void)queue_message(record->owner, record, hwnd, message, wparam,
                             lparam, 0);
@@ -329,6 +338,27 @@ static int pump_host_messages(ac1_window_win32 *ui, uint32_t guest_thread_id,
         ac1_window_record *record = &ui->windows[i];
         if (!record->native || record->guest_thread_id != guest_thread_id ||
             GetWindowThreadProcessId(record->native, NULL) != host_thread) continue;
+        /* Tick at the guest pump boundary, never call guest code from native WndProc. */
+        if (ac1_input_replaying() && !record->script_activated) {
+            /* A replay owns guest activation as well as input. Desktop focus
+             * may change freely without pausing the original game loop. */
+            record->script_activated = 1;
+            queue_message(ui, record, record->native, WM_ACTIVATEAPP, TRUE, 0, 0);
+            queue_message(ui, record, record->native, WM_ACTIVATE, WA_ACTIVE, 0, 0);
+        }
+        ac1_input_tick();
+        ac1_input_message injected;
+        while (ac1_input_next_message(&injected)) {
+            unsigned at = ui->message_count;
+            if (!queue_message(ui, record, record->native, injected.message,
+                               injected.wparam, injected.lparam, 0)) break;
+            ui->messages[at].scripted = 1;
+            ui->messages[at].input = injected;
+            POINT point = {injected.x, injected.y};
+            ClientToScreen(record->native, &point);
+            ui->messages[at].message.x = point.x;
+            ui->messages[at].message.y = point.y;
+        }
         MSG message;
         unsigned drained = 0;
         while (drained < 256 && PeekMessageW(&message, record->native, 0, 0, PM_REMOVE)) {
@@ -367,6 +397,10 @@ ac1_window_win32 *ac1_window_win32_create(
         set_error(error, error_capacity, "window bridge allocation failed");
         return NULL;
     }
+    if (!ac1_input_session_init(error, error_capacity)) {
+        free(ui);
+        return NULL;
+    }
     ui->callbacks = *callbacks;
     ui->next_token = AC1_WINDOW_TOKEN_BASE;
     set_error(error, error_capacity, "");
@@ -389,6 +423,7 @@ void ac1_window_win32_destroy(ac1_window_win32 *ui)
         (void)ShowCursor(TRUE);
         ++ui->show_cursor_balance;
     }
+    ac1_input_session_shutdown();
     free(ui);
 }
 
@@ -415,6 +450,37 @@ int ac1_window_win32_call(ac1_window_win32 *ui, CPU *cpu,
         return AC1_WINDOW_WIN32_ERROR;
     }
     const uint32_t tid = current_guest_thread(ui);
+
+    if (ac1_input_replaying() && !strcmp(name, "GetKeyboardState")) {
+        uint32_t address;
+        uint8_t keys[256];
+        if (!guest_read(ui, cpu->esp + 4, &address, 4)) goto invalid_one;
+        ac1_input_vk_state(keys);
+        if (!guest_write(ui, address, keys, sizeof(keys))) goto invalid_one;
+        cpu->eax = 1;
+        return_api(cpu, 4);
+        return AC1_WINDOW_WIN32_HANDLED;
+    }
+    if (ac1_input_replaying() && !strcmp(name, "ToUnicode")) {
+        uint32_t args[6];
+        uint8_t keys[256];
+        WCHAR output[64];
+        if (!guest_read(ui, cpu->esp + 4, args, sizeof(args)) ||
+            !guest_read(ui, args[2], keys, sizeof(keys)) || !args[4] || args[4] > 64) {
+            set_error(error, error_capacity, "replay ToUnicode: invalid keyboard/output buffer or capacity (1..64)");
+            return AC1_WINDOW_WIN32_ERROR;
+        }
+        int result = ToUnicodeEx(args[0], args[1], keys, output, (int)args[4], args[5],
+                                 LoadKeyboardLayoutW(L"00000409", KLF_NOTELLSHELL));
+        unsigned count = result < 0 ? 1 : (unsigned)result;
+        if (count && !guest_write(ui, args[3], output, count * 2)) {
+            set_error(error, error_capacity, "replay ToUnicode: guest output is unmapped");
+            return AC1_WINDOW_WIN32_ERROR;
+        }
+        cpu->eax = (uint32_t)result;
+        return_api(cpu, 24);
+        return AC1_WINDOW_WIN32_HANDLED;
+    }
 
     if (!strcmp(name, "LoadCursorA")) {
         uint32_t args[2];
@@ -677,21 +743,29 @@ int ac1_window_win32_call(ac1_window_win32 *ui, CPU *cpu,
         ac1_window_record *record = record_from_guest(ui, msg.hwnd);
         if (!record || !record->native) goto invalid_one;
         LRESULT default_result = 0;
+        int scripted = 0;
+        ac1_input_message input;
         for (unsigned i = 0; i < ui->message_count; ++i) {
             ac1_queued_message *queued = &ui->messages[i];
             if (queued->removed && queued->guest_thread_id == tid &&
                 !memcmp(&queued->message, &msg, sizeof(msg))) {
                 default_result = queued->native_default_result;
+                scripted = queued->scripted;
+                input = queued->input;
                 remove_message(ui, i);
                 break;
             }
         }
+        ac1_input_record_message(msg.message, msg.wparam, msg.lparam);
+        const ac1_input_message *previous_input = ac1_input_dispatch_state(scripted ? &input : NULL);
         uint32_t callback_result = 0;
         if (!call_guest_with_default(ui, cpu, record, msg.message, msg.wparam,
                                      msg.lparam, default_result, &callback_result)) {
+            ac1_input_dispatch_state(previous_input);
             set_error(error, error_capacity, "guest WndProc callback could not be invoked");
             return AC1_WINDOW_WIN32_ERROR;
         }
+        ac1_input_dispatch_state(previous_input);
         cpu->eax = callback_result;
         return_api(cpu, 4u);
         if (last_error) *last_error = 0;
@@ -868,7 +942,20 @@ int ac1_window_win32_call(ac1_window_win32 *ui, CPU *cpu,
             set_error(error, error_capacity, "GetCursorPos guest POINT is not writable");
             return AC1_WINDOW_WIN32_HANDLED;
         }
-        BOOL result = GetCursorPos(&point);
+        BOOL result;
+        if (ac1_input_replaying()) {
+            int32_t x, y;
+            ac1_input_cursor(&x, &y);
+            point.x = x;
+            point.y = y;
+            HWND hwnd = NULL;
+            for (unsigned i = 0; i < AC1_WINDOW_MAX_WINDOWS; ++i)
+                if (ui->windows[i].native && ui->windows[i].guest_thread_id == tid) {
+                    hwnd = ui->windows[i].native;
+                    break;
+                }
+            result = hwnd && ClientToScreen(hwnd, &point);
+        } else result = GetCursorPos(&point);
         if (result && !guest_write(ui, point_address, &point, sizeof(point))) {
             cpu->eax = FALSE;
             return_api(cpu, 4u);

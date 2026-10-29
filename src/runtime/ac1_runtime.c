@@ -6248,6 +6248,10 @@ void dispatch(CPU *cpu, uint32_t target)
             ++trace_import_count;
         }
         int handled = handle_network_import(cpu, import) ||
+#ifdef _WIN32
+                      (!import->by_ordinal && (!strcmp(import->name, "GetKeyboardState") ||
+                       !strcmp(import->name, "ToUnicode")) && handle_window_import(cpu, import)) ||
+#endif
                       handle_win32_compat_import(cpu, import) ||
                       handle_crypto_import(cpu, import) ||
                       handle_audio_import(cpu, import) ||
