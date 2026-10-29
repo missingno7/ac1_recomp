@@ -60,26 +60,24 @@ The APK contains generated code from the proprietary executable, so this local
 diagnostic package is ignored by Git and must not be redistributed. No game
 executable or assets are packaged.
 
-## Current Android startup boundary
+## Current Android status
 
-Android now has the surface and DXVK factory wiring, but it cannot yet reach
-that factory from the original startup path. `handle_window_import` only routes
-ordinary USER32 calls through the Win32 window bridge under `_WIN32`; Android
-currently handles the special `SetWindowsHookExA` fallback but not normal
-window calls. The recorded window-creation sequence uses `LoadCursorA`,
-`RegisterClassExA`, `AdjustWindowRect`, and `CreateWindowExA` before D3D9.
-The host trace also contains an earlier `PeekMessageA` call, with DirectSound
-initialization before it. Without an Android run, this does not establish the
-earliest overall startup failure. Windows-only audio and input providers also
-remain. Portable implementations of the D3DX texture-requirements and shader
-constant-table helpers are missing; linking DXVK does not resolve these
-game-side services.
+The Android CMake build links the D3D9 bridge and DXVK Native library, and the
+Java/JNI `SurfaceView` handoff has passed compilation. The latest runtime C
+source also compiles to an ARM64 object. These changes have not been packaged
+into a new APK; the only assembled APK is the older frozen checkpoint below.
+There has been no Android device run. The original startup still cannot reach
+the Android DXVK factory because ordinary USER32 calls such as `LoadCursorA`,
+`RegisterClassExA`, `AdjustWindowRect`, and `CreateWindowExA` lack an Android
+implementation. Windows-only audio and input providers and portable Android
+D3DX services also remain unresolved.
 
-The preserved host trace `work/startup_dxvk_texturelock.log` confirms native
-device creation, D3DX texture validation, and the original texture upload,
-followed by a resource-callback stop that later host builds have passed.
-`work/startup.log` records the current host boundary. Host progress does not
-imply the Android USER32 path or rendering has run.
+The latest host-only evidence is
+`work/startup_dxvk_monitors_d3dx_success.log` (SHA-256
+`C6F2726D97409F6BED53D2EDE5EE6C0DEC1335A9B3E3B3D1E8FCDFC1DB514E7C`): the
+host completed 460 shader constant-table calls and one monitor callback before
+stopping at guest target `0x00A25E90`. This does not establish Android startup
+or rendering.
 
 ## Isolated ARM64 package checkpoint
 
@@ -99,8 +97,8 @@ build output byte-for-byte (SHA-256
 signature verification passed. The APK has no assets directory and contains no
 EXE, DLL, FORGE, BIK, or DataPC game files.
 
-This is a historical package checkpoint from before the SurfaceView/DXVK
-integration described above. The snapshot's recorded host boundary was the
+This remains the only APK checkpoint. It predates the SurfaceView/DXVK
+integration and later host runtime changes. The snapshot's recorded host boundary was the
 unsupported `KERNEL32.dll!GetPrivateProfileIntA` import at `0x009d9600`; later
 host progress and the Android window/factory wiring are not included in that
 APK. It has not been installed or run on a device.
