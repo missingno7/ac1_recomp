@@ -3043,9 +3043,64 @@ def specialize_direct_calls(body: str, lifted: set[int]) -> tuple[str, set[int],
     return body, callees, count
 
 
+def native_instruction_hash(spec: dict, read_va) -> str:
+    """Hash sparse recovered code, including each instruction's VA and size."""
+    import struct
+    instructions = sorted({(a, n) for b in spec['blocks'] for a, n in b['instructions']})
+    digest = hashlib.sha256()
+    for address, size in instructions:
+        raw = read_va(address, size)
+        if len(raw) != size: raise ValueError(f"short native code read at 0x{address:08X}")
+        digest.update(struct.pack('<IH', address, size))
+        digest.update(raw)
+    return digest.hexdigest()
+
+
+def validate_native_bindings(entries: list, functions: list[dict], lifted: set[int], read_va, md) -> dict:
+    specs = {f['address']: f for f in functions}
+    result = {}
+    for entry in entries:
+        address = int(entry['address'], 0)
+        if address in result: raise ValueError(f"duplicate native binding 0x{address:08X}")
+        if address not in lifted: raise ValueError(f"native binding 0x{address:08X} has no translated oracle")
+        for key in ('implementation', 'plan'):
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', entry[key]):
+                raise ValueError(f"native binding 0x{address:08X}: invalid C identifier {key}")
+        spec = specs[address]
+        actual = native_instruction_hash(spec, read_va)
+        if actual != entry['instruction_sha256']:
+            raise ValueError(f"native binding 0x{address:08X}: instruction hash expected {entry['instruction_sha256']}, got {actual}")
+        # Verification executes both bodies on a serialized guest owner. Calls,
+        # imports and external tail transfers could yield or affect host state.
+        addresses = {a for b in spec['blocks'] for a, _ in b['instructions']}
+        for block in spec['blocks']:
+            for va, size in block['instructions']:
+                insn = next(md.disasm(read_va(va, size), va, count=1))
+                if insn.mnemonic.startswith(('call', 'int', 'sys', 'lock')):
+                    raise ValueError(f"native oracle 0x{address:08X} is not a pure leaf: {va:08X} {insn.mnemonic}")
+                if insn.mnemonic.startswith(('j', 'loop')):
+                    from capstone.x86 import X86_OP_IMM
+                    if not insn.operands or insn.operands[0].type != X86_OP_IMM or insn.operands[0].imm not in addresses:
+                        raise ValueError(f"native oracle 0x{address:08X} has external/indirect transfer at 0x{va:08X}")
+        result[address] = entry
+    return result
+
+
+def wrap_native_binding(body: str, address: int, entry: dict) -> str:
+    signature = f'void L_{address:08X}(CPU *c)'
+    if body.count(signature) != 1: raise ValueError(f"native binding 0x{address:08X}: unexpected function signature")
+    original = f'ac1_translated_{address:08X}'
+    body = body.replace(signature, f'static void {original}(CPU *c)', 1)
+    impl, plan = entry['implementation'], entry['plan']
+    return (body + f'\nvoid {impl}(CPU *);\nint {plan}(const CPU *, ac1_native_plan *);\n'
+            f'ac1_native_binding ac1_binding_{address:08X} = {{.va=0x{address:08X}u, '
+            f'.name="{impl}", .body={impl}, .plan={plan}}};\n'
+            f'void L_{address:08X}(CPU *c) {{ ac1_native_invoke(c, &ac1_binding_{address:08X}, {original}); }}\n')
+
+
 def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: Path,
               functions_per_tu: int, translation_unit_buckets: int = 0,
-              emission_cache=None, direct_calls: bool = True) -> dict:
+              emission_cache=None, direct_calls: bool = True, native_overrides=None) -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
@@ -3180,6 +3235,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
             instruction_counts[address] = spec["instruction_count"]
         except Exception as exc:  # preserve other real bodies when one is unsupported
             failures.append({"address": address, "error": repr(exc)})
+    bindings = validate_native_bindings(native_overrides or [], functions, set(lifted), read_va, lifter.md)
     pe.close()
     # Specialize after the complete success set is known. Cached bodies remain
     # independent of catalog membership; failed/removed callees cannot become
@@ -3190,6 +3246,11 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         for index, address in enumerate(lifted):
             bodies[index], direct_callees[address], sites = specialize_direct_calls(bodies[index], successful)
             direct_sites += sites
+    # Keep L_VA as the one public entry for direct transfers AND the dispatch
+    # table. Retain a private, callable translated oracle behind that entry.
+    for index, address in enumerate(lifted):
+        if address in bindings:
+            bodies[index] = wrap_native_binding(bodies[index], address, bindings[address])
     if translation_unit_buckets < 0:
         raise ValueError("translation_unit_buckets must be zero or positive")
     if not translation_unit_buckets and functions_per_tu < 1:
@@ -3211,7 +3272,8 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         # Per-shard prototypes avoid parsing all 100k entries in every TU.
         callees = set().union(*(direct_callees.get(a, set()) for a in addresses))
         direct_prototypes += len(callees)
-        return tu_header + "".join(f"void L_{a:08X}(CPU *);\n" for a in sorted(callees)) + "\n"
+        native_header = '#include "ac1_native.h"\n' if any(a in bindings for a in addresses) else ''
+        return tu_header + native_header + "".join(f"void L_{a:08X}(CPU *);\n" for a in sorted(callees)) + "\n"
 
     tu_names = []
     if translation_unit_buckets:
@@ -3236,6 +3298,14 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     # each bounded initial_NNNN.c translation unit alongside this file.
     write_text_if_changed(output_dir / "initial.c",
         "/* Generated function bodies are split across initial_NNNN.c files. */\n")
+    if image_base == 0x00400000:
+        registry = ['/* Generated native binding registry; no guest bytes. */', '#include "ac1_native.h"']
+        registry.extend(f'extern ac1_native_binding ac1_binding_{a:08X};' for a in sorted(bindings))
+        registry.append('ac1_native_binding *const ac1_native_bindings[] = {')
+        registry.extend(f'    &ac1_binding_{a:08X},' for a in sorted(bindings))
+        if not bindings: registry.append('    NULL,')
+        registry.extend(['};', f'const size_t ac1_native_binding_count = {len(bindings)}u;', ''])
+        write_text_if_changed(output_dir / 'initial_native.c', '\n'.join(registry))
     active_tus = set(tu_names)
     for old_tu in output_dir.glob("initial_[0-9][0-9][0-9][0-9].c"):
         if old_tu.name not in active_tus:
@@ -3293,6 +3363,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "relocation_entries": len(reloc_vas),
         "direct_call_sites": direct_sites,
         "direct_callee_declarations": direct_prototypes,
+        "native_overrides": [f"0x{a:08X}" for a in sorted(bindings)],
     }
 
 
@@ -3627,7 +3698,8 @@ def main() -> int:
     try:
         lift_result = emit_lift(binary, pcrecomp, catalog_doc["functions"], output_dir,
                                 functions_per_tu, translation_unit_buckets,
-                                emission_cache, direct_calls=not args.no_direct_calls)
+                                emission_cache, direct_calls=not args.no_direct_calls,
+                                native_overrides=config.get('native_overrides', []))
     except Exception:
         if emission_cache is not None:
             emission_cache.close()
@@ -3645,6 +3717,7 @@ def main() -> int:
         "relocation_entries": lift_result["relocation_entries"],
         "direct_call_sites": lift_result["direct_call_sites"],
         "direct_callee_declarations": lift_result["direct_callee_declarations"],
+        "native_overrides": lift_result["native_overrides"],
         "translation_unit_buckets": lift_result["translation_unit_buckets"],
         "outputs": {
             "c": output.name,
