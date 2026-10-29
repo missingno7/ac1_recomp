@@ -1,4 +1,4 @@
-# Startup benchmark without input: time from the first presents (loading
+﻿# Startup benchmark without input: time from the first presents (loading
 # screen) to the title screen, then idle title-screen frame rate.
 # Runs ac1_startup.exe with a timeout and parses the D3D9 present trace.
 param(
@@ -17,7 +17,7 @@ try {
     $env:DXVK_LOG_PATH = (Resolve-Path work\host_dxvk_run).Path
     $env:AC1_DISPATCH_LIMIT = '0'
     $env:AC1_D3D9_TRACE_FRAME = '1'
-    $env:AC1_HIDE_FILES = 'videos\UBI_LOGO.bik;videos\Ubisoft_Presents.bik;videos\Warning_Disclaimer.bik;videos\DemoIntro.bik'
+    $env:AC1_HIDE_FILES = 'videos\UBI_LOGO.bik;videos\Ubisoft_Presents.bik;videos\Warning_Disclaimer.bik;videos\DemoIntro.bik' + $(if ($env:AC1_BENCH_HIDE_LOADING) { ';videos\LoadingScreen.bik' } else { '' })
     Remove-Item Env:AC1_TRACE_IMPORTS -ErrorAction SilentlyContinue
     Remove-Item Env:AC1_D3D9_CAPTURE_DIR -ErrorAction SilentlyContinue
     $err = Join-Path $ProjectRoot "$Log.err"
