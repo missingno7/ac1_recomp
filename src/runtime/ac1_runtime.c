@@ -5727,7 +5727,7 @@ int ac1_run(const char *exe_path)
         }
     } else {
         runtime_stop_ready = 0;
-        fprintf(stderr, "AC1 guest stop: %s; caller=0x%08x EIP=0x%08x ESP=0x%08x EAX=0x%08x dispatches=%llu\n",
+        fprintf(stderr, "AC1 guest stop: %s; main-caller=0x%08x main-EIP=0x%08x main-ESP=0x%08x main-EAX=0x%08x main-dispatches=%llu\n",
                 stop_reason, last_guest_target, cpu->eip, cpu->esp, cpu->eax,
                 (unsigned long long)dispatch_count);
         if (!(scheduler && scheduler->failed))
