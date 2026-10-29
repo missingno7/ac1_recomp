@@ -271,6 +271,33 @@ static int run_one_lifecycle(smoke_context *context, CPU *cpu, int exercise_clos
         actual_client_point.y != expected_client_point.y)
         return 0;
 
+    RECT host_clip_before, host_clip_after;
+    RECT requested_clip = {0, 0, 3840, 2160};
+    memcpy(guest_ptr(GUEST_MSG, sizeof(requested_clip)), &requested_clip,
+           sizeof(requested_clip));
+    uint32_t clip_arg = GUEST_MSG;
+    uint32_t last_error = 0;
+    char error[256];
+    if (!GetClipCursor(&host_clip_before) ||
+        !prepare_cpu(cpu, 4, &clip_arg, 1) ||
+        ac1_window_win32_call(context->window, cpu, "ClipCursor", &last_error,
+                              error, sizeof(error)) != AC1_WINDOW_WIN32_HANDLED ||
+        cpu->eax != FALSE || last_error != ERROR_CALL_NOT_IMPLEMENTED ||
+        cpu->eip != RETURN_SENTINEL || cpu->esp != GUEST_STACK + 8u ||
+        !GetClipCursor(&host_clip_after) ||
+        memcmp(&host_clip_before, &host_clip_after, sizeof(host_clip_before)) != 0)
+        return 0;
+    clip_arg = 0;
+    last_error = 0;
+    if (!prepare_cpu(cpu, 4, &clip_arg, 1) ||
+        ac1_window_win32_call(context->window, cpu, "ClipCursor", &last_error,
+                              error, sizeof(error)) != AC1_WINDOW_WIN32_HANDLED ||
+        cpu->eax != FALSE || last_error != ERROR_CALL_NOT_IMPLEMENTED ||
+        cpu->eip != RETURN_SENTINEL || cpu->esp != GUEST_STACK + 8u ||
+        !GetClipCursor(&host_clip_after) ||
+        memcmp(&host_clip_before, &host_clip_after, sizeof(host_clip_before)) != 0)
+        return 0;
+
     if (exercise_close) return dispatch_close_and_quit(context, cpu, guest_hwnd);
 
     uint32_t destroy_arg = guest_hwnd;

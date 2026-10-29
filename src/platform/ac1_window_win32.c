@@ -20,6 +20,11 @@
 #define AC1_DESKTOP_TOKEN UINT32_C(0x0000FFF0)
 #define AC1_GUEST_MSG_BYTES 28u
 
+/* The observed game path ignores ClipCursor's return value and reaches its
+ * normal continuation after both rectangle and NULL calls. Keep confinement
+ * deferred without changing the host user's cursor state. */
+static int warned_clip_cursor_unavailable;
+
 typedef struct ac1_guest_msg32 {
     uint32_t hwnd, message, wparam, lparam, time;
     int32_t x, y;
@@ -788,6 +793,33 @@ int ac1_window_win32_call(ac1_window_win32 *ui, CPU *cpu,
         ui->show_cursor_balance += show ? 1 : -1;
         return_api(cpu, 4u);
         if (last_error) *last_error = 0;
+        set_error(error, error_capacity, "");
+        return AC1_WINDOW_WIN32_HANDLED;
+    }
+
+    if (!strcmp(name, "ClipCursor")) {
+        uint32_t rectangle_address;
+        RECT requested_rectangle = {0};
+        if (!guest_read(ui, cpu->esp + 4u, &rectangle_address, 4u))
+            goto invalid_one;
+        if (rectangle_address &&
+            !guest_read(ui, rectangle_address, &requested_rectangle,
+                        sizeof(requested_rectangle))) {
+            cpu->eax = FALSE;
+            return_api(cpu, 4u);
+            if (last_error) *last_error = ERROR_NOACCESS;
+            set_error(error, error_capacity, "ClipCursor guest RECT is unreadable");
+            return AC1_WINDOW_WIN32_HANDLED;
+        }
+        cpu->eax = FALSE;
+        return_api(cpu, 4u);
+        if (last_error) *last_error = ERROR_CALL_NOT_IMPLEMENTED;
+        if (!warned_clip_cursor_unavailable) {
+            warned_clip_cursor_unavailable = 1;
+            fprintf(stderr,
+                "AC1 optional service deferred: USER32!ClipCursor is unsupported; "
+                "guest caller ignores FALSE, host cursor confinement is unchanged\n");
+        }
         set_error(error, error_capacity, "");
         return AC1_WINDOW_WIN32_HANDLED;
     }
