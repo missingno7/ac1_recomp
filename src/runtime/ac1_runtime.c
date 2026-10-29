@@ -171,10 +171,18 @@ static char bink_host_path[32768];
 static ac1_window_win32 *window_bridge;
 static int ds8_configured;
 static int dinput8_configured;
+typedef struct { uintptr_t native; uint32_t guest; } ac1_guest_monitor;
+static ac1_guest_monitor *guest_monitors;
+static size_t guest_monitor_count;
+static size_t guest_monitor_capacity;
+static uint32_t next_guest_monitor = 0xE6000004u;
+static SRWLOCK guest_monitor_lock = SRWLOCK_INIT;
 #endif
 #if defined(AC1_HOST_D3D9)
 typedef struct { uint32_t guest_address, heap_address; } ac1_d3d9_heap_block;
-static ac1_d3d9_heap_block d3d9_heap_blocks[256];
+static ac1_d3d9_heap_block *d3d9_heap_blocks;
+static size_t d3d9_heap_block_count;
+static size_t d3d9_heap_block_capacity;
 static int d3d9_configured;
 #endif
 static uint8_t tls_used[AC1_TLS_SLOTS];
@@ -1279,6 +1287,49 @@ static pcrecomp_heap *heap_by_handle(uint32_t handle)
     return NULL;
 }
 
+#ifdef _WIN32
+static uint32_t guest_monitor_for_host(uintptr_t native_monitor)
+{
+    if (!native_monitor) return 0u;
+    AcquireSRWLockExclusive(&guest_monitor_lock);
+    for (size_t i = 0u; i < guest_monitor_count; ++i) {
+        if (guest_monitors[i].native == native_monitor) {
+            uint32_t token = guest_monitors[i].guest;
+            ReleaseSRWLockExclusive(&guest_monitor_lock);
+            return token;
+        }
+    }
+    if (guest_monitor_count == guest_monitor_capacity) {
+        size_t new_capacity = guest_monitor_capacity
+            ? guest_monitor_capacity * 2u : 8u;
+        if (new_capacity < guest_monitor_capacity ||
+            new_capacity > SIZE_MAX / sizeof(*guest_monitors)) {
+            ReleaseSRWLockExclusive(&guest_monitor_lock);
+            return 0u;
+        }
+        ac1_guest_monitor *grown = (ac1_guest_monitor *)realloc(
+            guest_monitors, new_capacity * sizeof(*guest_monitors));
+        if (!grown) {
+            ReleaseSRWLockExclusive(&guest_monitor_lock);
+            return 0u;
+        }
+        guest_monitors = grown;
+        guest_monitor_capacity = new_capacity;
+    }
+    if (next_guest_monitor > 0xE6FFFFFCu) {
+        ReleaseSRWLockExclusive(&guest_monitor_lock);
+        return 0u;
+    }
+    uint32_t token = next_guest_monitor;
+    next_guest_monitor += 4u;
+    guest_monitors[guest_monitor_count].native = native_monitor;
+    guest_monitors[guest_monitor_count].guest = token;
+    ++guest_monitor_count;
+    ReleaseSRWLockExclusive(&guest_monitor_lock);
+    return token;
+}
+#endif
+
 #if defined(AC1_HOST_D3D9)
 static void *d3d9_guest_resolve(void *context, uint32_t address,
                                uint32_t size, uint32_t access)
@@ -1293,14 +1344,52 @@ static uint32_t d3d9_guest_alloc(void *context, uint32_t size, uint32_t alignmen
 {
     (void)context;
     if (!process_heap || !size || !alignment || (alignment & (alignment - 1u)) ||
-        alignment > 4096u || size > UINT32_MAX - alignment + 1u)
+        alignment > 4096u || size > UINT32_MAX - alignment + 1u) {
+        if (trace_imports)
+            fprintf(stderr,
+                    "AC1 D3D9 guest allocation rejected: size=%u alignment=%u process_heap=%u\n",
+                    size, alignment, process_heap != NULL);
         return 0u;
+    }
     size_t slot;
-    for (slot = 0; slot < sizeof(d3d9_heap_blocks) / sizeof(d3d9_heap_blocks[0]); ++slot)
+    for (slot = 0; slot < d3d9_heap_block_count; ++slot)
         if (!d3d9_heap_blocks[slot].guest_address) break;
-    if (slot == sizeof(d3d9_heap_blocks) / sizeof(d3d9_heap_blocks[0])) return 0u;
+    if (slot == d3d9_heap_block_count) {
+        if (d3d9_heap_block_count == d3d9_heap_block_capacity) {
+            size_t new_capacity = d3d9_heap_block_capacity
+                ? d3d9_heap_block_capacity * 2u : 64u;
+            if (new_capacity < d3d9_heap_block_capacity ||
+                new_capacity > SIZE_MAX / sizeof(*d3d9_heap_blocks)) {
+                if (trace_imports)
+                    fprintf(stderr,
+                            "AC1 D3D9 heap ledger capacity overflow: entries=%zu\n",
+                            d3d9_heap_block_capacity);
+                return 0u;
+            }
+            ac1_d3d9_heap_block *grown = (ac1_d3d9_heap_block *)realloc(
+                d3d9_heap_blocks, new_capacity * sizeof(*d3d9_heap_blocks));
+            if (!grown) {
+                if (trace_imports)
+                    fprintf(stderr,
+                            "AC1 D3D9 heap ledger growth failed: old_entries=%zu new_entries=%zu\n",
+                            d3d9_heap_block_capacity, new_capacity);
+                return 0u;
+            }
+            memset(grown + d3d9_heap_block_capacity, 0,
+                   (new_capacity - d3d9_heap_block_capacity) * sizeof(*grown));
+            d3d9_heap_blocks = grown;
+            d3d9_heap_block_capacity = new_capacity;
+        }
+        ++d3d9_heap_block_count;
+    }
     uint32_t raw = pcrecomp_heap_alloc(process_heap, size + alignment - 1u, 1);
-    if (!raw) return 0u;
+    if (!raw) {
+        if (trace_imports)
+            fprintf(stderr,
+                    "AC1 D3D9 guest heap allocation failed: size=%u alignment=%u tracked=%zu\n",
+                    size, alignment, d3d9_heap_block_count);
+        return 0u;
+    }
     uint32_t aligned = (raw + alignment - 1u) & ~(alignment - 1u);
     d3d9_heap_blocks[slot].guest_address = aligned;
     d3d9_heap_blocks[slot].heap_address = raw;
@@ -1310,7 +1399,7 @@ static uint32_t d3d9_guest_alloc(void *context, uint32_t size, uint32_t alignmen
 static void d3d9_guest_free(void *context, uint32_t address)
 {
     (void)context;
-    for (size_t i = 0; i < sizeof(d3d9_heap_blocks) / sizeof(d3d9_heap_blocks[0]); ++i) {
+    for (size_t i = 0; i < d3d9_heap_block_count; ++i) {
         if (d3d9_heap_blocks[i].guest_address != address) continue;
         if (process_heap) pcrecomp_heap_free(process_heap, d3d9_heap_blocks[i].heap_address);
         memset(&d3d9_heap_blocks[i], 0, sizeof(d3d9_heap_blocks[i]));
@@ -1319,6 +1408,19 @@ static void d3d9_guest_free(void *context, uint32_t address)
 }
 
 #ifdef _WIN32
+#if defined(AC1_HOST_D3D9)
+static uint32_t d3d9_host_monitor_to_guest(void *context,
+                                          uintptr_t native_monitor)
+{
+    (void)context;
+    uint32_t token = guest_monitor_for_host(native_monitor);
+    if (!token && trace_imports)
+        fprintf(stderr, "AC1 D3D9 monitor mapping failed: native=%p\n",
+                (void *)native_monitor);
+    return token;
+}
+#endif
+
 static uintptr_t d3d9_guest_hwnd_to_host(void *context, uint32_t guest_hwnd)
 {
     (void)context;
@@ -1753,6 +1855,7 @@ static int d3d9_ensure_configured(void)
     callbacks.guest_free = d3d9_guest_free;
 #ifdef _WIN32
     callbacks.guest_hwnd_to_host = d3d9_guest_hwnd_to_host;
+    callbacks.host_monitor_to_guest = d3d9_host_monitor_to_guest;
 #elif defined(__ANDROID__)
     callbacks.factory = ac1_android_d3d9_factory;
     callbacks.guest_hwnd_to_host = ac1_android_d3d9_guest_hwnd;
@@ -1833,6 +1936,54 @@ static int handle_d3dx_texture_requirements_import(
     return 1;
 #else
     stop_guest("D3DXCheckTextureRequirements has no portable implementation",
+               import->token);
+    return 1;
+#endif
+}
+
+static int handle_d3dx_shader_constant_table_import(
+    CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal ||
+        !equal_ascii_fold(import->dll, "d3dx9_36.dll") ||
+        strcmp(import->name, "D3DXGetShaderConstantTable"))
+        return 0;
+
+#if defined(AC1_HOST_D3D9)
+    if (!d3d9_ensure_configured())
+        stop_guest(ac1_d3d9_last_error(), import->token);
+    if (!guest_memory_try_ptr(cpu->esp + 4u, 2u * 4u))
+        stop_guest("D3DXGetShaderConstantTable arguments are unmapped",
+                   import->token);
+
+    uint32_t guest_bytecode = rd32(cpu->esp + 4u);
+    uint32_t guest_output = rd32(cpu->esp + 8u);
+    uint32_t native_hresult = 0u;
+    int status = ac1_d3d9_get_shader_constant_table(
+        guest_bytecode, guest_output, &native_hresult);
+    if (status != 1) {
+        last_error = status == -2 ? 120u : 87u;
+        stop_guest(ac1_d3d9_last_error()[0]
+                   ? ac1_d3d9_last_error()
+                   : (status == -2
+                      ? "D3DXGetShaderConstantTable is unavailable"
+                      : "D3DXGetShaderConstantTable rejected its guest arguments"),
+                   import->token);
+    }
+
+    cpu->eax = native_hresult;
+    if (trace_imports) {
+        uint32_t guest_table = guest_output &&
+            guest_memory_try_ptr(guest_output, 4u) ? rd32(guest_output) : 0u;
+        fprintf(stderr,
+                "AC1 D3DXGetShaderConstantTable: bytecode=0x%08x output=0x%08x table=0x%08x HRESULT=0x%08x\n",
+                guest_bytecode, guest_output, guest_table, native_hresult);
+    }
+    return_stdcall(cpu, 2u * 4u);
+    scheduler_checkpoint();
+    return 1;
+#else
+    stop_guest("D3DXGetShaderConstantTable has no portable implementation",
                import->token);
     return 1;
 #endif
@@ -3734,6 +3885,127 @@ static int ensure_window_bridge(void)
                    last_guest_target);
     return 1;
 }
+
+typedef struct {
+    CPU *cpu;
+    uint32_t procedure;
+    uint32_t guest_data;
+    uint32_t callbacks_delivered;
+    int failed;
+    int guest_stopped;
+} ac1_monitor_enum_context;
+
+static BOOL CALLBACK invoke_guest_monitor_enum(HMONITOR monitor, HDC dc,
+                                               LPRECT rect, LPARAM opaque)
+{
+    ac1_monitor_enum_context *context =
+        (ac1_monitor_enum_context *)(uintptr_t)opaque;
+    if (!context || context->failed) return FALSE;
+    if (dc) {
+        context->failed = 1;
+        return FALSE;
+    }
+
+    uint32_t guest_monitor = guest_monitor_for_host((uintptr_t)monitor);
+    if (!guest_monitor) {
+        context->failed = 1;
+        return FALSE;
+    }
+
+    uint32_t guest_rect = 0u;
+    if (rect) {
+        if (!process_heap) {
+            context->failed = 1;
+            return FALSE;
+        }
+        guest_rect = pcrecomp_heap_alloc(process_heap, sizeof(*rect), 0);
+        if (!guest_rect) {
+            context->failed = 1;
+            return FALSE;
+        }
+        void *destination = guest_memory_try_ptr(guest_rect, sizeof(*rect));
+        if (!destination) {
+            pcrecomp_heap_free(process_heap, guest_rect);
+            context->failed = 1;
+            return FALSE;
+        }
+        memcpy(destination, rect, sizeof(*rect));
+    }
+
+    uint32_t callback_arguments[4] = {
+        guest_monitor, 0u, guest_rect, context->guest_data
+    };
+    uint32_t callback_result = 0u;
+    int invoked = invoke_guest_stdcall_callback(
+        context->cpu, context->procedure, callback_arguments, 4u,
+        &callback_result);
+    if (guest_rect) pcrecomp_heap_free(process_heap, guest_rect);
+    if (!invoked) {
+        context->failed = 1;
+        return FALSE;
+    }
+    ++context->callbacks_delivered;
+    if (!callback_result) {
+        context->guest_stopped = 1;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static int handle_enum_display_monitors_import(
+    CPU *cpu, const import_record *import)
+{
+    if (!import || import->by_ordinal ||
+        !equal_ascii_fold(import->dll, "USER32.dll") ||
+        strcmp(import->name, "EnumDisplayMonitors"))
+        return 0;
+    if (!guest_memory_try_ptr(cpu->esp + 4u, 4u * sizeof(uint32_t)))
+        stop_guest("EnumDisplayMonitors arguments are unmapped", import->token);
+    const uint32_t guest_dc = rd32(cpu->esp + 4u);
+    const uint32_t guest_rect = rd32(cpu->esp + 8u);
+    const uint32_t procedure = rd32(cpu->esp + 12u);
+    const uint32_t guest_data = rd32(cpu->esp + 16u);
+    if (guest_dc)
+        stop_guest("EnumDisplayMonitors received an unsupported non-null HDC",
+                   import->token);
+    if (!procedure)
+        stop_guest("EnumDisplayMonitors received a null guest callback",
+                   import->token);
+
+    RECT clip_rect;
+    RECT *native_clip_rect = NULL;
+    if (guest_rect) {
+        const void *source = guest_memory_try_ptr(guest_rect, sizeof(clip_rect));
+        if (!source)
+            stop_guest("EnumDisplayMonitors clip RECT is unmapped", import->token);
+        memcpy(&clip_rect, source, sizeof(clip_rect));
+        native_clip_rect = &clip_rect;
+    }
+
+    ac1_monitor_enum_context context;
+    memset(&context, 0, sizeof(context));
+    context.cpu = cpu;
+    context.procedure = procedure;
+    context.guest_data = guest_data;
+    SetLastError(ERROR_SUCCESS);
+    BOOL enumerated = EnumDisplayMonitors(
+        NULL, native_clip_rect, invoke_guest_monitor_enum,
+        (LPARAM)(uintptr_t)&context);
+    DWORD native_error = enumerated ? ERROR_SUCCESS : GetLastError();
+    if (context.failed)
+        stop_guest("EnumDisplayMonitors could not marshal a guest callback",
+                   procedure);
+    cpu->eax = enumerated ? 1u : 0u;
+    if (!enumerated && native_error) last_error = native_error;
+    if (trace_imports)
+        fprintf(stderr,
+                "AC1 EnumDisplayMonitors: clip=0x%08x callback=0x%08x data=0x%08x delivered=%u stopped=%u result=%u error=%lu\n",
+                guest_rect, procedure, guest_data, context.callbacks_delivered,
+                context.guest_stopped, cpu->eax, (unsigned long)native_error);
+    return_stdcall(cpu, 4u * sizeof(uint32_t));
+    scheduler_checkpoint();
+    return 1;
+}
 #endif
 
 static int handle_window_import(CPU *cpu, const import_record *import)
@@ -3755,6 +4027,8 @@ static int handle_window_import(CPU *cpu, const import_record *import)
         return 1;
     }
 #ifdef _WIN32
+    if (!strcmp(import->name, "EnumDisplayMonitors"))
+        return handle_enum_display_monitors_import(cpu, import);
     if (!ensure_window_bridge()) return 0;
     char error[256] = {0};
     int status = ac1_window_win32_call(window_bridge, cpu, import->name,
@@ -5375,6 +5649,7 @@ void dispatch(CPU *cpu, uint32_t target)
                       handle_d3d9_import(cpu, import) ||
 #endif
                       handle_d3dx_texture_requirements_import(cpu, import) ||
+                      handle_d3dx_shader_constant_table_import(cpu, import) ||
                       handle_module_import(cpu, import) ||
                       handle_profile_import(cpu, import) ||
                       handle_heap_import(cpu, import) ||
@@ -6087,10 +6362,18 @@ cleanup:
     if (d3d9_configured) {
         ac1_d3d9_shutdown();
         d3d9_configured = 0;
-        memset(d3d9_heap_blocks, 0, sizeof(d3d9_heap_blocks));
     }
+    free(d3d9_heap_blocks);
+    d3d9_heap_blocks = NULL;
+    d3d9_heap_block_count = 0u;
+    d3d9_heap_block_capacity = 0u;
 #endif
 #ifdef _WIN32
+    free(guest_monitors);
+    guest_monitors = NULL;
+    guest_monitor_count = 0u;
+    guest_monitor_capacity = 0u;
+    next_guest_monitor = 0xE6000004u;
     if (window_bridge) {
         ac1_window_win32_destroy(window_bridge);
         window_bridge = NULL;
