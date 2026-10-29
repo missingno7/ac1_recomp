@@ -29713,7 +29713,19 @@
       "0x00415C60",
       "0x00415DC0",
       "0x009E5340",
-      "0x009E51F0"
+      "0x009E51F0",      "0x00AA9110",
+      "0x00AA5B30",
+      "0x00AA9E90",
+      "0x00AA8E00",
+      "0x00AA9EB0",
+      "0x00AA8E90",
+      "0x00AA9ED0",
+      "0x00AA8F20",
+      "0x00AA9EF0",
+      "0x00AA5AB0",
+      "0x00AA9F10",
+      "0x00AAB4C0",
+      "0x00AAB4B0"
     ]
   },
   "functions_per_translation_unit": 100,
