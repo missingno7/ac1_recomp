@@ -1,4 +1,10 @@
 #include "guest_memory.h"
+#ifdef AC1_PROFILE_HOOKS
+#include "ac1_profile.h"
+#else
+#define AC1_PROFILE_COUNT(field) ((void)0)
+#define AC1_PROFILE_SCAN(n) ((void)0)
+#endif
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -250,13 +256,16 @@ void *guest_memory_try_ptr(uint32_t address, size_t width)
     guest_memory_region_t *cached=&current_memory.lookup[slot];
     if(address>=cached->base && end<=(uint64_t)cached->base+cached->size)
         return cached->data+(address-cached->base);
+    AC1_PROFILE_COUNT(slow);
     for (size_t i=0;i<current_memory.count;++i) {
         const guest_memory_region_t *r=&current_memory.regions[i];
         if (address>=r->base && end<=(uint64_t)r->base+r->size) {
             *cached=*r;
+            AC1_PROFILE_SCAN(i + 1);
             return r->data+(address-r->base);
         }
     }
+    AC1_PROFILE_SCAN(current_memory.count);
     return NULL;
 }
 int guest_memory_read(uint32_t address, void *output, size_t width)
@@ -391,6 +400,7 @@ void *guest_ptr(uint32_t address, size_t width)
      * for an adjacent mapping over a preceding mapping's one-past pointer. */
     if (width && address >= cached->base && end <= (uint64_t)cached->base + cached->size)
         return cached->data + (size_t)(address - cached->base);
+    AC1_PROFILE_COUNT(slow);
     for (i = 0; i < current_memory.count; ++i) {
         const guest_memory_region_t *region = &current_memory.regions[i];
         region_end = (uint64_t)region->base + region->size;
@@ -403,9 +413,11 @@ void *guest_ptr(uint32_t address, size_t width)
                 continue;
             }
             if (width) *cached = *region;
+            AC1_PROFILE_SCAN(i + 1);
             return region->data + (size_t)offset;
         }
     }
+    AC1_PROFILE_SCAN(current_memory.count);
     if (width == 0 && one_past)
         return one_past;
     fail("outside mapped range", address, width);

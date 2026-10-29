@@ -8,6 +8,9 @@
  */
 
 #include "ac1_d3d9_bridge.h"
+#ifdef AC1_PROFILE_HOOKS
+#include "../runtime/ac1_profile.h"
+#endif
 
 #include <d3d9.h>
 #if defined(_WIN32)
@@ -332,6 +335,9 @@ void capture_back_buffer(IDirect3DDevice9 *device)
 
 void trace_frame_success(bool is_present, const char *method)
 {
+#ifdef AC1_PROFILE_HOOKS
+    if (is_present && ac1_profile_frames_enabled) ac1_profile_present();
+#endif
 #if defined(_WIN32)
     if (!g_frame_trace_initialized) {
         char value[8]{};
