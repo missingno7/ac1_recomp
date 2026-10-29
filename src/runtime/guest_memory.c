@@ -177,11 +177,6 @@ void guest_memory_add(uint8_t *backing, uint32_t guest_base, uint64_t size)
     current_memory.regions[current_memory.count].base = guest_base;
     current_memory.regions[current_memory.count].size = size;
     ++current_memory.count;
-    if (current_memory.count==65) {
-        printf("guest-memory mapping checkpoint: count=65 base=0x%08x size=%llu\n",
-               guest_base,(unsigned long long)size);
-        fflush(stdout);
-    }
 }
 
 void guest_memory_bind(uint8_t *data, uint32_t guest_base, uint64_t size)

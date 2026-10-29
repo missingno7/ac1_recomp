@@ -161,6 +161,13 @@ def ac1_sse_width_translation(lifter, insn) -> list[str] | None:
     return None
 
 
+def ac1_int3_translation(insn) -> list[str]:
+    """Keep a reachable guest breakpoint as a precise runtime trap."""
+    return [
+        f'ac1_unsupported_instruction(0x{insn.address:08X}u, "guest INT3 breakpoint");'
+    ]
+
+
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -349,6 +356,41 @@ def run_selftest() -> None:
     from capstone.x86 import X86_OP_MEM, X86_OP_REG
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     md.detail = True
+    int3_fixture = next(md.disasm(b"\xCC", 0x00401234))
+    int3_code = ac1_int3_translation(int3_fixture)
+    assert int3_fixture.mnemonic == "int3" and int3_code == [
+        'ac1_unsupported_instruction(0x00401234u, "guest INT3 breakpoint");'
+    ]
+    int3_compiler = shutil.which("gcc")
+    if int3_compiler:
+        with tempfile.TemporaryDirectory(prefix="int3_selftest_", dir=ROOT / "work") as temp_name:
+            temp_dir = Path(temp_name)
+            source = temp_dir / "int3_trap.c"
+            executable = temp_dir / "int3_trap.exe"
+            source.write_text(
+                "#include <setjmp.h>\n#include <stdint.h>\n#include <string.h>\n"
+                "static jmp_buf trap_env; static uint32_t trap_va; "
+                "static const char *trap_reason; static int fell_through;\n"
+                "void ac1_unsupported_instruction(uint32_t va, const char *reason) { "
+                "trap_va = va; trap_reason = reason; longjmp(trap_env, 1); }\n"
+                "static void run_int3(void) { " + int3_code[0] +
+                " fell_through = 1; }\n"
+                "int main(void) { if (setjmp(trap_env) == 0) { run_int3(); return 2; } "
+                "return fell_through || trap_va != 0x00401234u || "
+                "strcmp(trap_reason, \"guest INT3 breakpoint\") != 0; }\n",
+                encoding="utf-8")
+            build = subprocess.run(
+                [int3_compiler, "-std=c11", "-O0", str(source), "-o", str(executable)],
+                text=True, capture_output=True)
+            if build.returncode:
+                raise AssertionError("INT3 trap self-test compile failed:\n" +
+                                     build.stdout + build.stderr)
+            result = subprocess.run([str(executable)], text=True, capture_output=True)
+            if result.returncode:
+                raise AssertionError("INT3 trap did not stop synthetic execution:\n" +
+                                     result.stdout + result.stderr)
+    else:
+        print("INT3 executed-trap self-test skipped (gcc not found)")
     rsqrt_reg = next(md.disasm(bytes.fromhex("0f52c1"), 0x401000))
     rsqrt_mem = next(md.disasm(bytes.fromhex("0f52542410"), 0x401000))
     assert rsqrt_reg.mnemonic == rsqrt_mem.mnemonic == "rsqrtps"
@@ -670,6 +712,17 @@ def run_ac1_switch_selftest(binary: Path, pcrecomp: Path) -> None:
         raise AssertionError("AC1 known direct thunk did not disassemble")
     assert direct_tail_thunk_target(known_thunk) == 0x005DA560
     assert validate_callback_code_entry(0x005DA560, dis, info, thunk_iat, {})
+    allocator = dis.disassemble_function(0x007AD880, thunk_iat)
+    if not allocator or not allocator.blocks:
+        raise AssertionError("AC1 allocator INT3 regression function did not disassemble")
+    allocator_int3 = next(
+        (ins for block in allocator.blocks.values() for ins in block.instructions
+         if ins.address == 0x007AD9FB), None)
+    if allocator_int3 is None or allocator_int3.mnemonic != "int3" or bytes(allocator_int3.bytes) != b"\xCC":
+        raise AssertionError("AC1 allocator assertion site is no longer the expected INT3")
+    assert ac1_int3_translation(allocator_int3) == [
+        'ac1_unsupported_instruction(0x007AD9FBu, "guest INT3 breakpoint");'
+    ]
     rdata = next(section for section in info.sections if section.name == ".rdata")
     data_target = info.image_base + rdata.virtual_address
     assert not validate_callback_code_entry(data_target, dis, info, thunk_iat, {})
@@ -1904,6 +1957,8 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     class AC1Lifter(BaseLifter):
         """AC1-specific instruction semantics missing from the donor lifter."""
         def translate(self, insn, labels):
+            if insn.mnemonic == "int3":
+                return ac1_int3_translation(insn)
             narrow_memory_sse = ac1_sse_width_translation(self, insn)
             if narrow_memory_sse is not None:
                 return narrow_memory_sse

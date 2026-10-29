@@ -53,14 +53,35 @@ def main() -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
         content = source.read_bytes()
         if destination == "src/runtime/guest_memory.h":
-            text = content.decode("utf-8")
+            text = content.decode("utf-8").replace("\r\n", "\n")
+            capacity = (
+                "/* Original map/renderer allocation exceeds the initial 64-region probe cap. */\n"
+                "#define GUEST_MEMORY_MAX_REGIONS 256u"
+            )
+            if text.count(capacity) != 1:
+                raise SystemExit(f"unexpected guest-memory capacity definition: {source}")
+            text = text.replace(
+                capacity,
+                "/* AC1 startup exceeds the donor's 256-region bookkeeping capacity. */\n"
+                "#define GUEST_MEMORY_MAX_REGIONS 4096u",
+            )
             marker = "void guest_memory_release(uint32_t base);"
             if text.count(marker) != 1:
                 raise SystemExit(f"unexpected guest-memory header shape: {source}")
             text = text.replace(marker, marker + "\nuint64_t guest_memory_region_size(uint32_t base);")
             content = text.replace("\r\n", "\n").encode("utf-8")
         if destination == "src/runtime/guest_memory.c":
-            text = content.decode("utf-8")
+            text = content.decode("utf-8").replace("\r\n", "\n")
+            checkpoint = (
+                "    if (current_memory.count==65) {\n"
+                '        printf("guest-memory mapping checkpoint: count=65 base=0x%08x size=%llu\\n",\n'
+                "               guest_base,(unsigned long long)size);\n"
+                "        fflush(stdout);\n"
+                "    }\n"
+            )
+            if text.count(checkpoint) != 1:
+                raise SystemExit(f"unexpected guest-memory checkpoint shape: {source}")
+            text = text.replace(checkpoint, "")
             marker = "void guest_memory_reset(void)"
             if text.count(marker) != 1:
                 raise SystemExit(f"unexpected guest-memory source shape: {source}")
@@ -100,6 +121,7 @@ def main() -> None:
             "source": str(source),
             "destination": destination,
             "sha256": actual_hash,
+            "prepared_sha256": hashlib.sha256(content).hexdigest(),
         })
     expected_game_hash = str(CONFIG["sha256"]).lower()
     if len(expected_game_hash) != 64 or any(c not in "0123456789abcdef" for c in expected_game_hash):
