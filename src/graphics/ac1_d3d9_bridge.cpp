@@ -25,6 +25,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -35,6 +36,8 @@ constexpr uint32_t kSlotStride = 0x10u;
 constexpr uint32_t kD3D9Kind = 1u;
 constexpr uint32_t kDeviceKind = 2u;
 constexpr uint32_t kSurfaceKind = 3u;
+constexpr uint32_t kVertexBufferKind = 4u;
+constexpr uint32_t kIndexBufferKind = 5u;
 constexpr uint32_t kD3D9VtableSlots = 17u;
 constexpr uint32_t kDeviceVtableSlots = 119u;
 constexpr uint32_t kSurfaceVtableSlots = 17u;
@@ -47,11 +50,17 @@ constexpr GUID kIidIDirect3DDevice9 =
     {0xd0223b96u, 0xbf7au, 0x43fdu, {0x92, 0xbd, 0xa4, 0x3b, 0x0d, 0x82, 0xb9, 0xeb}};
 constexpr GUID kIidIDirect3DSurface9 =
     {0x0cfbaf3au, 0x9ff6u, 0x429au, {0x99, 0xb3, 0xa2, 0x79, 0x6a, 0xf8, 0xb8, 0x9b}};
+constexpr GUID kIidIDirect3DVertexBuffer9 =
+    {0xb64bb1b5u, 0xfd70u, 0x4df6u, {0xbf, 0x91, 0x19, 0xd0, 0xa1, 0x24, 0x55, 0xe3}};
+constexpr GUID kIidIDirect3DIndexBuffer9 =
+    {0x7c9dd65eu, 0xd3f7u, 0x4529u, {0xac, 0xee, 0x78, 0x58, 0x30, 0xac, 0xde, 0x35}};
 
 enum class ObjectKind : uint32_t {
     D3D9 = kD3D9Kind,
     Device = kDeviceKind,
-    Surface = kSurfaceKind
+    Surface = kSurfaceKind,
+    VertexBuffer = kVertexBufferKind,
+    IndexBuffer = kIndexBufferKind
 };
 
 struct GuestObject {
@@ -118,9 +127,9 @@ std::map<IUnknown *, uint32_t> g_guest_by_native;
 std::mutex g_mutex;
 /* MinGW thread-exit crashes were reproduced with nontrivial TLS destructors. */
 thread_local char g_last_error[1024]{};
+std::string g_d3d9_provider_path;
 #if defined(_WIN32)
 HMODULE g_d3d9_module = nullptr;
-std::string g_d3d9_provider_path;
 #endif
 
 void set_error(const std::string &message)
@@ -282,23 +291,26 @@ uint32_t slot_count(ObjectKind kind)
     case ObjectKind::D3D9: return kD3D9VtableSlots;
     case ObjectKind::Device: return kDeviceVtableSlots;
     case ObjectKind::Surface: return kSurfaceVtableSlots;
+    case ObjectKind::VertexBuffer: return 14u;
+    case ObjectKind::IndexBuffer: return 14u;
     }
     return 0;
 }
 
 int token_argument_count(uint32_t token)
 {
-    if (token < kTokenBase || token >= kTokenBase + 4 * kKindStride) return 0;
+    if (token < kTokenBase || token >= kTokenBase + 6 * kKindStride) return 0;
     const uint32_t offset = token - kTokenBase;
     const uint32_t kind = offset / kKindStride;
     const uint32_t within_kind = offset % kKindStride;
-    if (kind != kD3D9Kind && kind != kDeviceKind && kind != kSurfaceKind) return 0;
+    if (kind < kD3D9Kind || kind > kIndexBufferKind) return 0;
     if (within_kind % kSlotStride) return -1;
     const uint32_t method = within_kind / kSlotStride;
     if (method >= slot_count(static_cast<ObjectKind>(kind))) return -1;
 
     if (kind == kDeviceKind) {
         if (method < 3) return method == 0 ? 3 : 1;
+        if (method == 26 || method == 27) return 7;
         if (method == 65 || method == 92 || method == 107) return method == 65 ? 3 : 2;
         if (method == 67 || method == 69) return 4;
         if (method == 94 || method == 96 || method == 98 ||
@@ -311,6 +323,10 @@ int token_argument_count(uint32_t token)
     if (kind == kSurfaceKind) {
         if (method < 3) return method == 0 ? 3 : 1;
         return method == 12 ? 2 : -2;
+    }
+    if (kind == kVertexBufferKind || kind == kIndexBufferKind) {
+        if (method < 3) return method == 0 ? 3 : 1;
+        return -2;
     }
 
     /* IDirect3D9 slots 0..16. Values include the COM `this` stack word. */
@@ -493,12 +509,16 @@ HRESULT checked_shader_constant_data(IDirect3DDevice9 *device,
 
 bool bridge_supports_iid(ObjectKind kind, const GUID &iid)
 {
-    const GUID &supported = kind == ObjectKind::D3D9
-        ? kIidIDirect3D9
-        : kind == ObjectKind::Device ? kIidIDirect3DDevice9
-                                     : kIidIDirect3DSurface9;
+    const GUID *supported = &kIidIDirect3DSurface9;
+    switch (kind) {
+    case ObjectKind::D3D9: supported = &kIidIDirect3D9; break;
+    case ObjectKind::Device: supported = &kIidIDirect3DDevice9; break;
+    case ObjectKind::Surface: supported = &kIidIDirect3DSurface9; break;
+    case ObjectKind::VertexBuffer: supported = &kIidIDirect3DVertexBuffer9; break;
+    case ObjectKind::IndexBuffer: supported = &kIidIDirect3DIndexBuffer9; break;
+    }
     return std::memcmp(&iid, &kIidIUnknown, sizeof(iid)) == 0 ||
-           std::memcmp(&iid, &supported, sizeof(iid)) == 0;
+           std::memcmp(&iid, supported, sizeof(iid)) == 0;
 }
 
 const char *interface_name(ObjectKind kind)
@@ -507,6 +527,8 @@ const char *interface_name(ObjectKind kind)
     case ObjectKind::D3D9: return "IDirect3D9";
     case ObjectKind::Device: return "IDirect3DDevice9";
     case ObjectKind::Surface: return "IDirect3DSurface9";
+    case ObjectKind::VertexBuffer: return "IDirect3DVertexBuffer9";
+    case ObjectKind::IndexBuffer: return "IDirect3DIndexBuffer9";
     }
     return "IUnknown";
 }
@@ -772,6 +794,50 @@ HRESULT get_device_surface(IDirect3DDevice9 *device, const uint32_t *args,
     return status;
 }
 
+template <typename Buffer>
+HRESULT create_guest_buffer(IDirect3DDevice9 *device, const uint32_t *args,
+                            bool index_buffer)
+{
+    const auto create_native = [&](Buffer **output) {
+        if constexpr (std::is_same<Buffer, IDirect3DIndexBuffer9>::value) {
+            return device->CreateIndexBuffer(args[1], args[2],
+                static_cast<D3DFORMAT>(args[3]), static_cast<D3DPOOL>(args[4]),
+                output, nullptr);
+        } else {
+            return device->CreateVertexBuffer(args[1], args[2], args[3],
+                static_cast<D3DPOOL>(args[4]), output, nullptr);
+        }
+    };
+    if (!args[5]) {
+        return create_native(nullptr);
+    }
+
+    auto *output = static_cast<uint32_t *>(guest_memory(
+        args[5], sizeof(uint32_t), AC1_D3D9_GUEST_WRITE));
+    if (!output) {
+        set_error(index_buffer
+            ? "CreateIndexBuffer output pointer is unmapped"
+            : "CreateVertexBuffer output pointer is unmapped");
+        return D3DERR_INVALIDCALL;
+    }
+    *output = 0;
+
+    Buffer *buffer = nullptr;
+    HRESULT status = create_native(&buffer);
+    if (FAILED(status)) return status;
+    if (!buffer) {
+        set_error("native D3D9 buffer creation succeeded without returning an object");
+        return E_FAIL;
+    }
+
+    const ObjectKind kind = index_buffer ? ObjectKind::IndexBuffer
+                                         : ObjectKind::VertexBuffer;
+    const uint32_t guest_buffer = wrap_native(static_cast<IUnknown *>(buffer), kind, true);
+    if (!guest_buffer) return E_OUTOFMEMORY;
+    *output = guest_buffer;
+    return status;
+}
+
 uint32_t invoke_d3d9(GuestObject &object, uint32_t method,
                     const uint32_t *args, uint32_t argc)
 {
@@ -952,6 +1018,17 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
         return hresult(get_device_surface(static_cast<IDirect3DDevice9 *>(object.native),
                                           args, true));
     }
+    if (method == 26 || method == 27) {
+        if (!require_count(argc, 7, method == 26
+                ? "IDirect3DDevice9::CreateVertexBuffer"
+                : "IDirect3DDevice9::CreateIndexBuffer"))
+            return hresult(D3DERR_INVALIDCALL);
+        return hresult(method == 26
+            ? create_guest_buffer<IDirect3DVertexBuffer9>(
+                static_cast<IDirect3DDevice9 *>(object.native), args, false)
+            : create_guest_buffer<IDirect3DIndexBuffer9>(
+                static_cast<IDirect3DDevice9 *>(object.native), args, true));
+    }
     if (method == 57) {
         if (!require_count(argc, 3, "IDirect3DDevice9::SetRenderState"))
             return hresult(D3DERR_INVALIDCALL);
@@ -1101,6 +1178,45 @@ uint32_t invoke_surface(GuestObject &object, uint32_t method,
     return hresult(D3DERR_NOTAVAILABLE);
 }
 
+uint32_t invoke_buffer(GuestObject &object, uint32_t method,
+                       const uint32_t *args, uint32_t argc)
+{
+    if (method == 0) {
+        if (!require_count(argc, 3, "IDirect3D buffer::QueryInterface"))
+            return hresult(D3DERR_INVALIDCALL);
+        uint32_t output = 0;
+        return hresult(do_query_interface(object, args, &output));
+    }
+    if (method == 1) {
+        if (!require_count(argc, 1, "IDirect3D buffer::AddRef")) return 0;
+        ++object.guest_references;
+        object.native->AddRef();
+        return object.guest_references;
+    }
+    if (method == 2) {
+        if (!require_count(argc, 1, "IDirect3D buffer::Release")) return 0;
+        if (!object.guest_references) {
+            set_error("IDirect3D buffer::Release called with zero guest references");
+            return 0;
+        }
+        IUnknown *native = object.native;
+        const uint32_t guest_address = args[0];
+        native->Release();
+        const uint32_t guest_count = --object.guest_references;
+        if (!guest_count) {
+            GuestObject retired = object;
+            g_guest_by_native.erase(native);
+            g_objects.erase(guest_address);
+            free_guest_object(guest_address, retired);
+        }
+        return guest_count;
+    }
+    set_error(object.kind == ObjectKind::VertexBuffer
+        ? "IDirect3DVertexBuffer9 method is not implemented"
+        : "IDirect3DIndexBuffer9 method is not implemented");
+    return hresult(D3DERR_NOTAVAILABLE);
+}
+
 } // namespace
 
 extern "C" AC1_D3D9_API int ac1_d3d9_configure(
@@ -1206,6 +1322,11 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
         set_error("non-null texture/shader guest object has no registered AC1 proxy kind");
         return -2;
     }
+    if (object->kind == ObjectKind::Device &&
+        (method == 26 || method == 27) && args[6] != 0u) {
+        set_error("D3D9 shared buffer handles are unsupported by the guest bridge");
+        return -2;
+    }
     if (method == 0) {
         GUID iid{};
         if (guest_read(args[1], &iid, sizeof(iid)) &&
@@ -1223,6 +1344,10 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
         break;
     case ObjectKind::Surface:
         *result_out = invoke_surface(*object, method, args, arg_count);
+        break;
+    case ObjectKind::VertexBuffer:
+    case ObjectKind::IndexBuffer:
+        *result_out = invoke_buffer(*object, method, args, arg_count);
         break;
     }
     return 1;
@@ -1249,8 +1374,8 @@ extern "C" AC1_D3D9_API void ac1_d3d9_shutdown(void)
         FreeLibrary(g_d3d9_module);
         g_d3d9_module = nullptr;
     }
-    g_d3d9_provider_path.clear();
 #endif
+    g_d3d9_provider_path.clear();
 }
 
 extern "C" AC1_D3D9_API const char *ac1_d3d9_last_error(void)

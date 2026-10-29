@@ -737,10 +737,13 @@ int main(int argc, char **argv)
         ac1_d3d9_argument_count(0x7e003000u) != 3 ||
         ac1_d3d9_argument_count(0x7e0030c0u) != 2 ||
         ac1_d3d9_argument_count(0x7e0030b0u) != -2 ||
-        ac1_d3d9_argument_count(0x7e004000u) != 0 ||
+        ac1_d3d9_argument_count(0x7e0021a0u) != 7 ||
+        ac1_d3d9_argument_count(0x7e0021b0u) != 7 ||
+        ac1_d3d9_argument_count(0x7e004000u) != 3 ||
+        ac1_d3d9_argument_count(0x7e005000u) != 3 ||
         ac1_d3d9_dispatch(0x7e002030u, nullptr, 0, nullptr) != -2 ||
         ac1_d3d9_dispatch(0x7e0030b0u, nullptr, 0, nullptr) != -2 ||
-        ac1_d3d9_dispatch(0x7e004000u, nullptr, 0, nullptr) != 0) {
+        ac1_d3d9_dispatch(0x7e006000u, nullptr, 0, nullptr) != 0) {
         std::fprintf(stderr, "COM method-arity classification failed\n");
         ac1_d3d9_shutdown();
         return 3;
@@ -822,11 +825,51 @@ int main(int argc, char **argv)
         return fake_passed ? 0 : 19;
     }
 
+    uint32_t getter_result = 0;
+    const uint32_t vertex_buffer_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t index_buffer_output = allocate_guest(nullptr, 4, 4);
+    const uint32_t create_vertex_buffer_args[] = {
+        device, 0x10000u, 0x208u, 0u, 0u, vertex_buffer_output, 0u
+    };
+    const uint32_t create_index_buffer_args[] = {
+        device, 0x2000u, 0x208u, D3DFMT_INDEX16, 0u, index_buffer_output, 0u
+    };
+    if (ac1_d3d9_dispatch(object_slot(device, 26), create_vertex_buffer_args, 7,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result)) || !guest_word(vertex_buffer_output) ||
+        ac1_d3d9_dispatch(object_slot(device, 27), create_index_buffer_args, 7,
+                          &getter_result) != 1 ||
+        FAILED(static_cast<HRESULT>(getter_result)) || !guest_word(index_buffer_output)) {
+        std::fprintf(stderr, "native vertex/index buffer creation failed: %s (HRESULT=0x%08x)\n",
+                     ac1_d3d9_last_error(), getter_result);
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 20;
+    }
+    const uint32_t vertex_buffer = guest_word(vertex_buffer_output);
+    const uint32_t index_buffer = guest_word(index_buffer_output);
+    if (ac1_d3d9_argument_count(object_slot(vertex_buffer, 2)) != 1 ||
+        ac1_d3d9_argument_count(object_slot(index_buffer, 2)) != 1) {
+        std::fprintf(stderr, "created D3D9 buffers did not receive the right proxy kinds\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 21;
+    }
+    const uint32_t unsupported_shared_args[] = {
+        device, 0x10000u, 0x208u, 0u, 0u, vertex_buffer_output, 1u
+    };
+    if (ac1_d3d9_dispatch(object_slot(device, 26), unsupported_shared_args, 7,
+                          &getter_result) != -2) {
+        std::fprintf(stderr, "non-null shared buffer handle was not trapped explicitly\n");
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 22;
+    }
+
     const uint32_t get_render_target = object_slot(device, 38);
     const uint32_t get_depth_stencil = object_slot(device, 40);
     const uint32_t render_output = allocate_guest(nullptr, 4, 4);
     const uint32_t depth_output = allocate_guest(nullptr, 4, 4);
-    uint32_t getter_result = 0;
     const uint32_t render_args[] = {device, 0, render_output};
     const uint32_t depth_args[] = {device, depth_output};
     if (ac1_d3d9_argument_count(get_render_target) != 3 ||
@@ -921,6 +964,17 @@ int main(int argc, char **argv)
     }
     const uint32_t device_release = object_slot(device, 2);
     const uint32_t device_this[] = {device};
+    const uint32_t vertex_release_this[] = {vertex_buffer};
+    const uint32_t index_release_this[] = {index_buffer};
+    if (ac1_d3d9_dispatch(object_slot(vertex_buffer, 2), vertex_release_this, 1,
+                          &references) != 1 || references != 0 ||
+        ac1_d3d9_dispatch(object_slot(index_buffer, 2), index_release_this, 1,
+                          &references) != 1 || references != 0) {
+        std::fprintf(stderr, "vertex/index buffer Release failed: %s\n", ac1_d3d9_last_error());
+        DestroyWindow(hidden_window);
+        ac1_d3d9_shutdown();
+        return 23;
+    }
     if (ac1_d3d9_dispatch(device_release, device_this, 1, &references) != 1) {
         std::fprintf(stderr, "device release smoke failed: %s\n", ac1_d3d9_last_error());
         DestroyWindow(hidden_window);
