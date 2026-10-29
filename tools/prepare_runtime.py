@@ -362,6 +362,146 @@ static inline uint64_t ac1_x87_integer(CPU *c, double value, unsigned bits, unsi
 '''
 
 
+def _replace_function(text: str, signature: str, body: str, source) -> str:
+    """Replace one top-level C function (signature line through its closing brace)."""
+    begin = text.find(signature)
+    if begin < 0 or text.count(signature) != 1:
+        raise SystemExit(f"unexpected guest_memory.c shape for {signature!r}: {source}")
+    end = text.find("\n}\n", begin)
+    if end < 0:
+        raise SystemExit(f"unterminated function {signature!r}: {source}")
+    return text[:begin] + body.rstrip("\n") + text[end + 2:]
+
+
+def sorted_region_transform(text: str, source) -> str:
+    """Keep guest regions sorted by base so lookups need no linear scans.
+
+    Measured on the title workload: guest_memory_find_gap (quadratic) and the
+    linear slow paths of guest_ptr/guest_memory_try_ptr over ~900 regions
+    were the remaining guest-memory costs in runtime code. Regions never
+    overlap, so a sorted array gives O(log n) lookups and a one-pass gap
+    search; remove() already preserves order with memmove.
+    """
+    helper = r'''
+/* AC1: regions are kept sorted by base (inserted in place); find the last
+ * region whose base is <= address, or SIZE_MAX if none. */
+static size_t ac1_region_floor(uint32_t address)
+{
+    size_t low = 0, high = current_memory.count;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        if (current_memory.regions[mid].base <= address) low = mid + 1;
+        else high = mid;
+    }
+    return low ? low - 1 : SIZE_MAX;
+}
+'''
+    marker = "void guest_memory_add(uint8_t *backing, uint32_t guest_base, uint64_t size)"
+    if text.count(marker) != 1:
+        raise SystemExit(f"unexpected guest_memory_add shape: {source}")
+    text = text.replace(marker, helper.lstrip("\n") + "\n" + marker)
+    text = _replace_function(text, marker, r'''void guest_memory_add(uint8_t *backing, uint32_t guest_base, uint64_t size)
+{
+    uint64_t end;
+    if (!selected_memory) guest_memory_reset();
+    if (!backing || !size)
+        fail("invalid binding", guest_base, (size_t)size);
+    if (current_memory.arena && backing != current_memory.arena+guest_base)
+        fail("non-arena backing",guest_base,(size_t)size);
+    if (size > UINT64_C(0x100000000))
+        fail("binding too large", guest_base, (size_t)size);
+    end = (uint64_t)guest_base + size;
+    if (end > UINT64_C(0x100000000))
+        fail("binding wraps", guest_base, (size_t)size);
+    if (current_memory.count == GUEST_MEMORY_MAX_REGIONS)
+        fail("too many regions", guest_base, (size_t)size);
+    /* Sorted insert: only the neighbours can overlap. */
+    size_t floor = ac1_region_floor(guest_base);
+    size_t at = floor == SIZE_MAX ? 0 : floor + 1;
+    if (floor != SIZE_MAX) {
+        const guest_memory_region_t *before = &current_memory.regions[floor];
+        if ((uint64_t)before->base + before->size > guest_base)
+            fail("overlapping regions", guest_base, (size_t)size);
+    }
+    if (at < current_memory.count && current_memory.regions[at].base < end)
+        fail("overlapping regions", guest_base, (size_t)size);
+    memmove(&current_memory.regions[at + 1], &current_memory.regions[at],
+            (current_memory.count - at) * sizeof(current_memory.regions[0]));
+    current_memory.regions[at].data = backing;
+    current_memory.regions[at].base = guest_base;
+    current_memory.regions[at].size = size;
+    ++current_memory.count;
+}
+''', source)
+    text = _replace_function(text, "uint32_t guest_memory_find_gap(uint32_t start, uint32_t size,", r'''uint32_t guest_memory_find_gap(uint32_t start, uint32_t size,
+                               uint32_t alignment, uint32_t limit)
+{
+    if (!selected_memory || !size || !alignment || (alignment & (alignment - 1)) ||
+        current_memory.count == GUEST_MEMORY_MAX_REGIONS) return 0;
+    uint64_t at = ((uint64_t)start + alignment - 1) & ~(uint64_t)(alignment - 1);
+    if (!at) return 0;
+    /* One pass over the sorted regions from the first one that can overlap. */
+    size_t i = ac1_region_floor((uint32_t)(at > UINT32_MAX ? UINT32_MAX : at));
+    for (i = i == SIZE_MAX ? 0 : i; i < current_memory.count; ++i) {
+        const guest_memory_region_t *r = &current_memory.regions[i];
+        uint64_t end = (uint64_t)r->base + r->size;
+        if (end <= at) continue;
+        if ((uint64_t)r->base >= at + size) break;
+        at = (end + alignment - 1) & ~(uint64_t)(alignment - 1);
+    }
+    if (at + size > limit) return 0;
+    return (uint32_t)at;
+}
+''', source)
+    # Slow paths: binary search instead of scanning every region.
+    old_try = '''    for (size_t i=0;i<current_memory.count;++i) {
+        const guest_memory_region_t *r=&current_memory.regions[i];
+        if (address>=r->base && end<=(uint64_t)r->base+r->size) {
+            *cached=*r;
+            AC1_PROFILE_SCAN(i + 1);
+            return r->data+(address-r->base);
+        }
+    }
+    AC1_PROFILE_SCAN(current_memory.count);
+    return NULL;'''
+    new_try = '''    size_t i = ac1_region_floor(address);
+    if (i != SIZE_MAX) {
+        const guest_memory_region_t *r=&current_memory.regions[i];
+        if (end<=(uint64_t)r->base+r->size) {
+            *cached=*r;
+            AC1_PROFILE_SCAN(1);
+            return r->data+(address-r->base);
+        }
+    }
+    AC1_PROFILE_SCAN(1);
+    return NULL;'''
+    if text.count(old_try) != 1:
+        raise SystemExit(f"unexpected guest_memory_try_ptr slow path: {source}")
+    text = text.replace(old_try, new_try)
+    old_ptr = '''    AC1_PROFILE_COUNT(slow);
+    for (i = 0; i < current_memory.count; ++i) {
+        const guest_memory_region_t *region = &current_memory.regions[i];'''
+    new_ptr = '''    AC1_PROFILE_COUNT(slow);
+    if (width) {
+        /* Sorted regions: the floor region is the only candidate. */
+        size_t floor = ac1_region_floor(address);
+        if (floor != SIZE_MAX) {
+            const guest_memory_region_t *region = &current_memory.regions[floor];
+            if (end <= (uint64_t)region->base + region->size) {
+                *cached = *region;
+                AC1_PROFILE_SCAN(1);
+                return region->data + (size_t)(address - region->base);
+            }
+        }
+    }
+    /* Zero width (adjacent-mapping preference) and misses keep the scan. */
+    for (i = 0; i < current_memory.count; ++i) {
+        const guest_memory_region_t *region = &current_memory.regions[i];'''
+    if text.count(old_ptr) != 1:
+        raise SystemExit(f"unexpected guest_ptr slow path: {source}")
+    return text.replace(old_ptr, new_ptr)
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -593,6 +733,7 @@ void guest_execution_write(uint32_t address, const void *input, size_t width)
                 body = body.replace(success, "            AC1_PROFILE_SCAN(i + 1);\n" + success)
                 body = body.replace(failure, "    AC1_PROFILE_SCAN(current_memory.count);\n" + failure)
                 text = text[:begin] + body + text[end:]
+            text = sorted_region_transform(text, source)
             content = text.replace("\r\n", "\n").encode("utf-8")
         if destination == "src/runtime/cpu.h":
             text = content.decode("utf-8")

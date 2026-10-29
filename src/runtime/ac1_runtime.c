@@ -202,10 +202,6 @@ static uint32_t next_guest_monitor = 0xE6000004u;
 static SRWLOCK guest_monitor_lock = SRWLOCK_INIT;
 #endif
 #if defined(AC1_HOST_D3D9)
-typedef struct { uint32_t guest_address, heap_address; } ac1_d3d9_heap_block;
-static ac1_d3d9_heap_block *d3d9_heap_blocks;
-static size_t d3d9_heap_block_count;
-static size_t d3d9_heap_block_capacity;
 static int d3d9_configured;
 #endif
 static uint8_t tls_used[AC1_TLS_SLOTS];
@@ -1407,71 +1403,48 @@ static void *d3d9_guest_resolve(void *context, uint32_t address,
     return guest_memory_try_ptr(address, size);
 }
 
+/* Bridge allocations carry an 8-byte header just below the aligned block:
+ * a magic word and the raw heap address. Alloc and free are O(1); the old
+ * ledger scanned every live bridge allocation on each call, which the
+ * profiler measured as ~24% of runtime samples (D3DX constant tables and
+ * COM proxy creation allocate per call). */
+#define AC1_D3D9_ALLOC_MAGIC 0xAC1D3D90u
 static uint32_t d3d9_guest_alloc(void *context, uint32_t size, uint32_t alignment)
 {
     (void)context;
     if (!process_heap || !size || !alignment || (alignment & (alignment - 1u)) ||
-        alignment > 4096u || size > UINT32_MAX - alignment + 1u) {
+        alignment > 4096u || size > UINT32_MAX - alignment - 8u) {
         if (trace_imports)
             fprintf(stderr,
                     "AC1 D3D9 guest allocation rejected: size=%u alignment=%u process_heap=%u\n",
                     size, alignment, process_heap != NULL);
         return 0u;
     }
-    size_t slot;
-    for (slot = 0; slot < d3d9_heap_block_count; ++slot)
-        if (!d3d9_heap_blocks[slot].guest_address) break;
-    if (slot == d3d9_heap_block_count) {
-        if (d3d9_heap_block_count == d3d9_heap_block_capacity) {
-            size_t new_capacity = d3d9_heap_block_capacity
-                ? d3d9_heap_block_capacity * 2u : 64u;
-            if (new_capacity < d3d9_heap_block_capacity ||
-                new_capacity > SIZE_MAX / sizeof(*d3d9_heap_blocks)) {
-                if (trace_imports)
-                    fprintf(stderr,
-                            "AC1 D3D9 heap ledger capacity overflow: entries=%zu\n",
-                            d3d9_heap_block_capacity);
-                return 0u;
-            }
-            ac1_d3d9_heap_block *grown = (ac1_d3d9_heap_block *)realloc(
-                d3d9_heap_blocks, new_capacity * sizeof(*d3d9_heap_blocks));
-            if (!grown) {
-                if (trace_imports)
-                    fprintf(stderr,
-                            "AC1 D3D9 heap ledger growth failed: old_entries=%zu new_entries=%zu\n",
-                            d3d9_heap_block_capacity, new_capacity);
-                return 0u;
-            }
-            memset(grown + d3d9_heap_block_capacity, 0,
-                   (new_capacity - d3d9_heap_block_capacity) * sizeof(*grown));
-            d3d9_heap_blocks = grown;
-            d3d9_heap_block_capacity = new_capacity;
-        }
-        ++d3d9_heap_block_count;
-    }
-    uint32_t raw = pcrecomp_heap_alloc(process_heap, size + alignment - 1u, 1);
+    uint32_t raw = pcrecomp_heap_alloc(process_heap, size + alignment - 1u + 8u, 1);
     if (!raw) {
         if (trace_imports)
-            fprintf(stderr,
-                    "AC1 D3D9 guest heap allocation failed: size=%u alignment=%u tracked=%zu\n",
-                    size, alignment, d3d9_heap_block_count);
+            fprintf(stderr, "AC1 D3D9 guest heap allocation failed: size=%u alignment=%u\n",
+                    size, alignment);
         return 0u;
     }
-    uint32_t aligned = (raw + alignment - 1u) & ~(alignment - 1u);
-    d3d9_heap_blocks[slot].guest_address = aligned;
-    d3d9_heap_blocks[slot].heap_address = raw;
+    uint32_t aligned = (raw + 8u + alignment - 1u) & ~(alignment - 1u);
+    wr32(aligned - 8u, AC1_D3D9_ALLOC_MAGIC);
+    wr32(aligned - 4u, raw);
     return aligned;
 }
 
 static void d3d9_guest_free(void *context, uint32_t address)
 {
     (void)context;
-    for (size_t i = 0; i < d3d9_heap_block_count; ++i) {
-        if (d3d9_heap_blocks[i].guest_address != address) continue;
-        if (process_heap) pcrecomp_heap_free(process_heap, d3d9_heap_blocks[i].heap_address);
-        memset(&d3d9_heap_blocks[i], 0, sizeof(d3d9_heap_blocks[i]));
+    if (address < 8u || !guest_memory_try_ptr(address - 8u, 8u) ||
+        rd32(address - 8u) != AC1_D3D9_ALLOC_MAGIC) {
+        if (trace_imports && address)
+            fprintf(stderr, "AC1 D3D9 guest free ignored unknown block 0x%08x\n", address);
         return;
     }
+    uint32_t raw = rd32(address - 4u);
+    wr32(address - 8u, 0u);
+    if (process_heap) pcrecomp_heap_free(process_heap, raw);
 }
 
 #ifdef _WIN32
@@ -6104,6 +6077,84 @@ static ac1_lifted_fn profile_lifted_lookup(uint32_t target)
     return ac1_lifted_lookup(target);
 }
 
+#ifdef _WIN32
+static int handle_window_keyboard_import(CPU *cpu, const import_record *import)
+{
+    return !import->by_ordinal && (!strcmp(import->name, "GetKeyboardState") ||
+           !strcmp(import->name, "ToUnicode")) && handle_window_import(cpu, import);
+}
+#endif
+
+typedef int (*import_handler_fn)(CPU *, const import_record *);
+/* Handler chain in priority order. */
+static const import_handler_fn import_handler_chain[] = {
+    handle_network_import,
+#ifdef _WIN32
+    handle_window_keyboard_import,
+#endif
+    handle_win32_compat_import,
+    handle_crypto_import,
+    handle_audio_import,
+    handle_optional_eax_import,
+    handle_bink_import,
+#ifdef _WIN32
+    handle_dinput8_import,
+    handle_ds8_import,
+#endif
+#if defined(AC1_HOST_D3D9)
+    handle_d3d9_import,
+#endif
+    handle_d3dx_texture_requirements_import,
+    handle_d3dx_shader_constant_table_import,
+    handle_module_import,
+    handle_profile_import,
+    handle_heap_import,
+    handle_critical_section_import,
+    handle_interlocked_import,
+    handle_stdio_import,
+    handle_thread_import,
+    handle_file_import,
+    handle_sync_import,
+    handle_shell_import,
+    handle_ole_import,
+    handle_registry_import,
+    handle_window_import,
+    handle_clock_import,
+    handle_version_import,
+    handle_import,
+};
+
+/* Per-import route cache. Walking the chain costs ~17 handler calls, several
+ * with 32-128 KB stack frames (probed by ___chkstk_ms) and case-folded name
+ * compares, before e.g. EnterCriticalSection is handled -- measured ~8% of
+ * runtime samples. Only handlers whose decision depends solely on the
+ * import's name are cached; handlers that claim or decline by runtime state
+ * (files, sync handles, compat paths, threads, windows) always use the chain.
+ * A cached handler that declines falls back to the full chain. */
+static import_handler_fn import_routes[AC1_IMPORT_LIMIT];
+
+static int import_handler_is_name_only(import_handler_fn handler)
+{
+    return handler == handle_heap_import || handler == handle_critical_section_import ||
+           handler == handle_interlocked_import || handler == handle_clock_import ||
+           handler == handle_stdio_import;
+}
+
+static int run_import_handlers(CPU *cpu, const import_record *import)
+{
+    const size_t index = (size_t)(import - imports);
+    if (index < AC1_IMPORT_LIMIT && import_routes[index] &&
+        import_routes[index](cpu, import))
+        return 1;
+    for (size_t i = 0; i < sizeof(import_handler_chain) / sizeof(import_handler_chain[0]); ++i) {
+        if (!import_handler_chain[i](cpu, import)) continue;
+        if (index < AC1_IMPORT_LIMIT && import_handler_is_name_only(import_handler_chain[i]))
+            import_routes[index] = import_handler_chain[i];
+        return 1;
+    }
+    return 0;
+}
+
 void dispatch(CPU *cpu, uint32_t target)
 {
     AC1_PROFILE_COUNT(dispatches);
@@ -6247,41 +6298,7 @@ void dispatch(CPU *cpu, uint32_t target)
                         trace_import_count, cpu->eip, target, import->dll, import->name);
             ++trace_import_count;
         }
-        int handled = handle_network_import(cpu, import) ||
-#ifdef _WIN32
-                      (!import->by_ordinal && (!strcmp(import->name, "GetKeyboardState") ||
-                       !strcmp(import->name, "ToUnicode")) && handle_window_import(cpu, import)) ||
-#endif
-                      handle_win32_compat_import(cpu, import) ||
-                      handle_crypto_import(cpu, import) ||
-                      handle_audio_import(cpu, import) ||
-                      handle_optional_eax_import(cpu, import) ||
-                      handle_bink_import(cpu, import) ||
-#ifdef _WIN32
-                      handle_dinput8_import(cpu, import) ||
-                      handle_ds8_import(cpu, import) ||
-#endif
-#if defined(AC1_HOST_D3D9)
-                      handle_d3d9_import(cpu, import) ||
-#endif
-                      handle_d3dx_texture_requirements_import(cpu, import) ||
-                      handle_d3dx_shader_constant_table_import(cpu, import) ||
-                      handle_module_import(cpu, import) ||
-                      handle_profile_import(cpu, import) ||
-                      handle_heap_import(cpu, import) ||
-                      handle_critical_section_import(cpu, import) ||
-                      handle_interlocked_import(cpu, import) ||
-                      handle_stdio_import(cpu, import) ||
-                      handle_thread_import(cpu, import) ||
-                      handle_file_import(cpu, import) ||
-                      handle_sync_import(cpu, import) ||
-                      handle_shell_import(cpu, import) ||
-                      handle_ole_import(cpu, import) ||
-                      handle_registry_import(cpu, import) ||
-                      handle_window_import(cpu, import) ||
-                      handle_clock_import(cpu, import) ||
-                      handle_version_import(cpu, import) ||
-                      handle_import(cpu, import);
+        int handled = run_import_handlers(cpu, import);
         if (handled) {
             scheduler_checkpoint();
             return;
@@ -6727,6 +6744,7 @@ int ac1_run(const char *exe_path)
 #endif
     import_count = 0;
     memset(imports, 0, sizeof(imports));
+    memset(import_routes, 0, sizeof(import_routes));
     memset(&bink_image, 0, sizeof(bink_image));
     bink_image_mapped = 0;
     bink_module_path[0] = '\0';
@@ -7088,10 +7106,6 @@ cleanup:
         ac1_d3d9_shutdown();
         d3d9_configured = 0;
     }
-    free(d3d9_heap_blocks);
-    d3d9_heap_blocks = NULL;
-    d3d9_heap_block_count = 0u;
-    d3d9_heap_block_capacity = 0u;
 #endif
 #ifdef _WIN32
     free(guest_monitors);

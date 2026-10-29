@@ -157,10 +157,22 @@ void guest_memory_reset(void)
     } else memset(&current_memory, 0, sizeof(current_memory));
 }
 
+/* AC1: regions are kept sorted by base (inserted in place); find the last
+ * region whose base is <= address, or SIZE_MAX if none. */
+static size_t ac1_region_floor(uint32_t address)
+{
+    size_t low = 0, high = current_memory.count;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        if (current_memory.regions[mid].base <= address) low = mid + 1;
+        else high = mid;
+    }
+    return low ? low - 1 : SIZE_MAX;
+}
+
 void guest_memory_add(uint8_t *backing, uint32_t guest_base, uint64_t size)
 {
-    uint64_t end, existing_end;
-    size_t i;
+    uint64_t end;
     if (!selected_memory) guest_memory_reset();
     if (!backing || !size)
         fail("invalid binding", guest_base, (size_t)size);
@@ -173,15 +185,21 @@ void guest_memory_add(uint8_t *backing, uint32_t guest_base, uint64_t size)
         fail("binding wraps", guest_base, (size_t)size);
     if (current_memory.count == GUEST_MEMORY_MAX_REGIONS)
         fail("too many regions", guest_base, (size_t)size);
-    for (i = 0; i < current_memory.count; ++i) {
-        const guest_memory_region_t *region = &current_memory.regions[i];
-        existing_end = (uint64_t)region->base + region->size;
-        if ((uint64_t)guest_base < existing_end && (uint64_t)region->base < end)
+    /* Sorted insert: only the neighbours can overlap. */
+    size_t floor = ac1_region_floor(guest_base);
+    size_t at = floor == SIZE_MAX ? 0 : floor + 1;
+    if (floor != SIZE_MAX) {
+        const guest_memory_region_t *before = &current_memory.regions[floor];
+        if ((uint64_t)before->base + before->size > guest_base)
             fail("overlapping regions", guest_base, (size_t)size);
     }
-    current_memory.regions[current_memory.count].data = backing;
-    current_memory.regions[current_memory.count].base = guest_base;
-    current_memory.regions[current_memory.count].size = size;
+    if (at < current_memory.count && current_memory.regions[at].base < end)
+        fail("overlapping regions", guest_base, (size_t)size);
+    memmove(&current_memory.regions[at + 1], &current_memory.regions[at],
+            (current_memory.count - at) * sizeof(current_memory.regions[0]));
+    current_memory.regions[at].data = backing;
+    current_memory.regions[at].base = guest_base;
+    current_memory.regions[at].size = size;
     ++current_memory.count;
 }
 
@@ -221,19 +239,18 @@ uint32_t guest_memory_find_gap(uint32_t start, uint32_t size,
     if (!selected_memory || !size || !alignment || (alignment & (alignment - 1)) ||
         current_memory.count == GUEST_MEMORY_MAX_REGIONS) return 0;
     uint64_t at = ((uint64_t)start + alignment - 1) & ~(uint64_t)(alignment - 1);
-    for (;;) {
-        if (!at || at + size > limit) return 0;
-        size_t i;
-        for (i = 0; i < current_memory.count; ++i) {
-            const guest_memory_region_t *r = &current_memory.regions[i];
-            uint64_t end = (uint64_t)r->base + r->size;
-            if (at < end && (uint64_t)r->base < at + size) {
-                at = (end + alignment - 1) & ~(uint64_t)(alignment - 1);
-                break;
-            }
-        }
-        if (i == current_memory.count) return (uint32_t)at;
+    if (!at) return 0;
+    /* One pass over the sorted regions from the first one that can overlap. */
+    size_t i = ac1_region_floor((uint32_t)(at > UINT32_MAX ? UINT32_MAX : at));
+    for (i = i == SIZE_MAX ? 0 : i; i < current_memory.count; ++i) {
+        const guest_memory_region_t *r = &current_memory.regions[i];
+        uint64_t end = (uint64_t)r->base + r->size;
+        if (end <= at) continue;
+        if ((uint64_t)r->base >= at + size) break;
+        at = (end + alignment - 1) & ~(uint64_t)(alignment - 1);
     }
+    if (at + size > limit) return 0;
+    return (uint32_t)at;
 }
 
 void guest_memory_unbind(void)
@@ -257,15 +274,16 @@ void *guest_memory_try_ptr(uint32_t address, size_t width)
     if(address>=cached->base && end<=(uint64_t)cached->base+cached->size)
         return cached->data+(address-cached->base);
     AC1_PROFILE_COUNT(slow);
-    for (size_t i=0;i<current_memory.count;++i) {
+    size_t i = ac1_region_floor(address);
+    if (i != SIZE_MAX) {
         const guest_memory_region_t *r=&current_memory.regions[i];
-        if (address>=r->base && end<=(uint64_t)r->base+r->size) {
+        if (end<=(uint64_t)r->base+r->size) {
             *cached=*r;
-            AC1_PROFILE_SCAN(i + 1);
+            AC1_PROFILE_SCAN(1);
             return r->data+(address-r->base);
         }
     }
-    AC1_PROFILE_SCAN(current_memory.count);
+    AC1_PROFILE_SCAN(1);
     return NULL;
 }
 int guest_memory_read(uint32_t address, void *output, size_t width)
@@ -401,6 +419,19 @@ void *guest_ptr(uint32_t address, size_t width)
     if (width && address >= cached->base && end <= (uint64_t)cached->base + cached->size)
         return cached->data + (size_t)(address - cached->base);
     AC1_PROFILE_COUNT(slow);
+    if (width) {
+        /* Sorted regions: the floor region is the only candidate. */
+        size_t floor = ac1_region_floor(address);
+        if (floor != SIZE_MAX) {
+            const guest_memory_region_t *region = &current_memory.regions[floor];
+            if (end <= (uint64_t)region->base + region->size) {
+                *cached = *region;
+                AC1_PROFILE_SCAN(1);
+                return region->data + (size_t)(address - region->base);
+            }
+        }
+    }
+    /* Zero width (adjacent-mapping preference) and misses keep the scan. */
     for (i = 0; i < current_memory.count; ++i) {
         const guest_memory_region_t *region = &current_memory.regions[i];
         region_end = (uint64_t)region->base + region->size;
