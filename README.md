@@ -247,8 +247,11 @@ Example using existing stripped binaries:
 
 The two-side environment overrides can also be supplied as `-EnvB @{ AC1_DISPATCH_FAST = '0' }`. Use `tools/bench_report.py <comparison-directory>` to print an existing comparison.
 
-Codegen flag liveness is selected with `tools/build.ps1 -BuildType RelWithDebInfo -Jobs 10 -FlagLiveness off|straight|cfg`
-(default `cfg`), or the lifter's `--flag-liveness` option. Preparation checks the selected mode in its report.
+Codegen flag liveness is selected with `tools/build.ps1 -BuildType RelWithDebInfo -Jobs 10 -FlagLiveness cfg`
+(default `cfg`; `off` and `straight` are also available), or the lifter's `--flag-liveness` option.
+`-LocalRegs all` enables function-gated GPR locals; its default is `off`, and an eight-digit hexadecimal
+list such as `-LocalRegs '0051DD60,00428540'` selects individual functions. The lifter accepts the same
+selection with `--local-regs`. Preparation checks both selected modes in its report.
 The benchmark preserves a complete frame window by draining the periodic profiler after CPU/GPU accounting stops;
 incomplete windows, guest stops and dropped frame samples fail its audit. See [codegen evidence](docs/codegen.md)
 for generated/compiled counts, correctness runs, immutable binary hashes and the interleaved baseline/flags result.

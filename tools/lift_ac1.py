@@ -3230,10 +3230,82 @@ def wrap_native_binding(body: str, address: int, entry: dict) -> str:
             f'void L_{address:08X}(CPU *c) {{ ac1_native_invoke(c, &ac1_binding_{address:08X}, {original}); }}\n')
 
 
+def local_register_function(body: str) -> str:
+    """Promote GPRs; keep every opaque CPU use as an architectural boundary.
+
+    The aggregate never escapes. GCC scalar replacement can retain its fields
+    in host registers. Flags remain architectural, with audited GPR-free flag
+    helpers. Each public C entry initializes its own locals; internal labels
+    share them. Segmented/SEH and nonlocal-resumption functions stay unchanged.
+    """
+    if re.search(r'\b(?:fs|gs):|c->(?:fs|gs)\b|\b(?:seh|setjmp|longjmp)\b', body, re.I):
+        return body
+    registers = 'eax ecx edx ebx esp ebp esi edi'.split()
+    gpr = re.compile(r'\bc->(' + '|'.join(registers) + r')\b')
+    spill = 'memcpy(&c->eax, &_ac1_regs, sizeof _ac1_regs);'
+    reload = 'memcpy(&_ac1_regs, &c->eax, sizeof _ac1_regs);'
+    lines = body.splitlines()
+    if len(lines) < 3 or lines[1] != '{' or lines[-1] != '}':
+        raise ValueError('unexpected lifted function shape for local registers')
+    output = lines[:2] + [
+        '    struct { uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi; } _ac1_regs;',
+        '    _Static_assert(sizeof _ac1_regs == 32 && offsetof(CPU, edi) == 28, "pinned GPR layout");',
+        '    ' + reload,
+    ]
+    def emit_group(group):
+        if not group:
+            return
+        text = '\n'.join(group)
+        # Leading donor comments can precede executable dispatch code. Cutting
+        # at the first comment loses that CPU use and flushes after the import.
+        code = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+        pointer_uses = re.sub(r'\bc->\w+', 'member', code)
+        pointer_uses = re.sub(r'\b(?:flags_\w+|AC1_SET_GUEST_EIP)\(c(?=[,)])', 'safe(', pointer_uses)
+        boundary = bool(re.search(r'\bc\b', pointer_uses)) or any(
+            token in code for token in ('RECOMP_TODO(', 'ac1_unsupported_instruction('))
+        if boundary:
+            output.append('    ' + spill)
+        else:
+            text = gpr.sub(lambda m: '_ac1_regs.' + m.group(1), text)
+            text = re.sub(r'\breturn;', '{ ' + spill + ' return; }', text)
+        # A helper-authoritative instruction can branch before the ordinary
+        # reload. Reload on that edge too; fence guest polling across backedges.
+        fence = (reload + ' ' if boundary else '') + '__asm__ __volatile__("" ::: "memory"); '
+        text = re.sub(r'\bgoto (L_[0-9A-F]{8});',
+                      lambda m: '{ ' + fence + 'goto ' + m.group(1) + '; }', text)
+        output.extend(text.splitlines())
+        if boundary:
+            output.append('    ' + reload)
+    group = []
+    for line in lines[2:-1]:
+        if 'AC1_SET_GUEST_EIP(c,' in line or re.fullmatch(r'L_[0-9A-F]{8}:', line):
+            emit_group(group)
+            group = []
+        group.append(line)
+    emit_group(group)
+    output.extend(('    ' + spill, '}'))
+    return '\n'.join(output)
+
+
+def local_register_selection(selection: str, lifted: set[int]) -> set[int]:
+    """Explicit per-function admission; malformed/unlifted entries fail closed."""
+    if selection == 'off':
+        return set()
+    if selection == 'all':
+        return lifted
+    if not re.fullmatch(r'(?:0x)?[0-9a-fA-F]{8}(?:,(?:0x)?[0-9a-fA-F]{8})*', selection):
+        raise ValueError('local-regs must be off, all, or comma-separated eight-digit hexadecimal VAs')
+    selected = {int(part, 16) for part in selection.split(',')}
+    if selected - lifted:
+        raise ValueError('local-regs selection is not lifted: ' +
+                         ', '.join(f'0x{va:08X}' for va in sorted(selected - lifted)))
+    return selected
+
+
 def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: Path,
               functions_per_tu: int, translation_unit_buckets: int = 0,
               emission_cache=None, direct_calls: bool = True, native_overrides=None,
-              flag_liveness: str = 'off') -> dict:
+              flag_liveness: str = 'off', local_regs: str = 'off') -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
@@ -3381,6 +3453,16 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
             direct_sites += sites
     if flag_liveness != 'off':
         bodies = [flag_liveness_function(body, flag_liveness) for body in bodies]
+    selected_locals = local_register_selection(local_regs, set(lifted))
+    local_count, local_excluded = 0, []
+    for index, address in enumerate(lifted):
+        if address in selected_locals:
+            transformed = local_register_function(bodies[index])
+            if transformed != bodies[index]:
+                local_count += 1
+            else:
+                local_excluded.append(f'0x{address:08X}')
+            bodies[index] = transformed
     # Keep L_VA as the one public entry for direct transfers AND the dispatch
     # table. Retain a private, callable translated oracle behind that entry.
     for index, address in enumerate(lifted):
@@ -3499,6 +3581,8 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "direct_call_sites": direct_sites,
         "direct_callee_declarations": direct_prototypes,
         "native_overrides": [f"0x{a:08X}" for a in sorted(bindings)],
+        'local_regs': {'requested': local_regs, 'admitted_count': local_count,
+                       'excluded_functions': local_excluded},
     }
 
 
@@ -3628,6 +3712,8 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=CONFIG_PATH,
                         help="discovery configuration (allows private seed-set A/B comparisons)")
     parser.add_argument("--selftest", action="store_true", help="run the focused block-entry ordering check")
+    parser.add_argument('--local-regs', default='off', metavar='off|all|VA,...',
+                        help='function-gated GPR locals; off restores CPU-struct registers')
     parser.add_argument('--flag-liveness', choices=('off', 'straight', 'cfg'), default='cfg',
                         help='constant-mask intra-function flag liveness; off restores eager flags')
     parser.add_argument("--no-direct-calls", action="store_true",
@@ -3837,7 +3923,7 @@ def main() -> int:
                                 functions_per_tu, translation_unit_buckets,
                                 emission_cache, direct_calls=not args.no_direct_calls,
                                 native_overrides=config.get('native_overrides', []),
-                                flag_liveness=args.flag_liveness)
+                                flag_liveness=args.flag_liveness, local_regs=args.local_regs)
     except Exception:
         if emission_cache is not None:
             emission_cache.close()
@@ -3854,6 +3940,7 @@ def main() -> int:
         "unsupported_count": todo_count,
         "relocation_entries": lift_result["relocation_entries"],
         "flag_liveness": args.flag_liveness,
+        "local_regs": lift_result["local_regs"],
         "direct_call_sites": lift_result["direct_call_sites"],
         "direct_callee_declarations": lift_result["direct_callee_declarations"],
         "native_overrides": lift_result["native_overrides"],

@@ -9,6 +9,7 @@ param(
     [switch]$CheckRepeat,
     [switch]$Run,
     [ValidateSet('off', 'straight', 'cfg')][string]$FlagLiveness = 'cfg',
+    [string]$LocalRegs = 'off',
     # Checked per-access guest memory (diagnosable bad pointers) instead of the direct arena.
     [switch]$CheckedMemory,
     [string]$GameExe = 'C:\Program Files (x86)\GOG.com\Assassins Creed\AssassinsCreed_Dx9.exe',
@@ -34,13 +35,14 @@ try {
             $NeedGenerate = $Report.config_sha256 -ne $ConfigHash -or
                 $Report.lift_driver_sha256 -ne $DriverHash -or $Report.initializer_tables_sha256 -ne $TablesHash -or
                 $Report.generation_input_sha256.emission_cache -ne $EmissionCacheHash -or
-                $Report.flag_liveness -ne $FlagLiveness
+                $Report.flag_liveness -ne $FlagLiveness -or
+                $Report.local_regs.requested -ne $LocalRegs
         }
     }
     if ($NeedGenerate) {
         & $Python -B tools/analyze_pe.py
         if ($LASTEXITCODE -ne 0) { throw 'PE analysis failed' }
-        & $Python -B tools/lift_ac1.py --flag-liveness $FlagLiveness
+        & $Python -B tools/lift_ac1.py --flag-liveness $FlagLiveness --local-regs $LocalRegs
         if ($LASTEXITCODE -ne 0) { throw 'AC1 generation failed' }
     }
     & $Python -B tools/prepare_runtime.py
