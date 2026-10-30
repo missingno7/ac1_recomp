@@ -10,7 +10,9 @@ param(
     [switch]$Run,
     # Checked per-access guest memory (diagnosable bad pointers) instead of the direct arena.
     [switch]$CheckedMemory,
-    [string]$GameExe = 'C:\Program Files (x86)\GOG.com\Assassins Creed\AssassinsCreed_Dx9.exe'
+    [string]$GameExe = 'C:\Program Files (x86)\GOG.com\Assassins Creed\AssassinsCreed_Dx9.exe',
+    # Reuse an existing build's generator; Ninja is the default for a new one.
+    [ValidateSet('Ninja', 'MinGW Makefiles')][string]$Generator
 )
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
@@ -55,7 +57,15 @@ try {
     $Ninja = Join-Path $Sdk 'cmake/3.22.1/bin/ninja.exe'
     $BuildDir = "build/$($Target.ToLower())"
     if ($BuildType -ne 'Debug') { $BuildDir += "-$($BuildType.ToLower())" }
-    $ConfigureArgs = @('-S', '.', '-B', $BuildDir, '-G', 'Ninja', "-DCMAKE_MAKE_PROGRAM=$Ninja", "-DCMAKE_BUILD_TYPE=$BuildType")
+    if (-not $Generator) {
+        $Generator = 'Ninja'
+        if (Test-Path "$BuildDir/CMakeCache.txt") {
+            $CachedGenerator = Select-String -LiteralPath "$BuildDir/CMakeCache.txt" -Pattern '^CMAKE_GENERATOR:INTERNAL=(.+)$'
+            if ($CachedGenerator) { $Generator = $CachedGenerator.Matches[0].Groups[1].Value }
+        }
+    }
+    $MakeProgram = if ($Generator -eq 'MinGW Makefiles') { 'C:/msys64/mingw64/bin/mingw32-make.exe' } else { $Ninja }
+    $ConfigureArgs = @('-S', '.', '-B', $BuildDir, '-G', $Generator, "-DCMAKE_MAKE_PROGRAM=$MakeProgram", "-DCMAKE_BUILD_TYPE=$BuildType")
     # Explicit, because an option default never overrides an existing CMake cache entry.
     $ConfigureArgs += "-DAC1_DIRECT_MEMORY=$(if ($CheckedMemory) { 'OFF' } else { 'ON' })"
     if ($Target -eq 'Host') {

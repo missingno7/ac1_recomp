@@ -3,6 +3,7 @@
 #include "ac1_runtime.h"
 #include "ac1_profile.h"
 #include "ac1_virtual_query.h"
+#include "ac1_memory_diagnostics.h"
 #include "ac1_profile_int.h"
 #include "cpu.h"
 #include "guest_memory.h"
@@ -238,6 +239,7 @@ static uint32_t static_tls_template_size;
 static uint32_t static_tls_zero_fill;
 static uint32_t static_tls_index_address;
 static uint32_t virtual_alloc_bases[GUEST_MEMORY_MAX_REGIONS];
+static struct { uint32_t eip, thread; } virtual_alloc_origins[GUEST_MEMORY_MAX_REGIONS];
 static ac1_scheduler *active_scheduler;
 
 static int virtual_allocation_contains(uint32_t base)
@@ -247,12 +249,14 @@ static int virtual_allocation_contains(uint32_t base)
     return 0;
 }
 
-static int virtual_allocation_add(uint32_t base)
+static int virtual_allocation_add(uint32_t base, uint32_t eip)
 {
     for (size_t i = 0; i < GUEST_MEMORY_MAX_REGIONS; ++i) {
         if (virtual_alloc_bases[i] == base) return 1;
         if (!virtual_alloc_bases[i]) {
             virtual_alloc_bases[i] = base;
+            virtual_alloc_origins[i].eip = eip;
+            virtual_alloc_origins[i].thread = active_guest_thread ? active_guest_thread->id : 0u;
             return 1;
         }
     }
@@ -2562,6 +2566,60 @@ static int handle_heap_import(CPU *cpu, const import_record *import)
     return 1;
 }
 
+/* A Win32 CS needs mapped guest bytes, not one contiguous host allocation.
+ * Reuse checked scalar copies for the complete span, before any mutation. */
+static int critical_section_span_mapped(uint32_t address)
+{
+    uint32_t scratch[4];
+    return (uint64_t)address + 24u <= UINT64_C(0x100000000) &&
+           guest_memory_read_scalar(address, scratch, 16u) &&
+           guest_memory_read_scalar(address + 16u, scratch, 8u);
+}
+
+static void trace_critical_section_span(const CPU *cpu, const char *name,
+                                    uint32_t address, int span_mapped)
+{
+    fprintf(stderr, "AC1 CS span: api=%s address=0x%08x width=24 mapped=%d EIP=0x%08x thread=%u\n",
+            name, address, span_mapped, cpu->eip, active_guest_thread ? active_guest_thread->id : 0u);
+    ac1_guest_memory_dump_span(address, 24u);
+    for (unsigned offset = 0; offset < 24u; offset += 4u) {
+        uint32_t word = 0u;
+        int mapped = (uint64_t)address + offset + 4u <= UINT64_C(0x100000000) &&
+                     guest_memory_read_scalar(address + offset, &word, 4u);
+        fprintf(stderr, "AC1 CS word: offset=%u mapped=%d value=0x%08x\n", offset, mapped, word);
+    }
+    uint32_t frame[21] = {0};
+    int frame_mapped = 1;
+    for (unsigned i = 0; i < 21u; ++i) {
+        int mapped = (uint64_t)cpu->ebp + i * 4u + 4u <= UINT64_C(0x100000000) &&
+                     guest_memory_read_scalar(cpu->ebp + i * 4u, &frame[i], 4u);
+        if (!mapped) frame_mapped = 0;
+    }
+    fprintf(stderr, "AC1 CS caller frame: EBP=0x%08x +4=0x%08x +24=0x%08x +28=0x%08x +44=0x%08x +48=0x%08x mapped=%d\n",
+            cpu->ebp, frame[1], frame[6], frame[7], frame[11], frame[12], frame_mapped);
+    /* Exact return-address/argument evidence for ActionComponent's
+     * registered allocation factory; diagnostics only, never a workaround. */
+    if (frame_mapped && frame[1] == 0x00505b7bu && frame[6] == 0x00505db2u &&
+        (uint64_t)frame[7] + 0x50u == address && frame[11] == 0x110u) {
+        uint32_t vtable = 0u, method = 0u;
+        int known = guest_memory_read_scalar(frame[12], &vtable, 4u) &&
+                    vtable <= UINT32_MAX - 4u &&
+                    guest_memory_read_scalar(vtable + 4u, &method, 4u);
+        fprintf(stderr, "AC1 CS allocation: object=0x%08x bytes=0x%08x allocator=0x%08x vtable=0x%08x allocate=0x%08x known=%d\n",
+                frame[7], frame[11], frame[12], vtable, method, known);
+    }
+    for (size_t i = 0; i < GUEST_MEMORY_MAX_REGIONS; ++i) {
+        uint32_t base = virtual_alloc_bases[i];
+        if (!base) continue;
+        uint64_t end = (uint64_t)base + guest_memory_region_size(base);
+        if ((uint64_t)base <= (uint64_t)address + 0x10000u &&
+            end + 0x10000u >= address)
+            fprintf(stderr, "AC1 CS VirtualAlloc: base=0x%08x end=0x%llx allocated-at=0x%08x thread=%u\n",
+                    base, (unsigned long long)end, virtual_alloc_origins[i].eip,
+                    virtual_alloc_origins[i].thread);
+    }
+}
+
 static int handle_critical_section_import(CPU *cpu, const import_record *import)
 {
     if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
@@ -2577,11 +2635,16 @@ static int handle_critical_section_import(CPU *cpu, const import_record *import)
     if (active_guest_thread) active_guest_thread->checkpoint_cause = AC1_HANDOFF_CS;
 
     uint32_t address = rd32(cpu->esp + 4u);
-    uint8_t *section = (uint8_t *)guest_memory_try_ptr(address, 24u);
-    if (!section) stop_guest("critical-section object is unmapped", import->token);
+    if (!guest_memory_try_ptr(address, 24u)) {
+        int mapped = critical_section_span_mapped(address);
+        const char *trace = getenv("AC1_TRACE_CS_SPANS");
+        if (!mapped || (trace && *trace && strcmp(trace, "0")))
+            trace_critical_section_span(cpu, name, address, mapped);
+        if (!mapped) stop_guest("critical-section object is unmapped", import->token);
+    }
     if (init_spin || init) {
         uint32_t spin = init_spin ? rd32(cpu->esp + 8u) : 0u;
-        memset(section, 0, 24u);
+        for (unsigned offset = 0; offset < 24u; offset += 4u) wr32(address + offset, 0u);
         wr32(address + 4u, UINT32_MAX);
         wr32(address + 20u, spin);
         cpu->eax = 1u;
@@ -2589,7 +2652,7 @@ static int handle_critical_section_import(CPU *cpu, const import_record *import)
         return 1;
     }
     if (destroy) {
-        memset(section, 0, 24u);
+        for (unsigned offset = 0; offset < 24u; offset += 4u) wr32(address + offset, 0u);
         wr32(address + 4u, UINT32_MAX);
         return_stdcall(cpu, 4u);
         return 1;
@@ -3639,7 +3702,7 @@ static void scheduler_trace_waits(ac1_scheduler *scheduler, uint64_t now)
         uint32_t count = t->wait_count ? t->wait_count : 1u;
         for (uint32_t h = 0; h < count; ++h)
             fprintf(stderr, "0x%08x,", t->wait_count ? t->wait_handles[h] : t->wait_handle);
-        if (t->wait_kind == AC1_WAIT_CRITICAL_SECTION && guest_memory_try_ptr(t->wait_handle, 24u))
+        if (t->wait_kind == AC1_WAIT_CRITICAL_SECTION && critical_section_span_mapped(t->wait_handle))
             fprintf(stderr, " CS(owner=%u,count=%d,recursion=%u)",
                     rd32(t->wait_handle + 12u), (int32_t)rd32(t->wait_handle + 4u), rd32(t->wait_handle + 8u));
         fprintf(stderr, " stack=");
@@ -5183,7 +5246,7 @@ static int handle_import(CPU *cpu, const import_record *import)
         if (!base || !guest_memory_allocate(base, rounded)) {
             cpu->eax = 0u;
             last_error = 8u; /* ERROR_NOT_ENOUGH_MEMORY */
-        } else if (!virtual_allocation_add(base)) {
+        } else if (!virtual_allocation_add(base, cpu->eip)) {
             guest_memory_release(base);
             cpu->eax = 0u;
             last_error = 8u; /* ERROR_NOT_ENOUGH_MEMORY */
