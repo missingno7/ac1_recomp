@@ -214,43 +214,100 @@ What is left in the cone (exploratory profile): guest memory accessors
 only for function exits ~10% (`parity8` alone 4.5%), the x87 integer store
 ~9%, calls and returns ~4%.
 
-## 8. Recommendation
+## 8. Third step: guest stack traffic
 
-1. **Stack-slot promotion is now the next lifter step**, as hypothesized:
-   guest memory accessors lead the cone's profile, and GCC already forwards
-   stack values inside straight-line code. What it cannot do is delete the
-   stores or keep values across calls and joins. Scope (static census of
-   101,990 functions): 57% have explicit stack operands; 21% take a frame
-   address (`lea r,[esp/ebp+k]`), so the other 79% have no address-taken
-   frame slot apart from outgoing arguments and the argument slots callees
-   read. Start there: frame-relative slot tracking through push/pop/sub/add
-   and direct-callee stack cleanup, private slots as C locals, argument
-   slots materialized before calls.
-2. **ABI-aware call boundaries** (Pinyon Shift's ABI sync: -11-12% guest
-   instructions; XenonRecomp's non-volatile locals). A guest call is ~70
-   host instructions in the cone: accounting (slow-mode and dispatch-limit
-   checks, depth, last target), an out-of-line scheduler checkpoint after
-   every return (which also clobbers every caller-saved host register),
-   stores of every dirty GPR and every referenced XMM register, reloads of
-   all of them, and the return address pushed through `c->esp`. An inline
-   countdown in front of the checkpoint call is a small runtime change;
-   skipping callee-saved GPR reloads and treating XMM1-7 as dead at returns
-   needs an exception list (CRT EH/SEH prologs, `_chkstk`, `longjmp`) or a
-   preservation proof.
-3. **XMM locals in exception-frame functions.** 2,084 of the 9,022 SSE
-   functions (25% of SSE instructions) keep XMM state in memory because the
-   XMM pass refuses any function that touches `fs:`. They get the vector
-   operations but not register allocation; admitting them needs an argument
-   about unwinding through those frames.
-4. **FLAGABI without body duplication.** The existing opt-in mode copies
-   5,988 private bodies (+11% `.text`), which hides its gain; the cone still
-   pays ~10% for flags that only a function exit keeps alive.
-5. **x87 sticky status in a local.** Each `fist(p)` read-modify-writes
-   `c->fpu_sw` for PE and reloads the control word (~9% of the cone).
-6. Per-instruction EIP stores still cost ~12% of the cone (159.6 vs 140.1);
-   a diagnostics build could keep them and a performance build record EIP
-   only at calls, now that crash reports carry the host PC.
-7. Keep native x87 and the vector lowering under validation on AArch64
-   hardware, Bink/MMX videos and long play; fix lowering bugs rather than
-   retreating. Native reconstruction stays the tool for kernels that remain
-   far off (pose propagation: 2.7x from its native version).
+Stack-slot promotion was the planned next step. Scope first: weighting the
+architecture study's main-thread samples by function, 47% of main-thread CPU
+is in functions whose frame never escapes (no `lea r,[esp/ebp+k]`, no ESP
+copies), 32% in functions that pass frame addresses to callees (the pose
+kernel among them), 12% in functions without register locals (`fs:`
+exception frames). The kernel's own profile then showed three concrete
+stack costs, each removable without a frame model:
+
+* **push/pop through `c->esp`.** The register-locals pass kept ESP in a
+  local but routed every push and pop through the CPU struct: store the
+  local, load, adjust and store `c->esp`, store the value, reload the local,
+  a memory round trip on the ESP dependency chain of each of ~1M pushes and
+  ~146k pops in the generated code. The pass now lowers the common forms to
+  arithmetic on the local ESP plus one guest store or load (the pushed value
+  is read first; `pop esp` takes the loaded value); other forms keep the
+  helpers.
+* **EIP stores as alias barriers between stack accesses.** With stack-only
+  EIP stores gone, the remaining store before every heap access still
+  stopped GCC forwarding stack values across it. EIP is now recorded at
+  function entries, control transfers, division and after calls (EIP stores
+  2.42M -> 0.97M; 214 -> 24 in the kernel's main function). Crash reports
+  carry the host PC for exact attribution. Recording it at conditional
+  branches too measured ~2% faster in the kernel than omitting them, with
+  identical C apart from those stores (scheduling or layout), and keeps the
+  rule "every control transfer".
+* **Vectors built through the stack.** MSVC builds `__m128` values with
+  4-byte stores (`movss`, `mov dword`) and then one 16-byte load. A CPU cannot
+  forward several narrow stores into one wide load, so the load waits for the
+  stores to commit; these stalls were the hottest remaining samples (8.4% on
+  the instruction after one such load, 5.5% after another). Within a block,
+  with ESP followed through push/pop/add/sub, the lifter now assembles such a
+  load from the stored lane values (`StackLaneForwarding`); unknown lanes are
+  4-byte loads, which forward. The stores still happen; any memory write it
+  cannot place, a call, a label or an ESP change it cannot follow ends the
+  tracking. Static census: 5,137 such loads in 2,689 functions (3,870 with
+  all four lanes just written), plus 733 8-byte loads after 4-byte stores
+  (not handled yet).
+
+Correctness: the cone is byte-identical to the default on all 19,202
+records and both poison fills after each step. New tests compare the
+push/pop lowering and the forwarding with the plain forms on 4,096 random
+states each (whole CPU and stack memory), including `push esp`, `pop esp`,
+`push [esp+4]`, a heap store that hits a tracked slot, an overlapping
+narrow store, a misaligned wide load and a packed op with a memory source.
+110 tests and the lifter self-test pass.
+
+| step (cumulative) | ticks/bone | vs first-step default | x64 instructions | host-stack refs | AArch64 instructions |
+|---|---:|---:|---:|---:|---:|
+| second-step default (`0d57d16`) | 159.2 | 1.73x | 2,899 | 96 | 2,672 |
+| + push/pop on the local ESP | 152.6 | 1.80x | 2,825 | 102 | 2,580 |
+| + EIP only at transfers | 135.7 | 2.03x | 2,718 | 127 | |
+| **+ stack lane forwarding** | **117.8** | **2.34x** | **2,714** | **102** | **2,277** |
+| native C reconstruction | 60 | 4.6x | | | |
+
+Against the shipped translation (478) the cone is 4.1x faster; the native
+version is now 2.0x away. Game build: 5,060 forwarded loads, `.text` 127.3
+-> 120.9 MB (-5.0%), stripped executable 137.4 -> 130.6 MB.
+
+Controlled gameplay comparison (second-step default `0d57d16` against the
+three stack steps, window-mean statistic, fixed clock, CCD0, lock; the
+interval excluded zero after three pairs): main-thread cycles/frame
+**-4.7%** [-8.7%, -0.7%], mean frame time **-4.8%** [-8.6%, -1.0%], 33.7 ->
+35.1 FPS (+5.0% [+0.8%, +9.3%]); B was faster in every pair. No guest stop
+or memory fault in the six runs; a run to Present 5010 and the intro videos
+show no stop or visual breakage.
+
+What is left in the cone (exploratory profile, harness excluded): x87
+integer stores ~15%, guest memory accessors ~23%, flags kept alive only for
+function exits ~15% (`parity8` 6.5%), calls ~8%.
+
+## 9. Recommendation
+
+1. **x87 integer stores.** Every `fist(p)` reloads the control word for the
+   rounding mode, range-checks, converts, re-converts to test exactness and
+   read-modify-writes `c->fpu_sw` for PE (~15% of the cone, the hottest
+   single instruction). Keep RC and the sticky status bits in locals synced
+   at the existing TOP sync points.
+2. **Flags at function exits** (NFSU2's FLAGABI: -4.5% cycles). The existing
+   opt-in mode copies 5,988 private bodies (+11% `.text`); a version without
+   duplication would remove the flags that only exits keep alive (~15% of
+   the cone).
+3. **Call boundaries** (Pinyon Shift's ABI sync: -11-12% guest
+   instructions). A guest call is ~70 host instructions: accounting, an
+   out-of-line scheduler checkpoint after every return, full GPR/XMM syncs.
+   An inline countdown before the checkpoint is a small runtime change;
+   skipping callee-saved reloads needs an exception list (CRT EH/SEH prologs,
+   `_chkstk`, `longjmp`) or a preservation proof.
+4. **Frame-slot promotion proper** (store elimination, values across calls)
+   for the 47% of main-thread CPU in private-frame functions, plus the 733
+   8-byte loads after 4-byte stores. Forwarding already removed the stalls;
+   what remains is the stores themselves and reloads across calls.
+5. **XMM and GPR locals in exception-frame functions** (12% of main-thread
+   CPU, 25% of SSE instructions): needs an argument about unwinding.
+6. Keep native x87, the vector lowering and the stack changes under
+   validation on AArch64 hardware, videos and long play.

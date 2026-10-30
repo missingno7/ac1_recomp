@@ -36,6 +36,16 @@ gameplay main-thread cycles/frame and mean frame time fall 5.0% [-6.9%,
 -3.1%], 32.4 -> 34.3 FPS, eight of eight pairs. The benchmark now decides on
 window-mean cycles/frame; see the same document.
 
+Third step: guest stack traffic. Push and pop move the local ESP instead of
+round-tripping it through the CPU struct; the guest EIP is recorded only at
+function entries, control transfers, division and after calls (2.42M ->
+0.97M stores; crash reports resolve the exact line from the host PC); and a
+16-byte stack load that reads lanes stored just before it in the same block
+takes their values instead of stalling on store forwarding (5,060 loads).
+The pose kernel runs 160 -> 118 ticks/bone (byte-identical); in gameplay
+main-thread cycles/frame -4.7% [-8.7%, -0.7%], mean frame time -4.8%, 33.7 ->
+35.1 FPS.
+
 ## Gamepad and Android touch controller (2026-10-30)
 
 The runtime now feeds AC1's original Xbox controller path from Windows XInput,
