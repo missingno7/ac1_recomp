@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile DXVK's built-in shaders with NDK glslc and validate Vulkan 1.1 SPIR-V."""
+"""Compile pinned DXVK 3.1 built-in shaders and validate Vulkan 1.3 SPIR-V."""
 # Adapted from codepdbh/nfsu2-recompiled ports/dxvk_android/shaders.py.
 # Copyright (c) codepdbh; MIT per the upstream repository README.
 import argparse
@@ -28,25 +28,29 @@ signature = hashlib.sha256(pathlib.Path(__file__).read_bytes())
 for shader in shaders:
     signature.update(shader.relative_to(root).as_posix().encode("utf-8"))
     signature.update(shader.read_bytes())
+for directory in (root / "src/dxvk/shaders", root / "src/dxvk/hud/shaders", root / "src/d3d9/shaders"):
+    for header in sorted(directory.glob("*.h")):
+        signature.update(header.relative_to(root).as_posix().encode("utf-8"))
+        signature.update(header.read_bytes())
 signature = signature.hexdigest()
 marker = output / "SHADERS_SHA256"
 if marker.exists() and marker.read_text(encoding="ascii").strip() == signature and all(
         (output / (shader.stem + suffix)).is_file() for shader in shaders for suffix in (".h", ".spv")):
-    print(f"DXVK shaders are current ({len(shaders)} Vulkan 1.1 shaders)")
+    print(f"DXVK shaders are current ({len(shaders)} Vulkan 1.3 shaders)")
     sys.exit(0)
 count = 0
 for shader in shaders:
     binary = output / (shader.stem + ".spv")
     header = output / (shader.stem + ".h")
-    subprocess.run([str(args.glslc), "--target-env=vulkan1.1", str(shader), "-o", str(binary)], check=True)
-    subprocess.run([str(args.spirv_val), "--target-env", "vulkan1.1", str(binary)], check=True)
+    subprocess.run([str(args.glslc), "--target-env=vulkan1.3", "-I" + str(shader.parent), str(shader), "-o", str(binary)], check=True)
+    subprocess.run([str(args.spirv_val), "--target-env", "vulkan1.3", "--scalar-block-layout", str(binary)], check=True)
     data = binary.read_bytes()
     if len(data) % 4:
         raise SystemExit(f"Invalid SPIR-V byte count: {shader}")
     words = struct.unpack("<" + "I" * (len(data) // 4), data)
     symbol = re.sub(r"\W", "_", shader.stem)
     with header.open("w", encoding="ascii", newline="\n") as stream:
-        stream.write("// Generated from " + shader.name + " for Vulkan 1.1.\n")
+        stream.write("// Generated from " + shader.name + " for Vulkan 1.3.\n")
         stream.write("#include <stdint.h>\n")
         stream.write(f"static const uint32_t {symbol}[] = {{\n")
         for offset in range(0, len(words), 8):
@@ -54,4 +58,4 @@ for shader in shaders:
         stream.write("};\n")
     count += 1
 marker.write_text(signature + "\n", encoding="ascii")
-print(f"{count} built-in shaders generated and validated for Vulkan 1.1")
+print(f"{count} built-in shaders generated and validated for Vulkan 1.3")
