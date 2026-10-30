@@ -8,7 +8,6 @@ import android.graphics.Rect;
 import android.os.Build;
 import android.util.DisplayMetrics;
 import android.os.Bundle;
-import android.system.ErrnoException;
 import android.system.Os;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -373,14 +372,21 @@ public final class LauncherActivity extends Activity {
 
     /** While the guest runs, the surface owns the whole display: launcher views and system bars hide. */
     /** Diagnostic runtime settings from `--es env "AC1_X=1,DXVK_Y=2"`; only AC1_ and DXVK_ keys. */
-    private static void applyEnvironment(String settings) throws ErrnoException {
+    private void applyEnvironment(String settings) throws Exception {
         if (settings == null || settings.isEmpty()) return;
         for (String setting : settings.split(",")) {
             int split = setting.indexOf('=');
             String key = split > 0 ? setting.substring(0, split) : "";
             if (!key.matches("(AC1|DXVK)_[A-Z0-9_]+"))
                 throw new IllegalArgumentException("env accepts AC1_/DXVK_ KEY=VALUE pairs: " + setting);
-            Os.setenv(key, setting.substring(split + 1), true);
+            String value = setting.substring(split + 1);
+            if (key.equals("AC1_FRAME_STATS") && value.startsWith("private:")) {
+                String name = value.substring("private:".length());
+                if (name.isEmpty() || name.contains("/") || name.contains("\\") || name.equals(".") || name.equals(".."))
+                    throw new IllegalArgumentException("AC1_FRAME_STATS private path must be a filename");
+                value = new File(getFilesDir(), name).getCanonicalPath();
+            }
+            Os.setenv(key, value, true);
         }
     }
 

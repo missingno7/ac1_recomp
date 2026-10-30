@@ -39,8 +39,179 @@ using D3DXMATRIX = ac1_d3dx::Matrix;
 #include <string>
 #include <type_traits>
 #include <vector>
+#include <chrono>
+#include <mutex>
+#include <array>
+
+#if defined(_WIN32)
+#include <processthreadsapi.h>
+#else
+#include <pthread.h>
+#include <time.h>
+#endif
 
 namespace {
+
+#if defined(_WIN32)
+constexpr uint64_t kCpuSampleWindowFrames = 16;
+#else
+constexpr uint64_t kCpuSampleWindowFrames = 1;
+#endif
+
+/* Optional low-overhead frame clock. CPU clocks are sampled on the Present
+ * thread so Linux/Android can use CLOCK_THREAD_CPUTIME_ID without another
+ * thread's clock lookup. Rows are buffered and periodically appended. */
+class FrameStats {
+public:
+    void present()
+    {
+        std::call_once(init_once_, [this] { initialize(); });
+        if (!enabled_) return;
+        std::lock_guard<std::mutex> guard(lock_);
+        if (!is_main_thread()) return;
+        if (slowdown_us_) {
+            const auto until = std::chrono::steady_clock::now() +
+                std::chrono::microseconds(slowdown_us_);
+            while (std::chrono::steady_clock::now() < until) {}
+        }
+        const auto wall = std::chrono::steady_clock::now();
+        const double thread_cpu = thread_cpu_seconds();
+        const double process_cpu = process_cpu_seconds();
+        const uint64_t present_index = have_previous_ ? frame_ + 1 : 1;
+        const size_t history_size = static_cast<size_t>(kCpuSampleWindowFrames + 1);
+        double thread_cpu_ms = 0.0;
+        double process_cpu_ms = 0.0;
+        const bool cpu_sample_ready = present_index > kCpuSampleWindowFrames;
+        if (cpu_sample_ready) {
+            const size_t baseline = static_cast<size_t>(
+                (present_index - kCpuSampleWindowFrames) % history_size);
+            thread_cpu_ms = (thread_cpu - thread_cpu_history_[baseline]) *
+                1000.0 / kCpuSampleWindowFrames;
+            process_cpu_ms = (process_cpu - process_cpu_history_[baseline]) *
+                1000.0 / kCpuSampleWindowFrames;
+        }
+        const size_t history_slot = static_cast<size_t>(present_index % history_size);
+        thread_cpu_history_[history_slot] = thread_cpu;
+        process_cpu_history_[history_slot] = process_cpu;
+        if (have_previous_) {
+            frame_ = present_index;
+            if (cpu_sample_ready) {
+                rows_.push_back({frame_,
+                    std::chrono::duration<double, std::milli>(wall - previous_wall_).count(),
+                    thread_cpu_ms, process_cpu_ms,
+                    static_cast<uint32_t>(kCpuSampleWindowFrames)});
+                if (rows_.size() >= 64) flush();
+            }
+        } else {
+            frame_ = present_index;
+        }
+        previous_wall_ = wall;
+        have_previous_ = true;
+    }
+
+    ~FrameStats() { std::lock_guard<std::mutex> guard(lock_); flush(); }
+
+private:
+    struct Row { uint64_t frame; double wall_ms, thread_cpu_ms, process_cpu_ms; uint32_t cpu_window_frames; };
+    bool enabled_ = false, have_previous_ = false;
+    unsigned long slowdown_us_ = 0;
+    std::once_flag init_once_;
+    std::mutex lock_;
+    std::string path_;
+    uint64_t frame_ = 0;
+    std::chrono::steady_clock::time_point previous_wall_{};
+    std::vector<Row> rows_;
+    std::array<double, 17> thread_cpu_history_{};
+    std::array<double, 17> process_cpu_history_{};
+
+    void initialize()
+    {
+        const char *path = std::getenv("AC1_FRAME_STATS");
+        if (path && *path) { path_ = path; enabled_ = true; rows_.reserve(64); }
+        const char *slowdown = std::getenv("AC1_FRAME_STATS_TEST_SLOWDOWN_US");
+        if (enabled_ && slowdown && *slowdown) {
+            char *end = nullptr;
+            const unsigned long requested = std::strtoul(slowdown, &end, 10);
+            if (end != slowdown && *end == '\0') slowdown_us_ = std::min(requested, 100000ul);
+        }
+    }
+    bool is_main_thread() const
+    {
+#if defined(_WIN32)
+        const DWORD id = GetCurrentThreadId();
+        if (!main_thread_id_) main_thread_id_ = id;
+        return id == main_thread_id_;
+#else
+        const pthread_t id = pthread_self();
+        if (!main_thread_set_) { main_thread_id_ = id; main_thread_set_ = true; }
+        return pthread_equal(id, main_thread_id_) != 0;
+#endif
+    }
+    double thread_cpu_seconds() const
+    {
+#if defined(_WIN32)
+        FILETIME create{}, exit{}, kernel{}, user{};
+        if (!GetThreadTimes(GetCurrentThread(), &create, &exit, &kernel, &user)) return 0;
+        ULARGE_INTEGER k{}, u{}; k.LowPart=kernel.dwLowDateTime; k.HighPart=kernel.dwHighDateTime;
+        u.LowPart=user.dwLowDateTime; u.HighPart=user.dwHighDateTime;
+        return static_cast<double>(k.QuadPart + u.QuadPart) / 10000000.0;
+#else
+        timespec value{};
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) return 0;
+        return static_cast<double>(value.tv_sec) + value.tv_nsec * 1e-9;
+#endif
+    }
+    double process_cpu_seconds() const
+    {
+#if defined(_WIN32)
+        FILETIME create{}, exit{}, kernel{}, user{};
+        if (!GetProcessTimes(GetCurrentProcess(), &create, &exit, &kernel, &user)) return 0;
+        ULARGE_INTEGER k{}, u{}; k.LowPart=kernel.dwLowDateTime; k.HighPart=kernel.dwHighDateTime;
+        u.LowPart=user.dwLowDateTime; u.HighPart=user.dwHighDateTime;
+        return static_cast<double>(k.QuadPart + u.QuadPart) / 10000000.0;
+#else
+        timespec value{};
+        if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &value) != 0) return 0;
+        return static_cast<double>(value.tv_sec) + value.tv_nsec * 1e-9;
+#endif
+    }
+    void flush()
+    {
+        if (rows_.empty() || path_.empty()) return;
+        FILE *file = std::fopen(path_.c_str(), "ab");
+        if (!file) {
+            if (!write_error_reported_) {
+                std::fprintf(stderr, "AC1 frame stats: cannot append '%s'\n", path_.c_str());
+                write_error_reported_ = true;
+            }
+            rows_.clear();
+            return;
+        }
+        if (file_size(file) == 0)
+            std::fputs("present_index,wall_ms,main_thread_cpu_ms,process_cpu_ms,cpu_sample_window_frames\n", file);
+        for (const Row &row : rows_)
+            std::fprintf(file, "%llu,%.6f,%.6f,%.6f,%u\n",
+                         static_cast<unsigned long long>(row.frame), row.wall_ms,
+                         row.thread_cpu_ms, row.process_cpu_ms, row.cpu_window_frames);
+        std::fclose(file);
+        rows_.clear();
+    }
+    static long file_size(FILE *file)
+    {
+        if (std::fseek(file, 0, SEEK_END) != 0) return 0;
+        const long size = std::ftell(file);
+        return size < 0 ? 0 : size;
+    }
+    bool write_error_reported_ = false;
+#if defined(_WIN32)
+    mutable DWORD main_thread_id_ = 0;
+#else
+    mutable pthread_t main_thread_id_{};
+    mutable bool main_thread_set_ = false;
+#endif
+};
+
+FrameStats g_frame_stats;
 
 constexpr uint32_t kTokenBase = 0x7e000000u;
 constexpr uint32_t kRdhRectangles = 1u;
@@ -350,7 +521,10 @@ void capture_back_buffer(IDirect3DDevice9 *device)
 void trace_frame_success(bool is_present, const char *method)
 {
     // Replay uses this clock on every platform, independently of frame tracing.
-    if (is_present) g_successful_present_calls.fetch_add(1, std::memory_order_relaxed);
+    if (is_present) {
+        g_successful_present_calls.fetch_add(1, std::memory_order_relaxed);
+        g_frame_stats.present();
+    }
 #ifdef AC1_PROFILE_HOOKS
     if (is_present && ac1_profile_frames_enabled) ac1_profile_present();
 #endif
