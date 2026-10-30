@@ -117,13 +117,11 @@ DIRECT_ACCESS_HELPERS = r'''/* Guest memory accessors are force-inlined: in very
 extern uint8_t *ac1_direct_arena;
 AC1_ACCESSOR_INLINE void ac1_direct_read(uint32_t a, void *o, size_t w)
 {
-    if (__builtin_expect(ac1_direct_arena != NULL, 1)) memcpy(o, ac1_direct_arena + a, w);
-    else (guest_execution_read)(a, o, w);
+    memcpy(o, ac1_direct_arena + a, w);
 }
 AC1_ACCESSOR_INLINE void ac1_direct_write(uint32_t a, const void *i, size_t w)
 {
-    if (__builtin_expect(ac1_direct_arena != NULL, 1)) memcpy(ac1_direct_arena + a, i, w);
-    else (guest_execution_write)(a, i, w);
+    memcpy(ac1_direct_arena + a, i, w);
 }
 #define guest_execution_read(a, o, w) ac1_direct_read((a), (o), (w))
 #define guest_execution_write(a, i, w) ac1_direct_write((a), (i), (w))
@@ -132,7 +130,7 @@ AC1_ACCESSOR_INLINE void ac1_direct_write(uint32_t a, const void *i, size_t w)
  * Unaligned operands keep the checked path and its diagnostic. */
 AC1_ACCESSOR_INLINE uint32_t *ac1_direct_atomic_cell(uint32_t a)
 {
-    return (ac1_direct_arena && !(a & 3u)) ? (uint32_t *)(ac1_direct_arena + a) : NULL;
+    return !(a & 3u) ? (uint32_t *)(ac1_direct_arena + a) : NULL;
 }
 AC1_ACCESSOR_INLINE uint32_t ac1_direct_xadd32(uint32_t a, uint32_t v)
 {
@@ -637,6 +635,85 @@ def masked_flag_helpers(text: str) -> str:
                         '\n'.join(helpers) + '\n\n' + marker)
 
 
+def helper_functions(text):
+    """Find pinned inline bodies; mask comments/strings to preserve edit offsets."""
+    masked=re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',lambda m:re.sub(r'[^\n]',' ',m[0]),text,flags=re.S)
+    pattern=re.compile(r'(?m)^(static inline|AC1_ACCESSOR_INLINE|AC1_X87_INTEGER_INLINE)\s+([^\n{};]+?)\b(\w+)\s*\(([^{};]*?)\)\s*\{')
+    functions={}
+    for m in pattern.finditer(masked):
+        depth=1;end=m.end()
+        while depth:
+            depth+=(masked[end]=='{')-(masked[end]=='}');end+=1
+        functions[m[3]]={'name':m[3],'start':m.start(),'body':m.end(),'end':end,
+            'args_start':m.start(4),'args_end':m.end(4),'name_start':m.start(3),'name_end':m.end(3),
+            'code':masked[m.end():end-1]}
+    return functions,masked
+
+def local_memory_helpers(text):
+    """Pass one captured arena value through every nested memory helper.
+
+    The runtime reserves the arena before guest entry and releases it only
+    after guest threads join, under the process run lock. Each invocation
+    captures its own value, including a later ac1_run with a different arena.
+    The local pointer's address never escapes; guest byte stores and opaque
+    CPU observers cannot invalidate it. No fixed VA or const-function promise
+    is required on Windows or Android. Unaligned atomics keep the original
+    checked fallback, including its precise rejection diagnostics.
+
+    The empty asm input observes only EIP before an access. It keeps the
+    existing tracing store live for fault diagnostics after opaque fallback
+    calls disappear, emits no instruction, and needs no GPR synchronization.
+    """
+    functions,masked=helper_functions(text)
+    aliases={'guest_execution_read':'ac1_direct_read','guest_execution_write':'ac1_direct_write',
+      'guest_atomic_xadd32':'ac1_direct_xadd32','guest_atomic_cmpxchg32':'ac1_direct_cmpxchg32','guest_atomic_xchg32':'ac1_direct_xchg32'}
+    seeds={'ac1_direct_read','ac1_direct_write','ac1_direct_atomic_cell'}
+    if not seeds<=functions.keys():
+        raise ValueError('unexpected direct-memory CPU helper definitions')
+    dependent=set(seeds)
+    while True:
+        current=set(dependent)
+        for name,f in functions.items():
+            called=set(re.findall(r'\b(\w+)\s*\(',f['code']))
+            if {aliases.get(c,c) for c in called}&dependent:current.add(name)
+        if current==dependent:break
+        dependent=current
+    prototypes=[];definitions=[]
+    overrides={
+      'ac1_direct_read':'memcpy(o, _ac1_base + a, w);',
+      'ac1_direct_write':'memcpy(_ac1_base + a, i, w);',
+      'ac1_direct_atomic_cell':'return !(a & 3u) ? (uint32_t *)(_ac1_base + a) : NULL;'}
+    for name,f in functions.items():
+        if name not in dependent:continue
+        prefix=text[f['start']:f['name_start']]
+        args=text[f['args_start']:f['args_end']].strip()
+        args='uint8_t * const _ac1_base, const CPU * const _ac1_observer'+(', '+args if args and args!='void' else '')
+        declaration=prefix+'ac1_base_'+name+'('+args+')'
+        prototypes.append(declaration+';')
+        body=text[f['body']:f['end']-1]
+        if name in overrides:body='\n    __asm__ __volatile__("" : : "m"(_ac1_observer->eip));\n    '+overrides[name]+'\n'
+        else:
+            edits=[]
+            for m in re.finditer(r'\b(\w+)\s*\(',f['code']):
+                target=aliases.get(m[1],m[1])
+                if target in dependent:edits.append((m.start(),m.end(),'ac1_base_'+target+'(_ac1_base, _ac1_observer, '))
+            for a,b,replacement in reversed(edits):body=body[:a]+replacement+body[b:]
+            if 'ac1_direct_arena' in body:raise SystemExit('unhandled arena read in '+name)
+        definitions.append(declaration+' {\n'+body+'}')
+    section='\n/* AC1_LOCAL_MEMORY_HELPERS */\n#if defined(AC1_DIRECT_MEMORY)\n'+'\n'.join(prototypes+definitions)+'\n#endif\n'
+    guard='#endif /* PCRECOMP_CPU_H */'
+    if text.count(guard)!=1:
+        raise ValueError('unexpected CPU header closing guard for local memory helpers')
+    text=text.replace(guard,section+guard,1)
+    header='#pragma once\n#if defined(AC1_DIRECT_MEMORY)\n'
+    header+='#define AC1_DECLARE_LOCAL_ARENA uint8_t * const _ac1_local_arena = ac1_direct_arena; (void)_ac1_local_arena\n'
+    mapping={name:name for name in dependent}|{a:t for a,t in aliases.items() if t in dependent}
+    for name,target in sorted(mapping.items()):
+        header+='#undef '+name+'\n#define '+name+'(...) ac1_base_'+target+'(_ac1_local_arena, c, __VA_ARGS__)\n'
+    header+='#else\n#define AC1_DECLARE_LOCAL_ARENA ((void)0)\n#endif\n'
+    return text,header,sorted(dependent)
+
+
 def main() -> None:
     provenance = {
         "duke_reference": str(DUKE_ROOT),
@@ -694,6 +771,22 @@ def main() -> None:
             if text.count(reserve) != 1:
                 raise SystemExit(f"unexpected direct-arena reservation in {source}")
             text = text.replace(reserve, "MEM_RESERVE | MEM_TOP_DOWN, PAGE_NOACCESS);")
+            text = text.replace("#include <stdlib.h>", "#include <stdlib.h>\n#include <errno.h>")
+            failure = "    if (!s->arena) { free(s); return NULL; }"
+            if text.count(failure) != 1:
+                raise SystemExit("unexpected direct-arena allocation failure shape")
+            text = text.replace(failure, '''    if (!s->arena) {
+#ifdef _WIN32
+        unsigned long native_error = GetLastError();
+        fprintf(stderr, "AC1 direct arena reservation failed: bytes=%llu guard=%zu VirtualAlloc error=%lu\\n",
+                (unsigned long long)(ARENA_BYTES+s->page_size), s->page_size, native_error);
+#else
+        int native_error = errno;
+        fprintf(stderr, "AC1 direct arena reservation failed: bytes=%llu guard=%zu mmap errno=%d (%s)\\n",
+                (unsigned long long)(ARENA_BYTES+s->page_size), s->page_size, native_error, strerror(native_error));
+#endif
+        free(s); return NULL;
+    }''')
             checkpoint = (
                 "    if (current_memory.count==65) {\n"
                 '        printf("guest-memory mapping checkpoint: count=65 base=0x%08x size=%llu\\n",\n'
@@ -963,6 +1056,11 @@ void guest_execution_write(uint32_t address, const void *input, size_t width)
                     "static inline ", "AC1_ACCESSOR_INLINE ", 1))
             text = masked_flag_helpers(text)
             text = x87_inline_helpers(text)
+            text, aliases, base_helpers = local_memory_helpers(text)
+            alias_path = output.with_name("ac1_local_memory.h")
+            if not alias_path.exists() or alias_path.read_text(encoding="utf-8") != aliases:
+                alias_path.write_text(aliases, encoding="utf-8")
+            provenance["local_memory_helpers"] = base_helpers
             content = text.replace("\r\n", "\n").encode("utf-8")
         if not output.exists() or output.read_bytes() != content:
             output.write_bytes(content)
