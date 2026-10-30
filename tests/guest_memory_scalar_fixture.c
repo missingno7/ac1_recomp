@@ -16,6 +16,46 @@
     } \
 } while (0)
 
+static int mapping_capacity_contract(void)
+{
+    enum { reservations = 8192 };
+#ifdef _WIN32
+    void *native[reservations];
+    for (unsigned i = 0; i < reservations; ++i) {
+        native[i] = VirtualAlloc(NULL, 4096u, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        CHECK(native[i] != NULL);
+    }
+    for (unsigned i = 0; i < reservations; ++i)
+        CHECK(VirtualFree(native[i], 0, MEM_RELEASE));
+#endif
+    guest_address_space *space = guest_address_space_create_direct();
+    CHECK(space);
+    guest_address_space_select(space);
+    uint32_t addresses[reservations];
+    for (unsigned i = 0; i < reservations; ++i) {
+        addresses[i] = guest_memory_find_gap(0x10000000u, 4096u, 65536u, 0x70000000u);
+        if (!addresses[i]) fprintf(stderr, "reservation %u/%u failed\n", i + 1u, reservations);
+        CHECK(addresses[i] != 0u);
+        uint32_t *p = guest_memory_allocate(addresses[i], 4096u);
+        CHECK(p && *p == 0u);
+        *p = i + 1u;
+    }
+    for (unsigned i = 0; i < reservations; ++i) {
+        CHECK(guest_memory_region_size(addresses[i]) == 4096u);
+        CHECK(*(uint32_t *)guest_memory_try_ptr(addresses[i], 4u) == i + 1u);
+    }
+    for (unsigned i = 0; i < reservations; i += 2u)
+        guest_memory_release(addresses[i]);
+    CHECK(guest_memory_find_gap(0x10000000u, 4096u, 65536u, 0x70000000u) == addresses[0]);
+    uint32_t *reused = guest_memory_allocate(addresses[0], 4096u);
+    CHECK(reused && *reused == 0u);
+    guest_memory_release(addresses[0]);
+    for (unsigned i = 1; i < reservations; i += 2u)
+        guest_memory_release(addresses[i]);
+    guest_address_space_destroy(space);
+    return 0;
+}
+
 int main(void)
 {
     /* VirtualQuery is bounded to tracked allocations. An interior address
@@ -153,6 +193,7 @@ int main(void)
     CHECK(top[0] == 0x55 && top[1] == 0x66 && bottom[0] == 0x77 && bottom[1] == 0x88);
 
     guest_address_space_destroy(space);
-    puts("PASS: VirtualQuery stays within tracked allocations; fixed-width CPU copies span only fully mapped adjacent guest regions");
+    CHECK(mapping_capacity_contract() == 0);
+    puts("PASS: VirtualQuery/scalar spans and 8192 simultaneous independent reservations with release/reuse");
     return 0;
 }

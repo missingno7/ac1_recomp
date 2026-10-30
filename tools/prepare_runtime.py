@@ -606,8 +606,8 @@ def main() -> None:
                 raise SystemExit(f"unexpected guest-memory capacity definition: {source}")
             text = text.replace(
                 capacity,
-                "/* AC1 startup exceeds the donor's 256-region bookkeeping capacity. */\n"
-                "#define GUEST_MEMORY_MAX_REGIONS 4096u",
+                "/* One record per 64 KiB reservation across the 4 GiB guest arena. */\n"
+                "#define GUEST_MEMORY_MAX_REGIONS 65536u",
             )
             marker = "void guest_memory_release(uint32_t base);"
             if text.count(marker) != 1:
