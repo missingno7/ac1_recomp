@@ -185,6 +185,204 @@ def ac1_sse_width_translation(lifter, insn) -> list[str] | None:
     return None
 
 
+# XMM lanes are named through the vector members of the prepared XMM union
+# (x.vf32[0], not x.f32[0]) and whole-register operations are single vector
+# expressions. GCC and Clang keep an XMM local in a host vector register only
+# while every access to it is vector-typed; one array-lane access, or a lane
+# loop, sends it to the stack and turns each packed op into lane traffic.
+XMM_ARRAY_LANE = re.compile(r'\.(f32|f64|u8|i8|u16|i16|u32|i32|u64|i64)\[')
+SSE_VECTOR_ARITH = {'add': '+', 'sub': '-', 'mul': '*', 'div': '/'}
+SSE_VECTOR_BITWISE = {'andps': '&', 'andpd': '&', 'pand': '&', 'orps': '|', 'orpd': '|', 'por': '|',
+                      'xorps': '^', 'xorpd': '^', 'pxor': '^', 'andnps': None, 'andnpd': None, 'pandn': None}
+# CMPccPS/PD per lane, in C's NaN rule as the scalar forms use it: a vector
+# compare yields all-ones or zero lanes, which is the instruction's mask.
+SSE_VECTOR_COMPARE = {'eq': '({a} == {b})', 'lt': '({a} < {b})', 'le': '({a} <= {b})',
+                      'unord': '(({a} != {a}) | ({b} != {b}))', 'neq': '~({a} == {b})',
+                      'nlt': '~({a} < {b})', 'nle': '~({a} <= {b})', 'ord': '~(({a} != {a}) | ({b} != {b}))'}
+SSE_VECTOR_COMPARE_RE = re.compile(r'^cmp(eq|lt|le|unord|neq|nlt|nle|ord)(ps|pd)$')
+SSE_VECTOR_INT = {f'p{op}{w}': (c, bits) for op, c in (('add', '+'), ('sub', '-'))
+                  for w, bits in (('b', 8), ('w', 16), ('d', 32), ('q', 64))}
+SSE_VECTOR_PCMP = {f'pcmp{op}{w}': (c, bits) for op, c in (('eq', '=='), ('gt', '>'))
+                   for w, bits in (('b', 8), ('w', 16), ('d', 32))}
+SSE_VECTOR_SHIFT = {'psllw': ('<<', 16, False), 'pslld': ('<<', 32, False), 'psllq': ('<<', 64, False),
+                    'psrlw': ('>>', 16, False), 'psrld': ('>>', 32, False), 'psrlq': ('>>', 64, False),
+                    'psraw': ('>>', 16, True), 'psrad': ('>>', 32, True)}
+SSE_VECTOR_PUNPCK = {f'punpck{half}{w}': (bits, half == 'h') for half in ('l', 'h')
+                     for w, bits in (('bw', 8), ('wd', 16), ('dq', 32), ('qdq', 64))}
+
+
+# The guest EIP is recorded for diagnostics (fault reports, dispatch and
+# profiler attribution); nothing guest-visible reads it. Its store is also a
+# store through the CPU pointer, which GCC must assume may alias guest memory,
+# so it stops GCC forwarding a guest-stack store to the reload that follows
+# (spill-and-reload sequences the original compiler wrote). Instructions whose
+# only memory accesses are to the stack therefore leave the previous EIP in
+# place; heap accesses, transfers and everything else still record theirs.
+STACK_EIP_TAG = ' /* stack */'
+STACK_EIP_MARKER = re.compile(r'^    AC1_SET_GUEST_EIP\(c, 0x[0-9A-F]{8}u\);' + re.escape(STACK_EIP_TAG) + r'\n', re.M)
+STACK_IMPLICIT = frozenset({'push', 'pop', 'pushal', 'popal', 'pushfd', 'popfd', 'leave'})
+EIP_ALWAYS = frozenset({'call', 'jmp', 'ret', 'retn', 'int', 'int3', 'into', 'iretd', 'div', 'idiv', 'bound'})
+
+
+def frame_pointer_entry(decoded: dict, address: int) -> bool:
+    """push ebp; mov ebp, esp at the entry: EBP addresses this function's frame."""
+    first = decoded.get(address)
+    second = decoded.get(address + 1)
+    return (first is not None and second is not None and first.mnemonic == 'push' and
+            first.op_str == 'ebp' and second.mnemonic == 'mov' and second.op_str == 'ebp, esp')
+
+
+def records_guest_eip(lifter, insn, frame_ebp: bool) -> bool:
+    from capstone.x86 import X86_OP_MEM
+
+    m = insn.mnemonic
+    if m in EIP_ALWAYS or m.startswith(('j', 'loop')):
+        return True
+    memory = [op for op in insn.operands if op.type == X86_OP_MEM]
+    if not memory:
+        return m not in STACK_IMPLICIT
+    stack = ('esp', 'ebp') if frame_ebp else ('esp',)
+    return any(op.mem.segment or not op.mem.base or lifter.md.reg_name(op.mem.base) not in stack
+               for op in memory) or m in ('lea', 'nop')
+
+
+def drop_stack_eip_markers(body: str) -> str:
+    """Remove the EIP stores of stack-only instructions once no pass needs their markers."""
+    return STACK_EIP_MARKER.sub('', body)
+
+
+# A lane assignment statement on an XMM register or an initialized copy of one.
+XMM_LANE_WRITE = re.compile(
+    r'(?:^|(?<=[;{}]))(\s*)((?:c->xmm\[\d\]|_ac1_xmm\d|_[sd])\.(v(?:f32|f64|u8|i8|u16|i16|u32|i32|u64|i64)))'
+    r'\[([^\]]+)\]\s*(<<|>>|[-+*/&|^])?=(?!=)\s*([^;]*);', re.M)
+
+
+def xmm_vector_lanes(text: str) -> str:
+    """Name XMM lanes through the union's vector members and write them as whole vectors.
+
+    x.vf32[i] reads the same lane with the same type as x.f32[i]. A lane
+    assignment x.vf32[i] = r becomes x.vf32 = ac1_lane_vf32(x.vf32, i, r): the
+    old value and r are read before the one store, as in the assignment. Lanes
+    whose value comes from a helper taking the CPU keep the in-place form.
+    """
+    text = XMM_ARRAY_LANE.sub(lambda m: '.v' + m[1] + '[', text)
+
+    def whole(m):
+        indent, target, member, index, op, value = m.groups()
+        if re.search(r'\(\s*c\s*[,)]', value):
+            return m[0]
+        if op:
+            value = f'{target}[{index}] {op} ({value})'
+        return f'{indent}{target} = ac1_lane_{member}({target}, {index}, {value});'
+    return XMM_LANE_WRITE.sub(whole, text)
+
+
+def ac1_vector_sse_translation(lifter, insn) -> list[str] | None:
+    """Whole-register SSE operations on xmm destinations as vector expressions.
+
+    Each form computes exactly what the donor's lane statements compute: the
+    same IEEE operation per lane in the same operand order, the same masks,
+    the same zeroed lanes. Memory sources are read with the same width.
+    """
+    from capstone.x86 import X86_OP_IMM, X86_OP_MEM
+
+    m, ops = insn.mnemonic, insn.operands
+    if len(ops) < 2 or not lifter._is_xmm(ops[0]):
+        return None
+    d, s = ops[0], ops[1]
+    D = f'c->xmm[{lifter._xi(d)}]'
+    if s.type != X86_OP_IMM and not lifter._is_xmm(s) and s.type != X86_OP_MEM:
+        return None
+
+    def src():
+        return lifter._xm(insn, s)
+
+    def shuffle(lane, first, second, indexes):
+        return f'__builtin_shufflevector({first}.{lane}, {second}.{lane}, {", ".join(map(str, indexes))})'
+
+    if m[:-2] in SSE_VECTOR_ARITH and m[-2:] in ('ps', 'pd'):
+        lane = 'vf64' if m.endswith('pd') else 'vf32'
+        return [f'{{ XMM _s = {src()}; {D}.{lane} = {D}.{lane} {SSE_VECTOR_ARITH[m[:-2]]} _s.{lane}; }}']
+    if m in ('sqrtps', 'sqrtpd'):
+        kind, lane = ('v2f64', 'vf64') if m.endswith('pd') else ('v4f32', 'vf32')
+        return [f'{{ XMM _s = {src()}; {D}.{lane} = ac1_sqrt_{kind}(_s.{lane}); }}']
+    if m in ('minps', 'maxps', 'minpd', 'maxpd'):
+        kind, lane = ('v2f64', 'vf64') if m.endswith('pd') else ('v4f32', 'vf32')
+        return [f'{{ XMM _s = {src()}; {D}.{lane} = ac1_{m[:3]}_{kind}({D}.{lane}, _s.{lane}); }}']
+    if m in SSE_VECTOR_BITWISE and s.type != X86_OP_IMM:
+        op = SSE_VECTOR_BITWISE[m]
+        value = f'~{D}.vu64 & _s.vu64' if op is None else f'{D}.vu64 {op} _s.vu64'
+        return [f'{{ XMM _s = {src()}; {D}.vu64 = {value}; }}']
+    if m in ('shufps', 'pshufd', 'shufpd') and len(ops) > 2:
+        imm = ops[2].imm & 0xFF
+        if m == 'shufpd':
+            return [f'{{ XMM _s = {src()}; {D}.vu64 = {shuffle("vu64", D, "_s", (imm & 1, 2 + ((imm >> 1) & 1)))}; }}']
+        sel = [(imm >> (2 * i)) & 3 for i in range(4)]
+        if m == 'pshufd':
+            return [f'{{ XMM _s = {src()}; {D}.vu32 = {shuffle("vu32", "_s", "_s", sel)}; }}']
+        return [f'{{ XMM _s = {src()}; {D}.vu32 = {shuffle("vu32", D, "_s", (sel[0], sel[1], 4 + sel[2], 4 + sel[3]))}; }}']
+    if m in ('unpcklps', 'unpckhps', 'unpcklpd', 'unpckhpd'):
+        high = m[5] == 'h'
+        if m.endswith('pd'):
+            return [f'{{ XMM _s = {src()}; {D}.vu64 = {shuffle("vu64", D, "_s", (1, 3) if high else (0, 2))}; }}']
+        return [f'{{ XMM _s = {src()}; {D}.vu32 = {shuffle("vu32", D, "_s", (2, 6, 3, 7) if high else (0, 4, 1, 5))}; }}']
+    if m in ('movhlps', 'movlhps') and lifter._is_xmm(s):
+        S = f'c->xmm[{lifter._xi(s)}]'
+        if m == 'movhlps':      # low qword from the source's high qword
+            return [f'{D}.vu64 = {shuffle("vu64", S, D, (1, 3))};']
+        return [f'{D}.vu64 = {shuffle("vu64", D, S, (0, 2))};']
+    if m in ('pslldq', 'psrldq') and s.type == X86_OP_IMM:
+        k = min(s.imm & 0xFF, 16)
+        if m == 'psrldq':
+            pick = [i + k if i + k < 16 else 16 for i in range(16)]
+        else:
+            pick = [i - k if i >= k else 16 for i in range(16)]
+        return [f'{D}.vu8 = __builtin_shufflevector({D}.vu8, (ac1_v16u8){{0}}, {", ".join(map(str, pick))});']
+    compare = SSE_VECTOR_COMPARE_RE.match(m)
+    if compare:
+        lane, mask = ('vf64', 'ac1_v2u64') if compare[2] == 'pd' else ('vf32', 'ac1_v4u32')
+        value = SSE_VECTOR_COMPARE[compare[1]].format(a=f'_d.{lane}', b=f'_s.{lane}')
+        mask_lane = 'vu64' if compare[2] == 'pd' else 'vu32'
+        return [f'{{ XMM _s = {src()}; XMM _d = {D}; {D}.{mask_lane} = ({mask}){value}; }}']
+    if m == 'cvtps2pd':
+        if lifter._is_xmm(s):
+            return [f'{D}.vf64 = ac1_cvtps2pd(c->xmm[{lifter._xi(s)}].vf32);']
+        return [f'{{ uint32_t _p = {lifter.addr_expr(insn, s)}; {D}.vf64 = (ac1_v2f64){{ rdf32(_p), rdf32(_p + 4u) }}; }}']
+    if m == 'cvtpd2ps':
+        return [f'{{ XMM _s = {src()}; {D}.vf32 = ac1_cvtpd2ps(_s.vf64); }}']
+    if m == 'cvtdq2ps':
+        return [f'{{ XMM _s = {src()}; {D}.vf32 = __builtin_convertvector(_s.vi32, ac1_v4f32); }}']
+    if m in SSE_VECTOR_INT and s.type != X86_OP_IMM:
+        op, bits = SSE_VECTOR_INT[m]
+        return [f'{{ XMM _s = {src()}; {D}.vu{bits} = {D}.vu{bits} {op} _s.vu{bits}; }}']
+    if m in SSE_VECTOR_PCMP:
+        op, bits = SSE_VECTOR_PCMP[m]
+        sign = 'i' if op == '>' else 'u'
+        return [f'{{ XMM _s = {src()}; {D}.vu{bits} = (ac1_v{128 // bits}u{bits})({D}.v{sign}{bits} {op} _s.v{sign}{bits}); }}']
+    if m in SSE_VECTOR_SHIFT:
+        op, bits, arith = SSE_VECTOR_SHIFT[m]
+        lanes = f'v{"i" if arith else "u"}{bits}'
+        if s.type == X86_OP_IMM:
+            n = s.imm & 0xFF
+            if arith:
+                return [f'{D}.{lanes} = {D}.{lanes} >> {min(n, bits - 1)};']
+            if n >= bits:
+                return [f'{D}.{lanes} = (ac1_v{128 // bits}u{bits}){{0}};']
+            return [f'{D}.{lanes} = {D}.{lanes} {op} {n};']
+        count = f'XMM _s = {src()}; unsigned _n = _s.vu64[0] > 255u ? 255u : (unsigned)_s.vu64[0];'
+        if arith:
+            return [f'{{ {count} {D}.{lanes} = {D}.{lanes} >> (_n > {bits - 1}u ? {bits - 1}u : _n); }}']
+        return [f'{{ {count} if (_n > {bits - 1}u) {D}.{lanes} = (ac1_v{128 // bits}u{bits}){{0}}; '
+                f'else {D}.{lanes} = {D}.{lanes} {op} _n; }}']
+    if m in SSE_VECTOR_PUNPCK:
+        bits, high = SSE_VECTOR_PUNPCK[m]
+        n = 128 // bits
+        base = n // 2 if high else 0
+        pick = [x for i in range(n // 2) for x in (base + i, n + base + i)]
+        return [f'{{ XMM _s = {src()}; {D}.vu{bits} = {shuffle(f"vu{bits}", D, "_s", pick)}; }}']
+    return None
+
+
 def ac1_mmx_translation(lifter, insn) -> list[str] | None:
     """CPU-owned MMX state, including the SSE-era MMX operand forms."""
     from capstone.x86 import X86_OP_MEM, X86_OP_REG, X86_OP_IMM, X86_REG_FS, X86_REG_GS
@@ -3953,6 +4151,9 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         def translate(self, insn, labels):
             if insn.mnemonic == "int3":
                 return ac1_int3_translation(insn)
+            vector_sse = ac1_vector_sse_translation(self, insn)
+            if vector_sse is not None:
+                return vector_sse
             narrow_memory_sse = ac1_sse_width_translation(self, insn)
             if narrow_memory_sse is not None:
                 return narrow_memory_sse
@@ -4147,7 +4348,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     for index, address in enumerate(lifted):
         if address in count_entries:
             bodies[index] = profile_count_entry(bodies[index], address)
-    bodies = [declare_local_memory_base(body) for body in bodies]
+    bodies = [drop_stack_eip_markers(declare_local_memory_base(body)) for body in bodies]
     if translation_unit_buckets < 0:
         raise ValueError("translation_unit_buckets must be zero or positive")
     if not translation_unit_buckets and functions_per_tu < 1:
@@ -4357,10 +4558,15 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
     output = [f"void L_{address:08X}(CPU *c)", "{"]
     entry_jump = entry_guard_lines(address, [insn.address for insn in insns])
     output.extend(entry_jump)
+    frame_ebp = frame_pointer_entry(decoded, address)
     for index, insn in enumerate(insns):
         if insn.address in labels or (entry_jump and insn.address == address):
             output.append(f"L_{insn.address:08X}:")
-        output.append(f"    AC1_SET_GUEST_EIP(c, 0x{insn.address:08X}u);")
+        # Every instruction keeps its marker: the codegen passes group by it.
+        # Stack-only markers are dropped after them (drop_stack_eip_markers).
+        recorded = (insn.address == address or (index and insns[index - 1].mnemonic == 'call') or
+                    records_guest_eip(lifter, insn, frame_ebp))
+        output.append(f"    AC1_SET_GUEST_EIP(c, 0x{insn.address:08X}u);" + ('' if recorded else STACK_EIP_TAG))
         if insn.address in register_switches:
             # Read the architectural register, not the table a second time:
             # intervening instructions may have changed memory since the MOV.
@@ -4401,7 +4607,7 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
         if target is not None:
             output.append(f"    dispatch(c, 0x{target:08X}u); return;")
     output.append("}")
-    return "\n".join(output)
+    return xmm_vector_lanes("\n".join(output))
 
 
 def main() -> int:

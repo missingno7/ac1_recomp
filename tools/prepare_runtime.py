@@ -456,6 +456,111 @@ FP_CLASSIFY_BUILTINS = r'''
 #endif'''
 
 
+XMM_VECTOR_TYPES = r'''/* AC1: vector views of the same 128 bits. Lifted code names XMM lanes and
+ * whole registers only through these (x.vf32[0], x.vf32 * y.vf32, shuffles):
+ * GCC and Clang keep an XMM local in a host vector register only while every
+ * access to it is vector-typed, and one array-lane access sends it to the
+ * stack. aligned(8) keeps the union's alignment, so CPU's layout is unchanged. */
+typedef float    ac1_v4f32 __attribute__((vector_size(16), aligned(8)));
+typedef double   ac1_v2f64 __attribute__((vector_size(16), aligned(8)));
+typedef uint32_t ac1_v4u32 __attribute__((vector_size(16), aligned(8)));
+typedef int32_t  ac1_v4i32 __attribute__((vector_size(16), aligned(8)));
+typedef uint64_t ac1_v2u64 __attribute__((vector_size(16), aligned(8)));
+typedef int64_t  ac1_v2i64 __attribute__((vector_size(16), aligned(8)));
+typedef uint16_t ac1_v8u16 __attribute__((vector_size(16), aligned(8)));
+typedef int16_t  ac1_v8i16 __attribute__((vector_size(16), aligned(8)));
+typedef uint8_t  ac1_v16u8 __attribute__((vector_size(16), aligned(8)));
+typedef int8_t   ac1_v16i8 __attribute__((vector_size(16), aligned(8)));
+typedef float    ac1_v2f32 __attribute__((vector_size(8), aligned(8)));
+
+'''
+
+XMM_VECTOR_MEMBERS = '''    ac1_v4f32 vf32; ac1_v2f64 vf64; ac1_v4u32 vu32; ac1_v4i32 vi32; ac1_v2u64 vu64;
+    ac1_v2i64 vi64; ac1_v8u16 vu16; ac1_v8i16 vi16; ac1_v16u8 vu8; ac1_v16i8 vi8;
+'''
+
+# Whole-register SQRTPS/PD and MINPS/MAXPS/MINPD/MAXPD for the vector lowering.
+# min/max keep the instruction's "dst OP src ? dst : src" lane rule (sse_minf).
+# Lane writes go through ac1_lane_*: GCC keeps a union local in a register
+# only if its lanes are written as whole-vector values, never in place.
+XMM_VECTOR_HELPERS = r'''
+#define AC1_XMM_LANE_SETTER(member, vector, lane) \
+    static inline vector ac1_lane_##member(vector v, unsigned i, lane x) { v[i] = x; return v; }
+AC1_XMM_LANE_SETTER(vf32, ac1_v4f32, float)
+AC1_XMM_LANE_SETTER(vf64, ac1_v2f64, double)
+AC1_XMM_LANE_SETTER(vu32, ac1_v4u32, uint32_t)
+AC1_XMM_LANE_SETTER(vi32, ac1_v4i32, int32_t)
+AC1_XMM_LANE_SETTER(vu64, ac1_v2u64, uint64_t)
+AC1_XMM_LANE_SETTER(vi64, ac1_v2i64, int64_t)
+AC1_XMM_LANE_SETTER(vu16, ac1_v8u16, uint16_t)
+AC1_XMM_LANE_SETTER(vi16, ac1_v8i16, int16_t)
+AC1_XMM_LANE_SETTER(vu8, ac1_v16u8, uint8_t)
+AC1_XMM_LANE_SETTER(vi8, ac1_v16i8, int8_t)
+/* CVTPS2PD reads the low two floats; CVTPD2PS zeroes the upper two lanes. */
+static inline ac1_v2f64 ac1_cvtps2pd(ac1_v4f32 s) { return (ac1_v2f64){ s[0], s[1] }; }
+static inline ac1_v4f32 ac1_cvtpd2ps(ac1_v2f64 s) {
+    return __builtin_shufflevector(__builtin_convertvector(s, ac1_v2f32), (ac1_v2f32){ 0.0f, 0.0f }, 0, 1, 2, 3);
+}
+#if defined(__clang__)
+#if __has_builtin(__builtin_elementwise_sqrt)
+#define AC1_ELEMENTWISE_SQRT 1
+#endif
+#endif
+static inline ac1_v4f32 ac1_sqrt_v4f32(ac1_v4f32 v) {
+#if defined(AC1_ELEMENTWISE_SQRT)
+    return __builtin_elementwise_sqrt(v);
+#elif defined(__SSE__) && !defined(__clang__)
+    return __builtin_ia32_sqrtps(v);
+#else
+    return (ac1_v4f32){ sqrtf(v[0]), sqrtf(v[1]), sqrtf(v[2]), sqrtf(v[3]) };
+#endif
+}
+static inline ac1_v2f64 ac1_sqrt_v2f64(ac1_v2f64 v) {
+#if defined(AC1_ELEMENTWISE_SQRT)
+    return __builtin_elementwise_sqrt(v);
+#elif defined(__SSE2__) && !defined(__clang__)
+    return __builtin_ia32_sqrtpd(v);
+#else
+    return (ac1_v2f64){ sqrt(v[0]), sqrt(v[1]) };
+#endif
+}
+static inline ac1_v4f32 ac1_min_v4f32(ac1_v4f32 d, ac1_v4f32 s) {
+    ac1_v4i32 pick = (ac1_v4i32)(d < s);
+    return (ac1_v4f32)(((ac1_v4i32)d & pick) | ((ac1_v4i32)s & ~pick));
+}
+static inline ac1_v4f32 ac1_max_v4f32(ac1_v4f32 d, ac1_v4f32 s) {
+    ac1_v4i32 pick = (ac1_v4i32)(d > s);
+    return (ac1_v4f32)(((ac1_v4i32)d & pick) | ((ac1_v4i32)s & ~pick));
+}
+static inline ac1_v2f64 ac1_min_v2f64(ac1_v2f64 d, ac1_v2f64 s) {
+    ac1_v2i64 pick = (ac1_v2i64)(d < s);
+    return (ac1_v2f64)(((ac1_v2i64)d & pick) | ((ac1_v2i64)s & ~pick));
+}
+static inline ac1_v2f64 ac1_max_v2f64(ac1_v2f64 d, ac1_v2f64 s) {
+    ac1_v2i64 pick = (ac1_v2i64)(d > s);
+    return (ac1_v2f64)(((ac1_v2i64)d & pick) | ((ac1_v2i64)s & ~pick));
+}
+'''
+
+
+def xmm_vector_views(text: str, source) -> str:
+    """Vector members on XMM, vector movss/movsd loads, whole-register helpers."""
+    replacements = (
+        ('/* ---- SSE register file ----', XMM_VECTOR_TYPES + '/* ---- SSE register file ----'),
+        ('    int64_t  i64[2];\n} XMM;', '    int64_t  i64[2];\n' + XMM_VECTOR_MEMBERS + '} XMM;'),
+        ('static inline void sse_load_ss(XMM *d, float  v) { d->u64[0] = 0; d->u64[1] = 0; d->f32[0] = v; }',
+         'static inline void sse_load_ss(XMM *d, float  v) { d->vf32 = (ac1_v4f32){ v, 0.0f, 0.0f, 0.0f }; }'),
+        ('static inline void sse_load_sd(XMM *d, double v) { d->u64[0] = 0; d->u64[1] = 0; d->f64[0] = v; }',
+         'static inline void sse_load_sd(XMM *d, double v) { d->vf64 = (ac1_v2f64){ v, 0.0 }; }'
+         + XMM_VECTOR_HELPERS),
+    )
+    for old, new in replacements:
+        if text.count(old) != 1:
+            raise SystemExit(f"unexpected XMM declaration shape in {source}: {old[:60]!r}")
+        text = text.replace(old, new)
+    return text
+
+
 def _replace_function(text: str, signature: str, body: str, source) -> str:
     """Replace one top-level C function (signature line through its closing brace)."""
     begin = text.find(signature)
@@ -1008,6 +1113,7 @@ void guest_execution_write(uint32_t address, const void *input, size_t width)
             if text.count(include) != 1:
                 raise SystemExit(f"unexpected CPU includes: {source}")
             text = text.replace(include, include + "\n#include <math.h>" + FP_CLASSIFY_BUILTINS)
+            text = xmm_vector_views(text, source)
             marker = "} CPU;"
             if text.count(marker) != 1:
                 raise SystemExit(f"unexpected pcrecomp CPU header shape: {source}")

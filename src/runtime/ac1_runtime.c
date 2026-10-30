@@ -7425,7 +7425,10 @@ uint8_t *ac1_direct_arena;
 
 #ifdef _WIN32
 /* Direct accesses to unmapped guest pages fault in host code. Report the
- * guest address and instruction before the default crash handling runs. */
+ * guest address and instruction before the default crash handling runs.
+ * Stack-only instructions do not record their EIP (tools/lift_ac1.py), so a
+ * fault there shows the previous recorded instruction of the same function;
+ * the host PC resolves the exact generated line with the build's symbols. */
 static LONG CALLBACK ac1_direct_fault_handler(EXCEPTION_POINTERS *info)
 {
     const EXCEPTION_RECORD *record = info->ExceptionRecord;
@@ -7438,11 +7441,11 @@ static LONG CALLBACK ac1_direct_fault_handler(EXCEPTION_POINTERS *info)
         return EXCEPTION_CONTINUE_SEARCH;
     const ULONG_PTR kind = record->ExceptionInformation[0];
     fprintf(stderr,
-            "AC1 direct guest memory fault: %s guest=0x%08llx guest-eip=0x%08x guest-thread=%u\n",
+            "AC1 direct guest memory fault: %s guest=0x%08llx guest-eip=0x%08x guest-thread=%u host-pc=%p\n",
             kind == 1 ? "write" : kind == 8 ? "execute" : "read",
             (unsigned long long)(address - arena),
             active_guest_thread ? active_guest_thread->cpu.eip : 0u,
-            active_guest_thread ? active_guest_thread->id : 0u);
+            active_guest_thread ? active_guest_thread->id : 0u, record->ExceptionAddress);
     fflush(stderr);
     return EXCEPTION_CONTINUE_SEARCH;
 }
