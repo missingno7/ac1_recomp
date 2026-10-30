@@ -130,7 +130,8 @@ class LocalRegisterTests(unittest.TestCase):
                 depth+=(header[end]=='{')-(header[end]=='}');end+=1
             code=re.sub(r'/\*.*?\*/','',header[match.end():end-1],flags=re.S)
             fields=set(re.findall(r'\bc->(\w+)',code))
-            permitted={'esp'} if name in lift.LOCAL_ESP_HELPERS else set(lift.FLAG_BITS)|{'df','eflags_misc'}
+            permitted={'esp'} if name in lift.LOCAL_ESP_HELPERS else set(lift.FLAG_BITS)|{'df','eflags_misc',
+                'fpu_sw','fpu_top','fpu_cw','fpu_tw','mxcsr','fp_initialized'}
             self.assertLessEqual(fields,permitted,name)
             pointer=re.sub(r'\bc->\w+','member',code)
             if name in lift.LOCAL_ESP_HELPERS:pointer=pointer.replace('STACK_BASE(c)','0u')

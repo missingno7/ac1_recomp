@@ -418,6 +418,27 @@ static inline uint64_t ac1_x87_integer(CPU *c, double value, unsigned bits, unsi
     }
     return (uint64_t)(int64_t)result;
 }
+/* Experimental native x87 lowering (--x87 native): the same values and
+ * status flags with masked exceptions, without unmasked-exception
+ * diagnostics. Reads the control word and writes only the status word.
+ * Chop (the game's CW=0x0E7F) stays inline; other modes are cold. */
+static __attribute__((noinline, cold)) uint64_t ac1_x87_integer_native_slow(CPU *c, double value, unsigned bits, unsigned rc) {
+    double limit=(double)(UINT64_C(1)<<(bits-1));
+    double result=ac1_fp_round(value,rc);
+    if(!(result>=-limit && result<limit)) { c->fpu_sw|=1u; return UINT64_C(1)<<(bits-1); }
+    if(result!=value) c->fpu_sw|=0x20u;
+    return (uint64_t)(int64_t)result;
+}
+static inline __attribute__((always_inline)) uint64_t ac1_x87_integer_native(CPU *c, double value, unsigned bits, unsigned trunc_mode) {
+    double limit=(double)(UINT64_C(1)<<(bits-1));
+    unsigned rc=trunc_mode?3u:(c->fpu_cw>>10)&3u;
+    if(__builtin_expect(rc==3u && value>-limit-1.0 && value<limit, 1)) {
+        int64_t chopped=(int64_t)value;
+        if((double)chopped!=value) c->fpu_sw|=0x20u;
+        return (uint64_t)chopped;
+    }
+    return ac1_x87_integer_native_slow(c,value,bits,rc);
+}
 '''
 
 

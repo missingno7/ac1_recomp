@@ -3431,6 +3431,9 @@ LOCAL_GPR_FREE_HELPERS = frozenset({
     'AC1_SET_GUEST_EIP', 'op_shl', 'op_shr', 'op_sar', 'op_rol', 'op_ror',
     'op_shld', 'op_shrd', 'op_bsf', 'op_bsr', 'shr32', 'shl32',
     'eflags_pack', 'eflags_unpack',
+    # x87 helpers that read or write only flags, x87 control/status and init state.
+    'fcompare', 'fcompare_eflags', 'do_sahf', 'ac1_x87_status', 'ac1_fp_init',
+    'ac1_x87_integer_native', 'ac1_x87_integer_native_slow',
 })
 LOCAL_ESP_HELPERS = frozenset({'push32', 'pop32'})
 def validate_region_bindings(entries, functions, lifted, read_va, md):
@@ -3747,7 +3750,9 @@ def xmm_free_helpers(cpu_header: str) -> frozenset:
     names|=set(re.findall(r'^#define\s+(\w+)\(',cpu_header,re.M))
     if re.search(r'\bxmm\s*\[',re.sub(r'^\s*XMM\s+xmm\[8\];','',cpu_header,flags=re.M)):
         raise ValueError('prepared CPU header accesses XMM state; audit the XMM-local sync points')
-    return frozenset((names|{'AC1_SET_GUEST_EIP'})-{'AC1_CALL','RECOMP_TODO'})
+    # ac1_x87_integer_native is emitted by native_x87_function; the header read at
+    # lift time can predate it (prepare_runtime.py runs after the lifter).
+    return frozenset((names|{'AC1_SET_GUEST_EIP','ac1_x87_integer_native'})-{'AC1_CALL','RECOMP_TODO'})
 
 
 _XMM_FREE_HELPERS = None
@@ -3769,8 +3774,10 @@ def local_xmm_function(body: str) -> str:
     if re.search(r'c->xmm(?!\[\d\])',clean):return body
     idx=sorted({int(i) for i in re.findall(r'c->xmm\[(\d)\]',clean)})
     if not idx:return body
-    call=re.compile(r'\b(\w+)\s*\(\s*c\s*[,)]');statement=re.compile(r'\b(\w+)\(c\b[^;]*\);')
-    if sum(m[1] not in free for m in call.finditer(clean))!=sum(m[1] not in free for m in statement.finditer(clean)):
+    # Only whole statements can be bracketed; a CPU-taking call inside an expression
+    # leaves the counts unequal and the body unchanged.
+    call=re.compile(r'\b(\w+)\s*\(\s*c\s*[,)]');statement=re.compile(r'(?:^|(?<=[;{}]))(\s*)(\w+)\(c\b[^;]*\);',re.M)
+    if sum(m[1] not in free for m in call.finditer(clean))!=sum(m[2] not in free for m in statement.finditer(clean)):
         return body
     store=' '.join(f'c->xmm[{i}] = _ac1_xmm{i};' for i in idx)
     load=' '.join(f'_ac1_xmm{i} = c->xmm[{i}];' for i in idx)
@@ -3780,7 +3787,7 @@ def local_xmm_function(body: str) -> str:
     for line in lines[2:-1]:
         code,separator,comment=line.partition('/*')
         code=re.sub(r'c->xmm\[(\d)\]',r'_ac1_xmm\1',code)
-        code=statement.sub(lambda m:m[0] if m[1] in free else f'{{ {store} {m[0]} {load} }}',code)
+        code=statement.sub(lambda m:m[0] if m[2] in free else f'{m[1]}{{ {store} {m[0].strip()} {load} }}',code)
         code=re.sub(r'\breturn;',f'{{ {store} return; }}',code)
         output.append(code+separator+comment)
     return '\n'.join(output+[lines[-1]])
@@ -3832,7 +3839,8 @@ def native_x87_function(body: str) -> str:
         header=(ROOT/'src/runtime/cpu.h').read_text(encoding='utf-8')
         names=set(re.findall(r'^(?:static inline|AC1_ACCESSOR_INLINE|AC1_X87_INTEGER_INLINE)\s+[^\n(]*?\b(\w+)\s*\(',header,re.M))
         names|=set(re.findall(r'^#define\s+(\w+)\(',header,re.M))|{'AC1_SET_GUEST_EIP'}
-        _X87_FREE_HELPERS=frozenset(names-{'AC1_CALL','RECOMP_TODO'}-X87_STACK_HELPERS)
+        # The pass emits ac1_x87_integer_native itself; the header read here may predate it.
+        _X87_FREE_HELPERS=frozenset((names|{'ac1_x87_integer_native'})-{'AC1_CALL','RECOMP_TODO'}-X87_STACK_HELPERS)
     free=_X87_FREE_HELPERS
     lines=body.splitlines()
     if len(lines)<3 or lines[1]!='{' or lines[-1]!='}':raise ValueError('unexpected lifted function shape for native x87')
@@ -3876,6 +3884,7 @@ def native_x87_function(body: str) -> str:
         code,separator,comment=line.partition('/*')
         indent=code[:len(code)-len(code.lstrip())]
         for pattern in X87_BOOKKEEPING:code=pattern.sub('',code)
+        code=re.sub(r'ac1_x87_integer\(c,(.*?),0x[0-9A-F]+u\)',lambda m:'ac1_x87_integer_native(c,'+m[1]+')',code)
         if re.fullmatch(r'\s*L_[0-9A-F]{8}:\s*',code):
             output+=['    '+' '.join(sync()),code.rstrip(),'    '+' '.join(anchor())];continue
         pieces=[]
@@ -3883,6 +3892,7 @@ def native_x87_function(body: str) -> str:
             s=statement.strip()
             names=[n for n in call.findall(s) if n not in ('fpush','fpop','fst')]
             escapes=any(n not in free for n in names) or 'RECOMP_TODO(' in s
+            if escapes and re.search(r'\b(?:fpush|fpop)\(c|\*fst\(c,',s):return body
             pre,s2=rewrite(s)
             if escapes or re.search(r'\bgoto\b|\breturn\b|\bswitch\b',s):
                 pieces+=pre+sync()+[s2]+(anchor() if escapes else [])
