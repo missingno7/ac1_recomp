@@ -21,6 +21,8 @@ static _Thread_local char bridge_error[512];
 static pthread_mutex_t window_mutex = PTHREAD_MUTEX_INITIALIZER;
 static ANativeWindow *current_window;
 
+#include "vulkan_driver.h"
+
 void ac1_android_surface_size(int32_t *width, int32_t *height) {
     pthread_mutex_lock(&window_mutex);
     *width = current_window ? ANativeWindow_getWidth(current_window) : 1280;
@@ -171,7 +173,9 @@ Java_org_ac1_recomp_LauncherActivity_nativeRun(JNIEnv *env, jclass type,
     if (!ac1_set_userdata_root(userdata)) {
         snprintf(bridge_error, sizeof(bridge_error), "Invalid app-private userdata directory: %.400s", userdata);
         result = -3;
-    } else if (setenv("DXVK_STATE_CACHE_PATH", userdata, 1) != 0) {
+    } else if (setenv("DXVK_SHADER_CACHE_PATH", userdata, 1) != 0 ||
+               setenv("MESA_SHADER_CACHE_DIR", userdata, 1) != 0 ||
+               setenv("DXVK_WSI_DRIVER", "Android", 1) != 0) {
         snprintf(bridge_error, sizeof(bridge_error), "Cannot configure app-private DXVK state cache: %s", strerror(errno));
         result = -3;
     } else if (setenv("AC1_TRACE_IMPORTS", trace_imports ? "1" : "0", 1) != 0) {
@@ -197,10 +201,15 @@ Java_org_ac1_recomp_LauncherActivity_nativeRun(JNIEnv *env, jclass type,
             close(log_fd);
         }
         bridge_error[0] = '\0';
-        result = ac1_run(path);
-        const char *detail = ac1_last_error();
-        if (detail) snprintf(bridge_error, sizeof(bridge_error), "%s", detail);
-        else bridge_error[0] = '\0';
+        if (!configure_vulkan_driver()) {
+            result = -4;
+            fprintf(stderr, "AC1 Vulkan initialization failed: %s\n", bridge_error);
+        } else {
+            result = ac1_run(path);
+            const char *detail = ac1_last_error();
+            if (detail) snprintf(bridge_error, sizeof(bridge_error), "%s", detail);
+            else bridge_error[0] = '\0';
+        }
         fflush(stdout); fflush(stderr);
         if (saved_out >= 0) { dup2(saved_out, STDOUT_FILENO); close(saved_out); }
         if (saved_err >= 0) { dup2(saved_err, STDERR_FILENO); close(saved_err); }

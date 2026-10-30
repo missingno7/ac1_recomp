@@ -1,10 +1,20 @@
 plugins { id 'com.android.application' }
 def ac1PrebuiltNativeDir = project.findProperty('ac1PrebuiltNativeDir')
+def ac1TurnipDir = file('../../work/build/turnip-arm64/package')
+if ((project.findProperty('ac1Abi') ?: 'arm64-v8a') == 'arm64-v8a') {
+    for (name in ['vulkan_freedreno', 'adrenotools', 'hook_impl', 'main_hook', 'file_redirect_hook', 'gsl_alloc_hook']) {
+        if (!new File(ac1TurnipDir, "arm64-v8a/lib${name}.so").isFile())
+            throw new GradleException("DXVK 3.1 requires packaged Turnip: missing lib${name}.so under ${ac1TurnipDir}; complete ports/turnip/build.ps1 first")
+    }
+}
 
 android {
     namespace 'org.ac1.recomp'
     compileSdk 35
     ndkVersion '28.2.13676358'
+    // libadrenotools loads hooks from ApplicationInfo.nativeLibraryDir.
+    packaging { jniLibs { useLegacyPackaging = true } }
+    sourceSets.main.jniLibs.srcDir ac1TurnipDir
 
     defaultConfig {
         applicationId 'org.ac1.recomp'
@@ -23,7 +33,7 @@ android {
 
     if (ac1PrebuiltNativeDir) {
         // The build entry point can use Make when Ninja cannot spawn in a sandbox.
-        sourceSets.main.jniLibs.srcDirs = [file(ac1PrebuiltNativeDir)]
+        sourceSets.main.jniLibs.srcDirs = [file(ac1PrebuiltNativeDir), ac1TurnipDir]
     } else externalNativeBuild {
         cmake { path file('src/main/cpp/CMakeLists.txt'); version '3.22.1' }
     }
