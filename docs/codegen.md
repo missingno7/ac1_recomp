@@ -5,6 +5,10 @@ This experiment uses the fingerprint in `config/ac1_dx9.json`, starting at
 logs stay under ignored `work/codegen/`, `work/gameplay/` and `build/`.
 No reference checkout or installed game file is changed.
 
+This is the historical first-round report. The current bundle starts at
+`c57847f`; see [the follow-up report](codegen-followup.md) for FLAGABI, revised
+locals, x87 measurements and current reproduction/evidence paths.
+
 ## Baseline facts
 
 Five functions from `docs/hot-functions.md` cover nonleaf transforms, SSE,
@@ -45,7 +49,7 @@ environment stores are included. A vector store counts once, even if it writes
 multiple fields. Parity counts recognize the byte-wide shift-by-four starting
 the XOR-fold recipe, rather than counting arbitrary shifts or host PF use.
 
-| VA | Host instructions | CPU loads/stores (proved) | Flag store sites / lanes | Parity folds | x87 helper calls |
+| VA | Host instructions | CPU loads/stores (proved) | Flag store sites / lanes | Parity folds | x87 calls (original exact-name count) |
 |---|---:|---:|---:|---:|---:|
 | `004F5A70` | 5,320 | 648 / 861 | 102 / 105 | 18 | 0 |
 | `00428540` | 1,397 | 255 / 200 | 6 / 6 | 1 | 0 |
@@ -53,9 +57,16 @@ the XOR-fold recipe, rather than counting arbitrary shifts or host PF use.
 | `00841BA0` | 911 | 71 / 143 | 59 / 60 | 10 | 0 |
 | `004F2390` | 961 | 121 / 182 | 18 / 18 | 3 | 0 |
 
+**Correction from the follow-up audit:** the last column's original counter
+missed compiler-suffixed helper names such as `.constprop.0` and `.isra.0`.
+It cannot establish that x87 helpers all inline. The old eager binary is no
+longer retained for an exact recount; the fresh accepted CFG baseline has
+seven `ac1_x87_integer.constprop.0` calls in `004F5A70` and three in `004F2390`.
+See [the follow-up evidence](codegen-followup.md) for the linked disassembly
+and separate x87 experiment. The other columns and measured FPS are unchanged.
+
 The first two functions retain their CPU pointer in RBX throughout their
-bodies; the quantizer also derives a pointer into the FP state. x87 helpers
-inline into environment/tag checks and stores. GCC already eliminates some
+bodies; the quantizer also derives a pointer into the FP state. GCC eliminates some
 overwritten flags: the two source helpers in `00428540` leave only six lane
 stores and one parity fold in the object. Source helper counts alone therefore
 overstate the remaining opportunity.
