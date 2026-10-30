@@ -1105,7 +1105,19 @@ static inline void ac1_x87_restore(CPU *c, uint32_t a) {
     }
     c->mmx_active=(uint8_t)(mmx_image && mmx_payload); c->x87_dirty=0; c->mmx_physical=0xffu;
 }
-static inline uint64_t ac1_x87_integer(CPU *c, double value, unsigned bits, unsigned trunc_mode, uint32_t va) {
+
+/* Independent A/B gate: keep the integer-conversion algorithm unchanged. */
+#if defined(AC1_FORCE_INLINE_X87)
+#if defined(__GNUC__) || defined(__clang__)
+#define AC1_X87_INTEGER_INLINE static inline __attribute__((always_inline))
+#else
+#error AC1_FORCE_INLINE_X87 requires always_inline compiler support
+#endif
+#else
+#define AC1_X87_INTEGER_INLINE static inline
+#endif
+
+AC1_X87_INTEGER_INLINE uint64_t ac1_x87_integer(CPU *c, double value, unsigned bits, unsigned trunc_mode, uint32_t va) {
     double result=ac1_fp_round(value,trunc_mode?3u:(c->fpu_cw>>10)&3u);
     double limit=ldexp(1.0,(int)bits-1);
     if(!isfinite(result) || result < -limit || result >= limit) {
