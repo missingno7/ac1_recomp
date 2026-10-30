@@ -71,9 +71,11 @@ shrinks 7,750 -> 5,049 -> 4,699 instructions with memory-base and locals.
 | memory-base -> + locals + x87 fast paths | 6 | -1.8% [-8.9%, +5.3%] (bimodal) | **-4.0%** [-7.0%, -1.0%] | 26.8 -> 28.4 |
 | -> + native x87 | 4 | **-10.6%** [-20.3%, -0.9%] | **-11.3%** [-17.6%, -4.9%] | 28.2 -> 31.0 |
 
-Together: about **+31% FPS** over main in this window (23.6 -> ~31), p95
-frame time 53.6 -> 44.8 ms in the last step. Executable `.text`: 240.7 MB ->
-~148 MB with memory-base; stripped 250.7 -> 144.8 MB with everything.
+Direct comparison, previous main `b4f4f8f` against the new default build
+(3 pairs): main-thread cycles/frame **-27.7%** [-41.4%, -14.0%], mean frame
+time **-28.0%** [-31.1%, -24.9%], **23.3 -> 32.9 FPS (+41.5%)**, p95 frame
+time ~61 -> ~48 ms. Executable `.text`: 240.7 MB -> ~148 MB with
+memory-base; stripped 250.7 -> 144.8 MB with everything.
 
 ## 5. Native x87 (`build.ps1 -X87 native`, now the default; `-X87 exact` restores)
 

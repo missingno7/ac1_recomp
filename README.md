@@ -13,8 +13,9 @@ gameplay comparison with the deterministic 30 Hz benchmark clock:
 | GPR+XMM register locals, x87 classification builtins | -1.8% (bimodal) | -4.0% [-7.0%, -1.0%] | 26.8 -> 28.4 |
 | native x87: stack in block-local doubles, no tag/env bookkeeping | -10.6% [-20.3%, -0.9%] | -11.3% [-17.6%, -4.9%] | 28.2 -> 31.0 |
 
-About +31% FPS over the previous main in the benchmark window; the stripped
-executable shrank 250.7 -> 144.8 MB. Rollback switches: `tools/build.ps1
+Directly against the previous main: mean frame time -28.0% [-31.1%, -24.9%],
+23.3 -> 32.9 FPS (+41.5%) in the benchmark window; the stripped executable
+shrank 250.7 -> 144.8 MB. Rollback switches: `tools/build.ps1
 -LocalRegs off` and `-X87 exact` (lifter `--local-regs`, `--x87`). Native
 x87 keeps values, TOP, C0-C3, IE/PE and the control word; it drops the tag
 word, dirty mask, FPU IP/DP/opcode and unmasked-exception diagnostics. It is
