@@ -2544,6 +2544,9 @@ static int handle_heap_import(CPU *cpu, const import_record *import)
     if (allocate) {
         if (flags & ~9u) stop_guest("HeapAlloc flags are unsupported", import->token);
         cpu->eax = pcrecomp_heap_alloc(heap, rd32(cpu->esp + 12u), !!(flags & 8u));
+        if (!cpu->eax)
+            fprintf(stderr, "AC1 HeapAlloc failed: eip=0x%08x heap=0x%08x size=0x%08x flags=0x%08x\n",
+                    cpu->eip, rd32(cpu->esp + 4u), rd32(cpu->esp + 12u), flags);
         return_stdcall(cpu, 12u);
     } else if (release) {
         if (flags & ~1u) stop_guest("HeapFree flags are unsupported", import->token);
@@ -5226,6 +5229,8 @@ static int handle_import(CPU *cpu, const import_record *import)
             protection != 4u) {
             cpu->eax = 0u;
             last_error = 87u; /* ERROR_INVALID_PARAMETER */
+            fprintf(stderr, "AC1 VirtualAlloc rejected: eip=0x%08x address=0x%08x size=0x%08x type=0x%08x protection=0x%08x error=%u\n",
+                    cpu->eip, requested, size, allocation_type, protection, last_error);
             return_stdcall(cpu, 16u);
             return 1;
         }
@@ -5254,6 +5259,9 @@ static int handle_import(CPU *cpu, const import_record *import)
             cpu->eax = base;
             last_error = 0u;
         }
+        if (!cpu->eax)
+            fprintf(stderr, "AC1 VirtualAlloc failed: eip=0x%08x address=0x%08x size=0x%08x type=0x%08x protection=0x%08x error=%u\n",
+                    cpu->eip, requested, size, allocation_type, protection, last_error);
         return_stdcall(cpu, 16u);
         return 1;
     }
@@ -6606,6 +6614,26 @@ void ac1_dispatch_guard_failed(CPU *cpu, uint32_t target)
     stop_guest("guest call depth exceeded", target);
 }
 
+/* Diagnose the original allocator's null result without changing its result. */
+static void dispatch_allocator_diagnostic(CPU *cpu, uint32_t target,
+                                          ac1_lifted_fn function)
+{
+    static uint32_t observed_target;
+    uint32_t args[8] = {0};
+    uint32_t object = cpu->ecx;
+    if (guest_memory_try_ptr(cpu->esp + 4u, sizeof(args)))
+        for (unsigned i = 0; i < 8; ++i) args[i] = rd32(cpu->esp + 4u + i * 4u);
+    if (observed_target != target) {
+        observed_target = target;
+        fprintf(stderr, "AC1 guest allocator: target=0x%08x this=0x%08x\n", target, object);
+    }
+    function(cpu);
+    if (!cpu->eax)
+        fprintf(stderr, "AC1 guest allocator returned NULL: target=0x%08x this=0x%08x args=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+                target, object, args[0], args[1], args[2], args[3],
+                args[4], args[5], args[6], args[7]);
+}
+
 void dispatch(CPU *cpu, uint32_t target)
 {
     AC1_PROFILE_COUNT(dispatches);
@@ -6638,7 +6666,9 @@ void dispatch(CPU *cpu, uint32_t target)
             uint32_t previous_target = calls->last_target;
             calls->last_target = target;
             ++calls->depth;
-            function(cpu);
+            if (guest_callsite == 0x007A4544u)
+                dispatch_allocator_diagnostic(cpu, target, function);
+            else function(cpu);
             --calls->depth;
             calls->last_target = previous_target;
             ac1_scheduler_return_checkpoint(cpu);
@@ -6877,7 +6907,9 @@ void dispatch(CPU *cpu, uint32_t target)
     uint32_t previous_target = calls->last_target;
     calls->last_target = target;
     ++calls->depth;
-    function(cpu);
+    if (guest_callsite == 0x007A4544u)
+        dispatch_allocator_diagnostic(cpu, target, function);
+    else function(cpu);
     --calls->depth;
     if (trace_object_types && guest_callsite == 0x0085B197u) {
         uint32_t descriptor = cpu->eax;
