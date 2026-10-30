@@ -1351,6 +1351,14 @@ HRESULT create_vertex_declaration(IDirect3DDevice9 *device, const uint32_t *args
     IDirect3DVertexDeclaration9 *declaration = nullptr;
     const HRESULT status = device->CreateVertexDeclaration(
         elements, output ? &declaration : nullptr);
+    if (std::getenv("AC1_D3D9_TRACE_CAPS")) {
+        std::fprintf(stderr, "AC1 D3D9 declaration: hr=%08x elements=", static_cast<unsigned>(status));
+        for (const auto &e : elements) {
+            if (e.Stream == 0xff) break;
+            std::fprintf(stderr, " [%u,%u,%u,%u,%u,%u]", e.Stream, e.Offset, e.Type, e.Method, e.Usage, e.UsageIndex);
+        }
+        std::fprintf(stderr, "\n");
+    }
     if (FAILED(status) || !output) return status;
     if (!declaration) {
         set_error("native CreateVertexDeclaration succeeded without returning an object");
@@ -1986,12 +1994,17 @@ uint32_t invoke_d3d9(GuestObject &object, uint32_t method,
         return hresult(d3d->CheckDeviceType(args[1], static_cast<D3DDEVTYPE>(args[2]),
                                              static_cast<D3DFORMAT>(args[3]),
                                              static_cast<D3DFORMAT>(args[4]), args[5]));
-    case 10:
+    case 10: {
         if (!require_count(argc, 7, "IDirect3D9::CheckDeviceFormat")) return hresult(D3DERR_INVALIDCALL);
-        return hresult(d3d->CheckDeviceFormat(args[1], static_cast<D3DDEVTYPE>(args[2]),
+        const HRESULT status = d3d->CheckDeviceFormat(args[1], static_cast<D3DDEVTYPE>(args[2]),
                                                static_cast<D3DFORMAT>(args[3]), args[4],
                                                static_cast<D3DRESOURCETYPE>(args[5]),
-                                               static_cast<D3DFORMAT>(args[6])));
+                                               static_cast<D3DFORMAT>(args[6]));
+        if (std::getenv("AC1_D3D9_TRACE_CAPS"))
+            std::fprintf(stderr, "AC1 D3D9 format: adapter=%u type=%u display=%u usage=%08x resource=%u format=%08x hr=%08x\n",
+                args[1], args[2], args[3], args[4], args[5], args[6], static_cast<unsigned>(status));
+        return hresult(status);
+    }
     case 11: {
         if (!require_count(argc, 7, "IDirect3D9::CheckDeviceMultiSampleType")) return hresult(D3DERR_INVALIDCALL);
         DWORD *quality = args[6] ? static_cast<DWORD *>(guest_memory(args[6], sizeof(DWORD), AC1_D3D9_GUEST_WRITE)) : nullptr;
@@ -2015,7 +2028,17 @@ uint32_t invoke_d3d9(GuestObject &object, uint32_t method,
         if (!require_count(argc, 4, "IDirect3D9::GetDeviceCaps")) return hresult(D3DERR_INVALIDCALL);
         auto *out = static_cast<D3DCAPS9 *>(guest_memory(args[3], sizeof(D3DCAPS9), AC1_D3D9_GUEST_WRITE));
         if (!out) { set_error("GetDeviceCaps output is unmapped"); return hresult(D3DERR_INVALIDCALL); }
-        return hresult(d3d->GetDeviceCaps(args[1], static_cast<D3DDEVTYPE>(args[2]), out));
+        const HRESULT status = d3d->GetDeviceCaps(args[1], static_cast<D3DDEVTYPE>(args[2]), out);
+        if (SUCCEEDED(status) && std::getenv("AC1_D3D9_TRACE_CAPS")) {
+            std::fprintf(stderr, "AC1 D3D9 caps:");
+            const auto *bytes = reinterpret_cast<const uint8_t *>(out);
+            for (size_t i = 0; i < sizeof(*out); i += 4) {
+                uint32_t value; std::memcpy(&value, bytes + i, 4);
+                std::fprintf(stderr, " %zu=%08x", i, value);
+            }
+            std::fprintf(stderr, "\n");
+        }
+        return hresult(status);
     }
     case 15: {
         if (!require_count(argc, 2, "IDirect3D9::GetAdapterMonitor")) return 0;
