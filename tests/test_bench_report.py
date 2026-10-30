@@ -38,6 +38,23 @@ class FrameWindowTests(unittest.TestCase):
         self.assertEqual(result['input_command_index_start'], result['input_command_index_end'])
         self.assertEqual(result['processor_migrations'], 0)
 
+    def test_multimodal_frame_cost_uses_the_window_mean(self):
+        # Short and long frames alternate; a median picks a mode, the mean is the work.
+        def run(name, cycles):
+            path = ROOT / 'work/bench-report-tests' / name
+            (path / 'captures').mkdir(parents=True, exist_ok=True)
+            (path / 'startup.log').write_text('')
+            rows = ['present_index,wall_ms,main_thread_cpu_ms,process_cpu_ms,cpu_sample_window_frames,'
+                    'main_thread_cycles,processor,guest_time_ns,input_command_index']
+            rows.extend(f'{1800 + i},{c / 4},5,10,16,{c},2,{1000000000 + i * 40000000},7' for i, c in enumerate(cycles))
+            (path / 'frame-stats.csv').write_text('\n'.join(rows) + '\n')
+            return report.internal_run(path, 0, 'gameplay', 1800, 1800, 1, 2200)
+        a = run('modes-a', ([100] * 3 + [200] * 2) * 80 + [100])
+        b = run('modes-b', ([80] * 2 + [150] * 3) * 80 + [80])
+        self.assertLess(a['main_thread_cycles_p50'], b['main_thread_cycles_p50'])
+        self.assertLess(b['main_thread_cycles_per_frame'], a['main_thread_cycles_per_frame'])
+        self.assertLess(b['frametime_mean_ms'], a['frametime_mean_ms'])
+
     def test_guest_stop_is_a_failure(self):
         self.assertFalse(self.fixture('stopped', 401, stop=True)['reached_gameplay'])
 
@@ -53,7 +70,7 @@ class FrameWindowTests(unittest.TestCase):
                 {'reached_workload': True, 'main_thread_cpu_ms_per_frame': cpu}]}
         text = report.comparison_text({'pair_count': 1, 'workload': 'gameplay',
             'A': side(5.0), 'B': side(7.0), 'paired_deltas': {}, 'vsync': 'off'})
-        self.assertIn('main CPU median ms/frame: 2.0', text)
+        self.assertIn('main CPU mean ms/frame: 2.0', text)
 
     def test_non_equivalent_workload_pair_is_excluded_but_cost_delta_is_reported(self):
         def side(values):
@@ -66,7 +83,7 @@ class FrameWindowTests(unittest.TestCase):
                 'pair_equivalence': [{'pair': 1, 'equivalent': True},
                                      {'pair': 2, 'equivalent': False}]}
         text = report.comparison_text(data)
-        self.assertIn('main CPU median ms/frame: 2 (workload-equivalent pairs=1)', text)
+        self.assertIn('main CPU mean ms/frame: 2 (workload-equivalent pairs=1)', text)
         self.assertIn('draw calls in window: 20 (workload-equivalent pairs=1)', text)
 
     def test_adaptive_decision_stops_for_a_clear_difference(self):

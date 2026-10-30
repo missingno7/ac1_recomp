@@ -44,10 +44,14 @@ because an implementation-cost counter differs.
 
 Comparisons (`-Compare`) take `D:\ac1_bench.lock` exclusively. If another worker
 owns it, wait or pass `-Exploratory` to label a non-controlled run. Pairs
-alternate AB/BA; the adaptive interval uses the paired per-run median of
-main-thread cycles/frame and reports the 95% Student-t CI of the mean paired
-delta, spread, valid pair count, and stop reason. (A bootstrap CI of the median
-over three same-sign A/A deltas always excluded zero.) CPU ms/frame is still reported, but it is quantized to
+alternate AB/BA; the adaptive interval uses the paired per-run mean of
+main-thread cycles/frame (total cycles over the Present window / frames) and
+reports the 95% Student-t CI of the mean paired delta, spread, valid pair
+count, and stop reason. (A bootstrap CI of the median over three same-sign A/A
+deltas always excluded zero.) Per-frame cost is multimodal (short and long
+frames alternate), so a per-run median can land in a different mode on each
+side: in the vector-SSE comparison it reported +12.5% cycles while the window
+mean and mean frame time both fell 5.0% in all eight pairs. CPU ms/frame is still reported, but it is quantized to
 one 15.625 ms scheduler tick per 16 Presents (~0.98 ms/frame, ~3%). A/A
 calibration uses the same binary on both sides:
 
