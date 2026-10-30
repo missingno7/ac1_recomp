@@ -176,7 +176,7 @@ class RegisterSwitchTests(unittest.TestCase):
             generated.write_text('#include "cpu.h"\n#define AC1_SET_GUEST_EIP(c,va) ((c)->eip=(va))\n' + self.body(dis, fn))
             executable = temp / "switch.exe"
             command = [compiler, "-std=c11", "-O0", f"-DFIXTURE_JUMP=0x{jump:08X}u",
-                       "-I", str(ROOT / "src/runtime"), str(generated),
+                       "-I", str(lift.prepare_test_runtime()), str(generated),
                        str(ROOT / "tests/register_switch_semantics.c"),
                        str(ROOT / "src/runtime/guest_memory.c"), str(ROOT / "src/runtime/guest_clock.c"),
                        "-lm", "-o", str(executable)]

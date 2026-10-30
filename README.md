@@ -17,6 +17,10 @@ cross-region Initialize/Enter/Leave sequence are retained under `work/cs/`.
 One final capture is white; the detailed evidence and validation limits are in
 [the investigation record](docs/critical-section-span.md).
 
+## Native leaf overrides and gameplay hotspots (2026-10-30)
+
+Gameplay CPU is flat: generated guest code is ~56% of sampled CPU, but the hottest single guest function is under 2%, and dispatch/import/scheduler overhead is a ~4.6% lower bound ([full breakdown](docs/hot-functions.md)). Three fingerprint-pinned native leaves (matrix product `0x00653400`, plane/AABB classification `0x01176DE0`, quaternion/vector transform `0x0042EE70`) preserve the guest CPU state and write sets; each passed 200,000 synthetic and 10,000 live differential checks. Interleaved 60-second A/B runs showed no overall FPS win, so overrides are **opt-in**: `AC1_NATIVE_OVERRIDES=1` (all) or a comma-separated hex VA list; unset or `0` runs the translated code. `AC1_NATIVE_VERIFY=N` compares the first N calls against the translated body. Compare with `tools/bench_gameplay.ps1 -Compare ... -EnvB @{ AC1_NATIVE_OVERRIDES='1' }`.
+
 ## Earlier host checkpoint: first original image (loading screen)
 
 Original code now renders AC1's loading screen on Windows. The translated Bink DLL decodes `videos\LoadingScreen.bik`, and the game draws its progress bar over it through the D3D9 bridge on DXVK. Back-buffer captures show loading progress from 4% at present 4 to 81% at present 64, with 81 original draw calls by then. Evidence: `work/startup_first_image_loading.log` (SHA-256 `77EBD97228EEF25CD839F887B44240EFFD52C690A353E51DF7CCE4D3A6BE0412`) and `work/captures/present_000064.bmp`. This verifies sustained original rendering of the loading screen. Menu, input, audio playback and gameplay are not yet verified.
@@ -242,3 +246,14 @@ Example using existing stripped binaries:
 ```
 
 The two-side environment overrides can also be supplied as `-EnvB @{ AC1_DISPATCH_FAST = '0' }`. Use `tools/bench_report.py <comparison-directory>` to print an existing comparison.
+
+Codegen flag liveness is selected with `tools/build.ps1 -BuildType RelWithDebInfo -Jobs 10 -FlagLiveness cfg`
+(default `cfg`; `off` and `straight` are also available), or the lifter's `--flag-liveness` option.
+`-LocalRegs all` enables function-gated GPR locals; its default is `off`, and an eight-digit hexadecimal
+list such as `-LocalRegs '0051DD60,00428540'` selects individual functions. The lifter accepts the same
+selection with `--local-regs`. Preparation checks both selected modes in its report.
+The benchmark preserves a complete frame window by draining the periodic profiler after CPU/GPU accounting stops;
+incomplete windows, guest stops and dropped frame samples fail its audit. See [codegen evidence](docs/codegen.md)
+for generated/compiled counts, correctness runs, immutable binary hashes and both interleaved comparisons.
+Median paired FPS changes were +5.97% for CFG flags and -53.19% for broad locals in this tutorial replay.
+Flags stay enabled; locals stay off pending lower synchronization overhead and another measured comparison.

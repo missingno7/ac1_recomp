@@ -3024,6 +3024,138 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
             immediate_summary, indexed.summary(results))
 
 
+FLAG_BITS = {name: 1 << i for i, name in enumerate(('cf', 'pf', 'af', 'zf', 'sf', 'of'))}
+FLAG_ALL = sum(FLAG_BITS.values())
+FLAG_HELPERS = {
+    'flags_add': FLAG_ALL, 'flags_sub': FLAG_ALL,
+    'flags_adc': FLAG_ALL, 'flags_sbb': FLAG_ALL,
+    'flags_logicz': FLAG_ALL & ~FLAG_BITS['af'],
+    'flags_incs': FLAG_ALL & ~FLAG_BITS['cf'],
+    'flags_decs': FLAG_ALL & ~FLAG_BITS['cf'],
+}
+
+
+def codegen_instruction_groups(body: str):
+    """Retain labels with the instruction they enter, including entry guards."""
+    lines = body.splitlines()
+    if len(lines) < 3 or lines[1] != '{' or lines[-1] != '}':
+        raise ValueError('unexpected lifted function shape for codegen pass')
+    prefix, groups, pending, group = lines[:2], [], [], []
+    for line in lines[2:-1]:
+        if re.fullmatch(r'L_[0-9A-F]{8}:', line):
+            if group:
+                groups.append(group)
+                group = []
+            pending.append(line)
+        elif 'AC1_SET_GUEST_EIP(c,' in line:
+            if group:
+                groups.append(group)
+            group = pending + [line]
+            pending = []
+        elif group:
+            group.append(line)
+        elif not pending:
+            # A sparse function's entry guard runs once, before any local
+            # label. It must not become a successor of its lowest VA block.
+            prefix.append(line)
+        else:
+            pending.append(line)
+    if group:
+        groups.append(group)
+    return prefix, pending, groups
+
+
+def flag_liveness_function(body: str, mode: str = 'cfg') -> str:
+    """Only kill writes proved dead in emitted semantics, never x86 undefined bits.
+
+    Calls, escapes, unknown CPU helpers and full flag observations are barriers.
+    Functions using FS/GS (including SEH) retain their complete original flags.
+    Return flags stay live: this is deliberately not a cross-call FLAGABI pass.
+    """
+    if mode == 'off' or re.search(r'\b(?:fs|gs):|c->(?:fs|gs)\b|\b(?:seh|longjmp)\b', body, re.I):
+        return body
+    prefix, pending, groups = codegen_instruction_groups(body)
+    if not groups:
+        return body
+    texts = [re.sub(r'/\*.*?\*/', '', '\n'.join(group), flags=re.S) for group in groups]
+    labels = {label: i for i, text in enumerate(texts)
+              for label in re.findall(r'^(L_[0-9A-F]{8}):', text, re.M)}
+    reads, writes, successors, eligible = [], [], [], []
+    for i, text in enumerate(texts):
+        calls = re.findall(r'\b(flags_\w+)\(c\s*,', text)
+        # Repeated string bodies and atomics contain intra-instruction control
+        # flow; retain those bodies until an instruction-local CFG is modeled.
+        simple = (len(calls) == 1 and calls[0] in FLAG_HELPERS and
+                  not re.search(r'\b(?:if|while|for|goto|return)\b|atomic_', text))
+        write = FLAG_HELPERS[calls[0]] if simple else 0
+        read = sum(bit for flag, bit in FLAG_BITS.items() if re.search(r'\bc->' + flag + r'\b', text))
+        if calls and calls[0] in ('flags_adc', 'flags_sbb'):
+            read |= FLAG_BITS['cf']
+        pointer_uses = re.sub(r'\bc->\w+', 'member', text)
+        safe = '|'.join(FLAG_HELPERS) + '|AC1_SET_GUEST_EIP|push32|pop32'
+        pointer_uses = re.sub(r'\b(?:' + safe + r')\(c(?=[,)])', 'safe(', pointer_uses)
+        if re.search(r'\bc\b|RECOMP_TODO\(|ac1_unsupported_instruction\(', pointer_uses):
+            read = FLAG_ALL
+        if re.search(r'/\*\s*[0-9A-Fa-f]{8}:\s*(?:lahf|pushfd|pushf)\b', '\n'.join(groups[i])):
+            read = FLAG_ALL
+        targets = re.findall(r'\bgoto (L_[0-9A-F]{8});', text)
+        edges = {labels[t] for t in targets if t in labels}
+        # A direct unconditional goto has no fallthrough. Conditional returns
+        # and switch-like generated blocks conservatively retain fallthrough.
+        terminal = bool(re.search(r'^\s*(?:goto L_[0-9A-F]{8};|(?:dispatch_jmp|guest_ret)\()',
+                                  text, re.M))
+        if not terminal and i + 1 < len(groups):
+            edges.add(i + 1)
+        if i + 1 == len(groups) or 'return;' in text or any(t not in labels for t in targets):
+            read = FLAG_ALL
+        if mode == 'straight' and (targets or i + 1 < len(groups) and
+                                  re.search(r'^L_[0-9A-F]{8}:', texts[i + 1], re.M)):
+            read = FLAG_ALL
+        reads.append(read)
+        writes.append(write)
+        successors.append(edges)
+        eligible.append(simple)
+    live = [0] * len(groups)
+    changed = True
+    while changed:
+        changed = False
+        for i in reversed(range(len(groups))):
+            out = 0
+            for target in successors[i]:
+                out |= live[target]
+            value = reads[i] | (out & ~writes[i])
+            if value != live[i]:
+                live[i] = value
+                changed = True
+    output = prefix + pending
+    for i, group in enumerate(groups):
+        if eligible[i]:
+            out = 0
+            for target in successors[i]:
+                out |= live[target]
+            # Include same-instruction observations/barriers conservatively.
+            mask = writes[i] & (out | reads[i])
+            text = '\n'.join(group)
+            match = re.search(r'\b(' + '|'.join(FLAG_HELPERS) + r')\(c\s*,', text)
+            depth, end = 1, match.end()
+            # The initial '(' precedes c; scan after the first comma. Nested
+            # operand expressions remain evaluated even with a zero mask.
+            while depth and end < len(text):
+                if text[end] == '(':
+                    depth += 1
+                elif text[end] == ')':
+                    depth -= 1
+                end += 1
+            if depth:
+                raise ValueError('unbalanced generated flag helper')
+            text = text[:end - 1] + f', 0x{mask:02X}u' + text[end - 1:]
+            text = text[:match.start()] + match.group(1) + '_m' + text[match.start() + len(match.group(1)):]
+            output.extend(text.splitlines())
+        else:
+            output.extend(group)
+    return '\n'.join(output + ['}'])
+
+
 def specialize_direct_calls(body: str, lifted: set[int]) -> tuple[str, set[int], int]:
     """Bind only successful main-image entries, after cached bodies are lifted.
 
@@ -3043,9 +3175,137 @@ def specialize_direct_calls(body: str, lifted: set[int]) -> tuple[str, set[int],
     return body, callees, count
 
 
+def native_instruction_hash(spec: dict, read_va) -> str:
+    """Hash sparse recovered code, including each instruction's VA and size."""
+    import struct
+    instructions = sorted({(a, n) for b in spec['blocks'] for a, n in b['instructions']})
+    digest = hashlib.sha256()
+    for address, size in instructions:
+        raw = read_va(address, size)
+        if len(raw) != size: raise ValueError(f"short native code read at 0x{address:08X}")
+        digest.update(struct.pack('<IH', address, size))
+        digest.update(raw)
+    return digest.hexdigest()
+
+
+def validate_native_bindings(entries: list, functions: list[dict], lifted: set[int], read_va, md) -> dict:
+    specs = {f['address']: f for f in functions}
+    result = {}
+    for entry in entries:
+        address = int(entry['address'], 0)
+        if address in result: raise ValueError(f"duplicate native binding 0x{address:08X}")
+        if address not in lifted: raise ValueError(f"native binding 0x{address:08X} has no translated oracle")
+        for key in ('implementation', 'plan'):
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', entry[key]):
+                raise ValueError(f"native binding 0x{address:08X}: invalid C identifier {key}")
+        spec = specs[address]
+        actual = native_instruction_hash(spec, read_va)
+        if actual != entry['instruction_sha256']:
+            raise ValueError(f"native binding 0x{address:08X}: instruction hash expected {entry['instruction_sha256']}, got {actual}")
+        # Verification executes both bodies on a serialized guest owner. Calls,
+        # imports and external tail transfers could yield or affect host state.
+        addresses = {a for b in spec['blocks'] for a, _ in b['instructions']}
+        for block in spec['blocks']:
+            for va, size in block['instructions']:
+                insn = next(md.disasm(read_va(va, size), va, count=1))
+                if insn.mnemonic.startswith(('call', 'int', 'sys', 'lock')):
+                    raise ValueError(f"native oracle 0x{address:08X} is not a pure leaf: {va:08X} {insn.mnemonic}")
+                if insn.mnemonic.startswith(('j', 'loop')):
+                    from capstone.x86 import X86_OP_IMM
+                    if not insn.operands or insn.operands[0].type != X86_OP_IMM or insn.operands[0].imm not in addresses:
+                        raise ValueError(f"native oracle 0x{address:08X} has external/indirect transfer at 0x{va:08X}")
+        result[address] = entry
+    return result
+
+
+def wrap_native_binding(body: str, address: int, entry: dict) -> str:
+    signature = f'void L_{address:08X}(CPU *c)'
+    if body.count(signature) != 1: raise ValueError(f"native binding 0x{address:08X}: unexpected function signature")
+    original = f'ac1_translated_{address:08X}'
+    body = body.replace(signature, f'static void {original}(CPU *c)', 1)
+    impl, plan = entry['implementation'], entry['plan']
+    return (body + f'\nvoid {impl}(CPU *);\nint {plan}(const CPU *, ac1_native_plan *);\n'
+            f'ac1_native_binding ac1_binding_{address:08X} = {{.va=0x{address:08X}u, '
+            f'.name="{impl}", .body={impl}, .plan={plan}}};\n'
+            f'void L_{address:08X}(CPU *c) {{ ac1_native_invoke(c, &ac1_binding_{address:08X}, {original}); }}\n')
+
+
+def local_register_function(body: str) -> str:
+    """Promote GPRs; keep every opaque CPU use as an architectural boundary.
+
+    The aggregate never escapes. GCC scalar replacement can retain its fields
+    in host registers. Flags remain architectural, with audited GPR-free flag
+    helpers. Each public C entry initializes its own locals; internal labels
+    share them. Segmented/SEH and nonlocal-resumption functions stay unchanged.
+    """
+    if re.search(r'\b(?:fs|gs):|c->(?:fs|gs)\b|\b(?:seh|setjmp|longjmp)\b', body, re.I):
+        return body
+    registers = 'eax ecx edx ebx esp ebp esi edi'.split()
+    gpr = re.compile(r'\bc->(' + '|'.join(registers) + r')\b')
+    spill = 'memcpy(&c->eax, &_ac1_regs, sizeof _ac1_regs);'
+    reload = 'memcpy(&_ac1_regs, &c->eax, sizeof _ac1_regs);'
+    lines = body.splitlines()
+    if len(lines) < 3 or lines[1] != '{' or lines[-1] != '}':
+        raise ValueError('unexpected lifted function shape for local registers')
+    output = lines[:2] + [
+        '    struct { uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi; } _ac1_regs;',
+        '    _Static_assert(sizeof _ac1_regs == 32 && offsetof(CPU, edi) == 28, "pinned GPR layout");',
+        '    ' + reload,
+    ]
+    def emit_group(group):
+        if not group:
+            return
+        text = '\n'.join(group)
+        # Leading donor comments can precede executable dispatch code. Cutting
+        # at the first comment loses that CPU use and flushes after the import.
+        code = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+        pointer_uses = re.sub(r'\bc->\w+', 'member', code)
+        pointer_uses = re.sub(r'\b(?:flags_\w+|AC1_SET_GUEST_EIP)\(c(?=[,)])', 'safe(', pointer_uses)
+        boundary = bool(re.search(r'\bc\b', pointer_uses)) or any(
+            token in code for token in ('RECOMP_TODO(', 'ac1_unsupported_instruction('))
+        if boundary:
+            output.append('    ' + spill)
+        else:
+            text = gpr.sub(lambda m: '_ac1_regs.' + m.group(1), text)
+            text = re.sub(r'\breturn;', '{ ' + spill + ' return; }', text)
+        # A helper-authoritative instruction can branch before the ordinary
+        # reload. Reload on that edge too; fence guest polling across backedges.
+        fence = (reload + ' ' if boundary else '') + '__asm__ __volatile__("" ::: "memory"); '
+        text = re.sub(r'\bgoto (L_[0-9A-F]{8});',
+                      lambda m: '{ ' + fence + 'goto ' + m.group(1) + '; }', text)
+        output.extend(text.splitlines())
+        if boundary:
+            output.append('    ' + reload)
+    group = []
+    for line in lines[2:-1]:
+        if 'AC1_SET_GUEST_EIP(c,' in line or re.fullmatch(r'L_[0-9A-F]{8}:', line):
+            emit_group(group)
+            group = []
+        group.append(line)
+    emit_group(group)
+    output.extend(('    ' + spill, '}'))
+    return '\n'.join(output)
+
+
+def local_register_selection(selection: str, lifted: set[int]) -> set[int]:
+    """Explicit per-function admission; malformed/unlifted entries fail closed."""
+    if selection == 'off':
+        return set()
+    if selection == 'all':
+        return lifted
+    if not re.fullmatch(r'(?:0x)?[0-9a-fA-F]{8}(?:,(?:0x)?[0-9a-fA-F]{8})*', selection):
+        raise ValueError('local-regs must be off, all, or comma-separated eight-digit hexadecimal VAs')
+    selected = {int(part, 16) for part in selection.split(',')}
+    if selected - lifted:
+        raise ValueError('local-regs selection is not lifted: ' +
+                         ', '.join(f'0x{va:08X}' for va in sorted(selected - lifted)))
+    return selected
+
+
 def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: Path,
               functions_per_tu: int, translation_unit_buckets: int = 0,
-              emission_cache=None, direct_calls: bool = True) -> dict:
+              emission_cache=None, direct_calls: bool = True, native_overrides=None,
+              flag_liveness: str = 'off', local_regs: str = 'off') -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
@@ -3180,6 +3440,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
             instruction_counts[address] = spec["instruction_count"]
         except Exception as exc:  # preserve other real bodies when one is unsupported
             failures.append({"address": address, "error": repr(exc)})
+    bindings = validate_native_bindings(native_overrides or [], functions, set(lifted), read_va, lifter.md)
     pe.close()
     # Specialize after the complete success set is known. Cached bodies remain
     # independent of catalog membership; failed/removed callees cannot become
@@ -3190,6 +3451,23 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         for index, address in enumerate(lifted):
             bodies[index], direct_callees[address], sites = specialize_direct_calls(bodies[index], successful)
             direct_sites += sites
+    if flag_liveness != 'off':
+        bodies = [flag_liveness_function(body, flag_liveness) for body in bodies]
+    selected_locals = local_register_selection(local_regs, set(lifted))
+    local_count, local_excluded = 0, []
+    for index, address in enumerate(lifted):
+        if address in selected_locals:
+            transformed = local_register_function(bodies[index])
+            if transformed != bodies[index]:
+                local_count += 1
+            else:
+                local_excluded.append(f'0x{address:08X}')
+            bodies[index] = transformed
+    # Keep L_VA as the one public entry for direct transfers AND the dispatch
+    # table. Retain a private, callable translated oracle behind that entry.
+    for index, address in enumerate(lifted):
+        if address in bindings:
+            bodies[index] = wrap_native_binding(bodies[index], address, bindings[address])
     if translation_unit_buckets < 0:
         raise ValueError("translation_unit_buckets must be zero or positive")
     if not translation_unit_buckets and functions_per_tu < 1:
@@ -3211,7 +3489,8 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         # Per-shard prototypes avoid parsing all 100k entries in every TU.
         callees = set().union(*(direct_callees.get(a, set()) for a in addresses))
         direct_prototypes += len(callees)
-        return tu_header + "".join(f"void L_{a:08X}(CPU *);\n" for a in sorted(callees)) + "\n"
+        native_header = '#include "ac1_native.h"\n' if any(a in bindings for a in addresses) else ''
+        return tu_header + native_header + "".join(f"void L_{a:08X}(CPU *);\n" for a in sorted(callees)) + "\n"
 
     tu_names = []
     if translation_unit_buckets:
@@ -3236,6 +3515,14 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     # each bounded initial_NNNN.c translation unit alongside this file.
     write_text_if_changed(output_dir / "initial.c",
         "/* Generated function bodies are split across initial_NNNN.c files. */\n")
+    if image_base == 0x00400000:
+        registry = ['/* Generated native binding registry; no guest bytes. */', '#include "ac1_native.h"']
+        registry.extend(f'extern ac1_native_binding ac1_binding_{a:08X};' for a in sorted(bindings))
+        registry.append('ac1_native_binding *const ac1_native_bindings[] = {')
+        registry.extend(f'    &ac1_binding_{a:08X},' for a in sorted(bindings))
+        if not bindings: registry.append('    NULL,')
+        registry.extend(['};', f'const size_t ac1_native_binding_count = {len(bindings)}u;', ''])
+        write_text_if_changed(output_dir / 'initial_native.c', '\n'.join(registry))
     active_tus = set(tu_names)
     for old_tu in output_dir.glob("initial_[0-9][0-9][0-9][0-9].c"):
         if old_tu.name not in active_tus:
@@ -3293,6 +3580,9 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "relocation_entries": len(reloc_vas),
         "direct_call_sites": direct_sites,
         "direct_callee_declarations": direct_prototypes,
+        "native_overrides": [f"0x{a:08X}" for a in sorted(bindings)],
+        'local_regs': {'requested': local_regs, 'admitted_count': local_count,
+                       'excluded_functions': local_excluded},
     }
 
 
@@ -3422,6 +3712,10 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=CONFIG_PATH,
                         help="discovery configuration (allows private seed-set A/B comparisons)")
     parser.add_argument("--selftest", action="store_true", help="run the focused block-entry ordering check")
+    parser.add_argument('--local-regs', default='off', metavar='off|all|VA,...',
+                        help='function-gated GPR locals; off restores CPU-struct registers')
+    parser.add_argument('--flag-liveness', choices=('off', 'straight', 'cfg'), default='cfg',
+                        help='constant-mask intra-function flag liveness; off restores eager flags')
     parser.add_argument("--no-direct-calls", action="store_true",
                         help="keep constant main-catalog transfers in dispatch for A/B comparisons")
     parser.add_argument("--binary", type=Path)
@@ -3627,7 +3921,9 @@ def main() -> int:
     try:
         lift_result = emit_lift(binary, pcrecomp, catalog_doc["functions"], output_dir,
                                 functions_per_tu, translation_unit_buckets,
-                                emission_cache, direct_calls=not args.no_direct_calls)
+                                emission_cache, direct_calls=not args.no_direct_calls,
+                                native_overrides=config.get('native_overrides', []),
+                                flag_liveness=args.flag_liveness, local_regs=args.local_regs)
     except Exception:
         if emission_cache is not None:
             emission_cache.close()
@@ -3643,8 +3939,11 @@ def main() -> int:
         "lift_failures": lift_result["lift_failures"],
         "unsupported_count": todo_count,
         "relocation_entries": lift_result["relocation_entries"],
+        "flag_liveness": args.flag_liveness,
+        "local_regs": lift_result["local_regs"],
         "direct_call_sites": lift_result["direct_call_sites"],
         "direct_callee_declarations": lift_result["direct_callee_declarations"],
+        "native_overrides": lift_result["native_overrides"],
         "translation_unit_buckets": lift_result["translation_unit_buckets"],
         "outputs": {
             "c": output.name,

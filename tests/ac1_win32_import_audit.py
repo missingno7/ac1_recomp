@@ -1,6 +1,7 @@
 """Read-only PE import audit against committed source and the adapter chain."""
 import argparse
 import json
+import re
 from pathlib import Path
 import subprocess
 import pefile
@@ -17,7 +18,11 @@ def audit(binary, baseline="HEAD"):
     adapter = Path("src/runtime/ac1_win32_compat.inc").read_text()
     runtime = Path("src/runtime/ac1_runtime.c").read_text()
     assert '#include "ac1_win32_compat.inc"' in runtime
-    assert "handle_win32_compat_import(cpu, import) ||" in runtime
+    if "handle_win32_compat_import(cpu, import) ||" not in runtime:
+        chain = re.search(r'import_handler_chain\[\]\s*=\s*\{(.*?)\};', runtime, re.S)
+        assert chain and "handle_win32_compat_import," in chain[1]
+        assert "import_handler_chain[i](cpu, import)" in runtime
+        assert "run_import_handlers(cpu, import)" in runtime
     result = {"baseline": baseline, "binary": str(binary), "literal_absent": {}, "disposition": {}}
     seh = {"RtlUnwind", "UnhandledExceptionFilter", "DebugBreak"}
     pure_network = {"htons", "htonl", "ntohs", "ntohl", "__WSAFDIsSet"}

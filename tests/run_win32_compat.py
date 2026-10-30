@@ -19,6 +19,9 @@ STUB.mkdir(exist_ok=True)
 # Declarations/empty lookup bodies, not generated game functions.
 (STUB / "initial_dispatch.h").write_text(
     "typedef void (*ac1_lifted_fn)(CPU *);\n"
+    "typedef struct { uint32_t guest_va; ac1_lifted_fn function; } ac1_lifted_entry;\n"
+    "static const ac1_lifted_entry ac1_lifted_functions[1]={{0,0}};\n"
+    "static const size_t ac1_lifted_function_count=0;\n"
     "static ac1_lifted_fn ac1_lifted_lookup(uint32_t a) { (void)a;return 0; }\n")
 (STUB / "bink_dispatch.h").write_text(
     "typedef void (*bink_lifted_fn)(CPU *);\n"

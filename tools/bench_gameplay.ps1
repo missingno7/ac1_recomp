@@ -62,14 +62,14 @@ try {
             Write-Host "$msg; waiting..."; Start-Sleep -Seconds 5
         }
     }
-    & git diff --quiet HEAD --
+    & git -c core.safecrlf=false diff --quiet HEAD --
     if ($LASTEXITCODE -gt 1) { throw 'git diff failed while checking tracked files' }
     $dirty = $LASTEXITCODE -eq 1
     if ($dirty -and -not $AllowDirty) { throw 'Tracked files are modified; commit or pass -AllowDirty. Untracked files do not affect identity.' }
     $sha = (& git rev-parse --short=12 HEAD).Trim()
     $branch = (& git branch --show-current).Trim()
     $dirtyHash = ''
-    if ($dirty) { $dirtyHash = (git diff --binary HEAD | & $Python -B -c "import sys,hashlib; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:12])").Trim() }
+    if ($dirty) { $dirtyHash = (git -c core.safecrlf=false diff --binary HEAD | & $Python -B -c "import sys,hashlib; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:12])").Trim() }
     $direct = if ($DirectMemory) { 'ON' } else { 'OFF' }
     $trace = if ($TraceEip) { 'ON' } else { 'OFF' }
     $inline = if ($ForceInline) { 'ON' } else { 'OFF' }
@@ -314,6 +314,23 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
             } catch { $topThreads = @() }
             if ($gameTimer) { $cpuNow = Get-ProcessCpuSeconds $proc }
             $proc.Refresh()
+            if ($durationReached -and -not $proc.HasExited) {
+                # Freeze CPU/GPU accounting at the measurement deadline. The
+                # frame profiler flushes periodically; killing immediately can
+                # discard the last (default: ten) seconds of the frame window.
+                if ($gpuProc -and -not $gpuProc.HasExited) {
+                    Stop-Process -Id $gpuProc.Id -Force -ErrorAction SilentlyContinue
+                    $gpuProc.WaitForExit()
+                }
+                $flushInterval = 10.0
+                $parsedInterval = 0.0
+                if ($envs.ContainsKey('AC1_PROFILE_INTERVAL') -and
+                    [double]::TryParse([string]$envs['AC1_PROFILE_INTERVAL'], [Globalization.NumberStyles]::Float,
+                        [Globalization.CultureInfo]::InvariantCulture, [ref]$parsedInterval) -and
+                    $parsedInterval -ge 0.1 -and $parsedInterval -le 3600) { $flushInterval = $parsedInterval }
+                $drainUntil = $gameTimer.Elapsed.TotalSeconds + $flushInterval + 2.0
+                while (-not $proc.WaitForExit(250) -and $gameTimer.Elapsed.TotalSeconds -lt $drainUntil) { }
+            }
         } finally {
             if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue; $proc.WaitForExit() }
             if ($gpuProc -and -not $gpuProc.HasExited) { Stop-Process -Id $gpuProc.Id -Force -ErrorAction SilentlyContinue; $gpuProc.WaitForExit() }
