@@ -100,7 +100,7 @@ public:
                     std::chrono::duration<double, std::milli>(wall - previous_wall_).count(),
                     thread_cpu_ms, process_cpu_ms,
                     static_cast<uint32_t>(kCpuSampleWindowFrames)});
-                if (rows_.size() >= 64) flush();
+                if (rows_.size() >= flush_rows_) flush();
             }
         } else {
             frame_ = present_index;
@@ -119,6 +119,7 @@ private:
     std::mutex lock_;
     std::string path_;
     uint64_t frame_ = 0;
+    size_t flush_rows_ = 64;
     std::chrono::steady_clock::time_point previous_wall_{};
     std::vector<Row> rows_;
     std::array<double, 17> thread_cpu_history_{};
@@ -127,7 +128,18 @@ private:
     void initialize()
     {
         const char *path = std::getenv("AC1_FRAME_STATS");
-        if (path && *path) { path_ = path; enabled_ = true; rows_.reserve(64); }
+        if (path && *path) {
+            path_ = path;
+            enabled_ = true;
+            const char *flush_rows = std::getenv("AC1_FRAME_STATS_FLUSH_FRAMES");
+            if (flush_rows && *flush_rows) {
+                char *end = nullptr;
+                const unsigned long requested = std::strtoul(flush_rows, &end, 10);
+                if (end != flush_rows && *end == '\0' && requested >= 1 && requested <= 4096)
+                    flush_rows_ = static_cast<size_t>(requested);
+            }
+            rows_.reserve(flush_rows_);
+        }
         const char *slowdown = std::getenv("AC1_FRAME_STATS_TEST_SLOWDOWN_US");
         if (enabled_ && slowdown && *slowdown) {
             char *end = nullptr;
@@ -505,6 +517,7 @@ void capture_back_buffer(IDirect3DDevice9 *device)
             std::fprintf(stderr, "AC1 D3D9 capture: %s (%ux%u format=%u draw_calls=%llu)\n",
                          path, desc.Width, desc.Height, static_cast<unsigned>(desc.Format),
                          static_cast<unsigned long long>(g_successful_draw_calls));
+            std::fflush(stderr);
         } else {
             std::fprintf(stderr, "AC1 D3D9 capture: cannot open %s\n", path);
         }
