@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Summarize AC1 gameplay runs and interleaved comparisons."""
 import argparse
+import csv
 import json
 import statistics
 import sys
@@ -22,7 +23,7 @@ def percentile(values, q):
     return values[lo] + (values[min(lo + 1, len(values) - 1)] - values[lo]) * (x - lo)
 
 
-def internal_run(run, seconds):
+def internal_run(run, seconds, workload="gameplay"):
     log_path = run / "startup.log"
     log = log_path.read_text(errors="replace") if log_path.exists() else ""
     captures = list((run / "captures").glob("present_*.bmp"))
@@ -70,18 +71,51 @@ def internal_run(run, seconds):
     reached = reached and full_window and not stop_lines and not frame_dropped
     reason = ("guest stopped" if stop_lines else
               f"incomplete {seconds}-second frame window: retained {coverage:.3f} seconds" if not full_window else
-              f"frame capture dropped {frame_dropped} frames" if frame_dropped else "gameplay start not reached")
-    frame_times = intervals
+              f"frame capture dropped {frame_dropped} frames" if frame_dropped else f"{workload} start not reached")
+    frame_stats = run / "frame-stats.csv"
+    sampled = []
+    if frame_stats.exists():
+        with frame_stats.open(newline="", encoding="utf-8-sig") as source:
+            sampled = list(csv.DictReader(source))
+    sampled = [{key: float(row[key]) for key in ("present_index", "wall_ms", "main_thread_cpu_ms", "process_cpu_ms")}
+               for row in sampled if all(row.get(key) not in (None, "") for key in
+                                        ("present_index", "wall_ms", "main_thread_cpu_ms", "process_cpu_ms"))]
+    anchor = next((i for i, row in enumerate(sampled) if row["present_index"] >= 2048), None)
+    runtime_rows = []
+    runtime_coverage_ms = 0.0
+    if anchor is not None:
+        for row in sampled[anchor + 1:]:
+            if runtime_coverage_ms + row["wall_ms"] > seconds * 1000:
+                break
+            runtime_rows.append(row)
+            runtime_coverage_ms += row["wall_ms"]
+    wall_times = sorted(row["wall_ms"] for row in runtime_rows)
+    main_cpu = [row["main_thread_cpu_ms"] for row in runtime_rows]
+    process_cpu = [row["process_cpu_ms"] for row in runtime_rows]
+    runtime_full_window = bool(wall_times) and runtime_coverage_ms >= seconds * 1000 - max(wall_times) * 1.5
+    reached = reached and runtime_full_window
+    if not runtime_full_window and reached is False and not reason.startswith("guest stopped") and not reason.startswith("incomplete") and not reason.startswith("frame capture dropped"):
+        reason = f"runtime frame statistics cover only {runtime_coverage_ms / 1000:.3f} seconds"
+    frame_times = wall_times
     return {
-        "reached_gameplay": reached, "gameplay_start_present_index": start_index + 1 if start_tick is not None else None,
+        "workload": workload, "reached_workload": reached,
+        "reached_gameplay": reached and workload == "gameplay",
+        "gameplay_start_present_index": start_index + 1 if start_tick is not None else None,
         "full_frame_window": full_window, "frame_capture_coverage_seconds": coverage, "frame_dropped": frame_dropped,
-        "frames_in_window": len(window), "fps": 1000 / statistics.mean(frame_times) if frame_times else None,
+        "frames_in_window": len(runtime_rows), "fps": 1000 / statistics.mean(frame_times) if frame_times else None,
         "measurement_elapsed_seconds": (window[-1] - window[0]) / freq if len(window) > 1 else 0.0,
         "frametime_mean_ms": statistics.mean(frame_times) if frame_times else None,
         "frametime_p50_ms": percentile(frame_times, .5), "frametime_p95_ms": percentile(frame_times, .95),
         "frametime_p99_ms": percentile(frame_times, .99), "frametime_min_ms": min(frame_times) if frame_times else None,
         "frametime_max_ms": max(frame_times) if frame_times else None, "draws_per_frame": draws,
-        "process_cpu_seconds": None, "cpu_utilization_cores": None, "top_threads": [],
+        "runtime_frame_stats_coverage_seconds": runtime_coverage_ms / 1000,
+        "main_thread_cpu_ms_per_frame": statistics.median(main_cpu) if main_cpu else None,
+        "main_thread_cpu_p95_ms_per_frame": percentile(sorted(main_cpu), .95),
+        "main_thread_cpu_p99_ms_per_frame": percentile(sorted(main_cpu), .99),
+        "process_cpu_ms_per_frame": statistics.median(process_cpu) if process_cpu else None,
+        "process_cpu_p95_ms_per_frame": percentile(sorted(process_cpu), .95),
+        "process_cpu_p99_ms_per_frame": percentile(sorted(process_cpu), .99),
+        "process_cpu_seconds": sum(process_cpu) / 1000 if process_cpu else None,
         "gpu_utilization_percent": statistics.mean(s["utilization_percent"] for s in gpu_samples) if gpu_samples else None,
         "gpu_samples": gpu_samples, "scene_proof": [str(c.relative_to(run)) for c in proof],
         "profile_snapshots": len(snapshots), "present_trace_points": traces,
@@ -91,7 +125,7 @@ def internal_run(run, seconds):
 
 
 def successful(data, key):
-    return [r[key] for r in data.get("runs", []) if r.get("reached_gameplay") and isinstance(r.get(key), (int, float))]
+    return [r[key] for r in data.get("runs", []) if r.get("reached_workload", r.get("reached_gameplay")) and isinstance(r.get(key), (int, float))]
 
 
 def stats(values):
@@ -102,30 +136,48 @@ def stats(values):
 
 
 def comparison_text(d):
-    lines = ["# AC1 interleaved gameplay comparison", "", f"- Pair count: {d['pair_count']}; A failures: {d['A']['failures']}; B failures: {d['B']['failures']}", f"- Busy-host override: {d.get('host_load_override', False)}", ""]
+    workload = d.get("workload", "gameplay")
+    lines = [f"# AC1 interleaved {workload} comparison", "", f"- Pair count: {d['pair_count']}; A failures: {d['A']['failures']}; B failures: {d['B']['failures']}", f"- Vsync: {d.get('vsync', 'unknown')}", f"- Busy-host override: {d.get('host_load_override', False)}", ""]
+    side_metrics = (("frametime_mean_ms", "mean frame time ms"),
+                    ("frametime_p50_ms", "wall frame ms p50"),
+                    ("frametime_p95_ms", "wall frame ms p95"),
+                    ("frametime_p99_ms", "wall frame ms p99"),
+                    ("main_thread_cpu_ms_per_frame", "main CPU ms/frame median"),
+                    ("main_thread_cpu_p95_ms_per_frame", "main CPU ms/frame p95"),
+                    ("main_thread_cpu_p99_ms_per_frame", "main CPU ms/frame p99"),
+                    ("process_cpu_ms_per_frame", "process CPU ms/frame median"),
+                    ("process_cpu_p95_ms_per_frame", "process CPU ms/frame p95"),
+                    ("process_cpu_p99_ms_per_frame", "process CPU ms/frame p99"),
+                    ("gpu_utilization_percent", "GPU %"), ("fps", "FPS"))
     for side in ("A", "B"):
         lines.append(f"## {side}: {d[side]['label']}")
-        for key, label in (("fps", "FPS"), ("frametime_mean_ms", "mean frame time ms"),
-                           ("frametime_p95_ms", "p95 ms"), ("frametime_p99_ms", "p99 ms"),
-                           ("cpu_utilization_cores", "CPU cores"), ("gpu_utilization_percent", "GPU %")):
+        for key, label in side_metrics:
             s = d[side].get("stats", {}).get(key) or stats(successful(d[side], key))
             lines.append(f"- {label}: median={s['median']}, min={s['min']}, max={s['max']}, p95={s['p95']}, p99={s['p99']} (n={s['n']})")
         for run in d[side].get("runs", []):
-            if not run.get("reached_gameplay"):
+            if not run.get("reached_workload", run.get("reached_gameplay")):
                 failure = run.get("failure") or {}
                 stop = failure.get("guest_stop_lines") or []
                 lines.append(f"- Failed run {run.get('run')}: {stop[-1] if stop else failure.get('reason', 'gameplay not reached')}")
         lines.append("")
     lines.append("## Paired median deltas (B - A)")
-    for key, label in (("fps", "FPS"), ("frametime_mean_ms", "mean frame time ms"),
-                       ("frametime_p95_ms", "p95 ms"), ("frametime_p99_ms", "p99 ms"),
-                       ("cpu_utilization_cores", "CPU cores"), ("gpu_utilization_percent", "GPU %")):
+    paired_metrics = (("frametime_mean_ms", "wall frame mean ms"),
+                      ("frametime_p50_ms", "wall frame p50 ms"),
+                      ("frametime_p95_ms", "wall frame p95 ms"),
+                      ("frametime_p99_ms", "wall frame p99 ms"),
+                      ("main_thread_cpu_ms_per_frame", "main CPU median ms/frame"),
+                      ("main_thread_cpu_p95_ms_per_frame", "main CPU p95 ms/frame"),
+                      ("main_thread_cpu_p99_ms_per_frame", "main CPU p99 ms/frame"),
+                      ("process_cpu_ms_per_frame", "process CPU median ms/frame"),
+                      ("process_cpu_p95_ms_per_frame", "process CPU p95 ms/frame"),
+                      ("process_cpu_p99_ms_per_frame", "process CPU p99 ms/frame"), ("fps", "FPS"))
+    for key, label in paired_metrics:
         delta = d.get("paired_deltas", {}).get(key)
         if delta is None:
             pairs = [(a.get(key), b.get(key)) for a, b in zip(d["A"].get("runs", []), d["B"].get("runs", []))
-                     if a.get("reached_gameplay") and b.get("reached_gameplay") and isinstance(a.get(key), (int, float)) and isinstance(b.get(key), (int, float))]
+                     if a.get("reached_workload", a.get("reached_gameplay")) and b.get("reached_workload", b.get("reached_gameplay")) and isinstance(a.get(key), (int, float)) and isinstance(b.get(key), (int, float))]
             delta = statistics.median([y - x for x, y in pairs]) if pairs else None
-        lines.append(f"- {label}: {delta} (valid pairs={sum(1 for a, b in zip(d['A'].get('runs', []), d['B'].get('runs', [])) if a.get('reached_gameplay') and b.get('reached_gameplay'))})")
+        lines.append(f"- {label}: {delta} (valid pairs={sum(1 for a, b in zip(d['A'].get('runs', []), d['B'].get('runs', [])) if a.get('reached_workload', a.get('reached_gameplay')) and b.get('reached_workload', b.get('reached_gameplay')) )})")
     lines.append("")
     return "\n".join(lines)
 
@@ -135,19 +187,20 @@ def main():
         p = argparse.ArgumentParser()
         p.add_argument("--internal-run", type=Path, required=True)
         p.add_argument("--seconds", type=int, required=True)
+        p.add_argument("--workload", choices=("gameplay", "menu"), default="gameplay")
         args = p.parse_args()
-        print(json.dumps(internal_run(args.internal_run, args.seconds)))
+        print(json.dumps(internal_run(args.internal_run, args.seconds, args.workload)))
         return
     if len(sys.argv) >= 2 and sys.argv[1] == "--summary":
         d = read(sys.argv[2])
         if d.get("comparison"):
             report = comparison_text(d)
         else:
-            failed = sum(not r.get("reached_gameplay") for r in d.get("runs", []))
-            lines = ["# AC1 gameplay benchmark", "", f"- Identity: `{d['identity']['sha']}` / `{d['identity']['config_id']}`; branch `{d['identity']['branch']}`; dirty={d['identity']['dirty']}", f"- Binary SHA-256: `{d['identity']['binary_sha256']}`", f"- Machine: {d['machine']['cpu_model']}; {d['machine']['logical_cores']} logical cores; {d['machine']['physical_memory_bytes']} bytes RAM", f"- Build generator: {d.get('environment', {}).get('actual_build_generator', 'unknown')}", f"- Failed runs: {failed}", ""]
+            workload = d.get("environment", {}).get("workload", "gameplay")
+            failed = sum(not r.get("reached_workload", r.get("reached_gameplay")) for r in d.get("runs", []))
+            lines = [f"# AC1 {workload} benchmark", "", f"- Identity: `{d['identity']['sha']}` / `{d['identity']['config_id']}`; branch `{d['identity']['branch']}`; dirty={d['identity']['dirty']}", f"- Binary SHA-256: `{d['identity']['binary_sha256']}`", f"- Machine: {d['machine']['cpu_model']}; {d['machine']['logical_cores']} logical cores; {d['machine']['physical_memory_bytes']} bytes RAM", f"- Vsync: {d.get('environment', {}).get('vsync', 'unknown')}", f"- Build generator: {d.get('environment', {}).get('actual_build_generator', 'unknown')}", f"- Failed runs: {failed}", ""]
             for r in d["runs"]:
-                tops = ", ".join(f"{t['tid']}:{t['cpu_seconds']:.2f}s" for t in r.get("top_threads", [])[:5]) or "unavailable"
-                lines.append(f"- Run {r['run']}: reached_gameplay={r.get('reached_gameplay', False)}, FPS={r.get('fps')}, mean/p50/p95/p99/max ms={r.get('frametime_mean_ms')}/{r.get('frametime_p50_ms')}/{r.get('frametime_p95_ms')}/{r.get('frametime_p99_ms')}/{r.get('frametime_max_ms')}, CPU={r.get('process_cpu_seconds')}s ({r.get('cpu_utilization_cores')} cores), GPU={r.get('gpu_utilization_percent')}%, top threads={tops}, failure={r.get('failure')}")
+                lines.append(f"- Run {r['run']}: reached_workload={r.get('reached_workload', False)}, main CPU ms/frame median/p95/p99={r.get('main_thread_cpu_ms_per_frame')}/{r.get('main_thread_cpu_p95_ms_per_frame')}/{r.get('main_thread_cpu_p99_ms_per_frame')}, process CPU ms/frame median/p95/p99={r.get('process_cpu_ms_per_frame')}/{r.get('process_cpu_p95_ms_per_frame')}/{r.get('process_cpu_p99_ms_per_frame')}, wall ms p50/p95/p99={r.get('frametime_p50_ms')}/{r.get('frametime_p95_ms')}/{r.get('frametime_p99_ms')}, FPS={r.get('fps')}, GPU={r.get('gpu_utilization_percent')}%, failure={r.get('failure')}")
             report = "\n".join(lines) + "\n"
         (Path(sys.argv[2]) / "summary.md").write_text(report, encoding="utf-8")
         print(report, end="")
@@ -161,7 +214,7 @@ def main():
     a, b = map(read, sys.argv[1:])
     for label, data in (("A", a), ("B", b)):
         print(f"{label}: {data['identity']['sha']} ({data['identity']['branch']}) {data['identity']['config_id']} dirty={data['identity']['dirty']}")
-        for key in ("fps", "frametime_mean_ms", "frametime_p95_ms", "frametime_p99_ms", "cpu_utilization_cores", "gpu_utilization_percent"):
+        for key in ("main_thread_cpu_ms_per_frame", "main_thread_cpu_p95_ms_per_frame", "main_thread_cpu_p99_ms_per_frame", "process_cpu_ms_per_frame", "frametime_p95_ms", "frametime_p99_ms", "fps", "gpu_utilization_percent"):
             print(f"  {key}: {stats(successful(data, key))}")
 
 

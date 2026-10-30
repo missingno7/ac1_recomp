@@ -1,6 +1,8 @@
 param(
     [ValidateRange(1, 50)][int]$Runs = 3,
     [ValidateRange(1, 86400)][int]$Seconds = 60,
+    [ValidateRange(1, 3600)][int]$StartupTimeoutSeconds = 120,
+    [ValidateSet('gameplay','menu')][string]$Workload = 'gameplay',
     [switch]$DirectMemory = $true,
     [switch]$TraceEip = $true,
     [string]$LiftArgs = '',
@@ -42,16 +44,6 @@ if ($EnvBJson) {
     foreach ($item in $parsedEnvB.PSObject.Properties) { $EnvB[$item.Name] = [string]$item.Value }
 }
 $ownedConfigProc = $null
-if (-not ('AC1BenchThreadTimes' -as [type])) { Add-Type -TypeDefinition @"
-using System; using System.Collections.Generic; using System.Runtime.InteropServices;
-public static class AC1BenchThreadTimes {
- const uint THREAD_QUERY_INFORMATION=0x0040;
- [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr OpenThread(uint access,bool inherit,uint id);
- [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetThreadTimes(IntPtr h,out long create,out long exit,out long kernel,out long user);
- [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
- public static Dictionary<int,ulong> Snapshot(int[] ids) { var d=new Dictionary<int,ulong>(); foreach(int id in ids){IntPtr h=OpenThread(THREAD_QUERY_INFORMATION,false,(uint)id);if(h==IntPtr.Zero)continue;try{long c,e,k,u;if(GetThreadTimes(h,out c,out e,out k,out u))d[id]=(ulong)(k+u);}finally{CloseHandle(h);}}return d; }
-}
-"@ }
 Push-Location $Root
 try {
     function Wait-ForQuietMachine {
@@ -109,19 +101,6 @@ public static class AC1BenchProcessTree {
         foreach ($childId in [AC1BenchProcessTree]::Children($OwnedProcess.Id)) { Stop-Process -Id $childId -Force -ErrorAction SilentlyContinue }
         $OwnedProcess.WaitForExit()
     }
-    function Get-ThreadCpuSnapshot($Process) {
-        $snapshot = @{}
-        try { $freshProcess = Get-Process -Id $Process.Id -ErrorAction Stop } catch { return $snapshot }
-        $ids = @($freshProcess.Threads | ForEach-Object { [int]$_.Id })
-        $raw = [AC1BenchThreadTimes]::Snapshot([int[]]$ids)
-        foreach ($tid in $raw.Keys) { $snapshot[[int]$tid] = [double]$raw[$tid] / 10000000.0 }
-        return $snapshot
-    }
-    function Get-ProcessCpuSeconds($Process) {
-        try { return (Get-Process -Id $Process.Id -ErrorAction Stop).TotalProcessorTime.TotalSeconds }
-        catch { $Process.Refresh(); return $Process.TotalProcessorTime.TotalSeconds }
-    }
-
     function Test-LiftFresh([string]$Dir) {
         $reportPath = Join-Path $Dir 'lift-report.json'
         if (-not (Test-Path (Join-Path $Dir 'initial.c')) -or -not (Test-Path $reportPath)) { return $false }
@@ -150,7 +129,7 @@ public static class AC1BenchProcessTree {
                     if ($LASTEXITCODE -ne 0) { throw 'Private userdata seed restoration failed' }
                 }
                 $childArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath,
-                    '-Runs','1','-Seconds',[string]$Seconds,
+                    '-Runs','1','-Seconds',[string]$Seconds,'-StartupTimeoutSeconds',[string]$StartupTimeoutSeconds,'-Workload',$Workload,
                     '-ResultDirOverride',$sideDir,'-Label',"${side}-pair-${pair}",'-Python',$Python,'-GameExe',$GameExe,'-AllowDirty')
                 if ($sideBinary) { $childArgs += @('-Binary',$sideBinary) }
                 $childDirect = $DirectMemory; $childTrace = $TraceEip; $childInline = $ForceInline; $childLift = $LiftArgs
@@ -176,9 +155,9 @@ public static class AC1BenchProcessTree {
         }
         $comparison = [ordered]@{
             comparison=$true; pair_count=$Runs; seconds=$Seconds; host_load_override=[bool]$AllowBusy
-            userdata_seed=$UserdataSeed
-            A=[ordered]@{ label=$sideLabels.A; binary=$Binary; runs=$sideRuns.A; failures=@($sideRuns.A | Where-Object { -not $_.reached_gameplay }).Count }
-            B=[ordered]@{ label=$sideLabels.B; binary=$BinaryB; runs=$sideRuns.B; failures=@($sideRuns.B | Where-Object { -not $_.reached_gameplay }).Count }
+            userdata_seed=$UserdataSeed; workload=$Workload; vsync='off (DXVK d3d9.presentInterval=0)'
+            A=[ordered]@{ label=$sideLabels.A; binary=$Binary; runtime_env=$Env; runs=$sideRuns.A; failures=@($sideRuns.A | Where-Object { -not $_.reached_workload }).Count }
+            B=[ordered]@{ label=$sideLabels.B; binary=$BinaryB; runtime_env=$EnvB; runs=$sideRuns.B; failures=@($sideRuns.B | Where-Object { -not $_.reached_workload }).Count }
             paired_deltas=@{}
         }
         $comparison | ConvertTo-Json -Depth 30 | Set-Content (Join-Path $comparisonDir 'result.json') -Encoding UTF8
@@ -265,21 +244,30 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
         Wait-ForQuietMachine
         $runDir = Join-Path $resultDir ("run-{0:D2}" -f $i)
         New-Item -ItemType Directory -Force -Path $runDir | Out-Null
+        $dxvkConfig = Join-Path $runDir 'dxvk.conf'
+        Set-Content -LiteralPath $dxvkConfig -Value 'd3d9.presentInterval = 0' -Encoding ASCII
         $envs = @{
             AC1_HIDE_FILES='videos\UBI_LOGO.bik;videos\Ubisoft_Presents.bik;videos\Warning_Disclaimer.bik;videos\DemoIntro.bik'
             AC1_D3D9_FORCE_WINDOWED='1'; AC1_D3D9_LIBRARY=(Resolve-Path work/d3d9_dxvk_probe/d3d9.dll).Path
-            AC1_DISPATCH_LIMIT='0'; AC1_INPUT_SCRIPT=(Resolve-Path tools/input/to_gameplay.txt).Path
+            AC1_DISPATCH_LIMIT='0'
             AC1_D3D9_CAPTURE_DIR=(Join-Path $runDir 'captures')
             AC1_D3D9_TRACE_FRAME='1'; AC1_PROFILE_FRAMES='1'; AC1_PROFILE='0'; AC1_D3D9_CAPTURE_EVERY=''; DXVK_LOG_PATH=$runDir
+            AC1_FRAME_STATS=(Join-Path $runDir 'frame-stats.csv'); DXVK_CONFIG_FILE=$dxvkConfig
         }
+        $envs['AC1_INPUT_SCRIPT'] = if ($Workload -eq 'gameplay') { (Resolve-Path tools/input/to_gameplay.txt).Path } else { '' }
         foreach ($k in $Env.Keys) { $envs[$k] = [string]$Env[$k] }
+        # Benchmark invariants stay enabled even when caller-supplied runtime
+        # environment overrides are used for A/B experiments.
+        $envs['AC1_FRAME_STATS'] = Join-Path $runDir 'frame-stats.csv'
+        $envs['DXVK_CONFIG_FILE'] = $dxvkConfig
+        $envs['DXVK_CONFIG'] = 'd3d9.presentInterval = 0'
         $envs['AC1_PROFILE_DIR'] = (Join-Path $runDir 'profile')
         $profileDir = Join-Path $runDir 'profile'
         $profileSource = Join-Path $Root 'work/work/profile'
         New-Item -ItemType Directory -Force -Path $envs.AC1_D3D9_CAPTURE_DIR,$profileDir,$profileSource | Out-Null
         $profileBefore = @{}; Get-ChildItem "$profileSource/raw_*.json" -ErrorAction SilentlyContinue | ForEach-Object { $profileBefore[$_.Name] = $_.LastWriteTimeUtc }
         $gpuLog = Join-Path $runDir 'gpu.csv'; $gpuProc = $null
-        $proc = $null; $timer = [Diagnostics.Stopwatch]::StartNew(); $gameTimer = $null; $cpuAtStart = 0.0; $cpuNow = 0.0; $topThreads = @(); $threadLast = @{}; $threadAccum = @{}; $durationReached = $false; $measurementStartFrame = 2048
+        $proc = $null; $timer = [Diagnostics.Stopwatch]::StartNew(); $gameTimer = $null; $durationReached = $false; $measurementStartFrame = 2048
         $previousEnv = @{}; foreach ($k in $envs.Keys) { $previousEnv[$k] = [Environment]::GetEnvironmentVariable($k,'Process'); [Environment]::SetEnvironmentVariable($k,[string]$envs[$k],'Process') }
         try {
             $proc = Start-Process -FilePath $binaryPath -ArgumentList ('"' + $GameExe + '"') -WorkingDirectory $Root -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $runDir 'stdout.log') -RedirectStandardError (Join-Path $runDir 'startup.log')
@@ -291,35 +279,14 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
                     $presentNow = 0
                     if ($presentCounts.Count) { $presentNow = [int]$presentCounts[$presentCounts.Count - 1].Groups[1].Value }
                     if ($presentNow -ge $measurementStartFrame) {
-                        $gameTimer = [Diagnostics.Stopwatch]::StartNew(); $cpuAtStart = Get-ProcessCpuSeconds $proc
-                        $threadLast = Get-ThreadCpuSnapshot $proc
+                        $gameTimer = [Diagnostics.Stopwatch]::StartNew()
                         if ($gpuAvailable) { $gpuProc = Start-Process -FilePath $gpuTool.Source -ArgumentList @('--query-gpu=utilization.gpu,clocks.gr','--format=csv,noheader,nounits','-lms','500') -PassThru -WindowStyle Hidden -RedirectStandardOutput $gpuLog -RedirectStandardError (Join-Path $runDir 'gpu.err') }
-                        Write-Host "Run $i gameplay measurement started at Present $measurementStartFrame."
+                        Write-Host "Run $i $Workload measurement started at Present $measurementStartFrame."
                     }
-                }
-                if ($gameTimer) {
-                    $threadNow = Get-ThreadCpuSnapshot $proc
-                    foreach ($tid in $threadNow.Keys) {
-                        $before = if ($threadLast.ContainsKey($tid)) { [double]$threadLast[$tid] } else { [double]$threadNow[$tid] }
-                        $delta = [Math]::Max(0.0, [double]$threadNow[$tid] - $before)
-                        if ($threadAccum.ContainsKey($tid)) { $threadAccum[$tid] += $delta } else { $threadAccum[$tid] = $delta }
-                    }
-                    $threadLast = $threadNow
                 }
                 if ($gameTimer -and $gameTimer.Elapsed.TotalSeconds -ge $Seconds) { $durationReached = $true; break }
-                if (-not $gameTimer -and $timer.Elapsed.TotalSeconds -ge ($Seconds + 120)) { break }
+                if (-not $gameTimer -and $timer.Elapsed.TotalSeconds -ge ($Seconds + $StartupTimeoutSeconds)) { break }
             }
-            $cpuNow = Get-ProcessCpuSeconds $proc
-            try {
-                $threadEnd = Get-ThreadCpuSnapshot $proc
-                foreach ($tid in $threadEnd.Keys) {
-                    $before = if ($threadLast.ContainsKey($tid)) { [double]$threadLast[$tid] } else { [double]$threadEnd[$tid] }
-                    $delta = [Math]::Max(0.0, [double]$threadEnd[$tid] - $before)
-                    if ($threadAccum.ContainsKey($tid)) { $threadAccum[$tid] += $delta } else { $threadAccum[$tid] = $delta }
-                }
-                $topThreads = @($threadAccum.Keys | ForEach-Object { $tid=$_; [ordered]@{ tid=$tid; cpu_seconds=[double]$threadAccum[$tid] } } | Sort-Object cpu_seconds -Descending | Select-Object -First 10)
-            } catch { $topThreads = @() }
-            if ($gameTimer) { $cpuNow = Get-ProcessCpuSeconds $proc }
             $proc.Refresh()
             if ($durationReached -and -not $proc.HasExited) {
                 # Freeze CPU/GPU accounting at the measurement deadline. The
@@ -344,12 +311,7 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
             Get-ChildItem "$profileSource/raw_*.json" -ErrorAction SilentlyContinue | Where-Object { -not $profileBefore.ContainsKey($_.Name) -or $_.LastWriteTimeUtc -gt $profileBefore[$_.Name] } | ForEach-Object { Copy-Item $_.FullName $profileDir; $bin = Join-Path $_.DirectoryName ($_.BaseName + '.bin'); if (Test-Path $bin) { Copy-Item $bin $profileDir } }
             foreach ($k in $envs.Keys) { [Environment]::SetEnvironmentVariable($k,$previousEnv[$k],'Process') }
         }
-        $runOut = & $Python -B tools/bench_report.py --internal-run $runDir --seconds $Seconds | ConvertFrom-Json
-        $cpuSeconds = [Math]::Max(0, $cpuNow - $cpuAtStart)
-        $measurementSeconds = if ($gameTimer) { [Math]::Min($Seconds,$gameTimer.Elapsed.TotalSeconds) } else { 0 }
-        $runOut | Add-Member -NotePropertyName process_cpu_seconds -NotePropertyValue $cpuSeconds -Force
-        $runOut | Add-Member -NotePropertyName cpu_utilization_cores -NotePropertyValue $(if ($measurementSeconds) { $cpuSeconds/$measurementSeconds } else { $null }) -Force
-        $runOut | Add-Member -NotePropertyName top_threads -NotePropertyValue $topThreads -Force
+        $runOut = & $Python -B tools/bench_report.py --internal-run $runDir --seconds $Seconds --workload $Workload | ConvertFrom-Json
         $runOut | Add-Member -NotePropertyName run -NotePropertyValue $i -Force
         $runOut | Add-Member -NotePropertyName measurement_start_present_index -NotePropertyValue $measurementStartFrame -Force
         $runOut | Add-Member -NotePropertyName elapsed_seconds -NotePropertyValue $timer.Elapsed.TotalSeconds -Force
@@ -361,7 +323,7 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
     $actualBuildDir = if (Test-Path "build/bench-$key-make/CMakeCache.txt") { "build/bench-$key-make" } else { $buildDir }
     $actualGenerator = 'unknown'
     if (Test-Path "$actualBuildDir/CMakeCache.txt") { $generatorLine = Select-String -Path "$actualBuildDir/CMakeCache.txt" -Pattern '^CMAKE_GENERATOR:INTERNAL=' | Select-Object -First 1; if ($generatorLine) { $actualGenerator = ($generatorLine.Line -split '=',2)[1] } }
-    $obj = [ordered]@{ identity=[ordered]@{ sha=$sha; branch=$branch; dirty=$dirty; dirty_diff_sha256=$dirtyHash; config_id=$cfg; config=$cfgSpec; binary_sha256=$binaryHash; label=$Label; runtime_env=$Env }; machine=$machine; environment=[ordered]@{ seconds=$Seconds; requested_runs=$Runs; replay='tools/input/to_gameplay.txt'; profile='frames-only'; profiler='none'; host_load_override=[bool]$AllowBusy; actual_build_generator=$actualGenerator; gpu_sampling=if ($gpuAvailable) {'nvidia-smi 500ms, measured window'} else {'unavailable'} }; runs=$runsOut }
+    $obj = [ordered]@{ identity=[ordered]@{ sha=$sha; branch=$branch; dirty=$dirty; dirty_diff_sha256=$dirtyHash; config_id=$cfg; config=$cfgSpec; binary_sha256=$binaryHash; label=$Label; runtime_env=$Env }; machine=$machine; environment=[ordered]@{ workload=$Workload; seconds=$Seconds; startup_timeout_seconds=$StartupTimeoutSeconds; requested_runs=$Runs; replay=if ($Workload -eq 'gameplay') {'tools/input/to_gameplay.txt'} else {'none (menu remains idle)'}; profile='frames-only'; profiler='none'; vsync='off (DXVK d3d9.presentInterval=0)'; host_load_override=[bool]$AllowBusy; actual_build_generator=$actualGenerator; gpu_sampling=if ($gpuAvailable) {'nvidia-smi 500ms, measured window'} else {'unavailable'} }; runs=$runsOut }
     $obj | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $resultDir 'result.json') -Encoding UTF8
     & $Python -B tools/bench_report.py --summary $resultDir
     Write-Host "Benchmark evidence: $resultDir"
