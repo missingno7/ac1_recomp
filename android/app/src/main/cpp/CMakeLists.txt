@@ -47,7 +47,7 @@ file(GLOB AC1_ANDROID_GENERATED CONFIGURE_DEPENDS
     "${AC1_GENERATED_DIR}/initial.c"
     "${AC1_GENERATED_DIR}/initial_*.c")
 set_source_files_properties(${AC1_ANDROID_GENERATED} TARGET_DIRECTORY ac1_runtime PROPERTIES
-    COMPILE_OPTIONS "-w;-fwrapv;-fno-strict-aliasing;-ffp-contract=off")
+    COMPILE_OPTIONS "-w;-fwrapv;-fno-strict-aliasing;-ffp-contract=off;$<$<STREQUAL:${AC1_GENERATED_DEBUG},lines>:-gline-tables-only>")
 
 # Keep one implementation of the PE loader, guest memory, dispatch and generated
 # functions. Only this small JNI adapter is Android-specific.

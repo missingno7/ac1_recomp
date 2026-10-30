@@ -32,6 +32,7 @@ add_library(ac1_runtime STATIC
   src/runtime/ac1_network.c
   src/runtime/ac1_files.c
   src/runtime/ac1_crypto.c
+  src/platform/ac1_gamepad.c
   src/runtime/guest_clock.c
   src/runtime/guest_memory.c
   src/runtime/pe32_loader.c
@@ -133,6 +134,19 @@ endif()
 if(NOT WIN32)
   target_link_libraries(ac1_runtime PUBLIC m)
 endif()
+# ~250 MB of generated C: full DWARF made the objects, archive and executable
+# several GB per build. Profilers only need function names and line tables.
+set(AC1_GENERATED_DEBUG "lines" CACHE STRING "Debug info for generated sources: lines or full")
+set_property(CACHE AC1_GENERATED_DEBUG PROPERTY STRINGS lines full)
+if(AC1_GENERATED_DEBUG STREQUAL "lines" AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+  if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    set(ac1_generated_debug_flag -gline-tables-only)
+  else()
+    set(ac1_generated_debug_flag -g1)
+  endif()
+  set_property(SOURCE ${AC1_GENERATED} ${AC1_BINK_GENERATED} TARGET_DIRECTORY ac1_runtime
+    APPEND PROPERTY COMPILE_OPTIONS ${ac1_generated_debug_flag})
+endif()
 if(NOT ANDROID)
   target_compile_definitions(ac1_runtime PRIVATE AC1_DEFAULT_USERDATA_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/work/userdata")
   add_executable(ac1_startup src/platform/main.c)
@@ -197,4 +211,13 @@ if(NOT ANDROID)
     target_compile_features(ac1_dinput8_state_contract PRIVATE cxx_std_17)
     target_link_libraries(ac1_dinput8_state_contract PRIVATE user32)
   endif()
+endif()
+
+# Thin archives reference the objects instead of copying them (the runtime
+# archive alone was 2.3 GB). Set last: enable_language(CXX) resets the rules.
+if(NOT MSVC)
+  foreach(lang C CXX)
+    set(CMAKE_${lang}_ARCHIVE_CREATE "<CMAKE_AR> qcT <TARGET> <LINK_FLAGS> <OBJECTS>")
+    set(CMAKE_${lang}_ARCHIVE_APPEND "<CMAKE_AR> qT <TARGET> <LINK_FLAGS> <OBJECTS>")
+  endforeach()
 endif()
