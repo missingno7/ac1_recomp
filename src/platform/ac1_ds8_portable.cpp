@@ -7,6 +7,7 @@
 #include "ac1_bink_native.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -75,6 +76,8 @@ std::recursive_mutex mutex;
 thread_local char error[256];
 uint32_t speaker = 4;
 bool output_active = false, output_paused = false;
+ac1_audio_stats statistics{}; // Protected by mutex, except the separate atomics below.
+std::atomic<uint64_t> render_calls{0}, requested_frames{0}, lock_misses{0};
 uint64_t visit = 0;
 const char *mixer_fault = nullptr; // Set on the audio thread; reported on guest service.
 struct BinkTrack {
@@ -388,9 +391,15 @@ extern "C" void ac1_audio_consume(uint64_t presented) {
 }
 extern "C" void ac1_audio_render(float *out, uint32_t count, uint32_t rate, uint64_t first,
                                  uint64_t presented) {
+    render_calls.fetch_add(1, std::memory_order_relaxed);
+    requested_frames.fetch_add(count, std::memory_order_relaxed);
     std::fill_n(out, size_t(count) * 2, 0.f);
     std::unique_lock<std::recursive_mutex> lock(mutex, std::try_to_lock);
-    if (!lock || !output_active || output_paused || !rate)
+    if (!lock) {
+        lock_misses.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (!output_active || output_paused || !rate)
         return;
     consume(presented);
     float master = 1;
@@ -427,6 +436,7 @@ extern "C" void ac1_audio_render(float *out, uint32_t count, uint32_t rate, uint
             float l = sample(b, a, 0), r = sample(b, a, 1);
             out[rendered * 2] += (l + (sample(b, next, 0) - l) * fraction) * left;
             out[rendered * 2 + 1] += (r + (sample(b, next, 1) - r) * fraction) * right;
+            ++statistics.ds_frames;
         }
         b.render_frame = start + rendered * step;
         if (rendered) {
@@ -453,8 +463,11 @@ extern "C" void ac1_audio_render(float *out, uint32_t count, uint32_t rate, uint
             for (uint32_t i = 0; i < count; ++i) {
                 double pos = (m.seconds + double(i) / rate) * v.rate;
                 uint64_t a = uint64_t(pos + 1e-7);
-                if (a >= v.submitted || v.submitted - a > capacity)
+                if (a >= v.submitted || v.submitted - a > capacity) {
+                    ++statistics.bink_underrun_frames;
                     continue; // underrun / late track
+                }
+                ++statistics.bink_frames;
                 uint64_t next = std::min(a + 1, v.submitted - 1);
                 float fraction = float(std::max(0., pos - double(a)));
                 for (unsigned ch = 0; ch < 2; ++ch) {
@@ -469,6 +482,17 @@ extern "C" void ac1_audio_render(float *out, uint32_t count, uint32_t rate, uint
     }
     for (size_t i = 0; i < size_t(count) * 2; ++i)
         out[i] = std::clamp(out[i] * master, -1.f, 1.f);
+    for (uint32_t i = 0; i < count; ++i)
+        if (out[i * 2] != 0.f || out[i * 2 + 1] != 0.f)
+            ++statistics.nonzero_frames;
+}
+extern "C" void ac1_audio_get_stats(ac1_audio_stats *stats) {
+    if (!stats) return;
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    *stats = statistics;
+    stats->render_calls = render_calls.load(std::memory_order_relaxed);
+    stats->requested_frames = requested_frames.load(std::memory_order_relaxed);
+    stats->lock_misses = lock_misses.load(std::memory_order_relaxed);
 }
 extern "C" int ac1_audio_bink_submit(uint32_t record, uint32_t track, const int16_t *pcm,
                                      size_t frames, uint32_t rate, uint32_t channels,
@@ -521,7 +545,14 @@ extern "C" int ac1_audio_bink_submit(uint32_t record, uint32_t track, const int1
         retired = std::max(retired, end);
     }
     if (end > retired && end - retired > uint64_t(rate) * 4) {
-        fail("Bink mixer queue exceeds four seconds; output is not consuming PCM");
+        char message[240];
+        std::snprintf(message, sizeof(message),
+            "Bink mixer queue exceeds four seconds: record=%08x track=%u rate=%u "
+            "chunk=%zu submitted=%llu retired=%llu end=%llu active=%u paused=%u",
+            record, track, rate, frames, (unsigned long long)v.submitted,
+            (unsigned long long)retired, (unsigned long long)end,
+            unsigned(output_active), unsigned(output_paused));
+        fail(message);
         return 0;
     }
     for (size_t i = 0; i < frames; ++i)
@@ -529,6 +560,7 @@ extern "C" int ac1_audio_bink_submit(uint32_t record, uint32_t track, const int1
             v.pcm[((v.submitted + i) % (uint64_t(rate) * 4)) * channels + c] =
                 pcm[i * channels + c];
     v.submitted = end;
+    statistics.bink_submitted_frames += frames;
     return 1;
 }
 extern "C" void ac1_audio_bink_control(uint32_t record, int event) {

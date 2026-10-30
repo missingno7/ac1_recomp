@@ -17,6 +17,14 @@ void ac1_audio_output_paused(int paused);
 void ac1_audio_consume(uint64_t consumed);
 void ac1_audio_render(float *stereo, uint32_t frames, uint32_t rate, uint64_t first_frame,
                       uint64_t consumed);
+/* Cumulative host-owned diagnostics. Voice frames count contributions before
+ * summation, not distinct output frames. Snapshot on a control thread only. */
+typedef struct ac1_audio_stats {
+    uint64_t render_calls, requested_frames, lock_misses;
+    uint64_t ds_frames, bink_frames, bink_underrun_frames, bink_submitted_frames;
+    uint64_t nonzero_frames;
+} ac1_audio_stats;
+void ac1_audio_get_stats(ac1_audio_stats *stats);
 /* Copies the whole native-endian s16 chunk; PTS starts at zero and must be
  * contiguous per (record, track). PCM has already had Bink volume applied.
  * Returns zero with ac1_ds8_last_error() on unsupported format/queue overflow.

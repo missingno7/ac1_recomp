@@ -14,12 +14,15 @@ std::mutex control;
 AAudioStream *stream;
 std::atomic<int32_t> stream_error{AAUDIO_OK};
 std::atomic<uint64_t> presented{0};
+std::atomic<uint64_t> rendered_public{0};
 std::atomic<bool> used_read_counter{false};
 uint64_t rendered; // Callback thread only, reset before requestStart.
 uint32_t device_rate;
 bool paused, wanted;
 bool reported_read_counter;
 std::chrono::steady_clock::time_point retry_at{};
+std::chrono::steady_clock::time_point report_at{};
+uint64_t generation;
 
 aaudio_data_callback_result_t pull(AAudioStream *s, void *, void *data, int32_t frames) {
     uint64_t consumed = presented.load(std::memory_order_relaxed);
@@ -44,16 +47,35 @@ aaudio_data_callback_result_t pull(AAudioStream *s, void *, void *data, int32_t 
     presented.store(consumed, std::memory_order_release);
     ac1_audio_render(static_cast<float *>(data), uint32_t(frames), device_rate, rendered, consumed);
     rendered += uint32_t(frames);
+    rendered_public.store(rendered, std::memory_order_release);
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 void error_callback(AAudioStream *, void *, aaudio_result_t error) {
     stream_error.store(error, std::memory_order_release);
+}
+void report(const char *reason) {
+    ac1_audio_stats stats{};
+    ac1_audio_get_stats(&stats);
+    uint64_t consumed = presented.load(std::memory_order_acquire);
+    uint64_t written = rendered_public.load(std::memory_order_acquire);
+    std::fprintf(stderr,
+        "AC1 AAudio stats: reason=%s stream=%llu callbacks=%llu requested=%llu "
+        "written=%llu consumed=%llu xruns=%d lock_misses=%llu ds_frames=%llu "
+        "bink_submitted=%llu bink_frames=%llu bink_underrun_frames=%llu nonzero_frames=%llu\n",
+        reason, (unsigned long long)generation, (unsigned long long)stats.render_calls,
+        (unsigned long long)stats.requested_frames, (unsigned long long)written,
+        (unsigned long long)consumed, stream ? AAudioStream_getXRunCount(stream) : 0,
+        (unsigned long long)stats.lock_misses, (unsigned long long)stats.ds_frames,
+        (unsigned long long)stats.bink_submitted_frames, (unsigned long long)stats.bink_frames,
+        (unsigned long long)stats.bink_underrun_frames, (unsigned long long)stats.nonzero_frames);
+    std::fflush(stderr); // Control thread only; never log from the data callback.
 }
 void close_stream() {
     if (!stream)
         return;
     // Mixer callbacks use try_lock; close cannot wait on a held bridge lock.
     AAudioStream_requestStop(stream);
+    report("stop");
     AAudioStream_close(stream); // Joins callbacks before state/PCM teardown.
     stream = nullptr;
     ac1_audio_consume(presented.load(std::memory_order_acquire));
@@ -75,6 +97,10 @@ void service() {
     }
     if (stream) {
         ac1_audio_consume(presented.load(std::memory_order_acquire));
+        if (now >= report_at) {
+            report("running");
+            report_at = now + std::chrono::seconds(10);
+        }
         return;
     }
     if (!wanted || paused || now < retry_at)
@@ -101,9 +127,11 @@ void service() {
     if (rc == AAUDIO_OK) {
         device_rate = uint32_t(AAudioStream_getSampleRate(stream));
         rendered = 0;
+        rendered_public.store(0);
         presented.store(0);
         stream_error.store(AAUDIO_OK);
         reported_read_counter = false;
+        used_read_counter.store(false);
         int32_t burst = AAudioStream_getFramesPerBurst(stream);
         if (burst > 0) {
             int32_t size = AAudioStream_setBufferSizeInFrames(stream, burst * 2);
@@ -121,6 +149,8 @@ void service() {
                      AAudio_convertResultToText(rc), rc);
         close_stream();
     } else {
+        ++generation;
+        report_at = now + std::chrono::seconds(10);
         std::fprintf(
             stderr, "AC1 AAudio: float stereo %u Hz, burst=%d, buffer=%d, low-latency=%s\n",
             device_rate, AAudioStream_getFramesPerBurst(stream),
@@ -138,6 +168,8 @@ extern "C" void ac1_audio_device_service() {
 extern "C" void ac1_audio_device_pause(int pause) {
     std::lock_guard<std::mutex> lock(control);
     paused = pause != 0;
+    std::fprintf(stderr, "AC1 AAudio lifecycle: %s\n", paused ? "paused" : "resumed");
+    std::fflush(stderr);
     if (paused) {
         // Close/flush instead of replaying stale queued audio on resume.
         ac1_audio_output_paused(1);

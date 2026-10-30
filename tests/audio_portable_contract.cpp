@@ -460,6 +460,33 @@ void unsupported() {
     assert(std::strstr(ac1_ds8_last_error(), "four seconds"));
     ac1_audio_bink_control(42, AC1_BINK_AUDIO_STOP);
 }
+void diagnostics() {
+    ac1_audio_stats before{}, after{};
+    ac1_audio_get_stats(&before);
+    uint32_t b = buffer(1000, 1, 16, 4);
+    const int16_t pcm[] = {8192, 8192, 8192, 8192};
+    upload(b, pcm, sizeof pcm);
+    start(b);
+    assert(ac1_audio_bink_submit(99, 0, pcm, 4, 1000, 1, 0));
+    auto mixed = render(8, 1000, head);
+    for (unsigned i = 0; i < 8; ++i)
+        near(mixed[i * 2], i < 4 ? .5f : .25f);
+    ac1_audio_get_stats(&after);
+    assert(after.render_calls == before.render_calls + 1);
+    assert(after.requested_frames == before.requested_frames + 8);
+    assert(after.lock_misses == before.lock_misses);
+    assert(after.ds_frames == before.ds_frames + 8);
+    assert(after.bink_submitted_frames == before.bink_submitted_frames + 4);
+    assert(after.bink_frames == before.bink_frames + 4);
+    assert(after.bink_underrun_frames == before.bink_underrun_frames + 4);
+    assert(after.nonzero_frames == before.nonzero_frames + 8);
+    // Taking a snapshot must not consume queued output or advance the play cursor.
+    uint32_t position = cursor(b);
+    ac1_audio_get_stats(&after);
+    assert(cursor(b) == position);
+    ac1_audio_bink_control(99, AC1_BINK_AUDIO_STOP);
+    close_buffer(b);
+}
 } // namespace
 int main() {
 #ifdef _WIN32
@@ -485,6 +512,7 @@ int main() {
     bink();
     unsupported();
     concurrency_and_fallback();
+    diagnostics();
     ac1_ds8_shutdown();
     std::puts("PASS audio "
               "consumption/notifications/PCM/gain/pan/rate/3D/Bink/snapshots/concurrency/fallback");
