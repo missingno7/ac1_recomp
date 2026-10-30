@@ -4,7 +4,15 @@ This repository builds and executes a statically translated portion of the origi
 
 Android preparation on `android-prep`: current runtime/platform/JNI ARM64 syntax checks and Java compilation pass; portable silent DS8 and keyboard/gamepad/touch/replay adapters are wired. No game-code build or device execution was performed. ARM64 FFmpeg archives and portable D3DX remain required; see the [current Android audit and post-benchmark commands](docs/android.md#current-preparation-android-prep-2026-10-29).
 
-## Current host checkpoint: first original image (loading screen)
+## hot-native gameplay experiment (2026-10-30)
+
+The original game reaches 3D tutorial gameplay unattended at 1280x720 in this worktree. Three fingerprint-pinned native leaves (matrix multiplication, plane/AABB classification and quaternion/vector transformation) preserve the full guest CPU and audited write sets. Each passed 200,000 supplemental synthetic comparisons in SSE2 and portable C and 10,000 live comparisons; ARM64 objects compile, with no device execution claimed.
+
+The 24 interleaved 60-second A/B timing runs show no demonstrated overall FPS win: all-on median FPS was 25.96 versus 26.77 off, with overlapping ranges and mixed p95/p99 results. Treat these as experimental options. Use `AC1_NATIVE_OVERRIDES=0` for the measured baseline, `1` for all overrides, or a comma-separated hexadecimal VA list; `AC1_NATIVE_VERIFY=10000` checks initial calls. The narrow adjacent-mapping CS repair from the parallel CS investigation is present on both sides of the final experiment.
+
+[Hot functions, ABI contracts, full A/B medians/spreads and private evidence paths](docs/hot-functions.md) document the results and commands. The checkpoints below are historical; native results do not verify Android gameplay.
+
+## Historical host checkpoint: first original image (loading screen)
 
 Original code now renders AC1's loading screen on Windows. The translated Bink DLL decodes `videos\LoadingScreen.bik`, and the game draws its progress bar over it through the D3D9 bridge on DXVK. Back-buffer captures show loading progress from 4% at present 4 to 81% at present 64, with 81 original draw calls by then. Evidence: `work/startup_first_image_loading.log` (SHA-256 `77EBD97228EEF25CD839F887B44240EFFD52C690A353E51DF7CCE4D3A6BE0412`) and `work/captures/present_000064.bmp`. This verifies sustained original rendering of the loading screen. Menu, input, audio playback and gameplay are not yet verified.
 

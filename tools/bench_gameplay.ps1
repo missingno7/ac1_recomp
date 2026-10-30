@@ -54,7 +54,7 @@ try {
     $sha = (& git rev-parse --short=12 HEAD).Trim()
     $branch = (& git branch --show-current).Trim()
     $dirtyHash = ''
-    if ($dirty) { $dirtyHash = (git diff --binary HEAD | & $Python -B -c "import sys,hashlib; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:12])").Trim() }
+    if ($dirty) { $dirtyHash = (git -c core.safecrlf=false diff --binary HEAD | & $Python -B -c "import sys,hashlib; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:12])").Trim() }
     $direct = if ($DirectMemory) { 'ON' } else { 'OFF' }
     $trace = if ($TraceEip) { 'ON' } else { 'OFF' }
     $inline = if ($ForceInline) { 'ON' } else { 'OFF' }

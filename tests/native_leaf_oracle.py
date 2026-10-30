@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--portable', action='store_true')
+    parser.add_argument('--partial-alias', action='store_true', help='stress overlapping late-read quaternion vectors')
     parser.add_argument('--cases', type=int, default=10000)
     parser.add_argument('--compiler', default='C:/msys64/mingw64/bin/gcc.exe')
     args = parser.parse_args()
@@ -75,12 +76,19 @@ int main(void){
   }
   ac1_native_invoke(&c,&binding_00653400,oracle_00653400);
   c.esp=0x10000+(rng()&15);
+#ifdef ORACLE_PARTIAL_ALIAS
+  unsigned ptrs[5]={0x28001,0x26000,0x27000,0x28000,0x28002};
+#else
   unsigned ptrs[5]={0x25000,0x26000,0x27000,0x28000,0x29000};
   if(i%5)ptrs[0]=ptrs[i%5]; /* out aliases q, v, scale or unit */
+#endif
   for(unsigned k=0;k<5;++k)wr32(c.esp+4+4*k,ptrs[k]);
   for(unsigned k=1;k<5;++k)for(unsigned j=0;j<4;++j){
     float f=((int)(rng()%20001)-10000)/1024.0f;wrss(ptrs[k]+4*j,f);
   }
+#ifdef ORACLE_PARTIAL_ALIAS
+  memset(memory+0x28000,0,64);
+#endif
   ac1_native_invoke(&c,&binding_0042EE70,oracle_0042EE70);
  }
  ac1_native_shutdown(); puts("native leaf differential oracle passed"); return 0;
@@ -89,6 +97,7 @@ int main(void){
     fixture = out/'fixture.c'; fixture.write_text(source, encoding='utf-8')
     exe = out/('portable.exe' if args.portable else 'sse2.exe')
     flags = ['-DAC1_NATIVE_PORTABLE'] if args.portable else []
+    if args.partial_alias: flags.append('-DORACLE_PARTIAL_ALIAS')
     subprocess.run([args.compiler, '-O2', '-g', '-DAC1_TRACE_EIP', '-DAC1_DIRECT_MEMORY',
                     '-ffp-contract=off', '-fno-strict-aliasing', '-I'+str(ROOT/'src/runtime'),
                     *flags, str(fixture), str(ROOT/'src/runtime/ac1_native.c'),
