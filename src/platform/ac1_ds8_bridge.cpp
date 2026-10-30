@@ -5,10 +5,14 @@
 #include <windows.h>
 #include <mmsystem.h>
 #include <dsound.h>
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -296,6 +300,35 @@ bool ensure_dsound_module()
         return false;
     }
     return true;
+}
+
+/* AC1_AUDIO_MUTE=1 (set by the unattended run/benchmark scripts) mutes this
+ * process's default session in the Windows mixer. Guest-visible DirectSound
+ * state, volumes and timing are untouched; only the speakers stay silent. */
+void mute_process_audio_session()
+{
+    static const GUID clsid_enumerator = {0xBCDE0395, 0xE52F, 0x467C, {0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E}};
+    static const GUID iid_enumerator = {0xA95664D2, 0x9614, 0x4F35, {0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6}};
+    static const GUID iid_session_manager = {0xBFA971F1, 0x4D5E, 0x40BB, {0x93, 0x5E, 0x96, 0x70, 0x39, 0xBF, 0xBE, 0xE4}};
+    const HRESULT init = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IMMDeviceEnumerator *enumerator = nullptr;
+    IMMDevice *device = nullptr;
+    IAudioSessionManager *manager = nullptr;
+    ISimpleAudioVolume *volume = nullptr;
+    HRESULT hr = CoCreateInstance(clsid_enumerator, nullptr, CLSCTX_ALL, iid_enumerator,
+                                  reinterpret_cast<void **>(&enumerator));
+    if (SUCCEEDED(hr)) hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    if (SUCCEEDED(hr)) hr = device->Activate(iid_session_manager, CLSCTX_ALL, nullptr,
+                                             reinterpret_cast<void **>(&manager));
+    if (SUCCEEDED(hr)) hr = manager->GetSimpleAudioVolume(nullptr, FALSE, &volume);
+    if (SUCCEEDED(hr)) hr = volume->SetMute(TRUE, nullptr);
+    std::fprintf(stderr, "AC1 audio: process session %s (AC1_AUDIO_MUTE, hr=0x%08lx)\n",
+                 SUCCEEDED(hr) ? "muted" : "NOT muted", static_cast<unsigned long>(hr));
+    if (volume) volume->Release();
+    if (manager) manager->Release();
+    if (device) device->Release();
+    if (enumerator) enumerator->Release();
+    if (init == S_OK || init == S_FALSE) CoUninitialize();
 }
 
 using DirectSoundCreate8Fn = HRESULT (WINAPI *)(LPCGUID, LPDIRECTSOUND8 *, LPUNKNOWN);
@@ -836,6 +869,8 @@ extern "C" int ac1_ds8_create8(uint32_t guid_address, uint32_t output_address,
     }
     const uint32_t guest_object = wrap_native(native, ObjectKind::Device);
     if (!guest_object) return AC1_DS8_ERROR;
+    const char *mute = std::getenv("AC1_AUDIO_MUTE");
+    if (mute && !std::strcmp(mute, "1")) mute_process_audio_session();
     *guest_output = guest_object;
     *result_out = static_cast<uint32_t>(result);
     return AC1_DS8_HANDLED;

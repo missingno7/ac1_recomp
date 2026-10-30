@@ -114,6 +114,7 @@ try {
         AC1_D3D9_FORCE_WINDOWED = '1'
         AC1_D3D9_LIBRARY = $Provider
         AC1_DISPATCH_LIMIT = '0'
+        AC1_AUDIO_MUTE = '1'  # unattended runs stay silent; -Env @{AC1_AUDIO_MUTE='0'} to listen
         AC1_INPUT_SCRIPT = $Script
         AC1_D3D9_CAPTURE_DIR = $CaptureDirectory
         AC1_D3D9_CAPTURE_EVERY = '100'

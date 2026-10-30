@@ -280,7 +280,7 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
         $envs = @{
             AC1_HIDE_FILES='videos\UBI_LOGO.bik;videos\Ubisoft_Presents.bik;videos\Warning_Disclaimer.bik;videos\DemoIntro.bik'
             AC1_D3D9_FORCE_WINDOWED='1'; AC1_D3D9_LIBRARY=(Resolve-Path work/d3d9_dxvk_probe/d3d9.dll).Path
-            AC1_DISPATCH_LIMIT='0'
+            AC1_DISPATCH_LIMIT='0'; AC1_AUDIO_MUTE='1'
             AC1_D3D9_CAPTURE_DIR=(Join-Path $runDir 'captures')
             AC1_D3D9_TRACE_FRAME='1'; AC1_PROFILE_FRAMES='0'; AC1_PROFILE='0'; AC1_D3D9_CAPTURE_EVERY=''; DXVK_LOG_PATH=$runDir
             AC1_FRAME_STATS=(Join-Path $runDir 'frame-stats.csv'); AC1_FRAME_STATS_FLUSH_FRAMES=[string]$FrameStatsFlushFrames; DXVK_CONFIG_FILE=$dxvkConfig
