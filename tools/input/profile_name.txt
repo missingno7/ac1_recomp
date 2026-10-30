@@ -1,0 +1,11 @@
+# Controller selected; PC name entry still consumes keyboard text events.
+at 0 pad connect
+at 0 mouse move 30 30
+at 200 tap RETURN 3
+at 400 tap RETURN 3
+# Altaïr4X, then correct X to 2 through the same path used by Android IME.
+at 500 text 0x0041 0x006c 0x0074 0x0061 0x00ef 0x0072 0x0034 0x0058
+at 520 textkey BACKSPACE
+at 530 text 0x0032
+# Present 600 is the review capture; Enter goes through the text-control queue.
+at 650 textkey ENTER

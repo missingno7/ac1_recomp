@@ -11,6 +11,8 @@ typedef struct ac1_input_message {
     uint32_t message, wparam, lparam;
     uint8_t keyboard[256]; /* VK state at this event, including modifiers. */
     int32_t x, y;
+    uint16_t text; /* ToUnicode result attached to this key event. */
+    uint8_t text_valid;
 } ac1_input_message;
 /* Pure parser/state interface, also used by the contract tests. */
 ac1_input_script *ac1_input_parse(const char *text, char *error, size_t capacity);
@@ -36,6 +38,13 @@ void ac1_input_cursor(int32_t *x, int32_t *y);
 void ac1_input_vk_state(uint8_t state[256]);
 /* UI-thread injection. DIK scan codes; ignored during scripted replay. */
 void ac1_input_physical_key(unsigned dik, int down);
+void ac1_input_physical_key_text(unsigned dik, int down, uint32_t codepoint);
+/* AC1 accepts CP1252 Latin letters/digits, space, plus and minus. UTF-16
+ * commits are atomic: 0 success, -1 unsupported, -2 queue full, -3 replay. */
+int ac1_input_text_supported(uint32_t codepoint);
+int ac1_input_commit_text(const uint16_t *text, size_t units);
+int ac1_input_text_key(unsigned vk); /* Backspace=8, Enter=13, Escape=27. */
+int ac1_input_text_translation(unsigned vk, uint16_t *text);
 void ac1_input_physical_mouse(int32_t dx, int32_t dy, int32_t wheel,
                               unsigned buttons);
 int ac1_input_physical_state(int keyboard, void *state, size_t size);

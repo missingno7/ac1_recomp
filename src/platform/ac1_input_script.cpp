@@ -175,7 +175,7 @@ int32_t signed_number(const std::string &s) {
         throw std::runtime_error("signed integer out of range: " + s);
     return static_cast<int32_t>(v);
 }
-enum Type { Key, Dik, Move, Button, MouseState, Wm, PadConnect, PadButton, PadStick, PadTrigger, PadRelease };
+enum Type { Key, Dik, Move, Button, MouseState, Wm, PadConnect, PadButton, PadStick, PadTrigger, PadRelease, Text };
 struct Event {
     uint64_t frame;
     Type type;
@@ -353,6 +353,24 @@ extern "C" ac1_input_script *ac1_input_parse(const char *text, char *error, size
                         throw std::runtime_error("invalid tap duration");
                     s->events.push_back({frame + duration, Key, static_cast<uint32_t>(k), 0});
                 }
+            } else if (command == "text") {
+                if (pos == t.size()) throw std::runtime_error("text requires UTF-16 code units (e.g. 0x41 0x62)");
+                size_t count=t.size()-pos;
+                if(count>256 || frame>UINT64_MAX-count*2)throw std::runtime_error("text exceeds 256 units or Present range");
+                uint64_t text_frame=frame;
+                while (pos < t.size()) {
+                    unsigned unit = unsigned(number(t[pos++],65535));
+                    if (!ac1_input_text_supported(unit)) throw std::runtime_error("text unit is outside AC1's CP1252 name repertoire");
+                    s->events.push_back({text_frame,Text,unit});text_frame+=2;
+                }
+            } else if (command == "textkey") {
+                need(1);
+                unsigned vk = t[pos] == "BACKSPACE" ? 8 : t[pos] == "ENTER" ? 13 : t[pos] == "ESCAPE" ? 27 : 0;
+                if (!vk) throw std::runtime_error("textkey expects BACKSPACE, ENTER or ESCAPE");
+                if(frame>UINT64_MAX-2)throw std::runtime_error("textkey Present overflow");
+                unsigned scan=vk==8?DIK_BACK:vk==13?DIK_RETURN:DIK_ESCAPE;
+                s->events.push_back({frame,Key,scan,0x80});
+                s->events.push_back({frame+2,Key,scan,0});
             } else if (command == "pad") {
                 if (pos == t.size()) throw std::runtime_error("missing pad command");
                 std::string sub = t[pos++];
@@ -475,6 +493,22 @@ void message(ac1_input_script *s, uint32_t m, uint32_t wp, uint32_t lp) {
     s->messages.push_back(v);
 }
 } // namespace
+extern "C" int ac1_input_text_supported(uint32_t c) {
+    // Matches the portable GetStringTypeW C1_ALPHA/DIGIT subset and the
+    // explicit space/plus/minus exceptions at 0077ffd7. Every accepted unit
+    // maps identically to a CP1252 byte; no best-fit or '?' substitution.
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') || c == ' ' || c == '+' || c == '-' ||
+        (c >= 0xc0 && c <= 0xff && c != 0xd7 && c != 0xf7);
+}
+namespace {
+void text_event(ac1_input_script *s, unsigned vk, uint16_t unit, bool supplied) {
+    message(s,WM_KEYDOWN,vk,1);
+    s->messages.back().text = unit; s->messages.back().text_valid = supplied;
+    message(s,WM_KEYUP,vk,0xc0000001u);
+    s->messages.back().text = unit; s->messages.back().text_valid = supplied;
+}
+}
 extern "C" void ac1_input_advance(ac1_input_script *s, uint64_t frame) {
     if (!s)
         return;
@@ -484,6 +518,7 @@ extern "C" void ac1_input_advance(ac1_input_script *s, uint64_t frame) {
         ac1_pad old_pad = s->pad;
         int old_connected = s->pad_connected;
         switch (e.type) {
+        case Text: text_event(s,0xe7,uint16_t(e.a),true); break; // VK_PACKET -> ToUnicode
         case PadConnect:
             s->pad_connected = e.a;
             s->pad = {};
@@ -594,6 +629,7 @@ bool initialized = false, failed = false;
 std::string failure;
 ac1_input_script *session = nullptr;
 ac1_input_script physical;
+uint64_t physical_text_next = 0;
 FILE *record = nullptr;
 uint64_t started = 0, last_frame = UINT64_MAX, recorded_keyboard_poll = 0, recorded_mouse_poll = 0;
 uint64_t recorded_keyboard_frame = UINT64_MAX, recorded_mouse_frame = UINT64_MAX;
@@ -615,8 +651,11 @@ void stamp(const std::string &command) {
     }
 }
 void tick() {
-    if (!session)
+    if (!session) {
+        ac1_input_advance(&physical,present());
+        if(physical.next==physical.events.size()){physical.events.clear();physical.next=0;}
         return;
+    }
     uint64_t f = present();
     size_t before = session->next;
     ac1_input_advance(session, f);
@@ -775,6 +814,7 @@ extern "C" void ac1_input_record_message(uint32_t m, uint32_t wp, uint32_t lp) {
 }
 extern "C" int ac1_input_next_message(ac1_input_message *m) {
     std::lock_guard<std::mutex> lock(session_mutex);
+    tick();
     return ac1_input_pop(session ? session : &physical, m);
 }
 extern "C" void ac1_input_cursor(int32_t *x, int32_t *y) {
@@ -787,11 +827,12 @@ extern "C" void ac1_input_vk_state(uint8_t *state) {
     std::lock_guard<std::mutex> lock(session_mutex);
     std::memcpy(state, dispatch ? dispatch->keyboard : (session ? session : &physical)->vk.data(), 256);
 }
-extern "C" void ac1_input_physical_key(unsigned dik, int down) {
+namespace {
+void physical_key(unsigned dik, int down, bool supplied, uint32_t codepoint) {
     std::lock_guard<std::mutex> lock(session_mutex);
     if (session || dik > 255) return;
     bool was = physical.keys[dik] != 0;
-    if (was == !!down) return;
+    if (was == !!down && !supplied) return;
     physical.keys[dik] = down ? 0x80 : 0;
     unsigned vk = ac1_input_key_vk(dik);
     vk_change(&physical, vk, down != 0);
@@ -799,9 +840,46 @@ extern "C" void ac1_input_physical_key(unsigned dik, int down) {
     if (vk == VK_LSHIFT || vk == VK_RSHIFT) wp = VK_SHIFT;
     if (vk == VK_LCONTROL || vk == VK_RCONTROL) wp = VK_CONTROL;
     if (vk == VK_LMENU || vk == VK_RMENU) wp = VK_MENU;
-    if (physical.messages.size() < 1024)
+    if (physical.messages.size() < 1024) {
         message(&physical, down ? WM_KEYDOWN : WM_KEYUP, wp,
                 ac1_input_key_lparam(dik, down, was));
+        physical.messages.back().text_valid = supplied;
+        physical.messages.back().text = ac1_input_text_supported(codepoint) ? uint16_t(codepoint) : 0;
+    }
+}
+}
+extern "C" void ac1_input_physical_key(unsigned dik, int down) { physical_key(dik,down,false,0); }
+extern "C" void ac1_input_physical_key_text(unsigned dik, int down, uint32_t cp) { physical_key(dik,down,true,cp); }
+extern "C" int ac1_input_commit_text(const uint16_t *text, size_t units) {
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if(session)return -3;
+    if((!text && units) || units > 256)return -1;
+    for(size_t i=0;i<units;++i)if(!ac1_input_text_supported(text[i]))return -1;
+    if(physical.messages.size()+(physical.events.size()-physical.next)*2+units*2>1024)return -2;
+    uint64_t frame=std::max(present(),physical_text_next);
+    for(size_t i=0;i<units;++i)physical.events.push_back({frame+i*2,Text,text[i]});
+    physical_text_next=frame+units*2;
+    return 0;
+}
+extern "C" int ac1_input_text_key(unsigned vk) {
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if(session)return -3;
+    if(vk!=8 && vk!=13 && vk!=27)return -1;
+    if(physical.messages.size()+(physical.events.size()-physical.next)*2+2>1024)return -2;
+    uint64_t frame=std::max(present(),physical_text_next);
+    unsigned scan=vk==8?DIK_BACK:vk==13?DIK_RETURN:DIK_ESCAPE;
+    physical.events.push_back({frame,Key,scan,0x80});
+    physical.events.push_back({frame+2,Key,scan,0});
+    physical_text_next=frame+3;return 0;
+}
+extern "C" int ac1_input_text_translation(unsigned vk, uint16_t *text) {
+    if(!dispatch || !dispatch->text_valid || dispatch->wparam!=vk ||
+       (dispatch->message!=WM_KEYDOWN && dispatch->message!=WM_KEYUP))return 0;
+    *text=dispatch->text;
+    if(std::getenv("AC1_TEXT_TRACE"))
+        std::fprintf(stderr,"AC1 text ToUnicode: message=%04x vk=%02x UTF16=%04x CP1252=%02x\n",
+                     dispatch->message,vk,*text,*text);
+    return 1;
 }
 extern "C" void ac1_input_physical_mouse(int32_t dx, int32_t dy, int32_t wheel, unsigned buttons) {
     std::lock_guard<std::mutex> lock(session_mutex);
@@ -820,13 +898,14 @@ extern "C" void ac1_input_physical_mouse(int32_t dx, int32_t dy, int32_t wheel, 
 extern "C" int ac1_input_physical_state(int keyboard,void *state,size_t size) {
     std::lock_guard<std::mutex> lock(session_mutex);
     if(!state || (keyboard ? size!=256 : size!=16 && size!=20))return -1;
+    tick();
     std::memcpy(state,keyboard?physical.keys.data():physical.mouse.data(),size);
     if(!keyboard)std::memset(physical.mouse.data(),0,12);
     return 1;
 }
 extern "C" void ac1_input_physical_reset(void) {
     std::lock_guard<std::mutex> lock(session_mutex);
-    physical = ac1_input_script{};
+    physical = ac1_input_script{};physical_text_next=0;
 }
 extern "C" const ac1_input_message *ac1_input_dispatch_state(const ac1_input_message *m) {
     const ac1_input_message *previous = dispatch;

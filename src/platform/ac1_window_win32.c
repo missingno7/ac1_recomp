@@ -461,6 +461,15 @@ int ac1_window_win32_call(ac1_window_win32 *ui, CPU *cpu,
         return_api(cpu, 4);
         return AC1_WINDOW_WIN32_HANDLED;
     }
+    if (!strcmp(name, "ToUnicode")) {
+        uint32_t args[6]; uint16_t text;
+        if (!guest_read(ui,cpu->esp+4,args,sizeof(args))) goto invalid_one;
+        if (ac1_input_text_translation(args[0],&text)) {
+            if (!args[4] || args[4] > 64 || (text && !guest_write(ui,args[3],&text,2))) goto invalid_one;
+            cpu->eax = text ? 1 : 0; return_api(cpu,24);
+            return AC1_WINDOW_WIN32_HANDLED;
+        }
+    }
     if (ac1_input_replaying() && !strcmp(name, "ToUnicode")) {
         uint32_t args[6];
         uint8_t keys[256];

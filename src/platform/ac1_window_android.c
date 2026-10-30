@@ -320,7 +320,12 @@ int ac1_window_win32_call(ac1_window_win32 *w, CPU *cpu, const char *name, uint3
         if (!wr(w, a[0], keys, 256))
             goto bad;
         result = 1;
-    } else if (IS("ToUnicode")) { // US text entry sufficient for the first-run profile name.
+    } else if (IS("ToUnicode")) {
+        uint16_t supplied;
+        if (ac1_input_text_translation(a[0],&supplied)) {
+            if (!a[4] || a[4]>64 || (supplied && !wr(w,a[3],&supplied,2))) goto bad;
+            return done(w,cpu,argc,supplied?1:0);
+        }
         uint8_t keys[256];
         if (!rd(w, a[2], keys, 256))
             goto bad;
