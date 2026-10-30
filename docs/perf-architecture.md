@@ -16,9 +16,11 @@ time. CPU ms/frame is quantized to ~0.98 ms. Now:
 
 * equivalence = complete window + identical replay command indices + a gross
   (33%) guest-time bound; screenshots are evidence only;
-* the decision uses per-run median main-thread cycles/frame and a Student-t
-  CI of the mean paired delta (a bootstrap of three same-sign deltas always
-  "excluded zero" in an A/A); mean frame time is reported beside it;
+* the decision uses per-run main-thread cycles/frame and a Student-t CI of
+  the mean paired delta (a bootstrap of three same-sign deltas always
+  "excluded zero" in an A/A); mean frame time is reported beside it. The
+  per-run statistic is the window mean since section 7 (the median can land
+  in different modes of the multimodal frame cost);
 * `AC1_FIXED_FRAME_HZ=30` (harness default) is a timedemo clock:
   GetTickCount, timeGetTime, QPC and GetSystemTimeAsFileTime advance exactly
   1/30 s per Present. Four of six A/A runs then rendered bit-identical frames;
@@ -71,6 +73,9 @@ shrinks 7,750 -> 5,049 -> 4,699 instructions with memory-base and locals.
 | memory-base -> + locals + x87 fast paths | 6 | -1.8% [-8.9%, +5.3%] (bimodal) | **-4.0%** [-7.0%, -1.0%] | 26.8 -> 28.4 |
 | -> + native x87 | 4 | **-10.6%** [-20.3%, -0.9%] | **-11.3%** [-17.6%, -4.9%] | 28.2 -> 31.0 |
 
+(Cycles in this table are per-run medians, the decision statistic at the
+time; section 7 re-evaluates them with window means: same conclusions.)
+
 Direct comparison, previous main `b4f4f8f` against the new default build
 (3 pairs): main-thread cycles/frame **-27.7%** [-41.4%, -14.0%], mean frame
 time **-28.0%** [-31.1%, -24.9%], **23.3 -> 32.9 FPS (+41.5%)**, p95 frame
@@ -106,21 +111,145 @@ functions and to AArch64, and each step was a small generator change. Native
 reconstruction reaches 7.9x on the same kernel, but no small set of
 subsystems dominates (top three regions 30-46%), and every region costs days
 of contract design and verification. The remaining gap on math kernels
-(274 vs 60 ticks/bone) is mostly the original program's own guest-stack
-traffic (73% of the cone's memory accesses are esp/ebp-relative), lane-wise
-SSE emulation, flags materialized at public exits and call-boundary state
-synchronization.
+after this step (274 vs 60 ticks/bone) was diagnosed in section 7: most of
+it was the representation of XMM registers, not the guest stack.
 
-## 7. Recommendation
+## 7. Second step: XMM values in host vector registers
 
-1. Keep native x87 as the default and harden it (Bink/MMX videos, longer
-   replays, AArch64 on the phone); fix lowering bugs rather than retreating.
-2. Next lifter step: promote proven-private guest stack slots to C locals
-   (the remaining guest-memory traffic) and keep x87 slots in locals across
-   basic blocks within a function; both reuse the CFG machinery of the
-   register-locals pass.
-3. Measure code-size levers explicitly: per-instruction EIP stores and inline
-   call accounting are diagnostics in the hot path, and code size has proven
-   worth more in-game than isolated timings suggest.
-4. Native reconstruction for kernels that remain >5x off after (2), starting
-   with pose propagation (prototype exists, 7.35x verified in game).
+The stack-slot hypothesis (73% of the cone's memory accesses are
+esp/ebp-relative) was checked against the assembly before building
+anything. On the first-step default (275 ticks/bone) the cone's profile was
+led by packed-SSE lines (addps 15%, mulps 10%, pslldq/psrldq 10%, sqrtps 4%),
+not by guest-stack accesses.
+
+**Cause 1: the XMM union of arrays.** GCC keeps an XMM local in a host
+register only while every access to it is vector-typed. The donor writes a
+packed op as four lane statements, `psrldq`/`pslldq` as 16-iteration byte
+loops, and scalar ops as in-place lane writes (`x.f64[0] = ...`). Any of
+these sends the local to the host stack, where lane stores followed by a
+16-byte reload fail store forwarding. The quaternion multiply `0042EE70`
+executed ~350 instructions for ~25 instructions of SSE work. Clang handles
+the lane form better (34 vs 14 AArch64 instructions in a test) but still
+pays for it.
+
+**Cause 2: EIP stores as alias barriers.** Every guest instruction stores
+its EIP through the CPU pointer, which under `-fno-strict-aliasing` may
+alias guest memory. GCC therefore cannot forward a guest-stack store to its
+reload in the next instruction (`movss [esp+58h],xmm1; fld [esp+58h]`,
+`fistp [esp+2Ch]; movzx eax,word [esp+2Ch]`, the original compiler's own
+spill/reload pairs); without the store it forwards them itself. `restrict`
+on the CPU pointer changes nothing: the pointer is passed to every callee,
+so GCC treats the CPU struct as escaped memory. (NFSU2 Web solved the same
+barrier by making guest memory a named object; AC1's arena is allocated at
+run time, so that is not available on PE.)
+
+Change (`tools/lift_ac1.py`, `tools/prepare_runtime.py`):
+
+* XMM has vector members (`vf32`, `vf64`, `vu32`, ...; `aligned(8)`, so the
+  CPU layout is unchanged). Packed arithmetic, sqrt/min/max, bitwise ops,
+  shuffles, unpacks, `movhlps`/`movlhps`, `pslldq`/`psrldq`, packed compares,
+  conversions and packed-integer add/sub/compare/shift/unpack are single
+  vector expressions. Every other lane access goes through the vector
+  members, and a lane write is a whole-vector assignment
+  (`x.vf64 = ac1_lane_vf64(x.vf64, 0, r)`).
+* Instructions whose only memory accesses are ESP- or frame-EBP-relative
+  (push/pop included) no longer record their EIP. Heap accesses, transfers,
+  `div`, function entries and the instruction after each call still do.
+  EIP stores fall from 3.36M to 2.42M. The fault handler now also prints the
+  host PC, which the build's symbols resolve to the exact generated line.
+
+Correctness: the cone is byte-identical to the first-step default on all
+19,202 records and both poison fills. A differential test
+(`tests/test_sse_vector_lowering.py`) runs 769 instruction forms x 4,096
+random and special-value states against the donor's lane lowering and
+compares the whole CPU. The only differences are NaN payloads in lanes of
+commutative ops where both inputs are NaN: C lets the compiler commute `+`
+and `*`, so neither lowering fixes the x86 rule (destination NaN wins). On
+100,000 such states the vector form matched the hardware and the lane form
+did not. All lowered forms also compile for AArch64 (NDK Clang 19). 108
+tests and the lifter self-test pass.
+
+Isolated cone (ticks per bone, mean of three rounds of per-record minima):
+
+| variant | ticks/bone | vs first step | x64 instructions | host-stack refs | AArch64 instructions |
+|---|---:|---:|---:|---:|---:|
+| first-step default | 275.3 | 1.00x | 3,564 | 307 | 3,228 |
+| + vector ops, in-place lane writes, stack-only EIP | 245.2 | 1.12x | 2,935 | 153 | 2,672 |
+| + whole-vector lane writes, every EIP kept | 177.2 | 1.55x | 3,060 | 100 | |
+| **+ stack-only EIP rule (new default)** | **159.6** | **1.72x** | **2,899** | **96** | **2,672** |
+| bound: no EIP stores at all | 140.1 | 1.96x | 2,753 | 113 | |
+| native C reconstruction | 60 | 4.6x | | | |
+
+Against the shipped translation (478) the cone is now 3.0x faster. Game
+build: `.text` 134.9 -> 127.3 MB (-5.7%), stripped executable 144.8 ->
+137.4 MB, generated C 630 -> 587 MB.
+
+Controlled gameplay comparison (first-step default `6a9ef73` against this
+step, eight interleaved pairs, fixed clock, CCD0, lock): main-thread
+cycles/frame **-5.0%** [-6.9%, -3.1%], mean frame time **-5.0%** [-6.9%,
+-3.1%], p95 frame time -9.1% [-14.9%, -3.3%], 32.4 -> 34.3 FPS (+5.3%
+[+3.2%, +7.5%]); B was faster in all eight pairs. No guest stop in the 16
+runs, and a run to Present 5062 (tutorial crowd, Animus loading) shows no
+stop or visual breakage. The kernel's 1.72x is ~5% of the game because
+SSE-heavy code was ~22% of main-thread CPU in the architecture study, and a
+quarter of the SSE instructions sit in functions without XMM locals (item 3
+below).
+
+This comparison exposed a harness defect: the adaptive decision used the
+per-run *median* of per-frame cycles. Per-frame cost here is multimodal
+(short and long frames alternate), and the median landed in different modes
+on the two sides: it reported +12.5% [+2.1%, +23.0%] while the window mean
+and the frame time both fell 5.0% in every pair (the presenting thread is
+100% busy, ~4.03 GHz of cycles per wall millisecond on both sides). The
+harness now decides on the window mean (total cycles / frames).
+Re-evaluated with it, the earlier comparisons keep their conclusions with
+tighter intervals: memory-base -14.1% [-19.1%, -9.1%], locals -3.5% [-6.4%,
+-0.5%] (previously inconclusive), native x87 -10.4% [-15.9%, -4.9%], old main
+to the first-step default -27.5% [-29.0%, -25.9%].
+
+What is left in the cone (exploratory profile): guest memory accessors
+(stack and heap) ~25%, `cvtsi2sd` merging into the previous register value
+~12% (a false dependency the original code has too), flags materialized
+only for function exits ~10% (`parity8` alone 4.5%), the x87 integer store
+~9%, calls and returns ~4%.
+
+## 8. Recommendation
+
+1. **Stack-slot promotion is now the next lifter step**, as hypothesized:
+   guest memory accessors lead the cone's profile, and GCC already forwards
+   stack values inside straight-line code. What it cannot do is delete the
+   stores or keep values across calls and joins. Scope (static census of
+   101,990 functions): 57% have explicit stack operands; 21% take a frame
+   address (`lea r,[esp/ebp+k]`), so the other 79% have no address-taken
+   frame slot apart from outgoing arguments and the argument slots callees
+   read. Start there: frame-relative slot tracking through push/pop/sub/add
+   and direct-callee stack cleanup, private slots as C locals, argument
+   slots materialized before calls.
+2. **ABI-aware call boundaries** (Pinyon Shift's ABI sync: -11-12% guest
+   instructions; XenonRecomp's non-volatile locals). A guest call is ~70
+   host instructions in the cone: accounting (slow-mode and dispatch-limit
+   checks, depth, last target), an out-of-line scheduler checkpoint after
+   every return (which also clobbers every caller-saved host register),
+   stores of every dirty GPR and every referenced XMM register, reloads of
+   all of them, and the return address pushed through `c->esp`. An inline
+   countdown in front of the checkpoint call is a small runtime change;
+   skipping callee-saved GPR reloads and treating XMM1-7 as dead at returns
+   needs an exception list (CRT EH/SEH prologs, `_chkstk`, `longjmp`) or a
+   preservation proof.
+3. **XMM locals in exception-frame functions.** 2,084 of the 9,022 SSE
+   functions (25% of SSE instructions) keep XMM state in memory because the
+   XMM pass refuses any function that touches `fs:`. They get the vector
+   operations but not register allocation; admitting them needs an argument
+   about unwinding through those frames.
+4. **FLAGABI without body duplication.** The existing opt-in mode copies
+   5,988 private bodies (+11% `.text`), which hides its gain; the cone still
+   pays ~10% for flags that only a function exit keeps alive.
+5. **x87 sticky status in a local.** Each `fist(p)` read-modify-writes
+   `c->fpu_sw` for PE and reloads the control word (~9% of the cone).
+6. Per-instruction EIP stores still cost ~12% of the cone (159.6 vs 140.1);
+   a diagnostics build could keep them and a performance build record EIP
+   only at calls, now that crash reports carry the host PC.
+7. Keep native x87 and the vector lowering under validation on AArch64
+   hardware, Bink/MMX videos and long play; fix lowering bugs rather than
+   retreating. Native reconstruction stays the tool for kernels that remain
+   far off (pose propagation: 2.7x from its native version).

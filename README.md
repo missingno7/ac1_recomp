@@ -24,6 +24,18 @@ fixture and gameplay to Present 5000; Bink/MMX videos, long play and AArch64
 hardware are not yet covered. Diagnosis, isolated results and the next step:
 [docs/perf-architecture.md](docs/perf-architecture.md).
 
+Second step: SSE registers stay in host vector registers. The XMM union has
+vector members; packed operations are single vector expressions, every lane
+access goes through the vector members, and lane writes are whole-vector
+assignments. Instructions whose only memory accesses are on the stack no
+longer record the guest EIP (its store through the CPU pointer blocked GCC's
+forwarding of stack spills); heap accesses, transfers, calls and function
+entries still do, and fault reports add the host PC. The pose kernel runs
+1.72x faster (275 -> 160 ticks/bone, byte-identical on 19,202 records); in
+gameplay main-thread cycles/frame and mean frame time fall 5.0% [-6.9%,
+-3.1%], 32.4 -> 34.3 FPS, eight of eight pairs. The benchmark now decides on
+window-mean cycles/frame; see the same document.
+
 ## Gamepad and Android touch controller (2026-10-30)
 
 The runtime now feeds AC1's original Xbox controller path from Windows XInput,
