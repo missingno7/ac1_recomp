@@ -190,7 +190,8 @@ cycles/frame **-5.0%** [-6.9%, -3.1%], mean frame time **-5.0%** [-6.9%,
 -3.1%], p95 frame time -9.1% [-14.9%, -3.3%], 32.4 -> 34.3 FPS (+5.3%
 [+3.2%, +7.5%]); B was faster in all eight pairs. No guest stop in the 16
 runs, and a run to Present 5062 (tutorial crowd, Animus loading) shows no
-stop or visual breakage. The kernel's 1.72x is ~5% of the game because
+stop or visual breakage; with the intro videos visible, Bink decodes clean
+frames to Present 1150. The kernel's 1.72x is ~5% of the game because
 SSE-heavy code was ~22% of main-thread CPU in the architecture study, and a
 quarter of the SSE instructions sit in functions without XMM locals (item 3
 below).
