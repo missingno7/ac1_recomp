@@ -92,7 +92,7 @@ def run(*, flag_liveness='off', local_regs='off', x87_inline=False):
         if lowering is None:
             raise RuntimeError(f"MMX probe did not lower: {ins.mnemonic} {ins.op_str}")
         body=f"void probe_{name}(CPU *c)\n{{\n    " + " ".join(lowering) + "\n}"
-        if local_regs=='all':body=lift.local_register_function(body)
+        if local_regs=='all':body=lift.local_xmm_function(lift.local_register_function(body))
         source += body+'\n'
         declarations.append(f"void probe_{name}(CPU *);")
         asm = ("movq %1, %%mm0\n\tmovq %2, %%mm1\n\tmovq %2, %%xmm0\n\t"
@@ -112,7 +112,7 @@ def run(*, flag_liveness='off', local_regs='off', x87_inline=False):
         if lowering is None:
             raise RuntimeError(f"state probe did not lower: {ins.mnemonic}")
         body=f"void probe_{name}(CPU *c)\n{{\n    " + " ".join(lowering) + "\n}"
-        if local_regs=='all':body=lift.local_register_function(body)
+        if local_regs=='all':body=lift.local_xmm_function(lift.local_register_function(body))
         source += body+'\n'
         declarations.append(f"void probe_{name}(CPU *);")
     mix_raw = bytes.fromhex("d9e8c3")
@@ -120,7 +120,7 @@ def run(*, flag_liveness='off', local_regs='off', x87_inline=False):
                 "instructions":[(0x600000,2),(0x600002,1)]}]}
     mix_body = lift.lift_exact_function(lifter,mix_spec,lambda va,n:mix_raw[va-0x600000:va-0x600000+n],X86_OP_IMM,X86_OP_MEM)
     mix_body=lift.flag_liveness_function(mix_body,flag_liveness)
-    if local_regs=='all':mix_body=lift.local_register_function(mix_body)
+    if local_regs=='all':mix_body=lift.local_xmm_function(lift.local_register_function(mix_body))
     source += "#define AC1_SET_GUEST_EIP(c,va) ((c)->eip=(va))\n" + mix_body
     declarations += ["void L_00600000(CPU *);", "void L_00834A90(CPU *);", "void L_1801E500(CPU *);"]
     (WORK / "ops.c").write_text(source)

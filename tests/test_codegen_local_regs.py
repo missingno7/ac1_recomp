@@ -35,6 +35,50 @@ class LocalRegisterTests(unittest.TestCase):
         run=subprocess.run([str(exe)],check=True,capture_output=True,text=True,timeout=30)
         self.assertIn('4096 dirty CFG full CPU and observer cases',run.stdout)
 
+    @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
+    def test_xmm_locals_match_full_cpu_at_calls_and_returns(self):
+        import test_codegen_flags as flags
+        source=flags.function(
+            'c->xmm[1] = c->xmm[0];',
+            '{ XMM _s = c->xmm[2]; XMM _d = c->xmm[1]; c->xmm[1].f32[0] = _d.f32[0] + _s.f32[0]; '
+            'c->xmm[1].f32[3] = _d.f32[3] * _s.f32[1]; }',
+            'AC1_CALL(c, L_00401100, 0x00401100u);',
+            'c->xmm[0].u32[1] ^= c->xmm[3].u32[2];',
+            'opaque(c);',
+            'if (c->eax & 1u) { c->esp += 4; return; }',
+            '{ uint32_t _ct = c->ecx; dispatch(c, _ct); }',
+            '{ uint64_t _lane = c->xmm[2].u64[1]; c->xmm[0].u64[0] = _lane; }',
+            'c->esp += 4; return;')
+        optimized=lift.local_xmm_function(source)
+        self.assertIn('XMM _ac1_xmm0 = c->xmm[0], _ac1_xmm1 = c->xmm[1]',optimized)
+        # Lane arithmetic uses the locals; the CPU copy is touched only at sync points.
+        self.assertNotRegex(optimized,r'c->xmm\[\d\]\.')
+        self.assertEqual(optimized.count('AC1_CALL('),1)
+        self.assertEqual(lift.local_xmm_function(source.replace('c->xmm[1] = c->xmm[0];',
+            'c->xmm[1] = c->xmm[c->ecx & 7u];')),source.replace('c->xmm[1] = c->xmm[0];',
+            'c->xmm[1] = c->xmm[c->ecx & 7u];'))   # dynamic index: unchanged
+        generated='#include "cpu.h"\n#define AC1_SET_GUEST_EIP(c,va) ((c)->eip=(va))\n'
+        generated+='void opaque(CPU *);\nvoid L_00401100(CPU *);\n'
+        generated+=source.replace('void L_00401000(','void plain_L_00401000(',1)+'\n'
+        generated+=optimized.replace('void L_00401000(','void local_L_00401000(',1)+'\n'
+        work=ROOT/'work/local-regs-tests';work.mkdir(parents=True,exist_ok=True)
+        path=work/'xmm.c';path.write_text(generated);exe=path.with_suffix('.exe')
+        subprocess.run(['gcc','-O2','-std=c11','-fwrapv','-fno-strict-aliasing',
+            '-I',str(lift.prepare_test_runtime()),str(path),str(ROOT/'tests/local_xmm_semantics.c'),
+            '-o',str(exe)],check=True,capture_output=True,timeout=60)
+        run=subprocess.run([str(exe)],check=True,capture_output=True,text=True,timeout=30)
+        self.assertIn('4096 XMM-local full CPU, call and return cases passed',run.stdout)
+
+    def test_xmm_free_helpers_cover_the_prepared_header(self):
+        header=(lift.prepare_test_runtime()/'cpu.h').read_text()
+        free=lift.xmm_free_helpers(header)
+        for name in ('push32','pop32','fst','fpush','sse_compare','flags_add_m','ac1_x87_integer','rdxm','wrxm'):
+            self.assertIn(name,free)
+        for name in ('AC1_CALL','dispatch','dispatch_jmp','RECOMP_TODO'):
+            self.assertNotIn(name,free)
+        with self.assertRaises(ValueError):
+            lift.xmm_free_helpers(header+'\nstatic inline void leak(CPU *c) { c->xmm[0].u32[0]=0; }\n')
+
     def test_flags_helpers_do_not_access_gprs(self):
         header = (lift.prepare_test_runtime() / 'cpu.h').read_text()
         count = 0

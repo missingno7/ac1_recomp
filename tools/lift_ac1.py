@@ -3741,6 +3741,51 @@ def local_register_function(body: str) -> str:
     return '\n'.join(output)
 
 
+def xmm_free_helpers(cpu_header: str) -> frozenset:
+    """Prepared CPU-header helpers never touch c->xmm; only guest calls can."""
+    names=set(re.findall(r'^(?:static inline|AC1_ACCESSOR_INLINE|AC1_X87_INTEGER_INLINE)\s+[^\n(]*?\b(\w+)\s*\(',cpu_header,re.M))
+    names|=set(re.findall(r'^#define\s+(\w+)\(',cpu_header,re.M))
+    if re.search(r'\bxmm\s*\[',re.sub(r'^\s*XMM\s+xmm\[8\];','',cpu_header,flags=re.M)):
+        raise ValueError('prepared CPU header accesses XMM state; audit the XMM-local sync points')
+    return frozenset((names|{'AC1_SET_GUEST_EIP'})-{'AC1_CALL','RECOMP_TODO'})
+
+
+_XMM_FREE_HELPERS = None
+
+
+def local_xmm_function(body: str) -> str:
+    """XMM locals: c->xmm[N] lives in a local, synced around guest calls and returns.
+
+    Generated code reads and writes XMM state only through literal c->xmm[N]
+    and through calls that run guest code; every header helper takes lane
+    values. Any other CPU-taking call is bracketed by a store and a reload.
+    """
+    global _XMM_FREE_HELPERS
+    if _XMM_FREE_HELPERS is None:
+        _XMM_FREE_HELPERS=xmm_free_helpers((ROOT/'src/runtime/cpu.h').read_text(encoding='utf-8'))
+    free=_XMM_FREE_HELPERS
+    if re.search(r'\b(?:fs|gs):|c->(?:fs|gs)\b|\b(?:seh|setjmp|longjmp)\b',body,re.I):return body
+    clean=re.sub(r'/\*.*?\*/','',body,flags=re.S)
+    if re.search(r'c->xmm(?!\[\d\])',clean):return body
+    idx=sorted({int(i) for i in re.findall(r'c->xmm\[(\d)\]',clean)})
+    if not idx:return body
+    call=re.compile(r'\b(\w+)\s*\(\s*c\s*[,)]');statement=re.compile(r'\b(\w+)\(c\b[^;]*\);')
+    if sum(m[1] not in free for m in call.finditer(clean))!=sum(m[1] not in free for m in statement.finditer(clean)):
+        return body
+    store=' '.join(f'c->xmm[{i}] = _ac1_xmm{i};' for i in idx)
+    load=' '.join(f'_ac1_xmm{i} = c->xmm[{i}];' for i in idx)
+    lines=body.splitlines()
+    if len(lines)<3 or lines[1]!='{' or lines[-1]!='}':raise ValueError('unexpected lifted function shape for XMM locals')
+    output=lines[:2]+['    XMM '+', '.join(f'_ac1_xmm{i} = c->xmm[{i}]' for i in idx)+';']
+    for line in lines[2:-1]:
+        code,separator,comment=line.partition('/*')
+        code=re.sub(r'c->xmm\[(\d)\]',r'_ac1_xmm\1',code)
+        code=statement.sub(lambda m:m[0] if m[1] in free else f'{{ {store} {m[0]} {load} }}',code)
+        code=re.sub(r'\breturn;',f'{{ {store} return; }}',code)
+        output.append(code+separator+comment)
+    return '\n'.join(output+[lines[-1]])
+
+
 def local_register_selection(selection: str, lifted: set[int]) -> set[int]:
     """Explicit per-function admission; malformed/unlifted entries fail closed."""
     if selection == 'off':
@@ -3938,17 +3983,19 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     elif flag_liveness != 'off':
         bodies = [flag_liveness_function(body, flag_liveness) for body in bodies]
     selected_locals = local_register_selection(local_regs, set(lifted))
-    local_count, local_excluded = 0, []
+    local_count, local_xmm_count, local_excluded = 0, 0, []
     for index, address in enumerate(lifted):
         if address in selected_locals:
-            transformed = local_register_function(bodies[index])
+            gprs = local_register_function(bodies[index])
+            transformed = local_xmm_function(gprs)
+            local_xmm_count += transformed != gprs
             if transformed != bodies[index]:
                 local_count += 1
             else:
                 local_excluded.append(f'0x{address:08X}')
             bodies[index] = transformed
             if address in abi_private:
-                abi_private[address] = local_register_function(abi_private[address])
+                abi_private[address] = local_xmm_function(local_register_function(abi_private[address]))
     for index, address in enumerate(lifted):
         if address in abi_private:
             bodies[index] += '\n\n' + abi_private[address]
@@ -4097,6 +4144,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "native_overrides": [f"0x{a:08X}" for a in sorted(bindings)],
         "flag_abi": abi_report,
         'local_regs': {'requested': local_regs, 'admitted_count': local_count,
+                       'xmm_admitted_count': local_xmm_count,
                        'excluded_functions': local_excluded},
     }
 
