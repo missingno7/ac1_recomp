@@ -42,6 +42,9 @@ void ac1_profile_wait_end(uint64_t start);
 void ac1_profile_handoff(ac1_handoff_cause cause);
 void ac1_profile_transfer(uint64_t nanoseconds);
 void ac1_profile_present(void);
+/* Only explicitly count-instrumented generated functions call this. Normal
+ * generated code has no call or enable test. Never use that build for timing. */
+void ac1_profile_entry(uint32_t target);
 #ifdef __cplusplus
 }
 #endif

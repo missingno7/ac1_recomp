@@ -31,6 +31,32 @@ void ac1_native_shutdown(void);
 void ac1_native_invoke(CPU *, ac1_native_binding *, void (*translated)(CPU *));
 void ac1_native_add_range(ac1_native_plan *, uint32_t, size_t);
 
+/* A region stops at an audited boundary BEFORE any external effect. The
+ * continuation executes that effect/epilogue once, after differential checking.
+ * The generator pins every member's recovered instructions and emits closed,
+ * private translated oracles; unresolved transfers fail before host dispatch. */
+typedef struct {
+    uint32_t kind, device, first, count, data, bytes;
+} ac1_pending_upload;
+typedef struct {
+    ac1_native_plan writes;
+    void *context;
+    size_t context_size;
+} ac1_region_plan;
+typedef struct {
+    uint32_t va, boundary;
+    const char *name;
+    size_t context_size;
+    int (*prepare)(const CPU *, ac1_region_plan *);
+    void (*body)(CPU *, const ac1_region_plan *);
+    void (*pending)(const CPU *, ac1_pending_upload *);
+    int enabled;
+    uint64_t calls, checked, fallbacks;
+} ac1_native_region;
+void ac1_native_region_invoke(CPU *, ac1_native_region *, void (*translated)(CPU *),
+                              void (*oracle)(CPU *), void (*continuation)(CPU *));
+void ac1_native_region_forbidden(CPU *, uint32_t target);
+
 /* Implementations and their plans live in ac1_native_leaf.c. The lifter emits
  * bindings from config and checks the hash of every recovered instruction. */
 #endif

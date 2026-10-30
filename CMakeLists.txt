@@ -29,6 +29,8 @@ add_library(ac1_runtime STATIC
   src/runtime/ac1_profile.c
   src/runtime/ac1_native.c
   src/runtime/ac1_native_leaf.c
+  src/runtime/ac1_palette.c
+  src/runtime/ac1_region_journal.c
   src/runtime/ac1_network.c
   src/runtime/ac1_files.c
   src/runtime/ac1_crypto.c
@@ -169,7 +171,7 @@ if(NOT ANDROID)
     tests/ac1_profile_int_fixture.c)
   target_include_directories(ac1_profile_int_contract PRIVATE src/runtime)
   add_executable(ac1_native_contract EXCLUDE_FROM_ALL
-    tests/native_contract.c src/runtime/ac1_native.c)
+    tests/native_contract.c src/runtime/ac1_native.c src/runtime/ac1_native_registry_empty.c)
   target_include_directories(ac1_native_contract PRIVATE src/runtime)
   if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ac1_native_contract PRIVATE -UNDEBUG)

@@ -11,6 +11,8 @@ param(
     [ValidateSet('off', 'straight', 'cfg', 'abi')][string]$FlagLiveness = 'cfg',
     [string]$LocalRegs = 'off',
     [switch]$X87Inline,
+    # Dedicated count build only; default generated code has zero count hooks.
+    [string]$ProfileCountEntries = '',
     # Checked per-access guest memory (diagnosable bad pointers) instead of the direct arena.
     [switch]$CheckedMemory,
     [string]$GameExe = 'C:\Program Files (x86)\GOG.com\Assassins Creed\AssassinsCreed_Dx9.exe',
@@ -38,12 +40,14 @@ try {
                 $Report.generation_input_sha256.emission_cache -ne $EmissionCacheHash -or
                 $Report.flag_liveness -ne $FlagLiveness -or
                 $Report.local_regs.requested -ne $LocalRegs
+            $CountEntries = @($ProfileCountEntries.Split(',') | Where-Object { $_ } | ForEach-Object { ([Convert]::ToUInt32($_,16)).ToString('X8') } | Sort-Object -Unique)
+            if ((@($Report.profile_count_entries) -join ',') -ne ($CountEntries -join ',')) { $NeedGenerate = $true }
         }
     }
     if ($NeedGenerate) {
         & $Python -B tools/analyze_pe.py
         if ($LASTEXITCODE -ne 0) { throw 'PE analysis failed' }
-        & $Python -B tools/lift_ac1.py --flag-liveness $FlagLiveness --local-regs $LocalRegs
+        & $Python -B tools/lift_ac1.py --flag-liveness $FlagLiveness --local-regs $LocalRegs "--profile-count-entries=$ProfileCountEntries"
         if ($LASTEXITCODE -ne 0) { throw 'AC1 generation failed' }
     }
     & $Python -B tools/prepare_runtime.py
