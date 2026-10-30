@@ -399,8 +399,59 @@ static int prepare_guest_thread(ac1_guest_thread *thread)
     return 1;
 }
 
+#ifdef __ANDROID__
+/* Android parked the guest baton threads on slow cores: on an S24 Ultra the
+ * CPU-bound main guest thread averaged 1.77 GHz while its prime core runs at
+ * 3.4 GHz. Restrict guest threads to high-capacity CPUs. AC1_CPU_AFFINITY:
+ * big (default, >= 80% of the largest cpu_capacity), prime, all, or hex mask. */
+static void android_pin_guest_thread(void)
+{
+    static cpu_set_t chosen;
+    static int state; /* 0 unresolved, 1 pin, -1 leave unchanged */
+    if (!state) {
+        const char *setting = getenv("AC1_CPU_AFFINITY");
+        if (!setting || !*setting) setting = "big";
+        CPU_ZERO(&chosen);
+        if (!strcmp(setting, "all")) {
+            state = -1;
+        } else if (strcmp(setting, "big") && strcmp(setting, "prime")) {
+            unsigned long long mask = strtoull(setting, NULL, 16);
+            for (int cpu = 0; cpu < 64 && cpu < CPU_SETSIZE; ++cpu)
+                if (mask >> cpu & 1ull) CPU_SET(cpu, &chosen);
+        } else {
+            unsigned capacity[64] = {0}, best = 0;
+            for (int cpu = 0; cpu < 64; ++cpu) {
+                char path[96];
+                snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpu_capacity", cpu);
+                FILE *file = fopen(path, "r");
+                if (!file) continue;
+                if (fscanf(file, "%u", &capacity[cpu]) != 1) capacity[cpu] = 0;
+                fclose(file);
+                if (capacity[cpu] > best) best = capacity[cpu];
+            }
+            int prime = !strcmp(setting, "prime");
+            for (int cpu = 0; cpu < 64 && cpu < CPU_SETSIZE; ++cpu)
+                if (best && capacity[cpu] &&
+                    (prime ? capacity[cpu] == best : capacity[cpu] * 5u >= best * 4u))
+                    CPU_SET(cpu, &chosen);
+        }
+        if (!state) state = CPU_COUNT(&chosen) ? 1 : -1;
+        unsigned long long shown = 0;
+        for (int cpu = 0; cpu < 64 && cpu < CPU_SETSIZE; ++cpu)
+            if (CPU_ISSET(cpu, &chosen)) shown |= 1ull << cpu;
+        fprintf(stderr, "AC1 guest CPU affinity: %s mask=0x%llx%s\n", setting, shown,
+                state > 0 ? "" : " (unchanged)");
+    }
+    if (state > 0 && sched_setaffinity(0, sizeof(chosen), &chosen) != 0)
+        fprintf(stderr, "AC1 guest CPU affinity failed: %s\n", strerror(errno));
+}
+#endif
+
 static void run_guest_thread(ac1_guest_thread *thread)
 {
+#ifdef __ANDROID__
+    android_pin_guest_thread();
+#endif
     ac1_scheduler *scheduler = thread->scheduler;
     ac1_profile_guest(thread->slot, thread->id, &thread->cpu.eip, &scheduler->owner);
     scheduler_lock(scheduler);
@@ -7270,6 +7321,9 @@ int ac1_run(const char *exe_path)
         return 2;
     }
     lock_ac1_run();
+#ifdef __ANDROID__
+    android_pin_guest_thread(); /* the caller's thread runs the main guest thread */
+#endif
     reset_main_lifted_lookup_cache();
     build_lifted_line_index();
     dispatch_limit = read_dispatch_limit();
