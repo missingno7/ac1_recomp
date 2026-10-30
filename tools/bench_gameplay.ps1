@@ -248,6 +248,7 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
         $runsOut += $runOut
     }
     $actualBuildDir = if (Test-Path "build/bench-$key-make/CMakeCache.txt") { "build/bench-$key-make" } else { $buildDir }
+    if ($Binary) { $actualBuildDir = Split-Path -Parent $Binary }
     $actualGenerator = 'unknown'
     if (Test-Path "$actualBuildDir/CMakeCache.txt") { $generatorLine = Select-String -Path "$actualBuildDir/CMakeCache.txt" -Pattern '^CMAKE_GENERATOR:INTERNAL=' | Select-Object -First 1; if ($generatorLine) { $actualGenerator = ($generatorLine.Line -split '=',2)[1] } }
     $obj = [ordered]@{ identity=[ordered]@{ sha=$sha; branch=$branch; dirty=$dirty; dirty_diff_sha256=$dirtyHash; config_id=$cfg; config=$cfgSpec; binary_sha256=$binaryHash; label=$Label; runtime_env=$Env }; machine=$machine; environment=[ordered]@{ seconds=$Seconds; requested_runs=$Runs; replay='tools/input/to_gameplay.txt'; profile='frames-only'; profiler='none'; actual_build_generator=$actualGenerator; gpu_sampling=if ($gpuAvailable) {'nvidia-smi 500ms, measured window'} else {'unavailable'} }; runs=$runsOut }

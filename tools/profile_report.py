@@ -167,6 +167,7 @@ def main():
     guest_entries = sorted({int(m.group(1), 16) for n in names if (m := GUEST.search(n))})
     modules, symbols, categories, guest_functions = Counter(), Counter(), Counter(), Counter()
     exclusive = Counter()
+    exclusive_threads = defaultdict(Counter)
     external_exports = Counter()
     by_thread = defaultdict(Counter)
     module_threads, symbol_threads, category_threads, guest_threads = (defaultdict(Counter) for _ in range(4))
@@ -219,7 +220,10 @@ def main():
                 index = bisect.bisect_right(rvas, rip-mod["base"])-1
                 name = names[index] if index >= 0 else "[unknown exe address]"
                 symbols[name] += 1; categories[category(name)] += 1
-                if match := GUEST.search(name): exclusive[int(match.group(1), 16)] += 1
+                if match := GUEST.search(name):
+                    address = int(match.group(1), 16)
+                    exclusive[address] += 1
+                    exclusive_threads[tid][address] += 1
                 symbol_threads[tid][name] += 1; category_threads[tid][category(name)] += 1
             else:
                 categories["external: "+modname] += 1
@@ -276,6 +280,10 @@ def main():
     add_top("Exe symbols (% of exe CPU-active samples)", symbols, sum(symbols.values()))
     add_top("Exclusive guest bodies (% of ALL CPU-active samples; helpers excluded, no stack inference)", exclusive, total,
             render=lambda a: f"0x{a:08X} L_{a:08X}")
+    if bounds and total:
+        all_cpu_ms = sum(max(0, cpu_after.get(tid, 0)-cpu_before.get(tid, 0)) for tid in cpu_after)/10000
+        add_cpu_top("Exclusive guest bodies (OS CPU-time weighted; % of all measured thread CPU)",
+                    exclusive_threads, all_cpu_ms, render=lambda a: f"0x{a:08X} L_{a:08X}")
     add_top("Guest entries including helper/import samples (% of attributed guest-thread CPU-active samples)", guest_functions, sum(guest_functions.values()), render=lambda a: f"0x{a:08X} L_{a:08X}")
     if bounds and total:
         add_cpu_top("Guest entries including helpers (OS CPU-time weighted sample mix)", guest_threads, render=lambda a: f"0x{a:08X} L_{a:08X}")
@@ -327,12 +335,20 @@ def main():
     report = "\n".join(lines)+"\n"
     if args.output: args.output.write_text(report, encoding="utf-8")
     if args.json_output:
+        weighted = cpu_estimates(exclusive_threads)
+        cpu_total_ms = sum(max(0, cpu_after.get(tid, 0)-cpu_before.get(tid, 0)) for tid in cpu_after)/10000
         args.json_output.write_text(json.dumps({
             "pid": latest["pid"], "run_start": latest["run_start"],
             "from_seconds": (low-origin)/hz, "seconds": elapsed,
             "active_samples": total, "categories": dict(categories),
+            "cpu_total_ms": cpu_total_ms,
+            "categories_cpu_weighted": {name: 100*ms/max(cpu_total_ms,1)
+                                        for name, ms in cpu_estimates(category_threads).most_common()},
             "exclusive_guest": [{"va": f"0x{a:08X}", "samples": n, "percent": 100*n/max(total,1)}
                                 for a, n in exclusive.most_common()],
+            "exclusive_guest_cpu_weighted": [{"va": f"0x{a:08X}", "estimated_ms": ms,
+                                               "percent": 100*ms/max(cpu_total_ms,1)}
+                                              for a, ms in weighted.most_common()],
             "symbols": dict(symbols), "guest_attributed": {f"0x{a:08X}": n for a, n in guest_functions.items()},
         }, indent=2)+"\n", encoding="utf-8")
     print(report, end="")
