@@ -1,6 +1,40 @@
 # Android D3D9 renderer foundation
 
-## Current host checkpoint
+## Current rendering and migration checkpoint (2026-10-30)
+
+Host DXVK 3.1 renders the tutorial's ground, buildings, shadows, characters,
+HUD and video panel (`work/merge3_run/captures/present_002800.bmp` and
+`present_003400.bmp`). The same replay on the physical Galaxy S24 Ultra with
+the existing Android DXVK Native 1.9.2b provider renders characters and HUD,
+but lacks the environment/shadows and shows a black tutorial video panel
+(`work/phone/run6-shot.png`). The x86_64 emulator capture
+`work/emu2/gameplay-verified.png` has ground, shadows and a working panel.
+This narrows the old-provider failure to ARM64 or the phone's driver/capabilities;
+it does not identify a proven rendering root cause. The phone's existing
+startup/logcat evidence contains no Vulkan shader/pipeline creation errors.
+
+The requested migration target is upstream DXVK 3.1, pinned to
+`70d7508c01201ed3d4bfb33da42ba834eafe3857`. A real-device NDK capability probe
+found that the proprietary Adreno 750 driver lacks `VK_KHR_maintenance5`,
+`VK_KHR_maintenance6` and `VK_KHR_load_store_op_none`; both maintenance feature
+bits are zero. Vulkan 1.3.128, 256-byte push constants and all queried mandatory
+core feature bits are present. The EXT load/store variant does not satisfy
+upstream's KHR-extension check. These are genuine requirements in the
+[pinned device compatibility code](https://github.com/doitsujin/dxvk/blob/70d7508c01201ed3d4bfb33da42ba834eafe3857/src/dxvk/dxvk_device_info.cpp).
+Raw evidence is `work/render/vulkan-probe/capabilities.txt`; reproduce with
+`ports/dxvk_android/probe.ps1 -Serial <adb-serial>`.
+
+DXVK 3.1 is not yet ported or verified on the phone. App-local Mesa Turnip via
+libadrenotools is the proposed alternative; its capabilities must be measured
+through the imported loader. See the [renderer migration notes](../ports/dxvk_android/README.md).
+The existing 1.9.2b build remains available. World geometry and video are still
+open issues; no successful fix or new-provider FPS result is claimed.
+
+Opt-in `AC1_D3D9_TRACE_CAPS=1` bridge diagnostics log CheckDeviceFormat requests
+and results, the complete adapter caps payload, and vertex declaration elements.
+They do not change reported capabilities or resource creation behavior.
+
+## Historical initial host checkpoint
 
 The current host trace, exact stop, and fingerprint are maintained in the [README checkpoint](../README.md). The host graphics path has passed native device creation, shader and texture initialization, all 460 D3DX constant-table calls, monitor enumeration, and `TestCooperativeLevel`. Original code has made a successful native `Present` with zero recorded draws. No rendered game image or menu is verified; the latest verification run failed earlier at device creation, as recorded in the README.
 
