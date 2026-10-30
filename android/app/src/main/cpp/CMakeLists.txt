@@ -32,6 +32,7 @@ target_sources(ac1_runtime PRIVATE
     "${AC1_ROOT}/src/graphics/ac1_d3d9_bridge.cpp"
     "${AC1_ROOT}/src/platform/ac1_audio_win32.c"
     "${AC1_ROOT}/src/platform/ac1_ds8_portable.cpp"
+    "${AC1_ROOT}/src/platform/ac1_audio_aaudio.cpp"
     "${AC1_ROOT}/src/platform/ac1_dinput8_portable.cpp"
     "${AC1_ROOT}/src/platform/ac1_input_script.cpp"
     "${AC1_ROOT}/src/platform/ac1_window_android.c")
@@ -54,4 +55,4 @@ target_compile_options(ac1_android PRIVATE -Wall -Wextra)
 add_library(ac1_dxvk_android SHARED IMPORTED GLOBAL)
 set_target_properties(ac1_dxvk_android PROPERTIES
     IMPORTED_LOCATION "${AC1_DXVK_ANDROID_LIBRARY}")
-target_link_libraries(ac1_android PRIVATE ac1_runtime ac1_dxvk_android android log dl vulkan)
+target_link_libraries(ac1_android PRIVATE ac1_runtime ac1_dxvk_android android log dl vulkan aaudio)

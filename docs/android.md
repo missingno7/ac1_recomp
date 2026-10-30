@@ -18,7 +18,8 @@ the original animated menu and **Press Any Key To Continue**. Its private trace
 is `final-title-startup.log` (including `present=350`, line 12047). There is no
 guest stop or DirectSound failure in that capture. `smoke-manifest.json` under
 `work/emu/` fingerprints the local APK, source changes and evidence.
-Sound remains explicitly silent, and this is not ARM64 phone/gameplay evidence.
+That captured APK used silent audio; the AAudio implementation below has host
+contract and NDK syntax evidence only. This is not ARM64 phone/gameplay evidence.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/build_android.ps1 -Abi x86_64 -Jobs 12
@@ -218,9 +219,10 @@ rendering, title screen, audible output or Android hardware execution.
 
 | Windows dependency | Android before this pass | Android now / remaining work |
 | --- | --- | --- |
-| DSOUND ordinal 2 enumeration / ordinal 11 Create8 | Both runtime routes excluded | One explicitly silent default output. Existing DS8 callback/token interface reaches portable device/buffer/Buffer8/3D/listener/notify proxies. |
-| DS8 samples, locks, Play/Stop/cursors | System32 COM only | Shared guest PCM storage, wrap locks, monotonic sample-rate/frequency cursors, loop/nonloop completion, volume/pan storage, duplicate lifetime. PCM mono/stereo 8/16-bit only; FX and other profiles diagnose unsupported slots. **No AAudio/mixer/output yet.** |
-| DS8 3D and notifications | Native Windows interfaces / HANDLE events | 3D values and deferred commit stored, no spatialization. Notification crossings/stop signal guest events under the scheduler baton, with a 10 ms wake when all guests wait. Invalid/closed events diagnose failure. No audio worker. |
+| DSOUND ordinal 2 enumeration / ordinal 11 Create8 | Both runtime routes excluded | One default AAudio output. Existing DS8 callback/token interface reaches portable device/buffer/Buffer8/3D/listener/notify proxies. Device open failure logs the AAudio error and selects the clock fallback, with retry. |
+| DS8 samples, locks, Play/Stop/cursors | System32 COM only | Host PCM snapshots shared by duplicates, updated at Unlock; linear resampling of mono/stereo PCM 8/16-bit, frequency, volume/pan and primary gain, loop/one-shot completion. Guest cursors follow presented output spans (AAudio hardware timestamps, downstream FramesRead if unavailable); no independent clock while output runs. Clock fallback remains without a device. Unsupported formats/flags diagnose failure. |
+| DS8 3D and notifications | Native Windows interfaces / HANDLE events | Listener position/orientation, source position, min/max distance, rolloff, head-relative/disabled mode and mute-at-max attenuation/pan, including deferred commit. Cone/Doppler acoustics remain unapplied. Audio callbacks only mark crossings/stop; guest service signals events under the scheduler baton, with a 10 ms wake when all guests wait. Invalid/closed events diagnose failure. |
+| Audio output / lifecycle | No portable output | API29+ AAudio shared low-latency float stereo at device rate; two-burst target buffer. Callback uses host PCM only, no guest memory or event callbacks; lock contention emits silence without moving voices. Control-thread service reopens disconnected streams, retrying failures. Activity pause closes/flushes output and freezes cursors; resume reopens it. **No device audio verification yet.** |
 | DirectInput8 | System32 COM; runtime route excluded | Canonical W keyboard (256 bytes), relative mouse (16/20 bytes), enumeration, acquire/unacquire, format/cooperative level and state. Touch holds Enter; keyboard/gamepad map to DIK/mouse. Buffered/custom/force-feedback interfaces remain unsupported. XInput itself still reports DEVICE_NOT_CONNECTED. |
 | Input script / recording | Windows headers/layout/clock; excluded | Same parser, successful-Present clock and poll ordinals; static US DIK-to-VK mapping and WndProc event snapshots. `input_script` extra sets `AC1_INPUT_SCRIPT`; bad files remain fatal. Android launcher disables recording. |
 | USER32 window/message loop / HWND | Surface-to-DXVK existed; guest USER32 missing | Single guest HWND resolved to JNI's DXVK HWND. Class registration, CREATESTRUCT/WM_NCCREATE/WM_CREATE, activation, Peek/Dispatch/DefWindowProc, rectangles, cursor/keyboard state, US text entry and destruction implemented. Metrics outside the subset stop. No multiwindow/monitor enumeration. SystemParametersInfoA GET still reports ERROR_CALL_NOT_IMPLEMENTED; accessibility SET stays guest-local. Desktop hooks remain unavailable. |
@@ -230,13 +232,44 @@ rendering, title screen, audible output or Android hardware execution.
 | INI/profile/save/special folders / registry | Win32 APIs plus project services | Existing portable INI, UTF conversion, private userdata and narrow virtual registry retained. Virtual `C:\AC1` maps to imported game files. Phone save/profile round-trip untested. Unsupported path/API profiles stop. |
 | Events/semaphores/mutexes/critical sections / threads | Win32 native objects/threads | Existing guest object state and pthread mutex/cond/thread scheduler retained. DS notifications feed guest events. Priorities/affinities retain existing guest semantics. No device scheduler evidence yet. |
 | PE static TLS / Tls* / C `_Thread_local` | Guest TLS modeled; API26 used emutls | Guest TLS retained. minSdk and DXVK platform raised to **29**. NDK28.2 API28 probe references `__emutls_get_address`; API29 emits ELF TLS + AArch64 TLSDESC. Phone API36 meets this. |
-| Bink | Translated DLL; native FFmpeg OFF | App CMake now selects native Bink plus four static ARM64 FFmpeg libraries. DLL fingerprint/map/attach retained. Decoder syntax passes; **archives not built/linked here**. Existing non-Windows native Bink PCM is explicitly silent. Exact dependency build below. |
+| Bink | Translated DLL; native FFmpeg OFF | App CMake selects native Bink plus four static FFmpeg libraries. DLL fingerprint/map/attach retained. Non-Windows s16 PCM now enters the same mixer per record/track with contiguous PTS, bounded four-second queues, resampling, pause/resume/stop and decoder-applied volume. `AC1_BINK_SILENT=1` remains explicit opt-out. Decoder and mixer compilation are separate from device playback verification. Exact dependency build below. |
 | Profiler | Windows GetThreadContext/cycle sampler | Existing non-Windows no-op implementation; hooks compile, no sampler thread. No profiling/performance claim. |
 | Direct memory / VEH diagnostics | POSIX 4 GiB mmap existed; VEH Windows-only | Direct arena and forced-inline accessors enabled explicitly. No Android equivalent of the Windows VEH guest-EIP report: direct faults produce native SIGSEGV/tombstones. Some guest block placement assumes 4 KiB pages; 16 KiB-page runtime support is unverified (ELF alignment alone does not establish it). |
 | CRT locale/time/environment/COM, crypto, network, WinMM | Portable subsets and Android stubs | Existing guest environment, en-US/ASCII locale, clock/FILETIME, COM bookkeeping, entropy-backed crypto and network startup/byte-order helpers retained. Non-ASCII collation/custom date formats need a provider. waveOutGetDevCapsA reports BADDEVICEID; WININET cookies stop pending verified offline fallback. Unknown imports/targets keep DLL/name/callsite diagnostics. |
 
 Native ELF TLS selection agrees with the [bionic NDK linker notes](https://android.googlesource.com/platform/bionic/+/HEAD/android-changes-for-ndk-developers.md#elf-tls-available-for-api-level-29).
 No pinned CPU/runtime donor inputs or transformations changed.
+
+### Portable audio (2026-10-30)
+
+The mixer uses DirectSound's [minimum/maximum distance model](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ee418662(v=vs.85))
+and [rolloff factor](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ee418787(v=vs.85)):
+full gain within minimum distance, inverse-distance attenuation with scaled
+rolloff, clamping at maximum distance or muting with MUTE3DATMAXDISTANCE.
+Panning uses the listener's right vector. The AAudio adapter follows the
+[AAudio callback/disconnect rules](https://developer.android.com/ndk/guides/audio/aaudio/aaudio):
+callbacks publish errors, and control-thread service closes/reopens the stream.
+PCM decoded while the Activity is paused is retired to follow the guest video
+clock; existing queued Bink PCM is retained when the decoder itself pauses.
+
+```powershell
+# Default generated-header paths are work/lift_initial and work/lift_bink.
+# This worktree's check used the existing headers as read-only references:
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/check_audio_portable.ps1 `
+  -GeneratedDir D:/Prog/ac1_recomp/work/lift_initial `
+  -BinkGeneratedDir D:/Prog/ac1_recomp/work/lift_bink
+```
+
+Evidence: `work/audio/checks.log`. Both Windows host contracts pass: the new
+audio fixture covers separate rendering/consumption heads, notifications,
+golden PCM/gain/pan/rate sums, 3D, Bink tracks/control, snapshots, concurrent
+Lock/Unlock/seek and clock fallback; `android_portable_contract` still passes.
+All six changed native translation units (including the new fixture) pass
+individual NDK 28.2/API29 syntax checks for ARM64 and x86_64. Audio-only shared
+libraries link against `libaaudio` for both ABIs and their ELF headers/dependencies
+are inspected. These checks compile no translated game functions and run no game.
+Actual audibility, callback underruns, A/V sync, device-route disconnect/restart,
+and background/resume require a Galaxy S24 Ultra run; none is claimed here.
 
 ### Portable D3DX (2026-10-30)
 

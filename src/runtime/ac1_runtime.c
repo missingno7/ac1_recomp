@@ -6145,6 +6145,10 @@ static int handle_optional_eax_import(CPU *cpu, const import_record *import)
 
 #if defined(AC1_NATIVE_BINK)
 #include "../platform/ac1_bink_native.h"
+#ifndef _WIN32
+#include "../platform/ac1_audio_mixer.h"
+#include "../platform/ac1_ds8_bridge.h"
+#endif
 /* Native Bink records use the runtime heap. AC1 only releases the handle via
  * BinkClose (009e8bdb), then zeros player+78; it never frees this pointer itself.
  * Guest allocator callbacks are metadata, never cast to native functions. */
@@ -6169,7 +6173,7 @@ static void native_bink_trace(int force)
     native_bink_trace_at = now;
     fprintf(stderr, "AC1 native Bink progress: DoFrame=%llu CopyToBuffer=%llu PCM-frames=%llu audio=%s%s\n",
             (unsigned long long)native_bink_frames, (unsigned long long)native_bink_copies,
-            (unsigned long long)native_bink_pcm_frames, native_bink_silent ? "silent" : "DirectSound",
+            (unsigned long long)native_bink_pcm_frames, native_bink_silent ? "silent" : "PCM output",
             force ? " final" : "");
 }
 static int native_bink_write(void *opaque, uint32_t address, const void *input, size_t bytes)
@@ -6209,12 +6213,14 @@ static int native_bink_pcm(void *opaque, uint32_t record, uint32_t track,
     if (native_bink_silent) return 1;
 #ifdef _WIN32
     if (!ac1_bink_audio_submit(native_bink_audio, record, track, pcm, frames, rate, channels, pts)) return 0;
+#else
+    if (!ac1_audio_bink_submit(record, track, pcm, frames, rate, channels, pts)) {
+        fprintf(stderr,"AC1 native Bink PCM: %s\n",ac1_ds8_last_error());
+        return 0;
+    }
+#endif
     native_bink_pcm_frames += frames;
     return 1;
-#else
-    (void)record; (void)track; (void)pcm; (void)frames; (void)rate; (void)channels; (void)pts;
-    return 0;
-#endif
 }
 static void native_bink_control(void *opaque, uint32_t record, int event)
 {
@@ -6222,7 +6228,7 @@ static void native_bink_control(void *opaque, uint32_t record, int event)
 #ifdef _WIN32
     ac1_bink_audio_control(native_bink_audio, record, event);
 #else
-    (void)record; (void)event;
+    ac1_audio_bink_control(record, event);
 #endif
 }
 static void native_bink_file_release(ac1_native_bink_file *file)
@@ -6239,6 +6245,8 @@ static void native_bink_shutdown(void)
     for (unsigned i = 0; i < 16u; ++i) native_bink_file_release(&native_bink_files[i]);
 #ifdef _WIN32
     ac1_bink_audio_destroy(native_bink_audio); native_bink_audio = NULL;
+#elif defined(__ANDROID__)
+    ac1_audio_device_shutdown();
 #endif
 }
 static void native_bink_reset(void)
@@ -6247,9 +6255,6 @@ static void native_bink_reset(void)
     const char *silent = getenv("AC1_BINK_SILENT");
     native_bink_enabled = !(translated && !strcmp(translated, "1"));
     native_bink_silent = silent && !strcmp(silent, "1");
-#ifndef _WIN32
-    native_bink_silent = 1;
-#endif
     native_bink_allocator = native_bink_free = 0u;
     native_bink_frames = native_bink_copies = native_bink_pcm_frames = native_bink_trace_at = 0u;
     if (trace_imports || native_bink_silent)
@@ -6314,7 +6319,7 @@ static int handle_native_bink_import(CPU *cpu, const import_record *import)
             }
         }
 #endif
-        if (trace_imports) fprintf(stderr,"AC1 native Bink sound handshake: factory=0x%08x guest-DirectSound=0x%08x audio=%s\n",a[0],a[1],native_bink_silent?"silent":"DirectSound");
+        if (trace_imports) fprintf(stderr,"AC1 native Bink sound handshake: factory=0x%08x guest-DirectSound=0x%08x audio=%s\n",a[0],a[1],native_bink_silent?"silent":"PCM output");
         result = 1u; break;
     case 5: rc = ac1_bink_do_frame(native_bink,a[0]); if (rc>0) ++native_bink_frames; break;
     case 6: {
