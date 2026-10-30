@@ -1,10 +1,9 @@
-# Captured guest-memory arena candidate
+# Captured guest-memory arena
 
-Base: main `2eacb46`. This is a candidate for the calibrated benchmark window,
-not an accepted gameplay performance result. `work/AGILE_RULES.md` currently
-prohibits gameplay benchmark series and performance-dependent integration
-until the supervisor's A/A calibration succeeds. CFG flags, register locals
-off, the main harness, native palette default and EIP tracing are unchanged.
+Accepted 2026-10-30: in the calibrated fixed-clock gameplay comparison the
+captured arena cut main-thread cycles/frame by 15.3% (95% CI -22.2% to
+-8.5%; 23.6 -> 27.8 FPS); see [perf-architecture.md](perf-architecture.md).
+The candidate notes below are kept as written (base main `2eacb46`).
 
 ## Implementation and correctness
 

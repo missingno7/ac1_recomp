@@ -9,10 +9,11 @@ param(
     [switch]$CheckRepeat,
     [switch]$Run,
     [ValidateSet('off', 'straight', 'cfg', 'abi')][string]$FlagLiveness = 'cfg',
-    [string]$LocalRegs = 'off',
+    # Register locals (GPR+XMM) for every admitted function; 'off' restores CPU-struct registers.
+    [string]$LocalRegs = 'all',
     [switch]$X87Inline,
-    # Experimental: x87 stack in block-local doubles without tag/env bookkeeping.
-    [ValidateSet('exact', 'native')][string]$X87 = 'exact',
+    # x87 stack in block-local doubles without tag/env bookkeeping; 'exact' restores the full model.
+    [ValidateSet('exact', 'native')][string]$X87 = 'native',
     # Dedicated count build only; default generated code has zero count hooks.
     [string]$ProfileCountEntries = '',
     # Checked per-access guest memory (diagnosable bad pointers) instead of the direct arena.

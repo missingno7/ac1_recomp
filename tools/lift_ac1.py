@@ -4409,10 +4409,11 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=CONFIG_PATH,
                         help="discovery configuration (allows private seed-set A/B comparisons)")
     parser.add_argument("--selftest", action="store_true", help="run the focused block-entry ordering check")
-    parser.add_argument('--x87', choices=('exact', 'native'), default='exact',
-                        help='native keeps the x87 stack in block-local doubles without tag/env bookkeeping (experiment)')
-    parser.add_argument('--local-regs', default='off', metavar='off|all|VA,...',
-                        help='function-gated GPR locals; off restores CPU-struct registers')
+    parser.add_argument('--x87', choices=('exact', 'native'), default='native',
+                        help='native keeps the x87 stack in block-local doubles without tag/env bookkeeping; '
+                             'exact keeps the full x87 model')
+    parser.add_argument('--local-regs', default='all', metavar='off|all|VA,...',
+                        help='function-gated GPR and XMM locals; off restores CPU-struct registers')
     parser.add_argument('--flag-liveness', choices=('off', 'straight', 'cfg', 'abi'), default='cfg',
                         help='constant-mask flag liveness; abi adds proved direct-only return contracts')
     parser.add_argument("--no-direct-calls", action="store_true",
@@ -4645,6 +4646,7 @@ def main() -> int:
         "flag_liveness": args.flag_liveness,
         "flag_abi": lift_result["flag_abi"],
         "local_regs": lift_result["local_regs"],
+        "x87": lift_result["x87"],
         "direct_call_sites": lift_result["direct_call_sites"],
         "profile_count_entries": lift_result['profile_count_entries'],
         "direct_callee_declarations": lift_result["direct_callee_declarations"],

@@ -1,11 +1,9 @@
 # ABI + dirty-sync locals: region compatibility
 
-Defaults remain CFG flags and register locals off. The binding temporary
-calibration rule in `work/AGILE_RULES.md` prohibits gameplay benchmark series
-and performance-dependent integration decisions. No FPS, frame-tail or paired
-spread result is claimed for the current-main combined candidate. Existing
-`-FlagLiveness abi -LocalRegs all` build options remain available for its
-controlled comparison; no unproved default or option removal is included.
+Update 2026-10-30: register locals (now GPR and XMM) became the default after
+the controlled comparisons in [perf-architecture.md](perf-architecture.md);
+CFG flags remain the default and ABI stays opt-in. The region-compatibility
+fix below applies to both. The original candidate notes follow.
 
 Source analysis found two interactions with the new native regions:
 

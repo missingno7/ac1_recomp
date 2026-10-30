@@ -2,6 +2,27 @@
 
 This repository builds and executes a statically translated portion of the original GOG DX9 executable on a 64-bit Windows host. The same runtime renders the original title screen and a 3D tutorial gameplay frame with the WALK prompt in the Android x86_64 emulator. See the [verified emulator evidence and commands](docs/android.md#optimized-native-apk-2026-10-30). The optimized native APK reaches the title prompt at the 591.747-second input-clock checkpoint (clear capture at 609.734 seconds), versus 907.573 seconds with Debug native code. The APK is 258.4 MB with symbols retained separately. The replay passes the former 4,096-mapping allocation limit; its gameplay capture is paired with `present=1175 ms=4940141`. Emulator runs predate the AAudio merge and were silent.
 
+## Generated-code efficiency (2026-10-30)
+
+Three generator changes are now the default, each measured in a controlled
+gameplay comparison with the deterministic 30 Hz benchmark clock:
+
+| change | main-thread cycles/frame | mean frame time | FPS |
+|---|---|---|---|
+| captured guest-memory arena per function | -15.3% [-22.2%, -8.5%] | | 23.6 -> 27.8 |
+| GPR+XMM register locals, x87 classification builtins | -1.8% (bimodal) | -4.0% [-7.0%, -1.0%] | 26.8 -> 28.4 |
+| native x87: stack in block-local doubles, no tag/env bookkeeping | -10.6% [-20.3%, -0.9%] | -11.3% [-17.6%, -4.9%] | 28.2 -> 31.0 |
+
+About +31% FPS over the previous main in the benchmark window; the stripped
+executable shrank 250.7 -> 144.8 MB. Rollback switches: `tools/build.ps1
+-LocalRegs off` and `-X87 exact` (lifter `--local-regs`, `--x87`). Native
+x87 keeps values, TOP, C0-C3, IE/PE and the control word; it drops the tag
+word, dirty mask, FPU IP/DP/opcode and unmasked-exception diagnostics. It is
+verified on 19,202 captured gameplay records, a 4,096-case differential
+fixture and gameplay to Present 5000; Bink/MMX videos, long play and AArch64
+hardware are not yet covered. Diagnosis, isolated results and the next step:
+[docs/perf-architecture.md](docs/perf-architecture.md).
+
 ## Gamepad and Android touch controller (2026-10-30)
 
 The runtime now feeds AC1's original Xbox controller path from Windows XInput,
@@ -289,9 +310,11 @@ The two-side environment overrides can also be supplied as `-EnvB @{ AC1_DISPATC
 Codegen flag liveness is selected with `tools/build.ps1 -BuildType RelWithDebInfo -Jobs 10 -FlagLiveness cfg`
 (default `cfg`; `off`, `straight` and experimental `abi` are also available), or the lifter's `--flag-liveness` option.
 `abi` retains complete public dispatch contracts and uses private direct-only bodies where returned flags are dead.
-`-LocalRegs all` enables function-gated GPR locals; its default is `off`, and an eight-digit hexadecimal
-list such as `-LocalRegs '0051DD60,00428540'` selects individual functions. The lifter accepts the same
-selection with `--local-regs`. Preparation checks both selected modes in its report.
+`-LocalRegs` selects function-gated GPR and XMM locals; its default is now `all` (`off` restores
+CPU-struct registers), and an eight-digit hexadecimal list such as `-LocalRegs '0051DD60,00428540'`
+selects individual functions. The lifter accepts the same selection with `--local-regs`.
+`-X87 native` (default) keeps the x87 stack in block-local doubles; `-X87 exact` restores the full
+x87 model. Preparation checks the selected modes in its report.
 `-X87Inline` independently force-inlines the audited integer-conversion helper (default off).
 The benchmark stops its own game at EndPresent and flushes frame stats at that boundary;
 incomplete fixed ranges or missing replay/guest-time evidence fail its audit. See [codegen evidence](docs/codegen.md)
@@ -301,4 +324,5 @@ records the FLAGABI comparison (+3.77%) and revised locals comparison (+7.35%), 
 Integer-helper inlining is bit-exact in the new oracle but shows no paired FPS win (-0.07% median); it stays off.
 These are separate three-pair replay measurements on a shared PC; their FPS changes must not be added.
 `-UserdataSeed work/<private-seed>` optionally restores identical workspace-only saves before every benchmark side.
-CFG flags remain the default; ABI and locals remain opt-in pending review and broader workload measurements.
+CFG flags remain the default and ABI stays opt-in; register locals and native x87 became defaults after the
+controlled comparisons in [docs/perf-architecture.md](docs/perf-architecture.md).
