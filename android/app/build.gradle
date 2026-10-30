@@ -1,4 +1,5 @@
 plugins { id 'com.android.application' }
+def ac1PrebuiltNativeDir = project.findProperty('ac1PrebuiltNativeDir')
 
 android {
     namespace 'org.ac1.recomp'
@@ -13,13 +14,17 @@ android {
         versionName '0.1.0'
         // -Pac1Abi=x86_64 builds the emulator APK; phones use arm64-v8a.
         ndk { abiFilters(project.findProperty('ac1Abi') ?: 'arm64-v8a') }
-        externalNativeBuild {
-            cmake { arguments '-DANDROID_STL=c++_static', '-DAC1_NATIVE_BINK=ON',
+        if (!ac1PrebuiltNativeDir) externalNativeBuild {
+            // Keep Java/debug signing debuggable, but optimize native game/runtime code.
+            cmake { arguments '-DANDROID_STL=c++_static', '-DCMAKE_BUILD_TYPE=RelWithDebInfo', '-DAC1_NATIVE_BINK=ON',
                     '-DAC1_DIRECT_MEMORY=ON', '-DAC1_FORCE_INLINE_ACCESSORS=ON' }
         }
     }
 
-    externalNativeBuild {
+    if (ac1PrebuiltNativeDir) {
+        // The build entry point can use Make when Ninja cannot spawn in a sandbox.
+        sourceSets.main.jniLibs.srcDirs = [file(ac1PrebuiltNativeDir)]
+    } else externalNativeBuild {
         cmake { path file('src/main/cpp/CMakeLists.txt'); version '3.22.1' }
     }
 }

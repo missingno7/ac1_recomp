@@ -4,7 +4,9 @@ param(
     [string]$Python = 'D:\Prog\dukemp_recomp\.venv\Scripts\python.exe',
     [ValidateRange(1,64)][int]$Jobs = 2,
     # x86_64 is for the emulator (native speed under WHPX); arm64-v8a for phones.
-    [ValidateSet('arm64-v8a', 'x86_64')][string]$Abi = 'arm64-v8a'
+    [ValidateSet('arm64-v8a', 'x86_64')][string]$Abi = 'arm64-v8a',
+    [ValidateSet('Gradle', 'Make')][string]$NativeBuilder = 'Gradle',
+    [string]$Make = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,9 +68,34 @@ $env:CMAKE_BUILD_PARALLEL_LEVEL = "$Jobs"
 
 $buildExit = 0
 $timer = [System.Diagnostics.Stopwatch]::StartNew()
+$nativeLibrary = $null
+$prebuiltArgument = @()
+$apkPath = Join-Path $repoRoot 'android\app\build\outputs\apk\debug\app-debug.apk'
 Push-Location (Join-Path $repoRoot 'android')
 try {
-    & .\gradlew.bat --no-daemon "--max-workers=$Jobs" "-Pac1Abi=$Abi" assembleDebug
+    if ($NativeBuilder -eq 'Make') {
+        if (-not $Make) { $Make = (Get-Command mingw32-make.exe -ErrorAction Stop).Source }
+        $cmake = Join-Path $AndroidSdk 'cmake/3.22.1/bin/cmake.exe'
+        $ndkToolchain = Join-Path $AndroidSdk 'ndk/28.2.13676358/build/cmake/android.toolchain.cmake'
+        $nativeBuild = Join-Path $repoRoot "work/build/ac1-android-$abiTag-relwithdebinfo"
+        $jniRoot = Join-Path $nativeBuild 'jniLibs'
+        $jniAbi = Join-Path $jniRoot $Abi
+        & $cmake -S (Join-Path $repoRoot 'android/app/src/main/cpp') -B $nativeBuild `
+            -G 'MinGW Makefiles' "-DCMAKE_MAKE_PROGRAM=$Make" `
+            "-DCMAKE_TOOLCHAIN_FILE=$ndkToolchain" "-DANDROID_ABI=$Abi" `
+            -DANDROID_PLATFORM=29 -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=$jniAbi" `
+            -DAC1_NATIVE_BINK=ON -DAC1_DIRECT_MEMORY=ON -DAC1_FORCE_INLINE_ACCESSORS=ON
+        if ($LASTEXITCODE) { throw 'Android native CMake configuration failed' }
+        & $cmake --build $nativeBuild --parallel $Jobs
+        if ($LASTEXITCODE) { throw 'Android native Make build failed' }
+        $nativeLibrary = Join-Path $jniAbi 'libac1_android.so'
+        Copy-Item -LiteralPath (Join-Path $repoRoot "work/build/dxvk-android-$abiTag/libac1_dxvk_android.so") -Destination $jniAbi
+        $prebuiltArgument = @("-Pac1PrebuiltNativeDir=$jniRoot")
+    }
+    # Recreate the ZIP: incremental packaging can retain large gaps after a .so shrinks.
+    if (Test-Path -LiteralPath $apkPath) { Remove-Item -LiteralPath $apkPath -Force }
+    & .\gradlew.bat --no-daemon "--max-workers=$Jobs" "-Pac1Abi=$Abi" @prebuiltArgument assembleDebug
     $buildExit = $LASTEXITCODE
 } finally {
     Pop-Location
@@ -81,6 +108,35 @@ try {
 $timer.Stop()
 if ($buildExit -ne 0) { exit $buildExit }
 
-$apkPath = Join-Path $repoRoot 'android\app\build\outputs\apk\debug\app-debug.apk'
 Write-Output "Built local diagnostic APK ($Abi): $apkPath"
 Write-Output ("Android build time: {0:n1} seconds" -f $timer.Elapsed.TotalSeconds)
+
+# Gradle strips the packaged copy; retain native symbols outside the APK.
+if (-not $nativeLibrary) {
+    $nativeLibrary = Get-ChildItem -Path (Join-Path $repoRoot "android/app/build/intermediates/cxx/RelWithDebInfo/*/obj/$Abi/libac1_android.so") |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $nativeLibrary -or -not (Test-Path -LiteralPath $nativeLibrary)) {
+    throw 'The unstripped Android native library was not found'
+}
+$symbols = Join-Path $repoRoot "work/android_symbols/$Abi"
+New-Item -ItemType Directory -Force -Path $symbols | Out-Null
+Copy-Item -LiteralPath $nativeLibrary -Destination (Join-Path $symbols 'libac1_android.so')
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$archive = [System.IO.Compression.ZipFile]::OpenRead($apkPath)
+try {
+    $entry = $archive.GetEntry("lib/$Abi/libac1_android.so")
+    if (-not $entry) { throw "APK has no $Abi runtime library" }
+    $metrics = [ordered]@{
+        abi = $Abi; native_build_type = 'RelWithDebInfo'; native_builder = $NativeBuilder
+        build_seconds = $timer.Elapsed.TotalSeconds
+        apk_bytes = (Get-Item -LiteralPath $apkPath).Length
+        unstripped_so_bytes = (Get-Item -LiteralPath $nativeLibrary).Length
+        packaged_so_bytes = $entry.Length
+        symbols = (Join-Path $symbols 'libac1_android.so')
+    }
+    $metrics | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $symbols 'build-metrics.json')
+    Write-Output "Native library: $($metrics.packaged_so_bytes) packaged bytes; $($metrics.unstripped_so_bytes) unstripped bytes"
+    Write-Output "Native symbols: $symbols"
+} finally { $archive.Dispose() }
+exit 0
