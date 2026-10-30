@@ -194,8 +194,8 @@ void advance(Buffer &b, uint64_t after, bool audio) {
         stopped(b, audio);
     }
 }
-void clock_update(Buffer &b, bool defer_events) {
-    uint64_t t = now(), dt = t - b.last_ns;
+void clock_update(Buffer &b, bool defer_events, uint64_t t = now()) {
+    uint64_t dt = t - b.last_ns;
     b.last_ns = t;
     if (!b.playing || output_active || output_paused)
         return;
@@ -205,7 +205,7 @@ void clock_update(Buffer &b, bool defer_events) {
     advance(b, b.frames + count, defer_events);
     b.render_frame = double(b.frames);
 }
-void update(Buffer &b) {
+void update(Buffer &b, uint64_t t = now()) {
     for (size_t i = 0; i < b.notify_pending.size(); ++i)
         if (b.notify_pending[i]) {
             signal(b.notifications[i].second);
@@ -215,7 +215,7 @@ void update(Buffer &b) {
         stopped(b);
         b.stop_pending = false;
     }
-    clock_update(b, false);
+    clock_update(b, false, t);
 }
 void reset_render(Buffer &b) {
     b.span_head = b.span_count = 0;
@@ -658,9 +658,12 @@ extern "C" int ac1_ds8_service(void) {
     if (mixer_fault)
         return fail(mixer_fault);
     // Aliases share a Buffer; update's elapsed time is zero on subsequent aliases.
+    // One clock read per service: it runs on scheduler handoffs, and a read
+    // per buffer was most of the Android vDSO clock time.
+    uint64_t t = now();
     for (auto &o : objects)
         if (o.second.buffer)
-            update(*o.second.buffer);
+            update(*o.second.buffer, t);
     return error[0] ? -1 : 1;
 }
 extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint32_t *hr) {
