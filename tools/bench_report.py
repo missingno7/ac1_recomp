@@ -64,9 +64,17 @@ def internal_run(run, seconds):
             if m:
                 gpu_samples.append({"utilization_percent": int(m.group(1)), "graphics_clock_mhz": int(m.group(2))})
     stop_lines = [line for line in log.splitlines() if "AC1 guest stop" in line]
+    coverage = (frames[-1][0] - start_tick) / freq if start_tick is not None else 0.0
+    full_window = coverage >= seconds
+    frame_dropped = max((d.get("frame_dropped", 0) for d in snapshots), default=0)
+    reached = reached and full_window and not stop_lines and not frame_dropped
+    reason = ("guest stopped" if stop_lines else
+              f"incomplete {seconds}-second frame window: retained {coverage:.3f} seconds" if not full_window else
+              f"frame capture dropped {frame_dropped} frames" if frame_dropped else "gameplay start not reached")
     frame_times = intervals
     return {
         "reached_gameplay": reached, "gameplay_start_present_index": start_index + 1 if start_tick is not None else None,
+        "full_frame_window": full_window, "frame_capture_coverage_seconds": coverage, "frame_dropped": frame_dropped,
         "frames_in_window": len(window), "fps": 1000 / statistics.mean(frame_times) if frame_times else None,
         "measurement_elapsed_seconds": (window[-1] - window[0]) / freq if len(window) > 1 else 0.0,
         "frametime_mean_ms": statistics.mean(frame_times) if frame_times else None,
@@ -77,7 +85,7 @@ def internal_run(run, seconds):
         "gpu_utilization_percent": statistics.mean(s["utilization_percent"] for s in gpu_samples) if gpu_samples else None,
         "gpu_samples": gpu_samples, "scene_proof": [str(c.relative_to(run)) for c in proof],
         "profile_snapshots": len(snapshots), "present_trace_points": traces,
-        "failure": None if reached else {"reason": "gameplay start not reached", "guest_stop_lines": stop_lines,
+        "failure": None if reached else {"reason": reason, "guest_stop_lines": stop_lines,
                                          "startup_log_tail": log.splitlines()[-12:]}
     }
 
