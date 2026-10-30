@@ -2541,6 +2541,16 @@ static int handle_heap_import(CPU *cpu, const import_record *import)
     return 1;
 }
 
+/* Reused from the parallel CS investigation: a guest object may cross two
+ * adjacent mappings even when no single checked host pointer spans it. */
+static int critical_section_span_mapped(uint32_t address)
+{
+    uint32_t scratch[4];
+    return (uint64_t)address + 24u <= UINT64_C(0x100000000) &&
+           guest_memory_read_scalar(address, scratch, 16u) &&
+           guest_memory_read_scalar(address + 16u, scratch, 8u);
+}
+
 static int handle_critical_section_import(CPU *cpu, const import_record *import)
 {
     if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
@@ -2556,11 +2566,11 @@ static int handle_critical_section_import(CPU *cpu, const import_record *import)
     if (active_guest_thread) active_guest_thread->checkpoint_cause = AC1_HANDOFF_CS;
 
     uint32_t address = rd32(cpu->esp + 4u);
-    uint8_t *section = (uint8_t *)guest_memory_try_ptr(address, 24u);
-    if (!section) stop_guest("critical-section object is unmapped", import->token);
+    if (!guest_memory_try_ptr(address, 24u) && !critical_section_span_mapped(address))
+        stop_guest("critical-section object is unmapped", import->token);
     if (init_spin || init) {
         uint32_t spin = init_spin ? rd32(cpu->esp + 8u) : 0u;
-        memset(section, 0, 24u);
+        for (unsigned offset = 0; offset < 24u; offset += 4u) wr32(address + offset, 0u);
         wr32(address + 4u, UINT32_MAX);
         wr32(address + 20u, spin);
         cpu->eax = 1u;
@@ -2568,7 +2578,7 @@ static int handle_critical_section_import(CPU *cpu, const import_record *import)
         return 1;
     }
     if (destroy) {
-        memset(section, 0, 24u);
+        for (unsigned offset = 0; offset < 24u; offset += 4u) wr32(address + offset, 0u);
         wr32(address + 4u, UINT32_MAX);
         return_stdcall(cpu, 4u);
         return 1;
