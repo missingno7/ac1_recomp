@@ -3423,60 +3423,100 @@ def wrap_native_binding(body: str, address: int, entry: dict) -> str:
             f'void L_{address:08X}(CPU *c) {{ ac1_native_invoke(c, &ac1_binding_{address:08X}, {original}); }}\n')
 
 
-def local_register_function(body: str) -> str:
-    """Promote GPRs; keep every opaque CPU use as an architectural boundary.
+# Audited pinned helpers only: every CPU access is flag state, with no GPR
+# pointer escaping or diagnostic callback. Unit tests check the actual header.
+LOCAL_GPR_FREE_HELPERS = frozenset({
+    'AC1_SET_GUEST_EIP', 'op_shl', 'op_shr', 'op_sar', 'op_rol', 'op_ror',
+    'op_shld', 'op_shrd', 'op_bsf', 'op_bsr', 'shr32', 'shl32',
+    'eflags_pack', 'eflags_unpack',
+})
+LOCAL_ESP_HELPERS = frozenset({'push32', 'pop32'})
 
-    The aggregate never escapes. GCC scalar replacement can retain its fields
-    in host registers. Flags remain architectural, with audited GPR-free flag
-    helpers. Each public C entry initializes its own locals; internal labels
-    share them. Segmented/SEH and nonlocal-resumption functions stay unchanged.
-    """
-    if re.search(r'\b(?:fs|gs):|c->(?:fs|gs)\b|\b(?:seh|setjmp|longjmp)\b', body, re.I):
-        return body
-    registers = 'eax ecx edx ebx esp ebp esi edi'.split()
-    gpr = re.compile(r'\bc->(' + '|'.join(registers) + r')\b')
-    spill = 'memcpy(&c->eax, &_ac1_regs, sizeof _ac1_regs);'
-    reload = 'memcpy(&_ac1_regs, &c->eax, sizeof _ac1_regs);'
-    lines = body.splitlines()
-    if len(lines) < 3 or lines[1] != '{' or lines[-1] != '}':
-        raise ValueError('unexpected lifted function shape for local registers')
-    output = lines[:2] + [
-        '    struct { uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi; } _ac1_regs;',
-        '    _Static_assert(sizeof _ac1_regs == 32 && offsetof(CPU, edi) == 28, "pinned GPR layout");',
-        '    ' + reload,
-    ]
-    def emit_group(group):
-        if not group:
-            return
-        text = '\n'.join(group)
-        # Leading donor comments can precede executable dispatch code. Cutting
-        # at the first comment loses that CPU use and flushes after the import.
-        code = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
-        pointer_uses = re.sub(r'\bc->\w+', 'member', code)
-        pointer_uses = re.sub(r'\b(?:flags_\w+|AC1_SET_GUEST_EIP)\(c(?=[,)])', 'safe(', pointer_uses)
-        boundary = bool(re.search(r'\bc\b', pointer_uses)) or any(
-            token in code for token in ('RECOMP_TODO(', 'ac1_unsupported_instruction('))
-        if boundary:
-            output.append('    ' + spill)
-        else:
-            text = gpr.sub(lambda m: '_ac1_regs.' + m.group(1), text)
-            text = re.sub(r'\breturn;', '{ ' + spill + ' return; }', text)
-        # A helper-authoritative instruction can branch before the ordinary
-        # reload. Reload on that edge too; fence guest polling across backedges.
-        fence = (reload + ' ' if boundary else '') + '__asm__ __volatile__("" ::: "memory"); '
-        text = re.sub(r'\bgoto (L_[0-9A-F]{8});',
-                      lambda m: '{ ' + fence + 'goto ' + m.group(1) + '; }', text)
-        output.extend(text.splitlines())
-        if boundary:
-            output.append('    ' + reload)
-    group = []
+
+def local_register_function(body: str) -> str:
+    """GPR locals with conservative CFG dirty sets and audited CPU boundaries."""
+    from collections import deque
+    if re.search(r'\b(?:fs|gs):|c->(?:fs|gs)\b|\b(?:seh|setjmp|longjmp)\b',body,re.I):return body
+    registers='eax ecx edx ebx esp ebp esi edi'.split()
+    clean=re.sub(r'/\*.*?\*/','',body,flags=re.S)
+    names='|'.join(registers)
+    if re.search(r'(?:^|[=(,;{?:]|\*\))\s*&\s*\(*\s*c->(?:'+names+r')\b',clean,re.M):return body
+    referenced=set(re.findall(r'\bc->('+names+r')\b',clean))
+    stack='|'.join(sorted(LOCAL_ESP_HELPERS))
+    if re.search(r'\b(?:'+stack+r')\(c(?=[,)])',clean):referenced.add('esp')
+    registers=[r for r in registers if r in referenced]
+    if not registers:return body
+    all_regs=set(registers)
+    gpr=re.compile(r'\bc->('+'|'.join(registers)+r')\b')
+    def spill(dirty):return ' '.join(f'c->{r} = _ac1_regs.{r};' for r in registers if r in dirty)
+    reload=' '.join(f'_ac1_regs.{r} = c->{r};' for r in registers)
+    esp_spill,esp_reload='c->esp = _ac1_regs.esp;','_ac1_regs.esp = c->esp;'
+    pure=r'flags_\w+|'+'|'.join(sorted(LOCAL_GPR_FREE_HELPERS))
+    lines=body.splitlines()
+    if len(lines)<3 or lines[1]!='{' or lines[-1]!='}':raise ValueError('unexpected lifted function shape for local registers')
+    groups=[];group=[]
     for line in lines[2:-1]:
-        if 'AC1_SET_GUEST_EIP(c,' in line or re.fullmatch(r'L_[0-9A-F]{8}:', line):
-            emit_group(group)
-            group = []
+        if 'AC1_SET_GUEST_EIP(c,' in line or re.fullmatch(r'L_[0-9A-F]{8}:',line):
+            if group:groups.append(group)
+            group=[]
         group.append(line)
-    emit_group(group)
-    output.extend(('    ' + spill, '}'))
+    if group:groups.append(group)
+    texts=[re.sub(r'/\*.*?\*/','', '\n'.join(g),flags=re.S) for g in groups]
+    labels={label:i for i,text in enumerate(texts) for label in re.findall(r'^(L_[0-9A-F]{8}):',text,re.M)}
+    full=[];partial=[];writes=[];edges=[];unknown_edges=False
+    for i,text in enumerate(texts):
+        pointer=re.sub(r'\bc->\w+','member',text)
+        pointer=re.sub(r'\b(?:'+pure+'|'+stack+r')\(c(?=[,)])','safe(',pointer)
+        full.append(bool(re.search(r'\bc\b|RECOMP_TODO\(|ac1_unsupported_instruction\(',pointer)))
+        partial.append(not full[-1] and bool(re.search(r'\b(?:'+stack+r')\(c(?=[,)])',text)))
+        changed=set(re.findall(r'\bc->('+'|'.join(registers)+r')\s*\)*\s*(?:(?:<<|>>|[+*/%&|^\-])?=(?!=)|\+\+|--)',text))
+        changed.update(re.findall(r'(?:\+\+|--)\s*\(*\s*c->('+'|'.join(registers)+r')\b',text))
+        changed.update(re.findall(r'\bSET(?:8[HL]|16)\(\s*\(*\s*c->('+'|'.join(registers)+r')\b',text))
+        macros=set(re.findall(r'\b([A-Z][A-Z0-9_]+)\(',text))
+        if macros-{'AC1_SET_GUEST_EIP','R8H','R8L','R16','SET8H','SET8L','SET16'}:
+            changed.update(gpr.findall(text))
+        writes.append(changed)
+        targets=re.findall(r'\bgoto (L_[0-9A-F]{8});',text)
+        unknown_edges |= any(t not in labels for t in targets) or text.count('goto ')!=len(targets)
+        successors={labels[t] for t in targets if t in labels}
+        control=re.sub(r'AC1_SET_GUEST_EIP\(c,\s*0x[0-9A-F]+u\);','',text)
+        control=re.sub(r'^L_[0-9A-F]{8}:','',control,flags=re.M)
+        terminal=bool(re.fullmatch(r'\s*goto L_[0-9A-F]{8};\s*',control))
+        terminal |= 'return;' in text and not re.search(r'\b(?:if|while|for|switch)\b',text)
+        if not terminal and i+1<len(groups):successors.add(i+1)
+        edges.append(successors)
+    def outgoing(i,before):
+        if full[i]:return set()
+        return (before|writes[i])-({'esp'} if partial[i] else set())
+    incoming={0:set()};queue=deque([0])
+    while queue:
+        i=queue.popleft();after=outgoing(i,incoming[i])
+        for target in edges[i]:
+            merged=incoming.get(target,set())|after
+            if target not in incoming or merged!=incoming[target]:incoming[target]=merged;queue.append(target)
+    output=lines[:2]+[
+        '    struct { uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi; } _ac1_regs;',
+        '    _Static_assert(STACK_BASE((CPU *)0) == 0u, "local GPR stack helpers require flat zero stack base");',
+        '    '+reload,
+    ]
+    for i,group in enumerate(groups):
+        before=all_regs if unknown_edges else incoming.get(i,all_regs)
+        after=outgoing(i,before)
+        text='\n'.join(group)
+        if full[i]:
+            sync=spill(before)
+            if sync:output.append('    '+sync)
+        else:
+            if partial[i] and 'esp' in before:output.append('    '+esp_spill)
+            text=gpr.sub(lambda m:m[0] if partial[i] and m[1]=='esp' else '_ac1_regs.'+m[1],text)
+            at_return=(esp_reload+' ' if partial[i] else '')+spill(after)
+            text=re.sub(r'\breturn;','{ '+at_return+' return; }',text)
+        edge_reload=reload if full[i] else esp_reload if partial[i] else ''
+        fence=edge_reload+' __asm__ __volatile__("" ::: "memory"); '
+        text=re.sub(r'\bgoto (L_[0-9A-F]{8});',lambda m:'{ '+fence+'goto '+m[1]+'; }',text)
+        output.extend(text.splitlines())
+        if edge_reload:output.append('    '+edge_reload)
+    output.extend(('    '+spill(all_regs),'}'))
     return '\n'.join(output)
 
 

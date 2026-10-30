@@ -12,6 +12,29 @@ lift, ROOT = direct.lift, direct.ROOT
 
 
 class LocalRegisterTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
+    def test_dirty_joins_loops_and_unreferenced_helper_writes(self):
+        import test_codegen_flags as flags
+        source=flags.function(
+            'c->ecx = (c->ecx & 7u) + 1u;',
+            ('L_00401001','if(c->eax & 1u) goto L_00401004;'),
+            'c->ebx += c->edi;', 'goto L_00401005;',
+            ('L_00401004','SET8L(c->edx, R8L(c->eax));'),
+            ('L_00401005','opaque(c);'), '--c->ecx;',
+            'if(c->ecx) goto L_00401001;', 'c->esp += 4; return;')
+        optimized=lift.local_register_function(source)
+        self.assertNotIn('_ac1_regs.ebp =',optimized)
+        generated='#include "cpu.h"\n#define AC1_SET_GUEST_EIP(c,va) ((c)->eip=(va))\nvoid opaque(CPU *);\n'
+        generated+=source.replace('void L_00401000(','void plain_L_00401000(',1)+'\n'
+        generated+=optimized.replace('void L_00401000(','void local_L_00401000(',1)+'\n'
+        work=ROOT/'work/local-regs-tests';work.mkdir(parents=True,exist_ok=True)
+        path=work/'dirty.c';path.write_text(generated);exe=path.with_suffix('.exe')
+        subprocess.run(['gcc','-O2','-std=c11','-fwrapv','-fno-strict-aliasing',
+            '-I',str(lift.prepare_test_runtime()),str(path),str(ROOT/'tests/local_dirty_semantics.c'),
+            '-o',str(exe)],check=True,capture_output=True,timeout=60)
+        run=subprocess.run([str(exe)],check=True,capture_output=True,text=True,timeout=30)
+        self.assertIn('4096 dirty CFG full CPU and observer cases',run.stdout)
+
     def test_flags_helpers_do_not_access_gprs(self):
         header = (lift.prepare_test_runtime() / 'cpu.h').read_text()
         count = 0
@@ -43,12 +66,62 @@ class LocalRegisterTests(unittest.TestCase):
             '    RECOMP_TODO(0x401002, "unknown");', '    c->esp += 4; return;', '}'])
         body = lift.local_register_function(source)
         self.assertIn('_ac1_regs.eax = flags_add_m(c, _ac1_regs.eax', body)
-        self.assertIn('c->ebx = pop32(c)', body)
-        self.assertIn('memcpy(&_ac1_regs, &c->eax, sizeof _ac1_regs); __asm__', body)
-        self.assertIn('memcpy(&c->eax, &_ac1_regs, sizeof _ac1_regs);\n    AC1_SET_GUEST_EIP(c, 0x00401002', body)
+        self.assertIn('_ac1_regs.ebx = pop32(c)', body)
+        self.assertIn('_ac1_regs.esp = c->esp; __asm__', body)
+        self.assertIn('c->esp = _ac1_regs.esp;\n    AC1_SET_GUEST_EIP(c, 0x00401002', body)
         for text in ('/* fs:[0] */', 'setjmp(c->opaque);', 'longjmp(c->opaque);'):
             unsafe = source.replace('    c->esp += 4; return;', '    ' + text + ' return;')
             self.assertEqual(lift.local_register_function(unsafe), unsafe)
+        escaped=source.replace('RECOMP_TODO(0x401002, "unknown");','opaque(&c->eax);')
+        self.assertEqual(lift.local_register_function(escaped),escaped)
+
+    def test_audited_pure_and_stack_helpers_use_only_declared_cpu_fields(self):
+        header=(lift.prepare_test_runtime()/'cpu.h').read_text()
+        self.assertRegex(header,re.compile(r'^#define STACK_BASE\(c\) 0u$',re.M))
+        for name in (lift.LOCAL_GPR_FREE_HELPERS-{'AC1_SET_GUEST_EIP'}) | lift.LOCAL_ESP_HELPERS:
+            match=re.search(r'\b'+name+r'\([^{};]*\)\s*\{',header)
+            self.assertIsNotNone(match,name)
+            depth,end=1,match.end()
+            while depth:
+                depth+=(header[end]=='{')-(header[end]=='}');end+=1
+            code=re.sub(r'/\*.*?\*/','',header[match.end():end-1],flags=re.S)
+            fields=set(re.findall(r'\bc->(\w+)',code))
+            permitted={'esp'} if name in lift.LOCAL_ESP_HELPERS else set(lift.FLAG_BITS)|{'df','eflags_misc'}
+            self.assertLessEqual(fields,permitted,name)
+            pointer=re.sub(r'\bc->\w+','member',code)
+            if name in lift.LOCAL_ESP_HELPERS:pointer=pointer.replace('STACK_BASE(c)','0u')
+            pointer=re.sub(r'\b(?:flags_\w+|'+'|'.join(lift.LOCAL_GPR_FREE_HELPERS)+r')\(c(?=[,)])','safe(',pointer)
+            self.assertNotRegex(pointer,r'\bc\b|unsupported_instruction|RECOMP_TODO',name)
+
+    @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
+    def test_push_pop_esp_flags_and_shifts_match_full_cpu_and_stack(self):
+        from capstone.x86 import X86_OP_IMM,X86_OP_MEM
+        from lift32_cpu import Lifter
+        # Save ESP; PUSH ESP/POP ECX; move stack via PUSH EAX/POP ESP;
+        # PUSHFD/POP EDX; SAR with CL=0..31; conditional return path.
+        raw=bytes.fromhex('89e354598d442440505c9c5a89f0d3f87405bf11111111c3')
+        read=lambda va,n:raw[va-0x401000:va-0x401000+n]
+        lifter=Lifter('synthetic scalar-local stack fixture',0x1000,read)
+        instructions=list(lifter.md.disasm(raw,0x401000))
+        spec={'address':0x401000,'size':len(raw),'blocks':[{'start':0x401000,'end':0x401000+len(raw),
+            'instructions':[[i.address,i.size] for i in instructions]}]}
+        plain=lift.flag_liveness_function(lift.lift_exact_function(lifter,spec,read,X86_OP_IMM,X86_OP_MEM))
+        local=lift.local_register_function(plain)
+        self.assertNotIn('memcpy(',local)
+        self.assertIn('c->esp = (uint32_t)(pop32(c))',local)
+        # The shift helper no longer forces a complete CPU synchronization.
+        self.assertIn('op_sar(c, _ac1_regs.eax',local)
+        source='#include "cpu.h"\n#define AC1_SET_GUEST_EIP(c,va) ((c)->eip=(va))\n'
+        source+=plain.replace('void L_00401000(','void plain_L_00401000(',1)+'\n'
+        source+=local.replace('void L_00401000(','void local_L_00401000(',1)+'\n'
+        work=ROOT/'work/local-regs-tests';work.mkdir(parents=True,exist_ok=True)
+        generated=work/'scalar-stack.c';generated.write_text(source)
+        exe=generated.with_suffix('.exe')
+        subprocess.run(['gcc','-O2','-std=c11','-fwrapv','-fno-strict-aliasing',
+            '-I',str(lift.prepare_test_runtime()),str(generated),str(ROOT/'tests/local_scalar_semantics.c'),
+            '-o',str(exe)],check=True,capture_output=True,timeout=60)
+        run=subprocess.run([str(exe)],check=True,capture_output=True,text=True,timeout=30)
+        self.assertIn('4096 scalar-local full CPU and stack cases',run.stdout)
 
     @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
     def test_leading_comment_dispatch_consumes_current_cpu(self):

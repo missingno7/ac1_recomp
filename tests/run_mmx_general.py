@@ -15,7 +15,9 @@ WORK = ROOT / "work/mmx_evidence/oracle"
 sys.dont_write_bytecode = True
 
 
-def run():
+def run(*, flag_liveness='off', local_regs='off'):
+    if local_regs not in ('off','all'):
+        raise ValueError('MMX oracle local_regs must be off or all')
     start = time.perf_counter()
     WORK.mkdir(parents=True, exist_ok=True)
     spec = importlib.util.spec_from_file_location("mmx_general_lift", ROOT / "tools/lift_ac1.py")
@@ -88,7 +90,9 @@ def run():
         lowering = lift.ac1_mmx_translation(lifter, ins)
         if lowering is None:
             raise RuntimeError(f"MMX probe did not lower: {ins.mnemonic} {ins.op_str}")
-        source += f"void probe_{name}(CPU *c) {{ " + " ".join(lowering) + " }\n"
+        body=f"void probe_{name}(CPU *c)\n{{\n    " + " ".join(lowering) + "\n}"
+        if local_regs=='all':body=lift.local_register_function(body)
+        source += body+'\n'
         declarations.append(f"void probe_{name}(CPU *);")
         asm = ("movq %1, %%mm0\n\tmovq %2, %%mm1\n\tmovq %2, %%xmm0\n\t"
                "movl %k3, %%eax\n\t" + instruction + f"\n\tmovq %%{result_reg}, %0\n\temms\n\t")
@@ -106,12 +110,16 @@ def run():
             lowering = lift.ac1_state_translation(lifter, ins)
         if lowering is None:
             raise RuntimeError(f"state probe did not lower: {ins.mnemonic}")
-        source += f"void probe_{name}(CPU *c) {{ " + " ".join(lowering) + " }\n"
+        body=f"void probe_{name}(CPU *c)\n{{\n    " + " ".join(lowering) + "\n}"
+        if local_regs=='all':body=lift.local_register_function(body)
+        source += body+'\n'
         declarations.append(f"void probe_{name}(CPU *);")
     mix_raw = bytes.fromhex("d9e8c3")
     mix_spec = {"address":0x600000,"size":3,"blocks":[{"start":0x600000,"end":0x600003,
                 "instructions":[(0x600000,2),(0x600002,1)]}]}
     mix_body = lift.lift_exact_function(lifter,mix_spec,lambda va,n:mix_raw[va-0x600000:va-0x600000+n],X86_OP_IMM,X86_OP_MEM)
+    mix_body=lift.flag_liveness_function(mix_body,flag_liveness)
+    if local_regs=='all':mix_body=lift.local_register_function(mix_body)
     source += "#define AC1_SET_GUEST_EIP(c,va) ((c)->eip=(va))\n" + mix_body
     declarations += ["void L_00600000(CPU *);", "void L_00834A90(CPU *);", "void L_1801E500(CPU *);"]
     (WORK / "ops.c").write_text(source)
@@ -131,7 +139,8 @@ def run():
             "start":block.start,"end":block.end,"successors":block.successors,"is_exit":block.is_exit,
             "instructions":[(i.address,i.size) for i in block.instructions]} for block in fn.blocks.values()]}
         output=WORK / tag
-        result=lift.emit_lift(binary,lift.DUKE_DEFAULT,[spec],output,100)
+        result=lift.emit_lift(binary,lift.DUKE_DEFAULT,[spec],output,100,
+                              flag_liveness=flag_liveness,local_regs=local_regs)
         if result["lift_failures"]:
             raise RuntimeError(str(result["lift_failures"]))
         units += [output / name for name in result["translation_units"]]
@@ -156,6 +165,7 @@ def run():
     if result.returncode:
         raise RuntimeError(result.stdout+result.stderr)
     report={"operations":len(operations),"output":result.stdout,"commands":commands,
+            "flag_liveness":flag_liveness,"local_regs":local_regs,
             "seconds":round(time.perf_counter()-start,3)}
     (WORK / "report.json").write_text(json.dumps(report,indent=2)+"\n")
     print(result.stdout.strip())
@@ -163,4 +173,9 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    import argparse
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--flag-liveness',choices=('off','straight','cfg'),default='off')
+    parser.add_argument('--local-regs',choices=('off','all'),default='off')
+    args=parser.parse_args()
+    run(flag_liveness=args.flag_liveness,local_regs=args.local_regs)

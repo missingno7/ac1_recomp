@@ -10,6 +10,8 @@ void cfg_L_00401000(CPU *);
 void cfg_L_00401100(CPU *);
 void abi_L_00401000(CPU *);
 void abi_L_00401100(CPU *);
+void abi_local_L_00401000(CPU *);
+void abi_local_L_00401100(CPU *);
 void guest_execution_read(uint32_t a, void *o, size_t n) {
     assert((uint64_t)a+n <= sizeof memory);memcpy(o,memory+a,n);
 }
@@ -20,7 +22,8 @@ void ac1_dispatch_guard_failed(CPU *c,uint32_t t) {(void)c;(void)t;abort();}
 void ac1_scheduler_return_checkpoint(CPU *c) {(void)c;}
 void dispatch(CPU *c,uint32_t target) {
     assert(target==0x401100u);
-    if(version)abi_L_00401100(c);else cfg_L_00401100(c);
+    if(version==2)abi_local_L_00401100(c);
+    else if(version)abi_L_00401100(c);else cfg_L_00401100(c);
 }
 static uint32_t random_state=0x12345678u;
 static uint32_t random32(void) {
@@ -42,14 +45,20 @@ int main(void) {
         if(i&128)cfg_L_00401100(&actual);else cfg_L_00401000(&actual);
         expected=actual;expected.calls=NULL;expected_calls=calls;
         memcpy(expected_memory,memory+0x7ff0,32);
-        memset(memory+0x7ff0,0x55,32);
-        memset(&calls,0,sizeof calls);
-        actual=seed;version=1;
-        if(i&128)abi_L_00401100(&actual);else abi_L_00401000(&actual);
-        actual.calls=NULL;
-        assert(!memcmp(&actual,&expected,sizeof actual));
-        assert(!memcmp(&calls,&expected_calls,sizeof calls));
-        assert(!memcmp(expected_memory,memory+0x7ff0,32));
+        for(version=1;version<=2;++version) {
+            memset(memory+0x7ff0,0x55,32);
+            memset(&calls,0,sizeof calls);
+            actual=seed;
+            if(version==1) {
+                if(i&128)abi_L_00401100(&actual);else abi_L_00401000(&actual);
+            } else {
+                if(i&128)abi_local_L_00401100(&actual);else abi_local_L_00401000(&actual);
+            }
+            actual.calls=NULL;
+            assert(!memcmp(&actual,&expected,sizeof actual));
+            assert(!memcmp(&calls,&expected_calls,sizeof calls));
+            assert(!memcmp(expected_memory,memory+0x7ff0,32));
+        }
     }
     puts("4096 public/private/fallback full CPU cases passed");return 0;
 }

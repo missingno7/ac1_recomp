@@ -56,7 +56,8 @@ class FlagAbiTests(unittest.TestCase):
         self.assertEqual(report['private_functions_narrowed'], 1)
         source = '#include "cpu.h"\n#define AC1_SET_GUEST_EIP(c,va) ((c)->eip=(va))\n'
         for variant, generated in [('cfg', [lift.flag_liveness_function(b) for b in bodies.values()]),
-                                   ('abi', [*public.values(), *private.values()])]:
+                                   ('abi', [*public.values(), *private.values()]),
+                                   ('abi_local', [lift.local_register_function(b) for b in [*public.values(), *private.values()]])]:
             text = '\n'.join(generated)
             text = re.sub(r'\b(L_[0-9A-F]{8}|ac1_abi_[0-9A-F]{8})\b',
                           lambda m: variant+'_'+m[0], text)
