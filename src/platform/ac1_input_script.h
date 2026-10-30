@@ -29,6 +29,7 @@ uint32_t ac1_input_key_lparam(unsigned dik, int down, int previous);
 int ac1_input_session_init(char *error, size_t capacity);
 void ac1_input_session_shutdown(void);
 int ac1_input_replaying(void);
+uint64_t ac1_input_script_command_index(void);
 int ac1_input_replace_state(int keyboard, void *state, size_t size);
 void ac1_input_record_state(int keyboard, const void *state, size_t size);
 void ac1_input_record_message(uint32_t message, uint32_t wp, uint32_t lp);

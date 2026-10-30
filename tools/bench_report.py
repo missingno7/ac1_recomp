@@ -2,6 +2,7 @@
 """Summarize AC1 gameplay runs and interleaved comparisons."""
 import argparse
 import csv
+import hashlib
 import json
 import random
 import statistics
@@ -24,8 +25,8 @@ def percentile(values, q):
     return values[lo] + (values[min(lo + 1, len(values) - 1)] - values[lo]) * (x - lo)
 
 
-def internal_run(run, seconds, workload="gameplay", start_present=1316,
-                 scene_present=1300, flush_frames=8):
+def internal_run(run, seconds=0, workload="gameplay", start_present=1800,
+                 scene_present=1800, flush_frames=1, end_present=2200):
     log_path = run / "startup.log"
     log = log_path.read_text(errors="replace") if log_path.exists() else ""
     captures = list((run / "captures").glob("present_*.bmp"))
@@ -36,8 +37,9 @@ def internal_run(run, seconds, workload="gameplay", start_present=1316,
         if m:
             capture_rows.append((int(m.group(1)), int(m.group(2))))
     proof = [c for c in captures if int(re.search(r"present_(\d+)", c.name).group(1)) >= scene_present]
-    eligible = [row for row in capture_rows if row[0] >= scene_present]
-    draws = (eligible[-1][1] - eligible[-2][1]) / max(1, eligible[-1][0] - eligible[-2][0]) if len(eligible) >= 2 else None
+    start_draw = next((draw for index, draw in capture_rows if index == start_present), None)
+    end_draw = next((draw for index, draw in capture_rows if index == end_present), None)
+    draws = end_draw - start_draw if start_draw is not None and end_draw is not None else None
     gpu_samples = []
     gpu_path = run / "gpu.csv"
     if gpu_path.exists():
@@ -51,34 +53,48 @@ def internal_run(run, seconds, workload="gameplay", start_present=1316,
     if frame_stats.exists():
         with frame_stats.open(newline="", encoding="utf-8-sig") as source:
             sampled = list(csv.DictReader(source))
-    sampled = [{key: float(row[key]) for key in ("present_index", "wall_ms", "main_thread_cpu_ms", "process_cpu_ms")}
-               for row in sampled if all(row.get(key) not in (None, "") for key in
-                                        ("present_index", "wall_ms", "main_thread_cpu_ms", "process_cpu_ms"))]
     runtime_rows = []
-    runtime_coverage_ms = 0.0
     for row in sampled:
-        if row["present_index"] < start_present:
+        try:
+            parsed = {key: float(row[key]) for key in
+                      ("present_index", "wall_ms", "main_thread_cpu_ms", "process_cpu_ms")}
+            for key in ("main_thread_cycles", "processor", "guest_time_ns", "input_command_index",
+                        "draw_calls", "shader_constant_uploads", "resource_locks"):
+                value = row.get(key, "")
+                parsed[key] = int(value) if value not in (None, "") else None
+            if start_present <= parsed["present_index"] <= end_present:
+                runtime_rows.append(parsed)
+        except (KeyError, TypeError, ValueError):
             continue
-        if runtime_coverage_ms + row["wall_ms"] > seconds * 1000:
-            break
-        runtime_rows.append(row)
-        runtime_coverage_ms += row["wall_ms"]
+    runtime_coverage_ms = sum(row["wall_ms"] for row in runtime_rows)
     wall_times = sorted(row["wall_ms"] for row in runtime_rows)
     main_cpu = [row["main_thread_cpu_ms"] for row in runtime_rows]
     process_cpu = [row["process_cpu_ms"] for row in runtime_rows]
-    flush_tolerance_ms = max(wall_times, default=0.0) * flush_frames
-    runtime_full_window = bool(wall_times) and runtime_coverage_ms >= seconds * 1000 - flush_tolerance_ms
+    runtime_full_window = (bool(runtime_rows) and runtime_rows[0]["present_index"] == start_present
+                           and runtime_rows[-1]["present_index"] == end_present
+                           and len(runtime_rows) == end_present - start_present + 1)
     frame_dropped = 0
-    reached = runtime_full_window and bool(proof) and any(draw > 0 for _, draw in capture_rows) and not stop_lines
+    commands = [row["input_command_index"] for row in runtime_rows if row["input_command_index"] is not None]
+    guest_times = [row["guest_time_ns"] for row in runtime_rows if row["guest_time_ns"] is not None]
+    cycles = [row["main_thread_cycles"] for row in runtime_rows if row["main_thread_cycles"] is not None]
+    draw_rows = [row["draw_calls"] for row in runtime_rows if row["draw_calls"] is not None]
+    constant_rows = [row["shader_constant_uploads"] for row in runtime_rows if row["shader_constant_uploads"] is not None]
+    lock_rows = [row["resource_locks"] for row in runtime_rows if row["resource_locks"] is not None]
+    processors = [row["processor"] for row in runtime_rows if row["processor"] is not None]
+    evidence_complete = len(commands) == len(runtime_rows) and len(guest_times) == len(runtime_rows)
+    reached = runtime_full_window and evidence_complete and not stop_lines
     if stop_lines:
         reason = "guest stopped"
     elif not runtime_full_window:
-        reason = f"incomplete {seconds}-second runtime frame window: retained {runtime_coverage_ms / 1000:.3f} seconds"
-    elif not proof or not any(draw > 0 for _, draw in capture_rows):
-        reason = f"{workload} scene proof missing at/after Present {scene_present}"
+        reason = f"incomplete Present range {start_present}-{end_present}: retained {len(runtime_rows)} frames"
+    elif not evidence_complete:
+        reason = "missing per-frame replay command or guest-clock equivalence evidence"
     else:
         reason = None
     frame_times = wall_times
+    boundary_paths = [run / "captures" / f"present_{p:06d}.bmp" for p in (start_present, end_present)]
+    boundary_hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                       for path in boundary_paths if path.exists()}
     return {
         "workload": workload, "reached_workload": reached,
         "reached_gameplay": reached and workload == "gameplay",
@@ -86,6 +102,7 @@ def internal_run(run, seconds, workload="gameplay", start_present=1316,
         "full_frame_window": runtime_full_window, "frame_capture_coverage_seconds": runtime_coverage_ms / 1000,
         "frame_stats_flush_frames": flush_frames, "frame_dropped": frame_dropped,
         "frames_in_window": len(runtime_rows), "fps": 1000 / statistics.mean(frame_times) if frame_times else None,
+        "present_range": [start_present, end_present],
         "measurement_elapsed_seconds": runtime_coverage_ms / 1000,
         "frametime_mean_ms": statistics.mean(frame_times) if frame_times else None,
         "frametime_p50_ms": percentile(frame_times, .5), "frametime_p95_ms": percentile(frame_times, .95),
@@ -93,12 +110,33 @@ def internal_run(run, seconds, workload="gameplay", start_present=1316,
         "frametime_max_ms": max(frame_times) if frame_times else None, "draws_per_frame": draws,
         "runtime_frame_stats_coverage_seconds": runtime_coverage_ms / 1000,
         "main_thread_cpu_ms_per_frame": statistics.median(main_cpu) if main_cpu else None,
-        "main_thread_cpu_p95_ms_per_frame": percentile(sorted(main_cpu), .95),
-        "main_thread_cpu_p99_ms_per_frame": percentile(sorted(main_cpu), .99),
+        "draw_calls_in_window": sum(draw_rows) if draw_rows else draws,
+        "shader_constant_uploads_in_window": sum(constant_rows) if constant_rows else None,
+        "resource_locks_in_window": sum(lock_rows) if lock_rows else None,
         "process_cpu_ms_per_frame": statistics.median(process_cpu) if process_cpu else None,
         "process_cpu_p95_ms_per_frame": percentile(sorted(process_cpu), .95),
         "process_cpu_p99_ms_per_frame": percentile(sorted(process_cpu), .99),
         "process_cpu_seconds": sum(process_cpu) / 1000 if process_cpu else None,
+        "main_thread_cycles_per_frame": statistics.median(cycles) if cycles else None,
+        "main_thread_cycles_p50": percentile(sorted(cycles), .50),
+        "main_thread_cycles_p95": percentile(sorted(cycles), .95),
+        "main_thread_cycles_p99": percentile(sorted(cycles), .99),
+        "processor_migrations": sum(a != b for a, b in zip(processors, processors[1:])),
+        "processors_seen": sorted(set(processors)),
+        "input_command_index_start": commands[0] if commands else None,
+        "input_command_index_end": commands[-1] if commands else None,
+        "guest_time_elapsed_ns": guest_times[-1] - guest_times[0] if len(guest_times) > 1 else None,
+        "boundary_captures": [f"captures/present_{p:06d}.bmp" for p in (start_present, end_present)
+                              if (run / "captures" / f"present_{p:06d}.bmp").exists()],
+        "boundary_capture_sha256": boundary_hashes,
+        "workload_equivalence_evidence": {
+            "command_progression_complete": len(commands) == len(runtime_rows),
+            "guest_clock_complete": len(guest_times) == len(runtime_rows),
+            "guest_time_elapsed_ns": guest_times[-1] - guest_times[0] if len(guest_times) > 1 else None,
+            "boundary_captures": [f"captures/present_{p:06d}.bmp" for p in (start_present, end_present)
+                                  if (run / "captures" / f"present_{p:06d}.bmp").exists()],
+            "boundary_capture_sha256": boundary_hashes,
+        },
         "gpu_utilization_percent": statistics.mean(s["utilization_percent"] for s in gpu_samples) if gpu_samples else None,
         "gpu_samples": gpu_samples, "scene_proof": [str(c.relative_to(run)) for c in proof],
         "profile_snapshots": 0, "present_trace_points": [],
@@ -171,8 +209,14 @@ def stats(values):
 
 def comparison_text(d):
     workload = d.get("workload", "gameplay")
-    lines = [f"# AC1 interleaved {workload} comparison", "", f"- Pair count: {d['pair_count']}; A failures: {d['A']['failures']}; B failures: {d['B']['failures']}", f"- Vsync: {d.get('vsync', 'unknown')}", f"- Busy-host override: {d.get('host_load_override', False)}", ""]
+    equivalence = d.get("pair_equivalence", [])
+    valid_pair_indices = {item.get("pair", 0) - 1 for item in equivalence if item.get("equivalent")}
+    lines = [f"# AC1 interleaved {workload} comparison", "", f"- Pair count: {d['pair_count']}; A failures: {d['A']['failures']}; B failures: {d['B']['failures']}", f"- Vsync: {d.get('vsync', 'unknown')}", f"- CCD affinity: {d.get('pin_mask', 'unknown')}; exploratory={d.get('exploratory', False)}; lock acquired={d.get('lock_acquired', False)}", f"- Workload-equivalent pairs: {len(valid_pair_indices)}; excluded pairs: {sum(1 for item in equivalence if not item.get('equivalent'))}", ""]
     decision = d.get("adaptive_decision")
+    for item in equivalence:
+        lines.append(f"- Pair {item.get('pair')}: equivalent={item.get('equivalent')}; replay commands match={item.get('command_indices_match')}; guest elapsed ns A/B={item.get('guest_time_A_ns')}/{item.get('guest_time_B_ns')}; boundary hashes match={item.get('observable_boundary_hashes_match')}; captures A/B={item.get('captures_A')}/{item.get('captures_B')}")
+    if equivalence:
+        lines.append("")
     if decision:
         lines.extend([
             f"- Adaptive verdict: {decision.get('verdict')}; stop reason: {decision.get('stop_reason')}",
@@ -185,11 +229,16 @@ def comparison_text(d):
                     ("frametime_p95_ms", "wall frame ms p95"),
                     ("frametime_p99_ms", "wall frame ms p99"),
                     ("main_thread_cpu_ms_per_frame", "main CPU ms/frame median"),
-                    ("main_thread_cpu_p95_ms_per_frame", "main CPU ms/frame p95"),
-                    ("main_thread_cpu_p99_ms_per_frame", "main CPU ms/frame p99"),
                     ("process_cpu_ms_per_frame", "process CPU ms/frame median"),
                     ("process_cpu_p95_ms_per_frame", "process CPU ms/frame p95"),
                     ("process_cpu_p99_ms_per_frame", "process CPU ms/frame p99"),
+                    ("main_thread_cycles_per_frame", "main-thread cycles/frame median"),
+                    ("main_thread_cycles_p50", "main-thread cycles/frame p50"),
+                    ("main_thread_cycles_p95", "main-thread cycles/frame p95"),
+                    ("main_thread_cycles_p99", "main-thread cycles/frame p99"),
+                    ("draw_calls_in_window", "draw calls in window (optimization effect)"),
+                    ("shader_constant_uploads_in_window", "shader constant uploads in window"),
+                    ("resource_locks_in_window", "resource locks in window"),
                     ("gpu_utilization_percent", "GPU %"), ("fps", "FPS"))
     for side in ("A", "B"):
         lines.append(f"## {side}: {d[side]['label']}")
@@ -208,18 +257,31 @@ def comparison_text(d):
                       ("frametime_p95_ms", "wall frame p95 ms"),
                       ("frametime_p99_ms", "wall frame p99 ms"),
                       ("main_thread_cpu_ms_per_frame", "main CPU median ms/frame"),
-                      ("main_thread_cpu_p95_ms_per_frame", "main CPU p95 ms/frame"),
-                      ("main_thread_cpu_p99_ms_per_frame", "main CPU p99 ms/frame"),
                       ("process_cpu_ms_per_frame", "process CPU median ms/frame"),
                       ("process_cpu_p95_ms_per_frame", "process CPU p95 ms/frame"),
-                      ("process_cpu_p99_ms_per_frame", "process CPU p99 ms/frame"), ("fps", "FPS"))
+                      ("process_cpu_p99_ms_per_frame", "process CPU p99 ms/frame"),
+                      ("main_thread_cycles_per_frame", "main-thread cycles/frame median"),
+                      ("main_thread_cycles_p50", "main-thread cycles/frame p50"),
+                      ("main_thread_cycles_p95", "main-thread cycles/frame p95"),
+                      ("main_thread_cycles_p99", "main-thread cycles/frame p99"),
+                      ("draw_calls_in_window", "draw calls in window"),
+                      ("shader_constant_uploads_in_window", "shader constant uploads in window"),
+                      ("resource_locks_in_window", "resource locks in window"), ("fps", "FPS"))
     for key, label in paired_metrics:
         delta = d.get("paired_deltas", {}).get(key)
+        valid_count = 0
         if delta is None:
-            pairs = [(a.get(key), b.get(key)) for a, b in zip(d["A"].get("runs", []), d["B"].get("runs", []))
-                     if a.get("reached_workload", a.get("reached_gameplay")) and b.get("reached_workload", b.get("reached_gameplay")) and isinstance(a.get(key), (int, float)) and isinstance(b.get(key), (int, float))]
+            pairs = [(a.get(key), b.get(key)) for index, (a, b) in enumerate(zip(d["A"].get("runs", []), d["B"].get("runs", [])))
+                     if (not equivalence or index in valid_pair_indices) and
+                     a.get("reached_workload", a.get("reached_gameplay")) and b.get("reached_workload", b.get("reached_gameplay")) and
+                     isinstance(a.get(key), (int, float)) and isinstance(b.get(key), (int, float))]
+            valid_count = len(pairs)
             delta = statistics.median([y - x for x, y in pairs]) if pairs else None
-        lines.append(f"- {label}: {delta} (valid pairs={sum(1 for a, b in zip(d['A'].get('runs', []), d['B'].get('runs', [])) if a.get('reached_workload', a.get('reached_gameplay')) and b.get('reached_workload', b.get('reached_gameplay')) )})")
+        else:
+            valid_count = len(valid_pair_indices) if equivalence else sum(
+                1 for a, b in zip(d["A"].get("runs", []), d["B"].get("runs", []))
+                if a.get("reached_workload", a.get("reached_gameplay")) and b.get("reached_workload", b.get("reached_gameplay")))
+        lines.append(f"- {label}: {delta} (workload-equivalent pairs={valid_count})")
     lines.append("")
     return "\n".join(lines)
 
@@ -228,14 +290,16 @@ def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "--internal-run":
         p = argparse.ArgumentParser()
         p.add_argument("--internal-run", type=Path, required=True)
-        p.add_argument("--seconds", type=int, required=True)
+        p.add_argument("--seconds", type=int, default=0)
         p.add_argument("--workload", choices=("gameplay", "menu"), default="gameplay")
-        p.add_argument("--start-present", type=int, default=1316)
-        p.add_argument("--scene-present", type=int, default=1300)
+        p.add_argument("--start-present", type=int, default=1800)
+        p.add_argument("--end-present", type=int, default=2200)
+        p.add_argument("--scene-present", type=int, default=1800)
         p.add_argument("--flush-frames", type=int, default=8)
         args = p.parse_args()
         print(json.dumps(internal_run(args.internal_run, args.seconds, args.workload,
-                                      args.start_present, args.scene_present, args.flush_frames)))
+                                      args.start_present, args.scene_present, args.flush_frames,
+                                      args.end_present)))
         return
     if len(sys.argv) >= 2 and sys.argv[1] == "--decision-json":
         p = argparse.ArgumentParser()
@@ -257,9 +321,9 @@ def main():
             workload = d.get("environment", {}).get("workload", "gameplay")
             failed = sum(not r.get("reached_workload", r.get("reached_gameplay")) for r in d.get("runs", []))
             env = d.get("environment", {})
-            lines = [f"# AC1 {workload} benchmark", "", f"- Identity: `{d['identity']['sha']}` / `{d['identity']['config_id']}`; branch `{d['identity']['branch']}`; dirty={d['identity']['dirty']}", f"- Binary SHA-256: `{d['identity']['binary_sha256']}`", f"- Machine: {d['machine']['cpu_model']}; {d['machine']['logical_cores']} logical cores; {d['machine']['physical_memory_bytes']} bytes RAM", f"- Vsync: {env.get('vsync', 'unknown')}", f"- Start: scene Present {env.get('start_present', 'unknown')}; measured from Present {env.get('measurement_start_present', 'unknown')} after {env.get('cpu_sample_window_frames', 'unknown')}-Present CPU smoothing window", f"- Build generator: {env.get('actual_build_generator', 'unknown')}", f"- Failed runs: {failed}", ""]
+            lines = [f"# AC1 {workload} benchmark", "", f"- Identity: `{d['identity']['sha']}` / `{d['identity']['config_id']}`; branch `{d['identity']['branch']}`; dirty={d['identity']['dirty']}", f"- Binary SHA-256: `{d['identity']['binary_sha256']}`", f"- Machine: {d['machine']['cpu_model']}; {d['machine']['logical_cores']} logical cores; {d['machine']['physical_memory_bytes']} bytes RAM", f"- Vsync: {env.get('vsync', 'unknown')}", f"- Present window: {env.get('start_present', 'unknown')}-{env.get('end_present', 'unknown')}; pin mask={env.get('pin_mask', 'unknown')}", f"- Build generator: {env.get('actual_build_generator', 'unknown')}", f"- Failed runs: {failed}", ""]
             for r in d["runs"]:
-                lines.append(f"- Run {r['run']}: reached_workload={r.get('reached_workload', False)}, main CPU ms/frame median/p95/p99={r.get('main_thread_cpu_ms_per_frame')}/{r.get('main_thread_cpu_p95_ms_per_frame')}/{r.get('main_thread_cpu_p99_ms_per_frame')}, process CPU ms/frame median/p95/p99={r.get('process_cpu_ms_per_frame')}/{r.get('process_cpu_p95_ms_per_frame')}/{r.get('process_cpu_p99_ms_per_frame')}, wall ms p50/p95/p99={r.get('frametime_p50_ms')}/{r.get('frametime_p95_ms')}/{r.get('frametime_p99_ms')}, FPS={r.get('fps')}, GPU={r.get('gpu_utilization_percent')}%, failure={r.get('failure')}")
+                lines.append(f"- Run {r['run']}: reached={r.get('reached_workload')}, main CPU ms/frame median={r.get('main_thread_cpu_ms_per_frame')}, cycles/frame p50/p95/p99={r.get('main_thread_cycles_p50')}/{r.get('main_thread_cycles_p95')}/{r.get('main_thread_cycles_p99')}, migrations={r.get('processor_migrations')}, guest ns={r.get('guest_time_elapsed_ns')}, command indices={r.get('input_command_index_start')} to {r.get('input_command_index_end')}, other CPU={r.get('other_process_cpu_percent')}%, frequency MHz={r.get('cpu_frequency_start_mhz')} to {r.get('cpu_frequency_end_mhz')}, draws/uploads/locks={r.get('draw_calls_in_window')}/{r.get('shader_constant_uploads_in_window')}/{r.get('resource_locks_in_window')}, wall p50/p95/p99={r.get('frametime_p50_ms')}/{r.get('frametime_p95_ms')}/{r.get('frametime_p99_ms')}, FPS={r.get('fps')}, failure={r.get('failure')}")
             report = "\n".join(lines) + "\n"
         (Path(sys.argv[2]) / "summary.md").write_text(report, encoding="utf-8")
         print(report, end="")
@@ -273,7 +337,7 @@ def main():
     a, b = map(read, sys.argv[1:])
     for label, data in (("A", a), ("B", b)):
         print(f"{label}: {data['identity']['sha']} ({data['identity']['branch']}) {data['identity']['config_id']} dirty={data['identity']['dirty']}")
-        for key in ("main_thread_cpu_ms_per_frame", "main_thread_cpu_p95_ms_per_frame", "main_thread_cpu_p99_ms_per_frame", "process_cpu_ms_per_frame", "frametime_p95_ms", "frametime_p99_ms", "fps", "gpu_utilization_percent"):
+        for key in ("main_thread_cpu_ms_per_frame", "process_cpu_ms_per_frame", "main_thread_cycles_per_frame", "main_thread_cycles_p95", "main_thread_cycles_p99", "frametime_p95_ms", "frametime_p99_ms", "fps", "gpu_utilization_percent"):
             print(f"  {key}: {stats(successful(data, key))}")
 
 

@@ -271,9 +271,9 @@ Original executables, `.forge` assets, generated game translations and local bin
 
 ## Benchmarking
 
-Run `tools/bench_gameplay.ps1` for the host gameplay benchmark; the default measurement window is 30 seconds, starting at gameplay Present 1300 (the first full Windows CPU sample follows the 16-frame smoothing window). It records the scene and measured Present indices. Runtime `AC1_FRAME_STATS` CSV rows report wall time, main Present-thread CPU time, and total process CPU time per frame; summaries use per-frame medians and p95/p99. FPS is retained as the last, secondary metric. Benchmark runs set `d3d9.presentInterval = 0` through a private DXVK config and record vsync as off. The game stops at the measurement deadline; runtime stats flush every eight frames during benchmarking. Runs without a complete frame-stats window or scene proof are marked failed and excluded from performance statistics. NVIDIA GPU sampling resolves `nvidia-smi.exe` from PATH, System32, or the standard NVSMI install directory. See [benchmarking details](docs/benchmarking.md).
+Run `tools/bench_gameplay.ps1` for the host gameplay benchmark; its default window is fixed at successful Presents 1800–2200 in the replay's steady WALK segment. `-Seconds` is a safety timeout. It pins the game to CCD0 mask `0x0000FFFF`, disables DXVK vsync, captures both boundaries, and stops the game at EndPresent. Frame stats include wall time, main-thread/process CPU milliseconds, Windows thread-cycle deltas, processor number, guest clock and replay command index. Windows CPU milliseconds remain 16-Present rolling averages; cycle deltas are per-frame and are not retired-instruction counts. FPS is retained last as context. See [benchmarking details](docs/benchmarking.md).
 
-For drift-resistant A/B comparisons, pass `-Compare` and optional stripped binaries `-Binary` and `-BinaryB`. By default it runs at least three and at most eight pairs, alternating AB/BA order. After each pair it bootstraps a 95% CI for the paired median main-thread CPU ms/frame delta, stopping when the CI excludes zero or its half-width is below 1% of the A baseline. The report records the verdict, stop reason, pair count, delta spread, and CI. Tune with `-MinPairs`, `-MaxPairs`, and `-PracticalPercent`. Without a binary for a side, that side uses the normal build settings; side B can override them with `-DirectMemoryB ON|OFF`, `-TraceEipB ON|OFF`, `-ForceInlineB ON|OFF`, and `-LiftArgsB`. `-Env` and `-EnvB` apply per-side runtime environment overrides. Use `-AllowBusy` only when other workloads cannot be paused; the result records that override.
+For A/B comparisons, pass `-Compare` and `-Binary`/`-BinaryB`; the harness takes `D:\ac1_bench.lock` exclusively. Pairs alternate AB/BA. Replay command progression, guest-visible elapsed time, and boundary captures establish workload comparability; internal operation counts and cycle changes are optimization effects and never exclude a pair. The adaptive CI uses paired main-thread CPU ms/frame; per-frame cycle distributions are reported alongside it. Use `-Exploratory` to bypass the lock and label the run exploratory. A/A calibration uses the same executable for both binaries; see the exact command in [benchmarking details](docs/benchmarking.md).
 
 Example using existing stripped binaries:
 
@@ -293,8 +293,8 @@ Codegen flag liveness is selected with `tools/build.ps1 -BuildType RelWithDebInf
 list such as `-LocalRegs '0051DD60,00428540'` selects individual functions. The lifter accepts the same
 selection with `--local-regs`. Preparation checks both selected modes in its report.
 `-X87Inline` independently force-inlines the audited integer-conversion helper (default off).
-The benchmark preserves a complete frame window by draining the periodic profiler after CPU/GPU accounting stops;
-incomplete windows, guest stops and dropped frame samples fail its audit. See [codegen evidence](docs/codegen.md)
+The benchmark stops its own game at EndPresent and flushes frame stats at that boundary;
+incomplete fixed ranges or missing replay/guest-time evidence fail its audit. See [codegen evidence](docs/codegen.md)
 for the accepted +5.97% CFG-flags experiment and original -53.19% locals result.
 The [follow-up evidence](docs/codegen-followup.md) diagnoses cadence-dependent tutorial progression,
 records the FLAGABI comparison (+3.77%) and revised locals comparison (+7.35%), and corrects the old x87 call counter.

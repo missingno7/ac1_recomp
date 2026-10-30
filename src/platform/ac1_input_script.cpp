@@ -752,6 +752,10 @@ extern "C" void ac1_input_session_shutdown(void) {
     dispatch = nullptr;
 }
 extern "C" int ac1_input_replaying(void) { return session != nullptr; }
+extern "C" uint64_t ac1_input_script_command_index(void) {
+    std::lock_guard<std::mutex> lock(session_mutex);
+    return session ? static_cast<uint64_t>(session->next) : 0;
+}
 extern "C" void ac1_input_tick(void) {
     std::lock_guard<std::mutex> lock(session_mutex);
     tick();

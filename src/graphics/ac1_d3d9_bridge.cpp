@@ -8,6 +8,10 @@
  */
 
 #include "ac1_d3d9_bridge.h"
+extern "C" {
+#include "../runtime/guest_clock.h"
+}
+#include "../platform/ac1_input_script.h"
 #ifdef AC1_PROFILE_HOOKS
 #include "../runtime/ac1_profile.h"
 #endif
@@ -52,6 +56,11 @@ using D3DXMATRIX = ac1_d3dx::Matrix;
 
 namespace {
 
+uint64_t g_frame_constant_uploads = 0;
+uint64_t g_frame_resource_locks = 0;
+extern uint64_t g_successful_draw_calls;
+extern bool g_frame_trace_enabled;
+
 #if defined(_WIN32)
 constexpr uint64_t kCpuSampleWindowFrames = 16;
 #else
@@ -77,6 +86,13 @@ public:
         const auto wall = std::chrono::steady_clock::now();
         const double thread_cpu = thread_cpu_seconds();
         const double process_cpu = process_cpu_seconds();
+        const uint64_t thread_cycles = thread_cycle_count();
+        const uint32_t processor = current_processor();
+        const uint64_t guest_ns = guest_monotonic_ns();
+        const uint64_t input_command = ac1_input_script_command_index();
+        const uint64_t draws = g_successful_draw_calls;
+        const uint64_t constant_uploads = g_frame_constant_uploads;
+        const uint64_t resource_locks = g_frame_resource_locks;
         const uint64_t present_index = have_previous_ ? frame_ + 1 : 1;
         const size_t history_size = static_cast<size_t>(kCpuSampleWindowFrames + 1);
         double thread_cpu_ms = 0.0;
@@ -99,20 +115,29 @@ public:
                 rows_.push_back({frame_,
                     std::chrono::duration<double, std::milli>(wall - previous_wall_).count(),
                     thread_cpu_ms, process_cpu_ms,
-                    static_cast<uint32_t>(kCpuSampleWindowFrames)});
-                if (rows_.size() >= flush_rows_) flush();
+                    static_cast<uint32_t>(kCpuSampleWindowFrames),
+                    thread_cycles >= previous_cycles_ ? thread_cycles - previous_cycles_ : 0,
+                    processor, guest_ns, input_command,
+                    draws >= previous_draws_ ? draws - previous_draws_ : draws,
+                    constant_uploads >= previous_constant_uploads_ ? constant_uploads - previous_constant_uploads_ : constant_uploads,
+                    resource_locks >= previous_resource_locks_ ? resource_locks - previous_resource_locks_ : resource_locks});
+                if (rows_.size() >= flush_rows_ || (flush_at_frame_ && frame_ >= flush_at_frame_)) flush();
             }
         } else {
             frame_ = present_index;
         }
         previous_wall_ = wall;
+        previous_cycles_ = thread_cycles;
+        previous_draws_ = draws;
+        previous_constant_uploads_ = constant_uploads;
+        previous_resource_locks_ = resource_locks;
         have_previous_ = true;
     }
 
     ~FrameStats() { std::lock_guard<std::mutex> guard(lock_); flush(); }
 
 private:
-    struct Row { uint64_t frame; double wall_ms, thread_cpu_ms, process_cpu_ms; uint32_t cpu_window_frames; };
+    struct Row { uint64_t frame; double wall_ms, thread_cpu_ms, process_cpu_ms; uint32_t cpu_window_frames; uint64_t cycles; uint32_t processor; uint64_t guest_ns, input_command, draw_calls, constant_uploads, resource_locks; };
     bool enabled_ = false, have_previous_ = false;
     unsigned long slowdown_us_ = 0;
     std::once_flag init_once_;
@@ -120,7 +145,10 @@ private:
     std::string path_;
     uint64_t frame_ = 0;
     size_t flush_rows_ = 64;
+    uint64_t flush_at_frame_ = 0;
     std::chrono::steady_clock::time_point previous_wall_{};
+    uint64_t previous_cycles_ = 0;
+    uint64_t previous_draws_ = 0, previous_constant_uploads_ = 0, previous_resource_locks_ = 0;
     std::vector<Row> rows_;
     std::array<double, 17> thread_cpu_history_{};
     std::array<double, 17> process_cpu_history_{};
@@ -139,6 +167,12 @@ private:
                     flush_rows_ = static_cast<size_t>(requested);
             }
             rows_.reserve(flush_rows_);
+            const char *end_present = std::getenv("AC1_FRAME_STATS_END_PRESENT");
+            if (end_present && *end_present) {
+                char *end = nullptr;
+                const unsigned long long requested = std::strtoull(end_present, &end, 10);
+                if (end != end_present && *end == '\0') flush_at_frame_ = requested;
+            }
         }
         const char *slowdown = std::getenv("AC1_FRAME_STATS_TEST_SLOWDOWN_US");
         if (enabled_ && slowdown && *slowdown) {
@@ -187,6 +221,24 @@ private:
         return static_cast<double>(value.tv_sec) + value.tv_nsec * 1e-9;
 #endif
     }
+    uint64_t thread_cycle_count() const
+    {
+#if defined(_WIN32)
+        ULONG64 cycles = 0;
+        QueryThreadCycleTime(GetCurrentThread(), &cycles);
+        return cycles;
+#else
+        return 0;
+#endif
+    }
+    uint32_t current_processor() const
+    {
+#if defined(_WIN32)
+        return GetCurrentProcessorNumber();
+#else
+        return UINT32_MAX;
+#endif
+    }
     void flush()
     {
         if (rows_.empty() || path_.empty()) return;
@@ -200,11 +252,25 @@ private:
             return;
         }
         if (file_size(file) == 0)
-            std::fputs("present_index,wall_ms,main_thread_cpu_ms,process_cpu_ms,cpu_sample_window_frames\n", file);
-        for (const Row &row : rows_)
-            std::fprintf(file, "%llu,%.6f,%.6f,%.6f,%u\n",
+            std::fputs("present_index,wall_ms,main_thread_cpu_ms,process_cpu_ms,cpu_sample_window_frames,main_thread_cycles,processor,guest_time_ns,input_command_index,draw_calls,shader_constant_uploads,resource_locks\n", file);
+        for (const Row &row : rows_) {
+#if defined(_WIN32)
+            const std::string cycles = std::to_string(row.cycles);
+            const std::string processor = std::to_string(row.processor);
+#else
+            const std::string cycles;
+            const std::string processor;
+#endif
+            std::fprintf(file, "%llu,%.6f,%.6f,%.6f,%u,%s,%s,%llu,%llu,%llu,%llu,%llu\n",
                          static_cast<unsigned long long>(row.frame), row.wall_ms,
-                         row.thread_cpu_ms, row.process_cpu_ms, row.cpu_window_frames);
+                         row.thread_cpu_ms, row.process_cpu_ms, row.cpu_window_frames,
+                         cycles.c_str(), processor.c_str(),
+                         static_cast<unsigned long long>(row.guest_ns),
+                         static_cast<unsigned long long>(row.input_command),
+                         static_cast<unsigned long long>(row.draw_calls),
+                         static_cast<unsigned long long>(row.constant_uploads),
+                         static_cast<unsigned long long>(row.resource_locks));
+        }
         std::fclose(file);
         rows_.clear();
     }
@@ -483,9 +549,22 @@ void capture_back_buffer(IDirect3DDevice9 *device)
     const char *dir = std::getenv("AC1_D3D9_CAPTURE_DIR");
     if (!dir || !*dir || !device) return;
     const uint64_t n = ++g_capture_present_index;
+    const char *points = std::getenv("AC1_D3D9_CAPTURE_POINTS");
+    if (points && *points) {
+        bool selected = false;
+        const char *cursor = points;
+        while (*cursor) {
+            char *end = nullptr;
+            const unsigned long long point = std::strtoull(cursor, &end, 10);
+            if (end == cursor) break;
+            if (point == n) selected = true;
+            cursor = *end == ',' ? end + 1 : end;
+        }
+        if (!selected) return;
+    }
     const char *every = std::getenv("AC1_D3D9_CAPTURE_EVERY");
     const uint64_t interval = every ? std::strtoull(every, nullptr, 10) : 0;
-    if ((n & (n - 1u)) && (!interval || n % interval)) return;
+    if ((!points || !*points) && (n & (n - 1u)) && (!interval || n % interval)) return;
     IDirect3DSurface9 *back = nullptr, *copy = nullptr;
     D3DSURFACE_DESC desc{};
     D3DLOCKED_RECT locked{};
@@ -2990,6 +3069,7 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
         HRESULT status = checked_shader_constant_data(device, data_kind,
             args[1], args[2], args[3], &data);
         if (FAILED(status)) return hresult(status);
+        if (g_frame_trace_enabled) ++g_frame_constant_uploads;
         switch (method) {
         case 94:
             return hresult(device->SetVertexShaderConstantF(args[1],
@@ -3122,6 +3202,7 @@ bool shadow_buffer_locks_enabled()
 
 HRESULT lock_guest_buffer(GuestObject &object, const uint32_t *args, uint32_t argc)
 {
+    if (g_frame_trace_enabled) ++g_frame_resource_locks;
     const char *name = object.kind == ObjectKind::VertexBuffer
         ? "IDirect3DVertexBuffer9::Lock" : "IDirect3DIndexBuffer9::Lock";
     if (!require_count(argc, 5, name)) return D3DERR_INVALIDCALL;
@@ -3573,6 +3654,7 @@ HRESULT lock_staged(GuestObject &object, uint32_t address, uint32_t face,
                     uint32_t level, uint32_t out_address, uint32_t region_address,
                     uint32_t flags, bool volume)
 {
+    if (g_frame_trace_enabled) ++g_frame_resource_locks;
     const TextureLockKey key{address, face, level};
     if (g_staged_locks.count(key)) { set_error("duplicate LockRect/LockBox for the same subresource"); return D3DERR_INVALIDCALL; }
     void *out = output<uint8_t>(out_address, volume ? sizeof(GuestLockedBox) : sizeof(GuestLockedRect));

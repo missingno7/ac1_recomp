@@ -1,8 +1,9 @@
 param(
     [ValidateRange(1, 50)][int]$Runs = 3,
-    [ValidateRange(1, 86400)][int]$Seconds = 30,
+    [ValidateRange(1, 86400)][int]$Seconds = 180,
     [ValidateRange(1, 3600)][int]$StartupTimeoutSeconds = 120,
-    [ValidateRange(1, 1000000)][int]$StartPresent = 1300,
+    [ValidateRange(1, 1000000)][int]$StartPresent = 1800,
+    [ValidateRange(1, 1000000)][int]$EndPresent = 2200,
     [ValidateRange(1, 4096)][int]$FrameStatsFlushFrames = 8,
     [ValidateRange(3, 8)][int]$MinPairs = 3,
     [ValidateRange(3, 8)][int]$MaxPairs = 8,
@@ -19,6 +20,7 @@ param(
     [string]$Binary = '',
     [string]$BinaryB = '',
     [switch]$Compare,
+    [switch]$Exploratory,
     [hashtable]$EnvB = @{},
     [string]$EnvBJson = '',
     [string]$DirectMemoryB = '',
@@ -49,6 +51,8 @@ if ($EnvBJson) {
     foreach ($item in $parsedEnvB.PSObject.Properties) { $EnvB[$item.Name] = [string]$item.Value }
 }
 $ownedConfigProc = $null
+$benchLockStream = $null
+$benchLockPath = 'D:\ac1_bench.lock'
 Push-Location $Root
 try {
     function Wait-ForQuietMachine {
@@ -118,6 +122,12 @@ public static class AC1BenchProcessTree {
             $rep.initializer_tables_sha256 -eq $tablesHash -and $rep.generation_input_sha256.emission_cache -eq $cacheHash
     }
     if ($BinaryB -or $Compare) {
+        if (-not $Exploratory) {
+            try { $benchLockStream = [IO.File]::Open($benchLockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None) }
+            catch { throw "Controlled comparison refused: $benchLockPath already exists or cannot be created. Use -Exploratory to run without the lock." }
+            $lockText = "worker=$env:USERNAME`nstarted=$([DateTime]::UtcNow.ToString('o'))`npurpose=AC1 fixed-present A/B benchmark`n"
+            $lockBytes = [Text.Encoding]::UTF8.GetBytes($lockText); $benchLockStream.Write($lockBytes,0,$lockBytes.Length); $benchLockStream.Flush()
+        }
         if ($MaxPairs -lt $MinPairs) { throw '-MaxPairs must be greater than or equal to -MinPairs.' }
         $comparisonId = 'comparison-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N').Substring(0,6)
         $comparisonDir = if ($ComparisonDir) { if ([IO.Path]::IsPathRooted($ComparisonDir)) { $ComparisonDir } else { Join-Path $Root $ComparisonDir } } else { Join-Path $Root "work/bench/$comparisonId" }
@@ -139,7 +149,7 @@ public static class AC1BenchProcessTree {
                 }
                 $childArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath,
                     '-Runs','1','-Seconds',[string]$Seconds,'-StartupTimeoutSeconds',[string]$StartupTimeoutSeconds,
-                    '-StartPresent',[string]$StartPresent,'-FrameStatsFlushFrames',[string]$FrameStatsFlushFrames,'-Workload',$Workload,
+                    '-StartPresent',[string]$StartPresent,'-EndPresent',[string]$EndPresent,'-FrameStatsFlushFrames',[string]$FrameStatsFlushFrames,'-Workload',$Workload,
                     '-ResultDirOverride',$sideDir,'-Label',"${side}-pair-${pair}",'-Python',$Python,'-GameExe',$GameExe,'-AllowDirty')
                 if ($sideBinary) { $childArgs += @('-Binary',$sideBinary) }
                 $childDirect = $DirectMemory; $childTrace = $TraceEip; $childInline = $ForceInline; $childLift = $LiftArgs
@@ -162,29 +172,36 @@ public static class AC1BenchProcessTree {
                 $sideRuns[$side] += $one.runs[0]
                 $sideLabels[$side] = if ($one.identity.label) { $one.identity.label } elseif ($sideBinary) { (Split-Path $sideBinary -Leaf) } else { $one.identity.config_id }
             }
-            $pairedInputs = @()
+            $pairedInputs = @(); $baselineInputs = @(); $pairEquivalence = @()
             for ($pairIndex=0; $pairIndex -lt $sideRuns.A.Count; $pairIndex++) {
                 $aRun = $sideRuns.A[$pairIndex]; $bRun = $sideRuns.B[$pairIndex]
-                if ($aRun.reached_workload -and $bRun.reached_workload -and
-                    $null -ne $aRun.main_thread_cpu_ms_per_frame -and $null -ne $bRun.main_thread_cpu_ms_per_frame) {
+                $sameCommands = $null -ne $aRun.input_command_index_start -and
+                    $aRun.input_command_index_start -eq $bRun.input_command_index_start -and
+                    $aRun.input_command_index_end -eq $bRun.input_command_index_end
+                $guestA = [double]$aRun.guest_time_elapsed_ns; $guestB = [double]$bRun.guest_time_elapsed_ns
+                $guestComparable = $guestA -gt 0 -and $guestB -gt 0 -and ([Math]::Abs($guestA-$guestB) / [Math]::Max($guestA,$guestB)) -le 0.01
+                $capturesPresent = @($aRun.boundary_captures).Count -eq 2 -and @($bRun.boundary_captures).Count -eq 2
+                $observableResultsMatch = $capturesPresent -and (($aRun.boundary_capture_sha256 | ConvertTo-Json -Compress) -eq ($bRun.boundary_capture_sha256 | ConvertTo-Json -Compress))
+                $equivalent = $aRun.reached_workload -and $bRun.reached_workload -and $sameCommands -and $guestComparable -and $observableResultsMatch
+                $pairEquivalence += [ordered]@{ pair=$pairIndex+1; equivalent=$equivalent; command_indices_match=$sameCommands; guest_time_comparable=$guestComparable; guest_time_A_ns=$aRun.guest_time_elapsed_ns; guest_time_B_ns=$bRun.guest_time_elapsed_ns; observable_boundary_hashes_match=$observableResultsMatch; captures_A=$aRun.boundary_captures; captures_B=$bRun.boundary_captures }
+                if ($equivalent -and $null -ne $aRun.main_thread_cpu_ms_per_frame -and $null -ne $bRun.main_thread_cpu_ms_per_frame) {
                     $pairedInputs += [double]$bRun.main_thread_cpu_ms_per_frame - [double]$aRun.main_thread_cpu_ms_per_frame
+                    $baselineInputs += [double]$aRun.main_thread_cpu_ms_per_frame
                 }
             }
-            $baselineInputs = @($sideRuns.A | Where-Object { $_.reached_workload -and $null -ne $_.main_thread_cpu_ms_per_frame } |
-                ForEach-Object { [double]$_.main_thread_cpu_ms_per_frame })
             [ordered]@{ executed_pairs=$pair; deltas=$pairedInputs; baseline=$baselineInputs } |
                 ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $decisionPath -Encoding UTF8
             $decision = (& $Python -B tools/bench_report.py --decision-json $decisionPath `
                 --min-pairs $MinPairs --max-pairs $MaxPairs --practical-percent $PracticalPercent | ConvertFrom-Json)
-            Write-Host "Pair $pair/$MaxPairs ($($pairOrder -join '/')): valid=$($decision.valid_pairs), paired main-CPU delta=$($decision.paired_delta_median_ms) ms/frame, verdict=$($decision.verdict)."
+            Write-Host "Pair $pair/$MaxPairs ($($pairOrder -join '/')): equivalent=$($pairEquivalence[-1].equivalent), valid=$($decision.valid_pairs), paired main-CPU delta=$($decision.paired_delta_median_ms) ms/frame, verdict=$($decision.verdict)."
             if ($decision.stop) {
                 Write-Host "Adaptive comparison stopped: $($decision.stop_reason)"
                 break
             }
         }
         $comparison = [ordered]@{
-            comparison=$true; pair_count=$pair; min_pairs=$MinPairs; max_pairs=$MaxPairs; seconds=$Seconds
-            start_present=$StartPresent; workload_definition='gameplay uses tools/input/to_gameplay.txt and begins timing at the first complete CPU sample at or after StartPresent';
+            comparison=$true; exploratory=[bool]$Exploratory; lock_acquired=([bool]$benchLockStream); pin_mask='0x0000FFFF'; pair_count=$pair; min_pairs=$MinPairs; max_pairs=$MaxPairs; safety_timeout_seconds=$Seconds
+            start_present=$StartPresent; end_present=$EndPresent; workload_definition='fixed successful Present range; gameplay uses tools/input/to_gameplay.txt'; pair_equivalence=$pairEquivalence
             practical_percent=$PracticalPercent; adaptive_decision=$decision; host_load_override=[bool]$AllowBusy
             userdata_seed=$UserdataSeed; workload=$Workload; vsync='off (DXVK d3d9.presentInterval=0)'
             A=[ordered]@{ label=$sideLabels.A; binary=$Binary; runtime_env=$Env; runs=$sideRuns.A; failures=@($sideRuns.A | Where-Object { -not $_.reached_workload }).Count }
@@ -257,6 +274,19 @@ public static class AC1BenchProcessTree {
     }
     $binaryHash = (Get-FileHash $binaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $cpuModel = (Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0').ProcessorNameString
+    if (-not ('AC1BenchTopology' -as [type])) { Add-Type -TypeDefinition @"
+using System; using System.Collections.Generic; using System.Runtime.InteropServices;
+public static class AC1BenchTopology {
+ [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetLogicalProcessorInformationEx(int relation, byte[] buffer, ref uint length);
+ [DllImport("powrprof.dll")] static extern int CallNtPowerInformation(int level, IntPtr input, uint inputLength, IntPtr output, uint outputLength);
+ public static ulong[] L3Masks() { uint n=0; GetLogicalProcessorInformationEx(2,null,ref n); byte[] b=new byte[n]; if(!GetLogicalProcessorInformationEx(2,b,ref n)) throw new System.ComponentModel.Win32Exception(); var a=new List<ulong>(); int o=0; while(o<n) { int size=BitConverter.ToInt32(b,o+4); if(BitConverter.ToInt32(b,o)==2 && b[o+8]==3) { int groups=BitConverter.ToUInt16(b,o+38); for(int g=0;g<groups;g++) { int q=o+40+g*16; if(BitConverter.ToUInt16(b,q+8)==0) a.Add(BitConverter.ToUInt64(b,q)); } } o+=size; } return a.ToArray(); }
+ public static double CurrentMhz(ulong mask) { int count=Environment.ProcessorCount; int bytes=count*24; IntPtr p=Marshal.AllocHGlobal(bytes); try { if(CallNtPowerInformation(11,IntPtr.Zero,0,p,(uint)bytes)!=0) return -1; double sum=0; int n=0; for(int i=0;i<count&&i<64;i++) if((mask&(1UL<<i))!=0) { sum+=Marshal.ReadInt32(p,i*24+8); n++; } return n==0?-1:sum/n; } finally { Marshal.FreeHGlobal(p); } }
+}
+"@ }
+    $pinMask = [UInt64]65535
+    $l3Masks = [AC1BenchTopology]::L3Masks()
+    if (-not ($l3Masks -contains $pinMask)) { throw 'CCD0 affinity mask 0x0000FFFF does not match a queried L3 cache domain.' }
+    $l3DomainMasks = @($l3Masks | ForEach-Object { '0x{0:X8}' -f $_ })
     if (-not ('AC1BenchMemory' -as [type])) { Add-Type -TypeDefinition @"
 using System; using System.Runtime.InteropServices;
 public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Auto)] public class M { public uint Length=(uint)Marshal.SizeOf(typeof(M)); public uint Load; public ulong TotalPhys,AvailPhys,TotalPageFile,AvailPageFile,TotalVirtual,AvailVirtual; public ulong AvailExtended; } [DllImport("kernel32.dll",SetLastError=true)] public static extern bool GlobalMemoryStatusEx([In,Out] M m); }
@@ -283,7 +313,7 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
             AC1_DISPATCH_LIMIT='0'; AC1_AUDIO_MUTE='1'
             AC1_D3D9_CAPTURE_DIR=(Join-Path $runDir 'captures')
             AC1_D3D9_TRACE_FRAME='1'; AC1_PROFILE_FRAMES='0'; AC1_PROFILE='0'; AC1_D3D9_CAPTURE_EVERY=''; DXVK_LOG_PATH=$runDir
-            AC1_FRAME_STATS=(Join-Path $runDir 'frame-stats.csv'); AC1_FRAME_STATS_FLUSH_FRAMES=[string]$FrameStatsFlushFrames; DXVK_CONFIG_FILE=$dxvkConfig
+            AC1_FRAME_STATS=(Join-Path $runDir 'frame-stats.csv'); AC1_FRAME_STATS_FLUSH_FRAMES=[string]$FrameStatsFlushFrames; AC1_FRAME_STATS_END_PRESENT=[string]$EndPresent; DXVK_CONFIG_FILE=$dxvkConfig
         }
         $envs['AC1_INPUT_SCRIPT'] = if ($Workload -eq 'gameplay') { (Resolve-Path tools/input/to_gameplay.txt).Path } else { '' }
         foreach ($k in $Env.Keys) { $envs[$k] = [string]$Env[$k] }
@@ -291,49 +321,51 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
         # environment overrides are used for A/B experiments.
         $envs['AC1_FRAME_STATS'] = Join-Path $runDir 'frame-stats.csv'
         $envs['AC1_FRAME_STATS_FLUSH_FRAMES'] = [string]$FrameStatsFlushFrames
+        $envs['AC1_FRAME_STATS_END_PRESENT'] = [string]$EndPresent
         $envs['AC1_PROFILE_FRAMES'] = '0'
+        $envs['AC1_D3D9_CAPTURE_DIR'] = Join-Path $runDir 'captures'
+        $envs['AC1_D3D9_CAPTURE_POINTS'] = "$StartPresent,$EndPresent"
+        $envs['AC1_D3D9_CAPTURE_EVERY'] = ''
+        $envs['AC1_D3D9_TRACE_FRAME'] = '1'
+        $envs['AC1_INPUT_SCRIPT'] = if ($Workload -eq 'gameplay') { (Resolve-Path tools/input/to_gameplay.txt).Path } else { '' }
         $envs['DXVK_CONFIG_FILE'] = $dxvkConfig
         $envs['DXVK_CONFIG'] = 'd3d9.presentInterval = 0'
         $envs['AC1_PROFILE_DIR'] = (Join-Path $runDir 'profile')
-        $envs['AC1_D3D9_CAPTURE_EVERY'] = [string]$StartPresent
+        $envs['AC1_D3D9_CAPTURE_EVERY'] = ''
+        $envs['AC1_D3D9_CAPTURE_POINTS'] = "$StartPresent,$EndPresent"
         $profileDir = Join-Path $runDir 'profile'
         $profileSource = Join-Path $Root 'work/work/profile'
         New-Item -ItemType Directory -Force -Path $envs.AC1_D3D9_CAPTURE_DIR,$profileDir,$profileSource | Out-Null
         $profileBefore = @{}; Get-ChildItem "$profileSource/raw_*.json" -ErrorAction SilentlyContinue | ForEach-Object { $profileBefore[$_.Name] = $_.LastWriteTimeUtc }
         $gpuLog = Join-Path $runDir 'gpu.csv'; $gpuProc = $null
-        $proc = $null; $timer = [Diagnostics.Stopwatch]::StartNew(); $gameTimer = $null; $durationReached = $false
-        $measurementRunSeconds = [double]$Seconds; $measurementPrefixMs = 0.0
-        $cpuSampleWindowFrames = 16
+        $proc = $null; $timer = [Diagnostics.Stopwatch]::StartNew(); $gameTimer = $null; $durationReached = $false; $safetyTimeoutReached = $false
+        $frequencyStartMhz = $null; $frequencyEndMhz = $null
+        $otherCpuStart = @{}; $hostWindowClock = $null; $otherCpuSeconds = $null; $otherCpuPercent = $null
+        $measurementPrefixMs = 0.0
+        $cpuSampleWindowFrames = 0
         $sceneStartFrame = $StartPresent
-        $measurementStartFrame = $sceneStartFrame + $cpuSampleWindowFrames
+        $measurementStartFrame = $sceneStartFrame
         $previousEnv = @{}; foreach ($k in $envs.Keys) { $previousEnv[$k] = [Environment]::GetEnvironmentVariable($k,'Process'); [Environment]::SetEnvironmentVariable($k,[string]$envs[$k],'Process') }
         try {
             $proc = Start-Process -FilePath $binaryPath -ArgumentList ('"' + $GameExe + '"') -WorkingDirectory $Root -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $runDir 'stdout.log') -RedirectStandardError (Join-Path $runDir 'startup.log')
             $null = $proc.Handle
-            while (-not $proc.WaitForExit(250)) {
-                if (-not $gameTimer) {
-                    $presentNow = 0
-                    $statsPath = Join-Path $runDir 'frame-stats.csv'
-                    if (Test-Path -LiteralPath $statsPath) {
-                        try {
-                            $lastStatsLine = Get-Content -LiteralPath $statsPath -Tail 1 -ErrorAction Stop
-                            if ($lastStatsLine -match '^(\d+),') { $presentNow = [int]$Matches[1] }
-                        } catch { }
-                    }
-                    if ($presentNow -ge $measurementStartFrame) {
-                        $prefixRows = Import-Csv -LiteralPath $statsPath | Where-Object {
-                            [int]$_.present_index -ge $measurementStartFrame -and [int]$_.present_index -le $presentNow
-                        }
-                        $prefixTotal = $prefixRows | Measure-Object -Property wall_ms -Sum
-                        if ($null -ne $prefixTotal.Sum) { $measurementPrefixMs = [double]$prefixTotal.Sum }
-                        $measurementRunSeconds = [Math]::Max(0.05, $Seconds - $measurementPrefixMs / 1000.0)
-                        $gameTimer = [Diagnostics.Stopwatch]::StartNew()
-                        if ($gpuAvailable) { $gpuProc = Start-Process -FilePath $gpuTool.Source -ArgumentList @('--query-gpu=utilization.gpu,clocks.gr','--format=csv,noheader,nounits','-lms','500') -PassThru -WindowStyle Hidden -RedirectStandardOutput $gpuLog -RedirectStandardError (Join-Path $runDir 'gpu.err') }
-                        Write-Host "Run $i $Workload measurement started at Present $measurementStartFrame."
-                    }
+            $pinMask = [long]65535
+            $proc.ProcessorAffinity = [IntPtr]$pinMask
+            $affinityReadback = [long]$proc.ProcessorAffinity
+            if ($affinityReadback -ne $pinMask) { throw 'Failed to pin game process to CCD0 mask 0x0000FFFF.' }
+            while (-not $proc.WaitForExit(50)) {
+                $presentNow = 0
+                $statsPath = Join-Path $runDir 'frame-stats.csv'
+                if (Test-Path -LiteralPath $statsPath) {
+                    try { $lastStatsLine = Get-Content -LiteralPath $statsPath -Tail 1 -ErrorAction Stop; if ($lastStatsLine -match '^(\d+),') { $presentNow = [int]$Matches[1] } } catch { }
                 }
-                if ($gameTimer -and $gameTimer.Elapsed.TotalSeconds -ge $measurementRunSeconds) { $durationReached = $true; break }
-                if (-not $gameTimer -and $timer.Elapsed.TotalSeconds -ge ($Seconds + $StartupTimeoutSeconds)) { break }
+                if ($null -eq $frequencyStartMhz -and $presentNow -ge $StartPresent) {
+                    $frequencyStartMhz = [AC1BenchTopology]::CurrentMhz($pinMask)
+                    $hostWindowClock = [Diagnostics.Stopwatch]::StartNew()
+                    foreach ($p in Get-Process -ErrorAction SilentlyContinue) { if ($p.Id -ne $proc.Id) { try { $otherCpuStart[$p.Id] = $p.TotalProcessorTime.TotalSeconds } catch { } } }
+                }
+                if ($presentNow -ge $EndPresent) { $durationReached = $true; break }
+                if ($timer.Elapsed.TotalSeconds -ge ($Seconds + $StartupTimeoutSeconds)) { $safetyTimeoutReached = $true; break }
             }
             $proc.Refresh()
             if ($durationReached -and -not $proc.HasExited) {
@@ -353,22 +385,39 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
             foreach ($k in $envs.Keys) { [Environment]::SetEnvironmentVariable($k,$previousEnv[$k],'Process') }
         }
         $runOut = & $Python -B tools/bench_report.py --internal-run $runDir --seconds $Seconds --workload $Workload `
-            --start-present $measurementStartFrame --scene-present $sceneStartFrame --flush-frames $FrameStatsFlushFrames | ConvertFrom-Json
+            --start-present $measurementStartFrame --end-present $EndPresent --scene-present $sceneStartFrame --flush-frames $FrameStatsFlushFrames | ConvertFrom-Json
         $runOut | Add-Member -NotePropertyName run -NotePropertyValue $i -Force
         $runOut | Add-Member -NotePropertyName measurement_start_present_index -NotePropertyValue $measurementStartFrame -Force
         $runOut | Add-Member -NotePropertyName scene_start_present_index -NotePropertyValue $sceneStartFrame -Force
         $runOut | Add-Member -NotePropertyName measurement_start_delay_ms -NotePropertyValue $measurementPrefixMs -Force
+        $runOut | Add-Member -NotePropertyName pin_mask -NotePropertyValue '0x0000FFFF' -Force
+        $runOut | Add-Member -NotePropertyName process_affinity_mask -NotePropertyValue ('0x{0:X8}' -f [UInt64]$affinityReadback) -Force
+        $runOut | Add-Member -NotePropertyName affinity_verified -NotePropertyValue ($affinityReadback -eq $pinMask) -Force
+        $frequencyEndMhz = [AC1BenchTopology]::CurrentMhz($pinMask)
+        if ($hostWindowClock) {
+            $otherCpuSeconds = 0.0
+            foreach ($p in Get-Process -ErrorAction SilentlyContinue) {
+                if ($p.Id -ne $proc.Id -and $otherCpuStart.ContainsKey($p.Id)) { try { $otherCpuSeconds += [Math]::Max(0.0, $p.TotalProcessorTime.TotalSeconds - [double]$otherCpuStart[$p.Id]) } catch { } }
+            }
+            if ($hostWindowClock.Elapsed.TotalSeconds -gt 0) { $otherCpuPercent = 100.0 * $otherCpuSeconds / ($hostWindowClock.Elapsed.TotalSeconds * [Environment]::ProcessorCount) }
+        }
+        $runOut | Add-Member -NotePropertyName l3_domain_mask -NotePropertyValue '0x0000FFFF' -Force
+        $runOut | Add-Member -NotePropertyName cpu_frequency_start_mhz -NotePropertyValue $frequencyStartMhz -Force
+        $runOut | Add-Member -NotePropertyName cpu_frequency_end_mhz -NotePropertyValue $frequencyEndMhz -Force
+        $runOut | Add-Member -NotePropertyName other_process_cpu_seconds -NotePropertyValue $otherCpuSeconds -Force
+        $runOut | Add-Member -NotePropertyName other_process_cpu_percent -NotePropertyValue $otherCpuPercent -Force
         $runOut | Add-Member -NotePropertyName elapsed_seconds -NotePropertyValue $timer.Elapsed.TotalSeconds -Force
         $runOut | Add-Member -NotePropertyName exit_code -NotePropertyValue $proc.ExitCode -Force
-        $runOut | Add-Member -NotePropertyName timed_out -NotePropertyValue $durationReached -Force
+        $runOut | Add-Member -NotePropertyName reached_end_present -NotePropertyValue $durationReached -Force
+        $runOut | Add-Member -NotePropertyName safety_timeout_hit -NotePropertyValue $safetyTimeoutReached -Force
         $runOut | Add-Member -NotePropertyName evidence -NotePropertyValue $runDir -Force
         $runsOut += $runOut
     }
     $actualBuildDir = if (Test-Path "build/bench-$key-make/CMakeCache.txt") { "build/bench-$key-make" } else { $buildDir }
     $actualGenerator = 'unknown'
     if (Test-Path "$actualBuildDir/CMakeCache.txt") { $generatorLine = Select-String -Path "$actualBuildDir/CMakeCache.txt" -Pattern '^CMAKE_GENERATOR:INTERNAL=' | Select-Object -First 1; if ($generatorLine) { $actualGenerator = ($generatorLine.Line -split '=',2)[1] } }
-    $obj = [ordered]@{ identity=[ordered]@{ sha=$sha; branch=$branch; dirty=$dirty; dirty_diff_sha256=$dirtyHash; config_id=$cfg; config=$cfgSpec; binary_sha256=$binaryHash; label=$Label; runtime_env=$Env }; machine=$machine; environment=[ordered]@{ workload=$Workload; seconds=$Seconds; start_present=$StartPresent; measurement_start_present=$StartPresent + $cpuSampleWindowFrames; cpu_sample_window_frames=$cpuSampleWindowFrames; frame_stats_flush_frames=$FrameStatsFlushFrames; startup_timeout_seconds=$StartupTimeoutSeconds; requested_runs=$Runs; replay=if ($Workload -eq 'gameplay') {'tools/input/to_gameplay.txt'} else {'none (menu remains idle)'}; profile='runtime-frame-stats'; profiler='none'; vsync='off (DXVK d3d9.presentInterval=0)'; host_load_override=[bool]$AllowBusy; actual_build_generator=$actualGenerator; gpu_sampling=if ($gpuAvailable) {'nvidia-smi 500ms, measured window'} else {'unavailable'} }; runs=$runsOut }
+    $obj = [ordered]@{ identity=[ordered]@{ sha=$sha; branch=$branch; dirty=$dirty; dirty_diff_sha256=$dirtyHash; config_id=$cfg; config=$cfgSpec; binary_sha256=$binaryHash; label=$Label; runtime_env=$Env }; machine=$machine; environment=[ordered]@{ workload=$Workload; safety_timeout_seconds=$Seconds; start_present=$StartPresent; end_present=$EndPresent; pin_mask='0x0000FFFF'; l3_domain_masks=$l3DomainMasks; frame_stats_flush_frames=$FrameStatsFlushFrames; startup_timeout_seconds=$StartupTimeoutSeconds; requested_runs=$Runs; replay=if ($Workload -eq 'gameplay') {'tools/input/to_gameplay.txt'} else {'none (menu remains idle)'}; profile='runtime-frame-stats'; profiler='none'; vsync='off (DXVK d3d9.presentInterval=0)'; host_load_override=[bool]$AllowBusy; actual_build_generator=$actualGenerator; gpu_sampling='not sampled' }; runs=$runsOut }
     $obj | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $resultDir 'result.json') -Encoding UTF8
     & $Python -B tools/bench_report.py --summary $resultDir
     Write-Host "Benchmark evidence: $resultDir"
-} finally { if ($ownedConfigProc -and -not $ownedConfigProc.HasExited) { Stop-OwnedTree $ownedConfigProc }; Pop-Location }
+} finally { if ($ownedConfigProc -and -not $ownedConfigProc.HasExited) { Stop-OwnedTree $ownedConfigProc }; if ($benchLockStream) { $benchLockStream.Dispose(); Remove-Item -LiteralPath $benchLockPath -Force -ErrorAction SilentlyContinue }; Pop-Location }
