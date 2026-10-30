@@ -239,3 +239,24 @@ Java_org_ac1_recomp_LauncherActivity_nativePad(JNIEnv *env, jclass type, jboolea
                    (int16_t)lx, (int16_t)ly, (int16_t)rx, (int16_t)ry};
     ac1_pad_submit(0, connected, &pad);
 }
+
+JNIEXPORT jint JNICALL
+Java_org_ac1_recomp_LauncherActivity_nativeCommitText(JNIEnv *env, jclass type, jstring text) {
+    (void)type;
+    if(!text)return -1;
+    jsize length=(*env)->GetStringLength(env,text);
+    const jchar *units=(*env)->GetStringChars(env,text,NULL);
+    if(!units)return -2;
+    int result=ac1_input_commit_text((const uint16_t *)units,(size_t)length);
+    (*env)->ReleaseStringChars(env,text,units);return result;
+}
+JNIEXPORT jint JNICALL
+Java_org_ac1_recomp_LauncherActivity_nativeTextKey(JNIEnv *env,jclass type,jint vk) {
+    (void)env;(void)type;return ac1_input_text_key((unsigned)vk);
+}
+JNIEXPORT jboolean JNICALL
+Java_org_ac1_recomp_LauncherActivity_nativeKeyText(JNIEnv *env,jclass type,jint dik,jboolean down,jint cp) {
+    (void)env;(void)type;
+    ac1_input_physical_key_text((unsigned)dik,down,(uint32_t)cp);
+    return ac1_input_text_supported((uint32_t)cp)?JNI_TRUE:JNI_FALSE;
+}

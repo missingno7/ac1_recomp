@@ -20,10 +20,13 @@ import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.KeyEvent;
+import android.view.KeyCharacterMap;
 import android.view.MotionEvent;
 import android.view.InputDevice;
 import android.view.View;
 import android.view.Window;
+import android.view.Gravity;
+import android.widget.Toast;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
@@ -48,7 +51,9 @@ public final class LauncherActivity extends Activity {
     private Button choose;
     private Button run;
     private File exeFile;
-    private SurfaceView gameSurface;
+    private Ac1TextSurface gameSurface;
+    private Button keyboard;
+    private int deadAccent;
     private Ac1ControllerView controller;
     private Ac1PhysicalPad physicalPad;
     private boolean gameMode, resumed = true, focused = true;
@@ -72,6 +77,9 @@ public final class LauncherActivity extends Activity {
     private static native void nativePad(boolean connected, int buttons, int lt, int rt,
                                          int lx, int ly, int rx, int ry);
     private static native void nativeAudioPause(boolean paused);
+    private static native int nativeCommitText(String text);
+    private static native int nativeTextKey(int vk);
+    private static native boolean nativeKeyText(int dik, boolean down, int codepoint);
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -91,7 +99,10 @@ public final class LauncherActivity extends Activity {
         run.setText("Run original startup");
         run.setEnabled(false);
         run.setOnClickListener(v -> runGuest());
-        gameSurface = new SurfaceView(this);
+        gameSurface = new Ac1TextSurface(this, new Ac1TextSurface.Sink() {
+            @Override public int commit(String text) { return nativeCommitText(text); }
+            @Override public int key(int vk) { return nativeTextKey(vk); }
+        }, () -> { if(keyboard!=null)keyboard.setText(gameSurface.isEditing()?"Hide keyboard":"Keyboard"); });
         gameSurface.setFocusableInTouchMode(true);
         controller = new Ac1ControllerView(this, LauncherActivity::nativePad);
         physicalPad = new Ac1PhysicalPad(this, LauncherActivity::nativePad, this::refreshController);
@@ -116,6 +127,25 @@ public final class LauncherActivity extends Activity {
         FrameLayout stage = new FrameLayout(this);
         stage.addView(gameSurface);
         stage.addView(controller);
+        keyboard = new Button(this);
+        keyboard.setText("Keyboard");keyboard.setTextSize(12);keyboard.setAlpha(0.72f);
+        keyboard.setVisibility(View.GONE);
+        keyboard.setOnClickListener(v -> {
+            if(gameSurface.isEditing())gameSurface.hideKeyboard(false);else gameSurface.showKeyboard();
+        });
+        FrameLayout.LayoutParams keyboardLayout = new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,FrameLayout.LayoutParams.WRAP_CONTENT,Gravity.TOP|Gravity.RIGHT);
+        stage.addView(keyboard,keyboardLayout);
+        keyboard.setOnApplyWindowInsetsListener((v,insets) -> {
+            int right=insets.getSystemWindowInsetRight(),top=insets.getSystemWindowInsetTop();
+            if(insets.getDisplayCutout()!=null) {
+                right=Math.max(right,insets.getDisplayCutout().getSafeInsetRight());
+                top=Math.max(top,insets.getDisplayCutout().getSafeInsetTop());
+            }
+            FrameLayout.LayoutParams params=(FrameLayout.LayoutParams)v.getLayoutParams();
+            int margin=(int)(8*getResources().getDisplayMetrics().density);
+            params.rightMargin=right+margin;params.topMargin=top+margin;v.setLayoutParams(params);return insets;
+        });
         content.addView(stage, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0f));
         setContentView(content);
@@ -164,7 +194,43 @@ public final class LauncherActivity extends Activity {
 
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
         if (physicalPad != null && physicalPad.key(event)) return true;
+        if(gameMode && resumed && focused && gameSurface.isEditing() && event.getKeyCode()==KeyEvent.KEYCODE_BACK) {
+            if(event.getAction()==KeyEvent.ACTION_UP)gameSurface.hideKeyboard(true);
+            return true;
+        }
         int code = dik(event.getKeyCode());
+        int unicode = event.getUnicodeChar();
+        if(gameMode && resumed && focused && !event.isFromSource(InputDevice.SOURCE_GAMEPAD)) {
+            if(event.getAction()==KeyEvent.ACTION_MULTIPLE && event.getCharacters()!=null) {
+                if(nativeCommitText(event.getCharacters())!=0)
+                    Toast.makeText(this,"Text is outside AC1's supported name repertoire or input is busy.",Toast.LENGTH_SHORT).show();
+                return true;
+            }
+            if((unicode & KeyCharacterMap.COMBINING_ACCENT)!=0) {
+                if(event.getAction()==KeyEvent.ACTION_DOWN)deadAccent=unicode & KeyCharacterMap.COMBINING_ACCENT_MASK;
+                if(code>=0)nativeKeyText(code,event.getAction()==KeyEvent.ACTION_DOWN,0);
+                return true;
+            }
+            if(deadAccent!=0 && unicode>=32 && event.getAction()==KeyEvent.ACTION_DOWN) {
+                int combined=KeyCharacterMap.getDeadChar(deadAccent,unicode);
+                unicode=combined!=0?combined:0xfffd;deadAccent=0;
+            }
+            if(event.getAction()==KeyEvent.ACTION_DOWN && (event.getKeyCode()==KeyEvent.KEYCODE_ENTER ||
+                event.getKeyCode()==KeyEvent.KEYCODE_ESCAPE || event.getKeyCode()==KeyEvent.KEYCODE_DEL))deadAccent=0;
+        }
+        if(gameMode && resumed && focused && !event.isFromSource(InputDevice.SOURCE_GAMEPAD)
+            && (unicode>=32 || unicode<0) && event.getKeyCode()!=KeyEvent.KEYCODE_ENTER
+            && event.getAction()!=KeyEvent.ACTION_MULTIPLE) {
+            boolean down=event.getAction()==KeyEvent.ACTION_DOWN;
+            if(code>=0) {
+                if(!nativeKeyText(code,down,unicode) && down)
+                    Toast.makeText(this,"Character is outside AC1's supported name repertoire.",Toast.LENGTH_SHORT).show();
+            } else if(down) {
+                if(nativeCommitText(new String(Character.toChars(Character.isValidCodePoint(unicode)?unicode:0xfffd)))!=0)
+                    Toast.makeText(this,"Character is outside AC1's supported name repertoire.",Toast.LENGTH_SHORT).show();
+            }
+            return true;
+        }
         if (gameMode && resumed && focused && (event.getSource() & InputDevice.SOURCE_GAMEPAD) != InputDevice.SOURCE_GAMEPAD && code >= 0 && (event.getAction() == KeyEvent.ACTION_DOWN || event.getAction() == KeyEvent.ACTION_UP)) {
             nativeKey(code, event.getAction() == KeyEvent.ACTION_DOWN);
             return true;
@@ -184,6 +250,8 @@ public final class LauncherActivity extends Activity {
     }
 
     @Override protected void onPause() {
+        gameSurface.hideKeyboard(false);
+        deadAccent=0;
         resumed = false;
         refreshController();
         nativeAudioPause(true);
@@ -212,7 +280,7 @@ public final class LauncherActivity extends Activity {
         super.onWindowFocusChanged(focus);
         focused = focus;
         refreshController();
-        if (!focus) nativeResetInput();
+        if (!focus) { deadAccent=0; gameSurface.hideKeyboard(false); nativeResetInput(); }
     }
 
     private void refreshRunEnabled() {
@@ -329,6 +397,10 @@ public final class LauncherActivity extends Activity {
 
     @SuppressWarnings("deprecation") // API 29 has no WindowInsetsController.
     private void setGameMode(boolean game) {
+        keyboard.setVisibility(game?View.VISIBLE:View.GONE);
+        if(!game) { gameSurface.resetEditor(); nativeResetInput(); }
+        keyboard.requestApplyInsets();
+        getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING);
         gameMode = game;
         refreshController();
         int launcher = game ? View.GONE : View.VISIBLE;
