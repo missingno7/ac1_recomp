@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -14,7 +15,7 @@
 #include <thread>
 #include <vector>
 namespace {
-std::array<uint8_t, 4 * 1024 * 1024> ram{};
+std::array<uint8_t, 16 * 1024 * 1024> ram{};
 uint32_t next_address = 4096;
 uint64_t clock_ns = 1000000000;
 thread_local bool audio_thread;
@@ -257,6 +258,29 @@ void mixing() {
     near(v[1], -.5f);
     close_buffer(s8);
 }
+void voice_registry() {
+    uint32_t b = buffer(1000, 1, 16, 8);
+    int16_t pcm[8];
+    std::fill(std::begin(pcm), std::end(pcm), 16384);
+    upload(b, pcm, sizeof pcm);
+    start(b);
+    near(render(1)[0], .5f);
+    assert(!call(b, 18));
+    near(render(1)[0], 0.f); // Stop removes the voice from callback iteration.
+    start(b);
+    near(render(1)[0], .5f); // Play registers it again.
+    assert(!call(dev, 5, {b, out}));
+    uint32_t duplicate = get(out);
+    start(duplicate);
+    near(render(1)[0], 1.f); // Duplicate voices own separate mixer cursors.
+    close_buffer(b);
+    near(render(1)[0], .5f); // Releasing one alias removes only that voice.
+    assert(!call(duplicate, 18));
+    near(render(1)[0], 0.f);
+    start(duplicate);
+    near(render(1)[0], .5f);
+    close_buffer(duplicate);
+}
 void spatial() {
     uint32_t desc = data({36, 0x11, 0, 0, 0, 0, 0, 0, 0});
     assert(!call(dev, 3, {desc, out, 0}));
@@ -487,6 +511,51 @@ void diagnostics() {
     ac1_audio_bink_control(99, AC1_BINK_AUDIO_STOP);
     close_buffer(b);
 }
+void benchmark() {
+    std::vector<uint32_t> all;
+    all.reserve(300);
+    for (unsigned i = 0; i < 300; ++i) {
+        const unsigned channels = (i % 3) ? 2 : 1;
+        const unsigned bits_per_sample = (i % 4 < 2) ? 16 : 8;
+        const unsigned rate = (i % 3 == 0) ? 22050 : (i % 3 == 1) ? 44100 : 48000;
+        const unsigned frames = i < 32 ? 48000 : 2048;
+        uint32_t b = buffer(rate, channels, bits_per_sample, frames,
+                            i % 3 == 0 ? 0x90 : 0xe0);
+        all.push_back(b);
+        if (i < 32) {
+            if (bits_per_sample == 16) {
+                std::vector<int16_t> pcm(frames * channels, int16_t(8192 + (i % 4) * 1024));
+                upload(b, pcm.data(), uint32_t(pcm.size() * sizeof(int16_t)));
+            } else {
+                std::vector<uint8_t> pcm(frames * channels, uint8_t(160 + (i % 4) * 8));
+                upload(b, pcm.data(), uint32_t(pcm.size()));
+            }
+            start(b, i != 0);
+        }
+    }
+    std::vector<int16_t> movie(192000, 4096);
+    std::array<float, 480 * 2> output{};
+    for (unsigned frames : {96u, 480u}) {
+        ac1_audio_bink_control(700, AC1_BINK_AUDIO_STOP);
+        assert(ac1_audio_bink_submit(700, 0, movie.data(), movie.size(), 48000, 1, 0));
+        constexpr unsigned iterations = 1200;
+        const auto begin = std::chrono::steady_clock::now();
+        for (unsigned n = 0; n < iterations; ++n) {
+            audio_thread = true;
+            ac1_audio_render(output.data(), frames, 48000, head, head);
+            audio_thread = false;
+            head += frames;
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - begin).count();
+        const double ns_callback = double(elapsed) / iterations;
+        std::printf("BENCH audio frames=%u voices=32 objects=300 bink=1 callbacks=%u "
+                    "ns/callback=%.0f ns/output-frame=%.2f\n",
+                    frames, iterations, ns_callback, ns_callback / frames);
+    }
+    ac1_audio_bink_control(700, AC1_BINK_AUDIO_STOP);
+    for (uint32_t b : all) close_buffer(b);
+}
 } // namespace
 int main() {
 #ifdef _WIN32
@@ -508,11 +577,13 @@ int main() {
     ac1_audio_output_active(1);
     consumption();
     mixing();
+    voice_registry();
     spatial();
     bink();
     unsupported();
     concurrency_and_fallback();
     diagnostics();
+    benchmark();
     ac1_ds8_shutdown();
     std::puts("PASS audio "
               "consumption/notifications/PCM/gain/pan/rate/3D/Bink/snapshots/concurrency/fallback");

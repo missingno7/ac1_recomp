@@ -24,6 +24,7 @@ struct Samples {
     // Published only at Unlock, under the bridge mutex and guest baton. The
     // audio thread never resolves or touches the writable guest allocation.
     std::vector<uint8_t> pcm;
+    std::vector<float> decoded;
     ~Samples();
 };
 struct Buffer {
@@ -43,6 +44,7 @@ struct Buffer {
     std::array<Span, 128> spans{};
     unsigned span_head = 0, span_count = 0;
     uint64_t visit = 0;
+    bool render_registered = false, consume_registered = false;
     bool stop_pending = false;
     std::vector<uint8_t> notify_pending;
     std::array<uint32_t, 16> spatial{}, pending{};
@@ -72,6 +74,10 @@ struct Proxy {
 ac1_ds8_callbacks cb{};
 void *ctx;
 std::map<uint32_t, Proxy> objects;
+// Callback-owned iteration sets. The control path updates them under mutex;
+// aliases share one Buffer and therefore produce one voice.
+std::vector<Buffer *> playing_buffers, pending_buffers;
+Buffer *primary_buffer = nullptr;
 std::recursive_mutex mutex;
 thread_local char error[256];
 uint32_t speaker = 4;
@@ -167,6 +173,32 @@ void stopped(Buffer &b, bool audio = false) {
         if (n.first == UINT32_MAX)
             signal(n.second);
 }
+void register_playing(Buffer &b) {
+    if (!b.render_registered) {
+        playing_buffers.push_back(&b);
+        b.render_registered = true;
+    }
+}
+void unregister_playing(Buffer &b) {
+    if (b.render_registered) {
+        auto it = std::find(playing_buffers.begin(), playing_buffers.end(), &b);
+        if (it != playing_buffers.end()) playing_buffers.erase(it);
+        b.render_registered = false;
+    }
+}
+void register_pending(Buffer &b) {
+    if (!b.consume_registered) {
+        pending_buffers.push_back(&b);
+        b.consume_registered = true;
+    }
+}
+void unregister_pending(Buffer &b) {
+    if (b.consume_registered) {
+        auto it = std::find(pending_buffers.begin(), pending_buffers.end(), &b);
+        if (it != pending_buffers.end()) pending_buffers.erase(it);
+        b.consume_registered = false;
+    }
+}
 void advance(Buffer &b, uint64_t after, bool audio) {
     uint64_t total = b.samples ? b.samples->bytes / b.align : 0;
     if (!total)
@@ -191,6 +223,7 @@ void advance(Buffer &b, uint64_t after, bool audio) {
     b.frames = after;
     if (!b.looping && after == total) {
         b.playing = false;
+        unregister_playing(b);
         stopped(b, audio);
     }
 }
@@ -230,7 +263,9 @@ template <class F> void each_buffer(F fn) {
         }
 }
 void consume(uint64_t presented) {
-    each_buffer([&](Buffer &b) {
+    size_t i = 0;
+    while (i < pending_buffers.size()) {
+        Buffer &b = *pending_buffers[i];
         while (b.span_count) {
             auto &s = b.spans[b.span_head];
             if (presented <= s.begin)
@@ -243,7 +278,9 @@ void consume(uint64_t presented) {
             b.span_head = (b.span_head + 1) % b.spans.size();
             --b.span_count;
         }
-    });
+        if (!b.span_count) unregister_pending(b);
+        else ++i;
+    }
 }
 float scalar(const std::array<uint32_t, 16> &v, unsigned i) {
     float f;
@@ -302,12 +339,8 @@ void gains(const Buffer &b, const std::array<uint32_t, 16> &listener, float &l, 
     l = gain * db(int32_t(-10000 * std::max(0.f, pan)));
     r = gain * db(int32_t(10000 * std::min(0.f, pan)));
 }
-float sample(const Buffer &b, uint64_t frame, unsigned channel) {
-    const unsigned channels = b.format[2], bits = b.format[14];
-    size_t index = size_t(frame) * b.align + (channels == 1 ? 0 : channel) * bits / 8;
-    const uint8_t *p = b.samples->pcm.data() + index;
-    if (bits == 8)
-        return (int(*p) - 128) / 128.f;
+float decode_sample(const uint8_t *p, unsigned bits) {
+    if (bits == 8) return (int(*p) - 128) / 128.f;
     int16_t value;
     std::memcpy(&value, p, 2);
     return value / 32768.f;
@@ -403,19 +436,13 @@ extern "C" void ac1_audio_render(float *out, uint32_t count, uint32_t rate, uint
         return;
     consume(presented);
     float master = 1;
-    const std::array<uint32_t, 16> *listener = nullptr;
-    each_buffer([&](Buffer &b) {
-        if (b.flags & 1) {
-            master = db(b.volume);
-            listener = &b.listener;
-        }
-    });
-    each_buffer([&](Buffer &b) {
-        if (!b.playing)
-            return;
+    const std::array<uint32_t, 16> *listener = primary_buffer ? &primary_buffer->listener : nullptr;
+    if (primary_buffer) master = db(primary_buffer->volume);
+    for (Buffer *voice : playing_buffers) {
+        Buffer &b = *voice;
         uint64_t total = b.samples->bytes / b.align;
         if (!b.looping && b.render_frame >= total)
-            return;
+            continue;
         if (b.span_count == b.spans.size()) {
             mixer_fault = "consumption history exhausted (128 outstanding parameter changes)";
             return;
@@ -424,19 +451,42 @@ extern "C" void ac1_audio_render(float *out, uint32_t count, uint32_t rate, uint
         float left, right;
         gains(b, listener ? *listener : b.listener, left, right);
         uint32_t rendered = 0;
+        double position = start;
+        uint64_t frame = uint64_t(start), a = frame % total;
+        const float *pcm = b.samples->decoded.data();
+        const bool mono = b.format[2] == 1;
         for (; rendered < count; ++rendered) {
-            double position = start + rendered * step;
             if (!b.looping && position >= total)
                 break;
-            if (b.flags & 1)
-                continue; // Primary cursors still follow device consumption.
-            uint64_t frame = uint64_t(position), a = frame % total;
-            uint64_t next = b.looping ? (a + 1) % total : std::min(a + 1, total - 1);
-            float fraction = float(position - frame);
-            float l = sample(b, a, 0), r = sample(b, a, 1);
-            out[rendered * 2] += (l + (sample(b, next, 0) - l) * fraction) * left;
-            out[rendered * 2 + 1] += (r + (sample(b, next, 1) - r) * fraction) * right;
-            ++statistics.ds_frames;
+            // Primary cursors still follow device consumption, but their PCM
+            // is not mixed to the output.
+            if (!(b.flags & 1)) {
+                uint64_t next = a + 1;
+                if (b.looping && next == total) next = 0;
+                else if (!b.looping) next = std::min(next, total - 1);
+                float fraction = float(position - frame);
+                if (mono) {
+                    float x = pcm[a], value = x + (pcm[next] - x) * fraction;
+                    out[rendered * 2] += value * left;
+                    out[rendered * 2 + 1] += value * right;
+                } else {
+                    size_t index = size_t(a) * 2, next_index = size_t(next) * 2;
+                    float l = pcm[index], r = pcm[index + 1];
+                    out[rendered * 2] += (l + (pcm[next_index] - l) * fraction) * left;
+                    out[rendered * 2 + 1] +=
+                        (r + (pcm[next_index + 1] - r) * fraction) * right;
+                }
+                ++statistics.ds_frames;
+            }
+            position += step;
+            uint64_t next_frame = uint64_t(position);
+            if (next_frame != frame) {
+                a += next_frame - frame;
+                frame = next_frame;
+                if (a >= total) {
+                    do { a -= total; } while (a >= total);
+                }
+            }
         }
         b.render_frame = start + rendered * step;
         if (rendered) {
@@ -445,14 +495,15 @@ extern "C" void ac1_audio_render(float *out, uint32_t count, uint32_t rate, uint
                 if (last.end == first && last.step == step &&
                     std::abs(last.source + double(last.end - last.begin) * step - start) < 1e-6) {
                     last.end += rendered;
-                    return;
+                    continue;
                 }
             }
             b.spans[(b.span_head + b.span_count) % b.spans.size()] = {first, first + rendered,
                                                                       start, step};
             ++b.span_count;
+            register_pending(b);
         }
-    });
+    }
     for (auto &entry : movies) {
         auto &m = entry.second;
         if (m.paused)
@@ -460,11 +511,13 @@ extern "C" void ac1_audio_render(float *out, uint32_t count, uint32_t rate, uint
         for (auto &track : m.tracks) {
             auto &v = track.second;
             uint64_t capacity = v.pcm.size() / v.channels;
+            double pos = m.seconds * v.rate;
+            const double step = double(v.rate) / rate;
             for (uint32_t i = 0; i < count; ++i) {
-                double pos = (m.seconds + double(i) / rate) * v.rate;
                 uint64_t a = uint64_t(pos + 1e-7);
                 if (a >= v.submitted || v.submitted - a > capacity) {
                     ++statistics.bink_underrun_frames;
+                    pos += step;
                     continue; // underrun / late track
                 }
                 ++statistics.bink_frames;
@@ -476,6 +529,7 @@ extern "C" void ac1_audio_render(float *out, uint32_t count, uint32_t rate, uint
                     float y = v.pcm[(next % capacity) * v.channels + c] / 32768.f;
                     out[i * 2 + ch] += x + (y - x) * fraction;
                 }
+                pos += step;
             }
         }
         m.seconds += double(count) / rate;
@@ -714,9 +768,21 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
     if (s == 2) {
         *hr = --o.refs;
         if (!o.refs) {
+            std::shared_ptr<Buffer> released = o.buffer;
+            bool was_primary = released && released.get() == primary_buffer;
             cb.guest_free(ctx, o.table);
             cb.guest_free(ctx, a[0]);
             objects.erase(it);
+            if (was_primary) primary_buffer = nullptr;
+            if (released) {
+                bool still_referenced = false;
+                for (const auto &entry : objects)
+                    if (entry.second.buffer == released) { still_referenced = true; break; }
+                if (!still_referenced) {
+                    unregister_playing(*released);
+                    unregister_pending(*released);
+                }
+            }
         }
         return 1;
     }
@@ -766,9 +832,14 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
                 return fail("sample allocation failed");
             std::memset(pcm, b->format[14] == 8 ? 128 : 0, bytes);
             b->samples->pcm.resize(bytes, b->format[14] == 8 ? 128 : 0);
+            b->samples->decoded.resize(bytes / (b->format[14] / 8));
+            for (size_t i = 0; i < b->samples->decoded.size(); ++i)
+                b->samples->decoded[i] = decode_sample(
+                    b->samples->pcm.data() + i * (b->format[14] / 8), b->format[14]);
             uint32_t obj = wrap(3, b);
             if (!obj)
                 return -1;
+            if (b->flags & 1) primary_buffer = b.get();
             return put(a[2], obj);
         }
         if (s == 4) {
@@ -790,6 +861,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
                 return fail("duplicate source invalid");
             auto b = std::make_shared<Buffer>(*src->second.buffer);
             b->playing = b->locked = false;
+            b->render_registered = b->consume_registered = false;
             b->resources_acquired = false;
             b->frames = b->remainder = 0;
             b->notifications.clear();
@@ -1034,6 +1106,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
             reset_render(b);
         }
         b.playing = true;
+        register_playing(b);
         b.resources_acquired = true;
         b.looping = a[3] & 1;
         b.last_ns = now();
@@ -1078,9 +1151,11 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
         b.resources_acquired = false;
         if (b.playing) {
             b.playing = false;
+            unregister_playing(b);
             stopped(b);
         }
         reset_render(b);
+        unregister_pending(b);
         return error[0] ? -1 : 1;
     }
     if (s == 19) {
@@ -1088,11 +1163,16 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
             *hr = invalid;
             return 1;
         }
-        for (unsigned i : {0u, 2u})
-            if (b.lock[i + 1] &&
-                !read(b.lock[i], b.samples->pcm.data() + b.lock[i] - b.samples->address,
-                      b.lock[i + 1]))
+        for (unsigned i : {0u, 2u}) {
+            if (!b.lock[i + 1]) continue;
+            size_t offset = b.lock[i] - b.samples->address;
+            if (!read(b.lock[i], b.samples->pcm.data() + offset, b.lock[i + 1]))
                 return fail("Unlock PCM range unmapped during snapshot");
+            const unsigned sample_bytes = b.format[14] / 8;
+            for (size_t byte = offset; byte < offset + b.lock[i + 1]; byte += sample_bytes)
+                b.samples->decoded[byte / sample_bytes] =
+                    decode_sample(b.samples->pcm.data() + byte, b.format[14]);
+        }
         b.locked = false;
         return 1;
     }
@@ -1110,6 +1190,9 @@ extern "C" void ac1_ds8_shutdown(void) {
         cb.guest_free(ctx, o.first);
     }
     objects.clear();
+    playing_buffers.clear();
+    pending_buffers.clear();
+    primary_buffer = nullptr;
     movies.clear();
     output_active = false;
     mixer_fault = nullptr;
