@@ -2,6 +2,17 @@
 
 This repository builds and executes a statically translated portion of the original GOG DX9 executable on a 64-bit Windows host. The same runtime renders the original title screen and a 3D tutorial gameplay frame with the WALK prompt in the Android x86_64 emulator. See the [verified emulator evidence and commands](docs/android.md#optimized-native-apk-2026-10-30). The optimized native APK reaches the title prompt at the 591.747-second input-clock checkpoint (clear capture at 609.734 seconds), versus 907.573 seconds with Debug native code. The APK is 258.4 MB with symbols retained separately. The replay passes the former 4,096-mapping allocation limit; its gameplay capture is paired with `present=1175 ms=4940141`. Emulator runs predate the AAudio merge and were silent.
 
+## Gamepad and Android touch controller (2026-10-30)
+
+The runtime now feeds AC1's original Xbox controller path from Windows XInput,
+Android physical pads, or a multitouch AC1 overlay. A DirectInput discovery node
+and the original controller-selection setting enable the game's own prompts.
+Host contracts and a tutorial replay verify raw state, packets, movement,
+camera and RT+A, with captures at `work/gamepad/replay2/`. ARM64 APK packaging
+passes; this input change has no phone/emulator verification. The 3120x1440
+layout preview is `work/gamepad/overlay.png`. See [bindings, settings and
+verification commands](docs/gamepad.md).
+
 ## Android ARM64 hardware run (2026-10-30)
 
 On a Galaxy S24 Ultra (SM-S928B, Snapdragon 8 Gen 3, Adreno 750, Android 16) the ARM64 APK runs the original executable through the replay into the 3D tutorial: first present at ~4.4 s, present 1175 at ~34 s (host: 3.5 s / 7.1 s), full-screen 1560x720 render at the display aspect, AAudio output with 0 xruns. Rendering is incomplete: with the inherited DXVK-native 1.9.2b backend, characters and HUD draw but world geometry, shadows and the HUD Bink panel are missing (the host renders them correctly). The stock Qualcomm driver lacks `VK_KHR_maintenance5/6` and `VK_KHR_load_store_op_none` required by upstream DXVK 3.1 (`ports/dxvk_android/vulkan_probe.c`), so the Android backend is moving to DXVK 3.1 with Mesa Turnip loaded in-process via libadrenotools (Snapdragon/Adreno only for now). Gameplay runs at ~8 FPS at 1560x720 with 1.9.2b; the GPU is ~14% busy and the main guest thread is CPU-bound yet averaged 1.77 GHz (prime core 3.4 GHz), which `AC1_CPU_AFFINITY` (default: high-capacity cores) targets. Phone diagnostics: `--es env "AC1_X=..,DXVK_Y=.."` sets runtime settings; `AC1_RENDER_SIZE=WxH` overrides the render size.

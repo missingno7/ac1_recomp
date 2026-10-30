@@ -368,7 +368,7 @@ rendering, title screen, audible output or Android hardware execution.
 | DS8 samples, locks, Play/Stop/cursors | System32 COM only | Host PCM snapshots shared by duplicates, updated at Unlock; linear resampling of mono/stereo PCM 8/16-bit, frequency, volume/pan and primary gain, loop/one-shot completion. Guest cursors follow presented output spans (AAudio hardware timestamps, downstream FramesRead if unavailable); no independent clock while output runs. Clock fallback remains without a device. Unsupported formats/flags diagnose failure. |
 | DS8 3D and notifications | Native Windows interfaces / HANDLE events | Listener position/orientation, source position, min/max distance, rolloff, head-relative/disabled mode and mute-at-max attenuation/pan, including deferred commit. Cone/Doppler acoustics remain unapplied. Audio callbacks only mark crossings/stop; guest service signals events under the scheduler baton, with a 10 ms wake when all guests wait. Invalid/closed events diagnose failure. |
 | Audio output / lifecycle | No portable output | API29+ AAudio shared low-latency float stereo at device rate; two-burst target buffer. Callback uses host PCM only, no guest memory or event callbacks; lock contention emits silence without moving voices. Control-thread service reopens disconnected streams, retrying failures. Activity pause closes/flushes output and freezes cursors; resume reopens it. **No device audio verification yet.** |
-| DirectInput8 | System32 COM; runtime route excluded | Canonical W keyboard (256 bytes), relative mouse (16/20 bytes), enumeration, acquire/unacquire, format/cooperative level and state. Touch holds Enter; keyboard/gamepad map to DIK/mouse. Buffered/custom/force-feedback interfaces remain unsupported. XInput itself still reports DEVICE_NOT_CONNECTED. |
+| DirectInput8 | System32 COM; runtime route excluded | Canonical W keyboard (256 bytes), relative mouse (16/20 bytes), enumeration, acquire/unacquire, format/cooperative level and state. Keyboard/mouse retain DIK/relative state. Physical gamepads and the AC1 touch overlay supply native XInput through the Xbox discovery node; original controller prompts are selected. Buffered/custom/force-feedback DI interfaces remain unsupported. See [gamepad verification](gamepad.md). |
 | Input script / recording | Windows headers/layout/clock; excluded | Same parser, successful-Present clock and poll ordinals; static US DIK-to-VK mapping and WndProc event snapshots. `input_script` extra sets `AC1_INPUT_SCRIPT`; bad files remain fatal. Android launcher disables recording. |
 | USER32 window/message loop / HWND | Surface-to-DXVK existed; guest USER32 missing | Single guest HWND resolved to JNI's DXVK HWND. Class registration, CREATESTRUCT/WM_NCCREATE/WM_CREATE, activation, Peek/Dispatch/DefWindowProc, rectangles, cursor/keyboard state, US text entry and destruction implemented. Metrics outside the subset stop. No multiwindow/monitor enumeration. SystemParametersInfoA GET still reports ERROR_CALL_NOT_IMPLEMENTED; accessibility SET stays guest-local. Desktop hooks remain unavailable. |
 | D3D9 / DXVK / Surface | Bridge + imported provider already wired | Retained platform factory, windowed presentation, landscape SurfaceView, mutex/ref-counted ANativeWindow handoff. Surface loss/reset and Vulkan/device rendering untested. DXVK must be built separately after the benchmark. |
@@ -541,9 +541,11 @@ $adb = "$env:LOCALAPPDATA/Android/Sdk/platform-tools/adb.exe"
 & $adb -s R5CX41MRV6V logcat -d -s AC1Recomp DEBUG AndroidRuntime
 ```
 
-Omit the input_script extra for physical input. Touch and hold the surface for
-Enter; release ends the press. Gamepad A/Start=Enter, B/Select=Escape, X=Space,
-Y=E, shoulders=Shift/Ctrl, D-pad=arrows, left stick=WASD, right stick=mouse.
+Omit the input_script extra for physical input. Physical controllers now supply
+XInput. Without one, the AC1 touch overlay supplies the same controller state;
+A/B/X/Y are Legs/Empty hand/Weapon/Head, RT is high profile and LT is target lock.
+The old touch-Enter and gamepad keyboard/mouse mappings are removed. See
+[bindings, layout configuration and host replay evidence](gamepad.md).
 The replay follows successful presents and does not bypass initialization or
 the remaining D3DX stop. The existing dispatch budget still applies. Force-stop
 terminates a guest stuck in a native/game loop; Activity destruction cannot
