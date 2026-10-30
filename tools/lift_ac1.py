@@ -3024,6 +3024,138 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
             immediate_summary, indexed.summary(results))
 
 
+FLAG_BITS = {name: 1 << i for i, name in enumerate(('cf', 'pf', 'af', 'zf', 'sf', 'of'))}
+FLAG_ALL = sum(FLAG_BITS.values())
+FLAG_HELPERS = {
+    'flags_add': FLAG_ALL, 'flags_sub': FLAG_ALL,
+    'flags_adc': FLAG_ALL, 'flags_sbb': FLAG_ALL,
+    'flags_logicz': FLAG_ALL & ~FLAG_BITS['af'],
+    'flags_incs': FLAG_ALL & ~FLAG_BITS['cf'],
+    'flags_decs': FLAG_ALL & ~FLAG_BITS['cf'],
+}
+
+
+def codegen_instruction_groups(body: str):
+    """Retain labels with the instruction they enter, including entry guards."""
+    lines = body.splitlines()
+    if len(lines) < 3 or lines[1] != '{' or lines[-1] != '}':
+        raise ValueError('unexpected lifted function shape for codegen pass')
+    prefix, groups, pending, group = lines[:2], [], [], []
+    for line in lines[2:-1]:
+        if re.fullmatch(r'L_[0-9A-F]{8}:', line):
+            if group:
+                groups.append(group)
+                group = []
+            pending.append(line)
+        elif 'AC1_SET_GUEST_EIP(c,' in line:
+            if group:
+                groups.append(group)
+            group = pending + [line]
+            pending = []
+        elif group:
+            group.append(line)
+        elif not pending:
+            # A sparse function's entry guard runs once, before any local
+            # label. It must not become a successor of its lowest VA block.
+            prefix.append(line)
+        else:
+            pending.append(line)
+    if group:
+        groups.append(group)
+    return prefix, pending, groups
+
+
+def flag_liveness_function(body: str, mode: str = 'cfg') -> str:
+    """Only kill writes proved dead in emitted semantics, never x86 undefined bits.
+
+    Calls, escapes, unknown CPU helpers and full flag observations are barriers.
+    Functions using FS/GS (including SEH) retain their complete original flags.
+    Return flags stay live: this is deliberately not a cross-call FLAGABI pass.
+    """
+    if mode == 'off' or re.search(r'\b(?:fs|gs):|c->(?:fs|gs)\b|\b(?:seh|longjmp)\b', body, re.I):
+        return body
+    prefix, pending, groups = codegen_instruction_groups(body)
+    if not groups:
+        return body
+    texts = [re.sub(r'/\*.*?\*/', '', '\n'.join(group), flags=re.S) for group in groups]
+    labels = {label: i for i, text in enumerate(texts)
+              for label in re.findall(r'^(L_[0-9A-F]{8}):', text, re.M)}
+    reads, writes, successors, eligible = [], [], [], []
+    for i, text in enumerate(texts):
+        calls = re.findall(r'\b(flags_\w+)\(c\s*,', text)
+        # Repeated string bodies and atomics contain intra-instruction control
+        # flow; retain those bodies until an instruction-local CFG is modeled.
+        simple = (len(calls) == 1 and calls[0] in FLAG_HELPERS and
+                  not re.search(r'\b(?:if|while|for|goto|return)\b|atomic_', text))
+        write = FLAG_HELPERS[calls[0]] if simple else 0
+        read = sum(bit for flag, bit in FLAG_BITS.items() if re.search(r'\bc->' + flag + r'\b', text))
+        if calls and calls[0] in ('flags_adc', 'flags_sbb'):
+            read |= FLAG_BITS['cf']
+        pointer_uses = re.sub(r'\bc->\w+', 'member', text)
+        safe = '|'.join(FLAG_HELPERS) + '|AC1_SET_GUEST_EIP|push32|pop32'
+        pointer_uses = re.sub(r'\b(?:' + safe + r')\(c(?=[,)])', 'safe(', pointer_uses)
+        if re.search(r'\bc\b|RECOMP_TODO\(|ac1_unsupported_instruction\(', pointer_uses):
+            read = FLAG_ALL
+        if re.search(r'/\*\s*[0-9A-Fa-f]{8}:\s*(?:lahf|pushfd|pushf)\b', '\n'.join(groups[i])):
+            read = FLAG_ALL
+        targets = re.findall(r'\bgoto (L_[0-9A-F]{8});', text)
+        edges = {labels[t] for t in targets if t in labels}
+        # A direct unconditional goto has no fallthrough. Conditional returns
+        # and switch-like generated blocks conservatively retain fallthrough.
+        terminal = bool(re.search(r'^\s*(?:goto L_[0-9A-F]{8};|(?:dispatch_jmp|guest_ret)\()',
+                                  text, re.M))
+        if not terminal and i + 1 < len(groups):
+            edges.add(i + 1)
+        if i + 1 == len(groups) or 'return;' in text or any(t not in labels for t in targets):
+            read = FLAG_ALL
+        if mode == 'straight' and (targets or i + 1 < len(groups) and
+                                  re.search(r'^L_[0-9A-F]{8}:', texts[i + 1], re.M)):
+            read = FLAG_ALL
+        reads.append(read)
+        writes.append(write)
+        successors.append(edges)
+        eligible.append(simple)
+    live = [0] * len(groups)
+    changed = True
+    while changed:
+        changed = False
+        for i in reversed(range(len(groups))):
+            out = 0
+            for target in successors[i]:
+                out |= live[target]
+            value = reads[i] | (out & ~writes[i])
+            if value != live[i]:
+                live[i] = value
+                changed = True
+    output = prefix + pending
+    for i, group in enumerate(groups):
+        if eligible[i]:
+            out = 0
+            for target in successors[i]:
+                out |= live[target]
+            # Include same-instruction observations/barriers conservatively.
+            mask = writes[i] & (out | reads[i])
+            text = '\n'.join(group)
+            match = re.search(r'\b(' + '|'.join(FLAG_HELPERS) + r')\(c\s*,', text)
+            depth, end = 1, match.end()
+            # The initial '(' precedes c; scan after the first comma. Nested
+            # operand expressions remain evaluated even with a zero mask.
+            while depth and end < len(text):
+                if text[end] == '(':
+                    depth += 1
+                elif text[end] == ')':
+                    depth -= 1
+                end += 1
+            if depth:
+                raise ValueError('unbalanced generated flag helper')
+            text = text[:end - 1] + f', 0x{mask:02X}u' + text[end - 1:]
+            text = text[:match.start()] + match.group(1) + '_m' + text[match.start() + len(match.group(1)):]
+            output.extend(text.splitlines())
+        else:
+            output.extend(group)
+    return '\n'.join(output + ['}'])
+
+
 def specialize_direct_calls(body: str, lifted: set[int]) -> tuple[str, set[int], int]:
     """Bind only successful main-image entries, after cached bodies are lifted.
 
@@ -3100,7 +3232,8 @@ def wrap_native_binding(body: str, address: int, entry: dict) -> str:
 
 def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: Path,
               functions_per_tu: int, translation_unit_buckets: int = 0,
-              emission_cache=None, direct_calls: bool = True, native_overrides=None) -> dict:
+              emission_cache=None, direct_calls: bool = True, native_overrides=None,
+              flag_liveness: str = 'off') -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
@@ -3246,6 +3379,8 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         for index, address in enumerate(lifted):
             bodies[index], direct_callees[address], sites = specialize_direct_calls(bodies[index], successful)
             direct_sites += sites
+    if flag_liveness != 'off':
+        bodies = [flag_liveness_function(body, flag_liveness) for body in bodies]
     # Keep L_VA as the one public entry for direct transfers AND the dispatch
     # table. Retain a private, callable translated oracle behind that entry.
     for index, address in enumerate(lifted):
@@ -3493,6 +3628,8 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=CONFIG_PATH,
                         help="discovery configuration (allows private seed-set A/B comparisons)")
     parser.add_argument("--selftest", action="store_true", help="run the focused block-entry ordering check")
+    parser.add_argument('--flag-liveness', choices=('off', 'straight', 'cfg'), default='cfg',
+                        help='constant-mask intra-function flag liveness; off restores eager flags')
     parser.add_argument("--no-direct-calls", action="store_true",
                         help="keep constant main-catalog transfers in dispatch for A/B comparisons")
     parser.add_argument("--binary", type=Path)
@@ -3699,7 +3836,8 @@ def main() -> int:
         lift_result = emit_lift(binary, pcrecomp, catalog_doc["functions"], output_dir,
                                 functions_per_tu, translation_unit_buckets,
                                 emission_cache, direct_calls=not args.no_direct_calls,
-                                native_overrides=config.get('native_overrides', []))
+                                native_overrides=config.get('native_overrides', []),
+                                flag_liveness=args.flag_liveness)
     except Exception:
         if emission_cache is not None:
             emission_cache.close()
@@ -3715,6 +3853,7 @@ def main() -> int:
         "lift_failures": lift_result["lift_failures"],
         "unsupported_count": todo_count,
         "relocation_entries": lift_result["relocation_entries"],
+        "flag_liveness": args.flag_liveness,
         "direct_call_sites": lift_result["direct_call_sites"],
         "direct_callee_declarations": lift_result["direct_callee_declarations"],
         "native_overrides": lift_result["native_overrides"],

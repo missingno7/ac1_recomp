@@ -246,3 +246,9 @@ Example using existing stripped binaries:
 ```
 
 The two-side environment overrides can also be supplied as `-EnvB @{ AC1_DISPATCH_FAST = '0' }`. Use `tools/bench_report.py <comparison-directory>` to print an existing comparison.
+
+Codegen flag liveness is selected with `tools/build.ps1 -BuildType RelWithDebInfo -Jobs 10 -FlagLiveness off|straight|cfg`
+(default `cfg`), or the lifter's `--flag-liveness` option. Preparation checks the selected mode in its report.
+The benchmark preserves a complete frame window by draining the periodic profiler after CPU/GPU accounting stops;
+incomplete windows, guest stops and dropped frame samples fail its audit. See [codegen evidence](docs/codegen.md)
+for generated/compiled counts, correctness runs, immutable binary hashes and the interleaved baseline/flags result.
