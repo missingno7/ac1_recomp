@@ -1,0 +1,5 @@
+{
+  "mesa": {"url": "https://gitlab.freedesktop.org/mesa/mesa.git", "tag": "mesa-26.2.5", "commit": "ddaf85e353442d9d7f192fdcf1823e652e3f2ee3", "directory": "mesa-turnip", "license": "MIT (see docs/license.rst and per-file notices)"},
+  "adrenotools": {"url": "https://github.com/bylaws/libadrenotools.git", "commit": "8fae8ce254dfc1344527e05301e43f37dea2df80", "directory": "libadrenotools", "license": "BSD-2-Clause"},
+  "linkernsbypass": {"url": "https://github.com/bylaws/liblinkernsbypass.git", "commit": "aa3975893d83ef1bc84c321ec60c65fbf1287887", "directory": "libadrenotools/lib/linkernsbypass", "license": "BSD-2-Clause"}
+}
