@@ -349,6 +349,8 @@ void capture_back_buffer(IDirect3DDevice9 *device)
 
 void trace_frame_success(bool is_present, const char *method)
 {
+    // Replay uses this clock on every platform, independently of frame tracing.
+    if (is_present) g_successful_present_calls.fetch_add(1, std::memory_order_relaxed);
 #ifdef AC1_PROFILE_HOOKS
     if (is_present && ac1_profile_frames_enabled) ac1_profile_present();
 #endif
@@ -359,7 +361,6 @@ void trace_frame_success(bool is_present, const char *method)
             "AC1_D3D9_TRACE_FRAME", value, static_cast<DWORD>(sizeof(value))) != 0;
         g_frame_trace_initialized = true;
     }
-    if (is_present) g_successful_present_calls.fetch_add(1, std::memory_order_relaxed);
     if (!g_frame_trace_enabled) return;
     if (is_present) {
         const uint64_t n = g_successful_present_calls;
