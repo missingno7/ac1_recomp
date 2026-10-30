@@ -394,8 +394,19 @@ static inline void ac1_x87_restore(CPU *c, uint32_t a) {
     c->mmx_active=(uint8_t)(mmx_image && mmx_payload); c->x87_dirty=0; c->mmx_physical=0xffu;
 }
 static inline uint64_t ac1_x87_integer(CPU *c, double value, unsigned bits, unsigned trunc_mode, uint32_t va) {
+    /* bits <= 64, so the power of two is exact without an ldexp call. */
+    double limit=(double)(UINT64_C(1)<<(bits-1));
+    if((trunc_mode || ((c->fpu_cw>>10)&3u)==3u) && bits<=32u && value>-limit-1.0 && value<limit) {
+        /* Chop (the game's CW=0x0E7F mode, and FISTTP): C conversion truncates toward
+         * zero, exact for every finite in-range value; NaN fails both comparisons. */
+        int64_t chopped=(int64_t)value;
+        if((double)chopped!=value) {
+            c->fpu_sw|=0x20u;
+            if(!(c->fpu_cw&0x20u)) ac1_unsupported_instruction(va,"unmasked x87 precision exception");
+        }
+        return (uint64_t)chopped;
+    }
     double result=ac1_fp_round(value,trunc_mode?3u:(c->fpu_cw>>10)&3u);
-    double limit=ldexp(1.0,(int)bits-1);
     if(!isfinite(result) || result < -limit || result >= limit) {
         c->fpu_sw|=1u;
         if(!(c->fpu_cw&1u)) ac1_unsupported_instruction(va,"unmasked x87 integer-conversion exception");
@@ -408,6 +419,20 @@ static inline uint64_t ac1_x87_integer(CPU *c, double value, unsigned bits, unsi
     return (uint64_t)(int64_t)result;
 }
 '''
+
+
+# MinGW's <math.h> classifies through its inline __fpclassify bit decoding; the
+# compiler builtins give identical results (all IEEE classes, no exceptions) as a
+# single compare. They sit on every x87 load (ac1_x87_tag) and conversion.
+FP_CLASSIFY_BUILTINS = r'''
+#if !defined(__cplusplus) && (defined(__GNUC__) || defined(__clang__))
+#undef isfinite
+#define isfinite(x) __builtin_isfinite(x)
+#undef isnan
+#define isnan(x) __builtin_isnan(x)
+#undef isinf
+#define isinf(x) __builtin_isinf(x)
+#endif'''
 
 
 def _replace_function(text: str, signature: str, body: str, source) -> str:
@@ -961,7 +986,7 @@ void guest_execution_write(uint32_t address, const void *input, size_t width)
             include = "#include <stdint.h>"
             if text.count(include) != 1:
                 raise SystemExit(f"unexpected CPU includes: {source}")
-            text = text.replace(include, include + "\n#include <math.h>")
+            text = text.replace(include, include + "\n#include <math.h>" + FP_CLASSIFY_BUILTINS)
             marker = "} CPU;"
             if text.count(marker) != 1:
                 raise SystemExit(f"unexpected pcrecomp CPU header shape: {source}")
