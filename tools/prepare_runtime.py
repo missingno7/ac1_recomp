@@ -579,6 +579,28 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+X87_INTEGER_INLINE = r'''
+/* Independent A/B gate: keep the integer-conversion algorithm unchanged. */
+#if defined(AC1_FORCE_INLINE_X87)
+#if defined(__GNUC__) || defined(__clang__)
+#define AC1_X87_INTEGER_INLINE static inline __attribute__((always_inline))
+#else
+#error AC1_FORCE_INLINE_X87 requires always_inline compiler support
+#endif
+#else
+#define AC1_X87_INTEGER_INLINE static inline
+#endif
+'''
+
+
+def x87_inline_helpers(text: str) -> str:
+    """Gate the observed out-of-line integer helper without changing its body."""
+    signature='static inline uint64_t ac1_x87_integer('
+    if text.count(signature)!=1:
+        raise SystemExit('unexpected CPU x87 integer-conversion helper shape')
+    return text.replace(signature,X87_INTEGER_INLINE+'\nAC1_X87_INTEGER_INLINE uint64_t ac1_x87_integer(',1)
+
+
 def masked_flag_helpers(text: str) -> str:
     """Clone pinned arithmetic helpers with constant, independently guarded lanes.
 
@@ -940,6 +962,7 @@ void guest_execution_write(uint32_t address, const void *input, size_t width)
                 text = text.replace(hits[0], hits[0].replace(
                     "static inline ", "AC1_ACCESSOR_INLINE ", 1))
             text = masked_flag_helpers(text)
+            text = x87_inline_helpers(text)
             content = text.replace("\r\n", "\n").encode("utf-8")
         if not output.exists() or output.read_bytes() != content:
             output.write_bytes(content)

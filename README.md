@@ -252,12 +252,18 @@ Example using existing stripped binaries:
 The two-side environment overrides can also be supplied as `-EnvB @{ AC1_DISPATCH_FAST = '0' }`. Use `tools/bench_report.py <comparison-directory>` to print an existing comparison.
 
 Codegen flag liveness is selected with `tools/build.ps1 -BuildType RelWithDebInfo -Jobs 10 -FlagLiveness cfg`
-(default `cfg`; `off` and `straight` are also available), or the lifter's `--flag-liveness` option.
+(default `cfg`; `off`, `straight` and experimental `abi` are also available), or the lifter's `--flag-liveness` option.
+`abi` retains complete public dispatch contracts and uses private direct-only bodies where returned flags are dead.
 `-LocalRegs all` enables function-gated GPR locals; its default is `off`, and an eight-digit hexadecimal
 list such as `-LocalRegs '0051DD60,00428540'` selects individual functions. The lifter accepts the same
 selection with `--local-regs`. Preparation checks both selected modes in its report.
+`-X87Inline` independently force-inlines the audited integer-conversion helper (default off).
 The benchmark preserves a complete frame window by draining the periodic profiler after CPU/GPU accounting stops;
 incomplete windows, guest stops and dropped frame samples fail its audit. See [codegen evidence](docs/codegen.md)
-for generated/compiled counts, correctness runs, immutable binary hashes and both interleaved comparisons.
-Median paired FPS changes were +5.97% for CFG flags and -53.19% for broad locals in this tutorial replay.
-Flags stay enabled; locals stay off pending lower synchronization overhead and another measured comparison.
+for the accepted +5.97% CFG-flags experiment and original -53.19% locals result.
+The [follow-up evidence](docs/codegen-followup.md) diagnoses cadence-dependent tutorial progression,
+records the FLAGABI comparison (+3.77%) and revised locals comparison (+7.35%), and corrects the old x87 call counter.
+Integer-helper inlining is bit-exact in the new oracle but shows no paired FPS win (-0.07% median); it stays off.
+These are separate three-pair replay measurements on a shared PC; their FPS changes must not be added.
+`-UserdataSeed work/<private-seed>` optionally restores identical workspace-only saves before every benchmark side.
+CFG flags remain the default; ABI and locals remain opt-in pending review and broader workload measurements.

@@ -3065,6 +3065,199 @@ def codegen_instruction_groups(body: str):
     return prefix, pending, groups
 
 
+def flag_flow(body, return_live=FLAG_ALL, call_defines=None, mode='cfg'):
+    """Instruction CFG; writes describe emitted helper semantics, not x86 UB."""
+    prefix, pending, groups = codegen_instruction_groups(body)
+    texts = [re.sub(r'/\*.*?\*/', '', '\n'.join(g), flags=re.S) for g in groups]
+    labels = {label: i for i, text in enumerate(texts)
+              for label in re.findall(r'^(L_[0-9A-F]{8}):', text, re.M)}
+    reads, writes, successors, eligible, calls, exits = [], [], [], [], {}, {}
+    for i, text in enumerate(texts):
+        helpers = re.findall(r'\b(flags_\w+)\(c\s*,', text)
+        simple = (len(helpers) == 1 and helpers[0] in FLAG_HELPERS and
+                  not re.search(r'\b(?:if|while|for|goto|return)\b|atomic_', text))
+        write = FLAG_HELPERS[helpers[0]] if simple else 0
+        read = sum(bit for flag, bit in FLAG_BITS.items() if re.search(r'\bc->'+flag+r'\b', text))
+        if any(helper in ('flags_adc', 'flags_sbb') for helper in helpers):
+            read |= FLAG_BITS['cf']
+        direct = re.findall(r'\bAC1_CALL\(c, L_([0-9A-F]{8}), 0x\1u\)', text)
+        direct_call = (len(direct) == 1 and
+                       not re.search(r'\b(?:if|while|for|goto|return)\b', text))
+        if direct_call:
+            target = int(direct[0], 16)
+            calls[i] = target
+            write |= (call_defines or {}).get(target, 0)
+        pointer = re.sub(r'\bc->\w+', 'member', text)
+        safe = '|'.join(FLAG_HELPERS) + '|AC1_SET_GUEST_EIP|push32|pop32'
+        pointer = re.sub(r'\b(?:'+safe+r')\(c(?=[,)])', 'safe(', pointer)
+        opaque = bool(re.search(r'\bc\b|RECOMP_TODO\(|ac1_unsupported_instruction\(', pointer))
+        # AC1_CALL guards/slow paths keep incoming diagnostic flags live. A
+        # proven callee definition can kill successor demands, never this read.
+        if opaque:
+            read = FLAG_ALL
+        if re.search(r'/\*\s*[0-9A-Fa-f]{8}:\s*(?:lahf|pushfd|pushf)\b', '\n'.join(groups[i])):
+            read = FLAG_ALL
+        targets = re.findall(r'\bgoto (L_[0-9A-F]{8});', text)
+        edges = {labels[t] for t in targets if t in labels}
+        terminal = bool(re.search(r'^\s*(?:goto L_[0-9A-F]{8};|(?:dispatch_jmp|guest_ret)\()', text, re.M))
+        plain_return = ('return;' in text and
+                        not re.search(r'\b(?:if|while|for|switch)\b', text))
+        terminal |= plain_return
+        if not terminal and i+1 < len(groups): edges.add(i+1)
+        if 'return;' in text or (i+1 == len(groups) and not terminal):
+            read |= return_live
+            exits[i] = 'escape' if opaque else 'return'
+        if any(t not in labels for t in targets):
+            read = FLAG_ALL
+            exits[i] = 'escape'
+        if terminal and not edges and i not in exits: exits[i] = 'escape'
+        if mode == 'straight' and (targets or i+1 < len(groups) and
+                                  re.search(r'^L_[0-9A-F]{8}:', texts[i+1], re.M)):
+            read = FLAG_ALL
+        reads.append(read); writes.append(write); successors.append(edges); eligible.append(simple)
+    entry = 0
+    guards = re.findall(r'\bgoto (L_[0-9A-F]{8});', '\n'.join(prefix[2:]))
+    if guards:
+        if len(guards) != 1 or guards[0] not in labels:
+            raise ValueError('FLAGABI cannot resolve sparse entry guard')
+        entry = labels[guards[0]]
+    live = [0]*len(groups)
+    changed = True
+    while changed:
+        changed = False
+        for i in reversed(range(len(groups))):
+            out = 0
+            for target in successors[i]: out |= live[target]
+            value = reads[i] | (out & ~writes[i])
+            if value != live[i]: live[i] = value; changed = True
+    after = []
+    for edges in successors:
+        out = 0
+        for target in edges: out |= live[target]
+        after.append(out)
+    return dict(prefix=prefix, pending=pending, groups=groups, reads=reads,
+                writes=writes, successors=successors, eligible=eligible,
+                calls=calls, exits=exits, entry=entry, live=live, after=after)
+
+
+def flag_flow_emit(flow):
+    output = flow['prefix'] + flow['pending']
+    for i, group in enumerate(flow['groups']):
+        if not flow['eligible'][i]: output.extend(group); continue
+        mask = flow['writes'][i] & (flow['after'][i] | flow['reads'][i])
+        text = '\n'.join(group)
+        match = re.search(r'\b('+'|'.join(FLAG_HELPERS)+r')\(c\s*,', text)
+        depth, end = 1, match.end()
+        while depth and end < len(text):
+            depth += (text[end] == '(') - (text[end] == ')')
+            end += 1
+        if depth: raise ValueError('unbalanced generated flag helper in FLAGABI')
+        text = text[:end-1] + f', 0x{mask:02X}u' + text[end-1:]
+        text = text[:match.start()] + match.group(1)+'_m' + text[match.start()+len(match.group(1)):]
+        output.extend(text.splitlines())
+    return '\n'.join(output+['}'])
+
+
+def flag_abi_must_define(flow, definitions):
+    """Intersection of definitions on every reachable return; unknown tails=0."""
+    if not flow['groups']: return 0
+    incoming = {flow['entry']: 0}
+    queue = [flow['entry']]
+    outgoing = {}
+    while queue:
+        i = queue.pop()
+        written = flow['writes'][i]
+        if i in flow['calls']: written |= definitions.get(flow['calls'][i], 0)
+        value = incoming[i] | written
+        outgoing[i] = value
+        for target in flow['successors'][i]:
+            merged = incoming[target] & value if target in incoming else value
+            if target not in incoming or incoming[target] != merged:
+                incoming[target] = merged; queue.append(target)
+    returns = [outgoing[i] if kind == 'return' else 0
+               for i, kind in flow['exits'].items() if i in outgoing]
+    result = FLAG_ALL if returns else 0
+    for value in returns: result &= value
+    return result
+
+
+def flag_abi_program(bodies, pinned=(), private_variants=False):
+    """Public dispatch entries retain all flags; private bodies require proof.
+
+    No caller proof is inferred from missing observed edges. Optional direct-only
+    copies are separate C functions, never exported through guest dispatch. Each
+    use must have a zero successor demand. Callee definitions reach a monotone
+    fixed point using actual emitted flag semantics (logical AF/INC CF survive).
+    """
+    from collections import defaultdict, deque
+    pinned = set(pinned)
+    unsafe = {a for a,b in bodies.items() if re.search(
+        r'\b(?:fs|gs):|c->(?:fs|gs)\b|\b(?:seh|setjmp|longjmp)\b|RECOMP_TODO\(|ac1_unsupported_instruction\(', b, re.I)}
+    flows = {a: flag_flow(b) for a,b in bodies.items()}
+    parents = defaultdict(set)
+    for a,flow in flows.items():
+        for target in flow['calls'].values(): parents[target].add(a)
+    definitions = {a:0 for a in bodies}
+    queue, queued = deque(bodies), set(bodies)
+    updates = 0
+    while queue:
+        a = queue.popleft(); queued.remove(a)
+        value = 0 if a in unsafe else flag_abi_must_define(flows[a], definitions)
+        if value & definitions[a] != definitions[a]:
+            raise ValueError(f'non-monotone FLAGABI definition at 0x{a:08X}')
+        if value != definitions[a]:
+            definitions[a] = value; updates += 1
+            for caller in parents[a]:
+                if caller not in queued: queue.append(caller); queued.add(caller)
+    public, private, narrowed_sites = {}, {}, 0
+    worth_cloning = {}
+    demands = defaultdict(int)
+    pending = deque()
+    def transform(a, return_live, is_private):
+        nonlocal narrowed_sites
+        if a in unsafe: return bodies[a]
+        flow = flag_flow(bodies[a], return_live, definitions)
+        text = flag_flow_emit(flow)
+        for i,target in flow['calls'].items():
+            demands[target] |= flow['after'][i]
+            if (not private_variants or flow['after'][i] or
+                target not in bodies or target in pinned or target in unsafe): continue
+            # Only material copies: public helpers/masks are compared without
+            # changing function identity. Dispatch wrappers remain untouched.
+            if target not in private:
+                if target not in worth_cloning:
+                    ordinary = flag_flow_emit(flag_flow(bodies[target], FLAG_ALL, definitions))
+                    narrowed = flag_flow_emit(flag_flow(bodies[target], 0, definitions))
+                    worth_cloning[target] = ordinary != narrowed
+                if not worth_cloning[target]: continue
+                private[target] = None
+                pending.append(target)
+            original = f'AC1_CALL(c, L_{target:08X}, 0x{target:08X}u)'
+            # Match by instruction group, not global replacement: another call
+            # to this callee in the same caller may consume returned flags.
+            group = '\n'.join(flow['groups'][i])
+            replacement = group.replace(original, f'AC1_CALL(c, ac1_abi_{target:08X}, 0x{target:08X}u)')
+            if group == replacement: raise ValueError('FLAGABI lost direct callsite')
+            if text.count(group) != 1: raise ValueError('FLAGABI ambiguous instruction group')
+            text = text.replace(group, replacement, 1)
+            narrowed_sites += 1
+        if is_private:
+            text = text.replace(f'void L_{a:08X}(CPU *c)', f'void ac1_abi_{a:08X}(CPU *c)', 1)
+        return text
+    for a in bodies: public[a] = transform(a, FLAG_ALL, False)
+    while pending:
+        a = pending.popleft()
+        private[a] = transform(a, 0, True)
+    report = dict(public_entries_all_live=len(bodies), public_returns_narrowed=0,
+                  private_functions_narrowed=len(private), direct_sites_narrowed=narrowed_sites,
+                  private_returns_narrowed=sum(len(re.findall(r'\breturn;', b)) for b in private.values()),
+                  proven_defining_callees=sum(bool(v) for v in definitions.values()),
+                  definition_updates=updates, unsafe_functions=len(unsafe),
+                  pinned_functions=len(pinned), caller_return_demands={f'0x{a:08X}':v for a,v in sorted(demands.items())})
+    return public, private, report
+
+
+
 def flag_liveness_function(body: str, mode: str = 'cfg') -> str:
     """Only kill writes proved dead in emitted semantics, never x86 undefined bits.
 
@@ -3230,60 +3423,100 @@ def wrap_native_binding(body: str, address: int, entry: dict) -> str:
             f'void L_{address:08X}(CPU *c) {{ ac1_native_invoke(c, &ac1_binding_{address:08X}, {original}); }}\n')
 
 
-def local_register_function(body: str) -> str:
-    """Promote GPRs; keep every opaque CPU use as an architectural boundary.
+# Audited pinned helpers only: every CPU access is flag state, with no GPR
+# pointer escaping or diagnostic callback. Unit tests check the actual header.
+LOCAL_GPR_FREE_HELPERS = frozenset({
+    'AC1_SET_GUEST_EIP', 'op_shl', 'op_shr', 'op_sar', 'op_rol', 'op_ror',
+    'op_shld', 'op_shrd', 'op_bsf', 'op_bsr', 'shr32', 'shl32',
+    'eflags_pack', 'eflags_unpack',
+})
+LOCAL_ESP_HELPERS = frozenset({'push32', 'pop32'})
 
-    The aggregate never escapes. GCC scalar replacement can retain its fields
-    in host registers. Flags remain architectural, with audited GPR-free flag
-    helpers. Each public C entry initializes its own locals; internal labels
-    share them. Segmented/SEH and nonlocal-resumption functions stay unchanged.
-    """
-    if re.search(r'\b(?:fs|gs):|c->(?:fs|gs)\b|\b(?:seh|setjmp|longjmp)\b', body, re.I):
-        return body
-    registers = 'eax ecx edx ebx esp ebp esi edi'.split()
-    gpr = re.compile(r'\bc->(' + '|'.join(registers) + r')\b')
-    spill = 'memcpy(&c->eax, &_ac1_regs, sizeof _ac1_regs);'
-    reload = 'memcpy(&_ac1_regs, &c->eax, sizeof _ac1_regs);'
-    lines = body.splitlines()
-    if len(lines) < 3 or lines[1] != '{' or lines[-1] != '}':
-        raise ValueError('unexpected lifted function shape for local registers')
-    output = lines[:2] + [
-        '    struct { uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi; } _ac1_regs;',
-        '    _Static_assert(sizeof _ac1_regs == 32 && offsetof(CPU, edi) == 28, "pinned GPR layout");',
-        '    ' + reload,
-    ]
-    def emit_group(group):
-        if not group:
-            return
-        text = '\n'.join(group)
-        # Leading donor comments can precede executable dispatch code. Cutting
-        # at the first comment loses that CPU use and flushes after the import.
-        code = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
-        pointer_uses = re.sub(r'\bc->\w+', 'member', code)
-        pointer_uses = re.sub(r'\b(?:flags_\w+|AC1_SET_GUEST_EIP)\(c(?=[,)])', 'safe(', pointer_uses)
-        boundary = bool(re.search(r'\bc\b', pointer_uses)) or any(
-            token in code for token in ('RECOMP_TODO(', 'ac1_unsupported_instruction('))
-        if boundary:
-            output.append('    ' + spill)
-        else:
-            text = gpr.sub(lambda m: '_ac1_regs.' + m.group(1), text)
-            text = re.sub(r'\breturn;', '{ ' + spill + ' return; }', text)
-        # A helper-authoritative instruction can branch before the ordinary
-        # reload. Reload on that edge too; fence guest polling across backedges.
-        fence = (reload + ' ' if boundary else '') + '__asm__ __volatile__("" ::: "memory"); '
-        text = re.sub(r'\bgoto (L_[0-9A-F]{8});',
-                      lambda m: '{ ' + fence + 'goto ' + m.group(1) + '; }', text)
-        output.extend(text.splitlines())
-        if boundary:
-            output.append('    ' + reload)
-    group = []
+
+def local_register_function(body: str) -> str:
+    """GPR locals with conservative CFG dirty sets and audited CPU boundaries."""
+    from collections import deque
+    if re.search(r'\b(?:fs|gs):|c->(?:fs|gs)\b|\b(?:seh|setjmp|longjmp)\b',body,re.I):return body
+    registers='eax ecx edx ebx esp ebp esi edi'.split()
+    clean=re.sub(r'/\*.*?\*/','',body,flags=re.S)
+    names='|'.join(registers)
+    if re.search(r'(?:^|[=(,;{?:]|\*\))\s*&\s*\(*\s*c->(?:'+names+r')\b',clean,re.M):return body
+    referenced=set(re.findall(r'\bc->('+names+r')\b',clean))
+    stack='|'.join(sorted(LOCAL_ESP_HELPERS))
+    if re.search(r'\b(?:'+stack+r')\(c(?=[,)])',clean):referenced.add('esp')
+    registers=[r for r in registers if r in referenced]
+    if not registers:return body
+    all_regs=set(registers)
+    gpr=re.compile(r'\bc->('+'|'.join(registers)+r')\b')
+    def spill(dirty):return ' '.join(f'c->{r} = _ac1_regs.{r};' for r in registers if r in dirty)
+    reload=' '.join(f'_ac1_regs.{r} = c->{r};' for r in registers)
+    esp_spill,esp_reload='c->esp = _ac1_regs.esp;','_ac1_regs.esp = c->esp;'
+    pure=r'flags_\w+|'+'|'.join(sorted(LOCAL_GPR_FREE_HELPERS))
+    lines=body.splitlines()
+    if len(lines)<3 or lines[1]!='{' or lines[-1]!='}':raise ValueError('unexpected lifted function shape for local registers')
+    groups=[];group=[]
     for line in lines[2:-1]:
-        if 'AC1_SET_GUEST_EIP(c,' in line or re.fullmatch(r'L_[0-9A-F]{8}:', line):
-            emit_group(group)
-            group = []
+        if 'AC1_SET_GUEST_EIP(c,' in line or re.fullmatch(r'L_[0-9A-F]{8}:',line):
+            if group:groups.append(group)
+            group=[]
         group.append(line)
-    emit_group(group)
-    output.extend(('    ' + spill, '}'))
+    if group:groups.append(group)
+    texts=[re.sub(r'/\*.*?\*/','', '\n'.join(g),flags=re.S) for g in groups]
+    labels={label:i for i,text in enumerate(texts) for label in re.findall(r'^(L_[0-9A-F]{8}):',text,re.M)}
+    full=[];partial=[];writes=[];edges=[];unknown_edges=False
+    for i,text in enumerate(texts):
+        pointer=re.sub(r'\bc->\w+','member',text)
+        pointer=re.sub(r'\b(?:'+pure+'|'+stack+r')\(c(?=[,)])','safe(',pointer)
+        full.append(bool(re.search(r'\bc\b|RECOMP_TODO\(|ac1_unsupported_instruction\(',pointer)))
+        partial.append(not full[-1] and bool(re.search(r'\b(?:'+stack+r')\(c(?=[,)])',text)))
+        changed=set(re.findall(r'\bc->('+'|'.join(registers)+r')\s*\)*\s*(?:(?:<<|>>|[+*/%&|^\-])?=(?!=)|\+\+|--)',text))
+        changed.update(re.findall(r'(?:\+\+|--)\s*\(*\s*c->('+'|'.join(registers)+r')\b',text))
+        changed.update(re.findall(r'\bSET(?:8[HL]|16)\(\s*\(*\s*c->('+'|'.join(registers)+r')\b',text))
+        macros=set(re.findall(r'\b([A-Z][A-Z0-9_]+)\(',text))
+        if macros-{'AC1_SET_GUEST_EIP','R8H','R8L','R16','SET8H','SET8L','SET16'}:
+            changed.update(gpr.findall(text))
+        writes.append(changed)
+        targets=re.findall(r'\bgoto (L_[0-9A-F]{8});',text)
+        unknown_edges |= any(t not in labels for t in targets) or text.count('goto ')!=len(targets)
+        successors={labels[t] for t in targets if t in labels}
+        control=re.sub(r'AC1_SET_GUEST_EIP\(c,\s*0x[0-9A-F]+u\);','',text)
+        control=re.sub(r'^L_[0-9A-F]{8}:','',control,flags=re.M)
+        terminal=bool(re.fullmatch(r'\s*goto L_[0-9A-F]{8};\s*',control))
+        terminal |= 'return;' in text and not re.search(r'\b(?:if|while|for|switch)\b',text)
+        if not terminal and i+1<len(groups):successors.add(i+1)
+        edges.append(successors)
+    def outgoing(i,before):
+        if full[i]:return set()
+        return (before|writes[i])-({'esp'} if partial[i] else set())
+    incoming={0:set()};queue=deque([0])
+    while queue:
+        i=queue.popleft();after=outgoing(i,incoming[i])
+        for target in edges[i]:
+            merged=incoming.get(target,set())|after
+            if target not in incoming or merged!=incoming[target]:incoming[target]=merged;queue.append(target)
+    output=lines[:2]+[
+        '    struct { uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi; } _ac1_regs;',
+        '    _Static_assert(STACK_BASE((CPU *)0) == 0u, "local GPR stack helpers require flat zero stack base");',
+        '    '+reload,
+    ]
+    for i,group in enumerate(groups):
+        before=all_regs if unknown_edges else incoming.get(i,all_regs)
+        after=outgoing(i,before)
+        text='\n'.join(group)
+        if full[i]:
+            sync=spill(before)
+            if sync:output.append('    '+sync)
+        else:
+            if partial[i] and 'esp' in before:output.append('    '+esp_spill)
+            text=gpr.sub(lambda m:m[0] if partial[i] and m[1]=='esp' else '_ac1_regs.'+m[1],text)
+            at_return=(esp_reload+' ' if partial[i] else '')+spill(after)
+            text=re.sub(r'\breturn;','{ '+at_return+' return; }',text)
+        edge_reload=reload if full[i] else esp_reload if partial[i] else ''
+        fence=edge_reload+' __asm__ __volatile__("" ::: "memory"); '
+        text=re.sub(r'\bgoto (L_[0-9A-F]{8});',lambda m:'{ '+fence+'goto '+m[1]+'; }',text)
+        output.extend(text.splitlines())
+        if edge_reload:output.append('    '+edge_reload)
+    output.extend(('    '+spill(all_regs),'}'))
     return '\n'.join(output)
 
 
@@ -3451,7 +3684,12 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         for index, address in enumerate(lifted):
             bodies[index], direct_callees[address], sites = specialize_direct_calls(bodies[index], successful)
             direct_sites += sites
-    if flag_liveness != 'off':
+    abi_private, abi_report = {}, None
+    if flag_liveness == 'abi':
+        public, abi_private, abi_report = flag_abi_program(
+            dict(zip(lifted, bodies)), pinned=set(bindings), private_variants=True)
+        bodies = [public[a] for a in lifted]
+    elif flag_liveness != 'off':
         bodies = [flag_liveness_function(body, flag_liveness) for body in bodies]
     selected_locals = local_register_selection(local_regs, set(lifted))
     local_count, local_excluded = 0, []
@@ -3463,6 +3701,11 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
             else:
                 local_excluded.append(f'0x{address:08X}')
             bodies[index] = transformed
+            if address in abi_private:
+                abi_private[address] = local_register_function(abi_private[address])
+    for index, address in enumerate(lifted):
+        if address in abi_private:
+            bodies[index] += '\n\n' + abi_private[address]
     # Keep L_VA as the one public entry for direct transfers AND the dispatch
     # table. Retain a private, callable translated oracle behind that entry.
     for index, address in enumerate(lifted):
@@ -3484,13 +3727,18 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "",
     ])
     direct_prototypes = 0
+    body_by_address = dict(zip(lifted, bodies))
     def tu_header_for(addresses: list[int]) -> str:
         nonlocal direct_prototypes
         # Per-shard prototypes avoid parsing all 100k entries in every TU.
         callees = set().union(*(direct_callees.get(a, set()) for a in addresses))
         direct_prototypes += len(callees)
         native_header = '#include "ac1_native.h"\n' if any(a in bindings for a in addresses) else ''
-        return tu_header + native_header + "".join(f"void L_{a:08X}(CPU *);\n" for a in sorted(callees)) + "\n"
+        private_needed = set().union(*(set(int(v, 16) for v in re.findall(
+            r'AC1_CALL\(c, ac1_abi_([0-9A-F]{8}),', body_by_address[a])) for a in addresses)) if abi_private else set()
+        return (tu_header + native_header +
+                "".join(f"void L_{a:08X}(CPU *);\n" for a in sorted(callees)) +
+                "".join(f"void ac1_abi_{a:08X}(CPU *);\n" for a in sorted(private_needed)) + "\n")
 
     tu_names = []
     if translation_unit_buckets:
@@ -3581,6 +3829,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "direct_call_sites": direct_sites,
         "direct_callee_declarations": direct_prototypes,
         "native_overrides": [f"0x{a:08X}" for a in sorted(bindings)],
+        "flag_abi": abi_report,
         'local_regs': {'requested': local_regs, 'admitted_count': local_count,
                        'excluded_functions': local_excluded},
     }
@@ -3714,8 +3963,8 @@ def main() -> int:
     parser.add_argument("--selftest", action="store_true", help="run the focused block-entry ordering check")
     parser.add_argument('--local-regs', default='off', metavar='off|all|VA,...',
                         help='function-gated GPR locals; off restores CPU-struct registers')
-    parser.add_argument('--flag-liveness', choices=('off', 'straight', 'cfg'), default='cfg',
-                        help='constant-mask intra-function flag liveness; off restores eager flags')
+    parser.add_argument('--flag-liveness', choices=('off', 'straight', 'cfg', 'abi'), default='cfg',
+                        help='constant-mask flag liveness; abi adds proved direct-only return contracts')
     parser.add_argument("--no-direct-calls", action="store_true",
                         help="keep constant main-catalog transfers in dispatch for A/B comparisons")
     parser.add_argument("--binary", type=Path)
@@ -3940,6 +4189,7 @@ def main() -> int:
         "unsupported_count": todo_count,
         "relocation_entries": lift_result["relocation_entries"],
         "flag_liveness": args.flag_liveness,
+        "flag_abi": lift_result["flag_abi"],
         "local_regs": lift_result["local_regs"],
         "direct_call_sites": lift_result["direct_call_sites"],
         "direct_callee_declarations": lift_result["direct_callee_declarations"],
@@ -4060,6 +4310,13 @@ def main() -> int:
     print(f"entry=0x{entry:08X}; discovered={len(catalog)}; lifted={len(lift_result['lifted'])}; "
           f"discovery failures={len(discovery_failures)}; lift failures={len(lift_result['lift_failures'])}; "
           f"RECOMP_TODO={todo_count}; remaining call queue={queued}; out={output_dir}")
+    if lift_result['flag_abi'] is not None:
+        abi = lift_result['flag_abi']
+        print('FLAGABI: public entries all-live={public_entries_all_live}; '
+              'public narrowed={public_returns_narrowed}; '
+              'private functions/returns narrowed={private_functions_narrowed}/{private_returns_narrowed}; '
+              'direct sites narrowed={direct_sites_narrowed}; '
+              'proved defining callees={proven_defining_callees}'.format(**abi))
     return 0 if lift_result["lifted"] else 2
 
 

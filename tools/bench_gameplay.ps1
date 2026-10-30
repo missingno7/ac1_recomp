@@ -20,6 +20,8 @@ param(
     [string]$LiftArgsB = '',
     [string]$ResultDirOverride = '',
     [string]$ComparisonDir = '',
+    # Optional controlled private save/profile state, restored before each side.
+    [string]$UserdataSeed = '',
     [string]$Label = '',
     # Keep the dedicated build directory (default: delete after copying the binary).
     [switch]$KeepBuild,
@@ -143,6 +145,10 @@ public static class AC1BenchProcessTree {
                 $sideEnv = if ($side -eq 'A') { $Env } else { $EnvB }
                 $sideDir = Join-Path $comparisonDir ("{0}/pair-{1:D2}" -f $side,$pair)
                 New-Item -ItemType Directory -Force -Path $sideDir | Out-Null
+                if ($UserdataSeed) {
+                    & $Python -B tools/bench_userdata.py --seed $UserdataSeed --archive (Join-Path $sideDir 'userdata-before') --manifest (Join-Path $sideDir 'userdata-input.json')
+                    if ($LASTEXITCODE -ne 0) { throw 'Private userdata seed restoration failed' }
+                }
                 $childArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath,
                     '-Runs','1','-Seconds',[string]$Seconds,
                     '-ResultDirOverride',$sideDir,'-Label',"${side}-pair-${pair}",'-Python',$Python,'-GameExe',$GameExe,'-AllowDirty')
@@ -170,6 +176,7 @@ public static class AC1BenchProcessTree {
         }
         $comparison = [ordered]@{
             comparison=$true; pair_count=$Runs; seconds=$Seconds; host_load_override=[bool]$AllowBusy
+            userdata_seed=$UserdataSeed
             A=[ordered]@{ label=$sideLabels.A; binary=$Binary; runs=$sideRuns.A; failures=@($sideRuns.A | Where-Object { -not $_.reached_gameplay }).Count }
             B=[ordered]@{ label=$sideLabels.B; binary=$BinaryB; runs=$sideRuns.B; failures=@($sideRuns.B | Where-Object { -not $_.reached_gameplay }).Count }
             paired_deltas=@{}
