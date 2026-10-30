@@ -890,9 +890,13 @@ static void scheduler_checkpoint_for_thread(ac1_guest_thread *thread)
     if (scheduler_batch_imports && scheduler_return_slice_ns && !force &&
         !thread->blocked && !thread->suspended && !scheduler->failed &&
         !scheduler->stopping && cause != AC1_HANDOFF_YIELD &&
-        cause != AC1_HANDOFF_START &&
-        guest_monotonic_ns() < thread->return_slice_deadline)
-        return;
+        cause != AC1_HANDOFF_START) {
+        /* Imports run millions of times per second; on Android the vDSO clock
+         * read alone was ~8% of the main thread. Sample it like returns do. */
+        if (++thread->return_slice_checks < 16u) return;
+        thread->return_slice_checks = 0u;
+        if (guest_monotonic_ns() < thread->return_slice_deadline) return;
+    }
     scheduler_lock(scheduler);
     for (;;) {
         if (scheduler->failed || scheduler->stopping) break;
@@ -986,14 +990,29 @@ int ac1_set_userdata_root(const char *path)
     return 1;
 }
 
+/* Guest code joins host userdata paths with '\\'; POSIX hosts need '/'. */
+static void host_path_separators(char *path)
+{
+#ifndef _WIN32
+    for (; *path; ++path)
+        if (*path == '\\') *path = '/';
+#else
+    (void)path;
+#endif
+}
+
 static int directory_exists(const char *path)
 {
 #ifdef _WIN32
     DWORD attrs = GetFileAttributesA(path);
     return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
 #else
+    char host[32768];
     struct stat st;
-    return !stat(path, &st) && S_ISDIR(st.st_mode);
+    if (strlen(path) >= sizeof(host)) return 0;
+    memcpy(host, path, strlen(path) + 1u);
+    host_path_separators(host);
+    return !stat(host, &st) && S_ISDIR(st.st_mode);
 #endif
 }
 
@@ -1014,6 +1033,7 @@ static int ensure_directory_tree(const char *path)
     size_t length = strlen(path);
     if (!length || length >= sizeof(copy)) return 0;
     memcpy(copy, path, length + 1u);
+    host_path_separators(copy);
     size_t start = 1u;
 #ifdef _WIN32
     if (length >= 3u && copy[1] == ':') start = 3u;
@@ -3005,7 +3025,9 @@ static int resolve_profile_path(const char *guest_path, char *host_path, size_t 
 #ifdef __ANDROID__
     if (guest_path[0] == '/') {
         int written = snprintf(host_path, capacity, "%s", guest_path);
-        return written >= 0 && (size_t)written < capacity;
+        if (written < 0 || (size_t)written >= capacity) return 0;
+        host_path_separators(host_path);
+        return 1;
     }
     char relative[32768];
     if (!android_guest_path_to_game_relative(guest_path, relative,
