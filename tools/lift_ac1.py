@@ -3786,6 +3786,118 @@ def local_xmm_function(body: str) -> str:
     return '\n'.join(output+[lines[-1]])
 
 
+# Header helpers that read or write the x87 register stack, tags or TOP.
+X87_STACK_HELPERS = frozenset({
+    'ac1_mmx_enter', 'ac1_mmx_emms', 'ac1_mmx_read', 'ac1_mmx_write', 'ac1_mmx_from_ps',
+    'ac1_mmx_to_ps', 'ac1_x87_reset', 'ac1_x87_tags', 'ac1_x87_load_env', 'ac1_x87_store_env',
+    'ac1_x87_save', 'ac1_x87_restore'})
+X87_BOOKKEEPING = (
+    re.compile(r'if \(!ac1_x87_check\(c, 0x[0-9A-F]+u\)\) return;'),
+    re.compile(r'c->fpu_ip=GVA\(0x[0-9A-F]+\); c->fpu_cs=c->cs; c->fpu_opcode=0x[0-9A-F]+u;'),
+    re.compile(r'c->fpu_dp=[^;]*; c->fpu_ds=c->ss;'),
+    re.compile(r'ac1_x87_set_tag\(c,[^;]*\);'))
+
+
+def c_statements(code: str) -> list[str]:
+    """Top-level statements of one generated line; brace blocks stay whole."""
+    out,depth,start=[],0,0
+    for i,ch in enumerate(code):
+        if ch=='{':depth+=1
+        elif ch=='}':
+            depth-=1
+            if depth==0:out.append(code[start:i+1]);start=i+1
+        elif ch==';' and depth==0:out.append(code[start:i+1]);start=i+1
+    if code[start:].strip():out.append(code[start:])
+    return [s for s in out if s.strip()]
+
+
+def native_x87_function(body: str) -> str:
+    """Experimental x87 lowering: the register stack in double locals.
+
+    Within a basic block the stack depth is static, so st(i) is a fixed local.
+    Each block anchors on c->fpu_top; slots load lazily from c->st[] and dirty
+    slots plus TOP are written back before branches, labels, calls and returns.
+    Arithmetic is unchanged (binary64, as before). Dropped: per-instruction
+    MMX/init checks, FPU IP/DP/opcode stores, tag-word and dirty bookkeeping,
+    which only fnstenv/fnsave/fxsave, MMX entry and stack-fault semantics
+    observe. Bodies using those helpers keep the exact lowering.
+    """
+    if not re.search(r'\b(?:fpush|fpop)\(c|\*fst\(c,',body):return body
+    clean=re.sub(r'/\*.*?\*/','',body,flags=re.S)
+    call=re.compile(r'\b(\w+)\s*\(\s*c\s*[,)]')
+    if X87_STACK_HELPERS & set(call.findall(clean)):return body
+    if re.search(r'\b(?:seh|setjmp|longjmp)\b',clean,re.I):return body
+    global _X87_FREE_HELPERS
+    if _X87_FREE_HELPERS is None:
+        header=(ROOT/'src/runtime/cpu.h').read_text(encoding='utf-8')
+        names=set(re.findall(r'^(?:static inline|AC1_ACCESSOR_INLINE|AC1_X87_INTEGER_INLINE)\s+[^\n(]*?\b(\w+)\s*\(',header,re.M))
+        names|=set(re.findall(r'^#define\s+(\w+)\(',header,re.M))|{'AC1_SET_GUEST_EIP'}
+        _X87_FREE_HELPERS=frozenset(names-{'AC1_CALL','RECOMP_TODO'}-X87_STACK_HELPERS)
+    free=_X87_FREE_HELPERS
+    lines=body.splitlines()
+    if len(lines)<3 or lines[1]!='{' or lines[-1]!='}':raise ValueError('unexpected lifted function shape for native x87')
+    fst=re.compile(r'\*fst\(c,\s*(\d)\)')
+    state={'d':0,'loaded':set(),'dirty':set()}
+    def slot(i):return (i-state['d'])&7
+    def load(r):
+        if r in state['loaded']:return []
+        state['loaded'].add(r);return [f'_ac1_st{r} = c->st[(_ac1_x87_top + {r}u) & 7u];']
+    def sync():
+        code=[f'c->st[(_ac1_x87_top + {r}u) & 7u] = _ac1_st{r};' for r in sorted(state['dirty'])]
+        state['dirty']=set()
+        return code+[f'c->fpu_top = (int)((_ac1_x87_top - {state["d"]}u) & 7u);']
+    def anchor():
+        state.update(d=0,loaded=set(),dirty=set())
+        return ['_ac1_x87_top = (uint32_t)c->fpu_top;']
+    def rewrite(text):
+        pre,out,pos=[],[],0
+        while True:
+            m=re.search(r'fpush\(c,\s*|fpop\(c\)|\*fst\(c,\s*(\d)\)',text[pos:])
+            if not m:out.append(text[pos:]);break
+            start=pos+m.start();out.append(text[pos:start])
+            if m[0].startswith('fpush'):
+                i,depth=pos+m.end(),1
+                while depth:depth+=(text[i]=='(')-(text[i]==')');i+=1
+                expr=text[pos+m.end():i-1]
+                for f in fst.finditer(expr):pre+=load(slot(int(f[1])))
+                expr=fst.sub(lambda f:f'_ac1_st{slot(int(f[1]))}',expr)
+                state['d']+=1;r=slot(0);state['loaded'].add(r);state['dirty'].add(r)
+                out.append(f'(_ac1_st{r} = ({expr}))');pos=i
+            elif m[0].startswith('fpop'):
+                state['d']-=1;out.append('(void)0');pos=start+len(m[0])
+            else:
+                r=slot(int(m[1]));pre+=load(r)
+                if re.match(r'\s*=(?!=)',text[start+len(m[0]):]):state['dirty'].add(r)
+                out.append(f'_ac1_st{r}');pos=start+len(m[0])
+        return pre,''.join(out)
+    output=lines[:2]+['    double _ac1_st0, _ac1_st1, _ac1_st2, _ac1_st3, _ac1_st4, _ac1_st5, _ac1_st6, _ac1_st7;',
+                      '    uint32_t _ac1_x87_top; ac1_fp_init(c);','    '+anchor()[0]]
+    for line in lines[2:-1]:
+        code,separator,comment=line.partition('/*')
+        indent=code[:len(code)-len(code.lstrip())]
+        for pattern in X87_BOOKKEEPING:code=pattern.sub('',code)
+        if re.fullmatch(r'\s*L_[0-9A-F]{8}:\s*',code):
+            output+=['    '+' '.join(sync()),code.rstrip(),'    '+' '.join(anchor())];continue
+        pieces=[]
+        for statement in c_statements(code):
+            s=statement.strip()
+            names=[n for n in call.findall(s) if n not in ('fpush','fpop','fst')]
+            escapes=any(n not in free for n in names) or 'RECOMP_TODO(' in s
+            pre,s2=rewrite(s)
+            if escapes or re.search(r'\bgoto\b|\breturn\b|\bswitch\b',s):
+                pieces+=pre+sync()+[s2]+(anchor() if escapes else [])
+            elif 'ac1_x87_status(c)' in s:
+                pieces+=pre+[f'c->fpu_top = (int)((_ac1_x87_top - {state["d"]}u) & 7u);',s2]
+            else:pieces+=pre+[s2]
+        text=' '.join(p.strip() for p in pieces if p.strip())
+        if text or comment:output.append(indent+text+(' ' if text and separator else '')+separator+comment)
+    output.append('    '+' '.join(sync()))
+    return '\n'.join(output+[lines[-1]])
+
+
+_X87_FREE_HELPERS = None
+
+
 def local_register_selection(selection: str, lifted: set[int]) -> set[int]:
     """Explicit per-function admission; malformed/unlifted entries fail closed."""
     if selection == 'off':
@@ -3819,7 +3931,8 @@ def profile_count_entry(body: str, address: int) -> str:
 def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: Path,
               functions_per_tu: int, translation_unit_buckets: int = 0,
               emission_cache=None, direct_calls: bool = True, native_overrides=None,
-              flag_liveness: str = 'off', local_regs: str = 'off', profile_counts=()) -> dict:
+              flag_liveness: str = 'off', local_regs: str = 'off', profile_counts=(),
+              x87: str = 'exact') -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
@@ -3982,6 +4095,16 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         bodies = [public[a] for a in lifted]
     elif flag_liveness != 'off':
         bodies = [flag_liveness_function(body, flag_liveness) for body in bodies]
+    if x87 not in ('exact', 'native'):
+        raise ValueError('x87 must be exact or native')
+    x87_native_count = 0
+    if x87 == 'native':
+        for index, address in enumerate(lifted):
+            transformed = native_x87_function(bodies[index])
+            x87_native_count += transformed != bodies[index]
+            bodies[index] = transformed
+            if address in abi_private:
+                abi_private[address] = native_x87_function(abi_private[address])
     selected_locals = local_register_selection(local_regs, set(lifted))
     local_count, local_xmm_count, local_excluded = 0, 0, []
     for index, address in enumerate(lifted):
@@ -4143,6 +4266,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "direct_callee_declarations": direct_prototypes,
         "native_overrides": [f"0x{a:08X}" for a in sorted(bindings)],
         "flag_abi": abi_report,
+        'x87': {'mode': x87, 'native_count': x87_native_count},
         'local_regs': {'requested': local_regs, 'admitted_count': local_count,
                        'xmm_admitted_count': local_xmm_count,
                        'excluded_functions': local_excluded},
@@ -4275,6 +4399,8 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=CONFIG_PATH,
                         help="discovery configuration (allows private seed-set A/B comparisons)")
     parser.add_argument("--selftest", action="store_true", help="run the focused block-entry ordering check")
+    parser.add_argument('--x87', choices=('exact', 'native'), default='exact',
+                        help='native keeps the x87 stack in block-local doubles without tag/env bookkeeping (experiment)')
     parser.add_argument('--local-regs', default='off', metavar='off|all|VA,...',
                         help='function-gated GPR locals; off restores CPU-struct registers')
     parser.add_argument('--flag-liveness', choices=('off', 'straight', 'cfg', 'abi'), default='cfg',
@@ -4489,7 +4615,8 @@ def main() -> int:
                                 emission_cache, direct_calls=not args.no_direct_calls,
                                 native_overrides=config.get('native_overrides', []),
                                 flag_liveness=args.flag_liveness, local_regs=args.local_regs,
-                                profile_counts=[int(s, 16) for s in args.profile_count_entries.split(',') if s])
+                                profile_counts=[int(s, 16) for s in args.profile_count_entries.split(',') if s],
+                                x87=args.x87)
     except Exception:
         if emission_cache is not None:
             emission_cache.close()
