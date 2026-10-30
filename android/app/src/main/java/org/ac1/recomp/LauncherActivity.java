@@ -29,7 +29,10 @@ public final class LauncherActivity extends Activity {
     private static final int PICK_GAME = 1;
     private static final String EXE_NAME = "AssassinsCreed_Dx9.exe";
     private static final String LIB_NAME = "ac1_android";
-    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    // Lifted C call frames need more native stack than Android's default 1 MiB.
+    // This is independent of the emulated x86 stack managed by the runtime.
+    private final ExecutorService worker = Executors.newSingleThreadExecutor(
+        task -> new Thread(null, task, "AC1 startup", 64L * 1024L * 1024L));
     private TextView status;
     private Button choose;
     private Button run;

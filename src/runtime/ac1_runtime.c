@@ -596,7 +596,22 @@ static int create_guest_thread(CPU *cpu, const import_record *import)
     thread->host = CreateThread(NULL, 0, guest_thread_entry, thread, 0, NULL);
     thread->spawned = thread->host != NULL;
 #else
-    thread->spawned = pthread_create(&thread->host, NULL, guest_thread_entry, thread) == 0;
+    /* Lifted C recursion uses a separate native stack. Android's default 1 MiB
+     * overflowed in the original recursive loader at 0x0093C740; even dispatch
+     * alone needs about 4 KiB per frame in the x86_64 diagnostic build. Reserve
+     * room for the 4096-call guard, independently of the guest x86 stack. */
+    pthread_attr_t native_attributes;
+    int host_error = pthread_attr_init(&native_attributes);
+    if (!host_error) {
+        host_error = pthread_attr_setstacksize(&native_attributes, 64u * 1024u * 1024u);
+        if (!host_error)
+            host_error = pthread_create(&thread->host, &native_attributes, guest_thread_entry, thread);
+        pthread_attr_destroy(&native_attributes);
+    }
+    thread->spawned = host_error == 0;
+    if (host_error)
+        fprintf(stderr, "AC1 native worker creation failed: pthread error=%d (%s)\n",
+                host_error, strerror(host_error));
 #endif
     if (thread->spawned) ++scheduler->count;
     scheduler_notify(scheduler);
