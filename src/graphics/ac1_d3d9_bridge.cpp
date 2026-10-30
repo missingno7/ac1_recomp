@@ -1968,6 +1968,11 @@ uint32_t invoke_d3d9(GuestObject &object, uint32_t method,
         guest.revision = native.Revision;
         guest.device_identifier = native.DeviceIdentifier;
         guest.whql_level = native.WHQLLevel;
+        if (std::getenv("AC1_D3D9_TRACE_CAPS"))
+            std::fprintf(stderr, "AC1 D3D9 adapter: index=%u flags=%08x vendor=%04x device=%04x revision=%u subsystem=%08x description=\"%s\"\n",
+                args[1], args[2], static_cast<unsigned>(native.VendorId),
+                static_cast<unsigned>(native.DeviceId), static_cast<unsigned>(native.Revision),
+                static_cast<unsigned>(native.SubSysId), native.Description);
         if (!guest_write(args[3], &guest, sizeof(guest))) {
             set_error("GetAdapterIdentifier output is unmapped");
             return hresult(D3DERR_INVALIDCALL);
@@ -2295,7 +2300,12 @@ uint32_t invoke_remaining_device(GuestObject &object, uint32_t method, const uin
 {
     auto *d = static_cast<IDirect3DDevice9 *>(object.native);
     switch (method) {
-    case 4: return d->GetAvailableTextureMem();
+    case 4: {
+        const UINT available = d->GetAvailableTextureMem();
+        if (std::getenv("AC1_D3D9_TRACE_CAPS"))
+            std::fprintf(stderr, "AC1 D3D9 available texture memory: %u bytes\n", available);
+        return available;
+    }
     case 5: return hresult(d->EvictManagedResources());
     case 6: return hresult(interface_output<IDirect3D9>(a[1], ObjectKind::D3D9, [&](auto **p) { return d->GetDirect3D(p); }));
     case 7: return hresult(copied_output<D3DCAPS9>(a[1],[&](auto *p) { return d->GetDeviceCaps(p); }));

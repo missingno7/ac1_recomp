@@ -3392,6 +3392,113 @@ static int profile_enumerate_sections(const char *path, char *output,
     return (int)used;
 }
 
+/* The title reads its graphics options from Assassin.ini through the profile
+ * API. Keep preset selection at this boundary so the game UI and renderer see
+ * the same values on every backend. Values follow the game's four quality
+ * levels; MSAA is 0/1/2 = off/2x/4x. */
+static int graphics_preset_value(const char *section, const char *key,
+                                 unsigned level, uint32_t *value)
+{
+    if (equal_ascii_fold(section, "Performance") &&
+        equal_ascii_fold(key, "MaxNumNPCs")) {
+        *value = level == 4u ? 105u : level == 3u ? 100u : level == 2u ? 90u : 80u;
+        return 1;
+    }
+    if (!equal_ascii_fold(section, "Graphics")) return 0;
+#define PRESET_BOOL(name, max_level) \
+    if (equal_ascii_fold(key, name)) { *value = level >= (max_level) ? 1u : 0u; return 1; }
+    PRESET_BOOL("PostFX", 2u)
+    PRESET_BOOL("Particle", 3u)
+    PRESET_BOOL("Clutter", 3u)
+    PRESET_BOOL("LODBlend", 4u)
+    PRESET_BOOL("Layers", 3u)
+    PRESET_BOOL("Anisotropic", 4u)
+    PRESET_BOOL("AlphaTest", 2u)
+    PRESET_BOOL("ProcessBoneModifiers", 3u)
+    PRESET_BOOL("AdvancedDynamicLighting", 2u)
+#undef PRESET_BOOL
+    if (equal_ascii_fold(key, "DistanceLODEnabled")) {
+        *value = level <= 2u ? 1u : 0u;
+        return 1;
+    }
+    if (equal_ascii_fold(key, "ShadowDistance")) {
+        *value = level >= 3u ? 4u : level == 2u ? 2u : 0u;
+        return 1;
+    }
+    if (equal_ascii_fold(key, "ShadowMapSize")) {
+        *value = level == 4u ? 1024u : level == 3u ? 768u : level == 2u ? 640u : 512u;
+        return 1;
+    }
+    if (equal_ascii_fold(key, "SkipMips")) {
+        *value = 0u;
+        return 1;
+    }
+    if (equal_ascii_fold(key, "Multisampling")) {
+        *value = level == 4u ? 2u : level == 3u ? 1u : 0u;
+        return 1;
+    }
+    if (equal_ascii_fold(key, "DistanceLOD")) {
+        *value = level >= 3u ? 0u : 2u;
+        return 1;
+    }
+    if (equal_ascii_fold(key, "MaxNPCLODLevel")) {
+        *value = level == 4u ? 5u : level;
+        return 1;
+    }
+    if (equal_ascii_fold(key, "SmallObjectsCullDistanceModifier")) {
+        *value = level == 4u ? 1u : level == 3u ? 2u : level == 2u ? 3u : 5u;
+        return 1;
+    }
+    if (equal_ascii_fold(key, "MediumObjectsCullDistanceModifier")) {
+        *value = level == 4u ? 1u : level == 3u ? 2u : level == 2u ? 2u : 3u;
+        return 1;
+    }
+    return 0;
+}
+
+static int graphics_preset_level(unsigned *level, int *explicit_request)
+{
+    static int invalid_reported;
+    const char *setting = getenv("AC1_GRAPHICS_PRESET");
+    *explicit_request = setting && *setting;
+    if (!*explicit_request) {
+        *level = 4u;
+        return 1; /* Seed missing settings to max once; preserve saved values. */
+    }
+    if (equal_ascii_fold(setting, "auto")) return 0;
+    if (equal_ascii_fold(setting, "max")) *level = 4u;
+    else if (equal_ascii_fold(setting, "high")) *level = 3u;
+    else if (equal_ascii_fold(setting, "medium")) *level = 2u;
+    else if (equal_ascii_fold(setting, "low")) *level = 1u;
+    else {
+        *level = 4u;
+        if (!invalid_reported) {
+            fprintf(stderr, "AC1 graphics preset: invalid value '%s'; using max\n", setting);
+            invalid_reported = 1;
+        }
+    }
+    return 1;
+}
+
+static int profile_path_is_roaming(const char *path)
+{
+    for (const char *cursor = path; *cursor; ++cursor) {
+        if (cursor != path && cursor[-1] != '/' && cursor[-1] != '\\') continue;
+        static const char component[] = "roaming";
+        size_t i = 0u;
+        while (component[i] && cursor[i]) {
+            unsigned char left = (unsigned char)component[i];
+            unsigned char right = (unsigned char)cursor[i];
+            if (left >= 'A' && left <= 'Z') left += 'a' - 'A';
+            if (right >= 'A' && right <= 'Z') right += 'a' - 'A';
+            if (left != right) break;
+            ++i;
+        }
+        if (!component[i] && (cursor[i] == '/' || cursor[i] == '\\')) return 1;
+    }
+    return 0;
+}
+
 static int handle_profile_import(CPU *cpu, const import_record *import)
 {
     if (!import || import->by_ordinal ||
@@ -3482,6 +3589,35 @@ static int handle_profile_import(CPU *cpu, const import_record *import)
         int found = profile_get_value(host_path, section, key, "",
                                       value, sizeof(value), &file_opened);
         uint32_t result = ac1_profile_int_parse(value, found, arguments[2]);
+        uint32_t preset_value = 0u;
+        unsigned preset_level = 0u;
+        int explicit_preset = 0;
+        if (graphics_preset_level(&preset_level, &explicit_preset) &&
+            graphics_preset_value(section, key, preset_level, &preset_value) &&
+            (explicit_preset || !found)) {
+            if (!explicit_preset && profile_path_is_roaming(host_path) &&
+                profile_path_is_in_userdata(host_path)) {
+                char seeded[32];
+                snprintf(seeded, sizeof(seeded), "%u", preset_value);
+                char parent_path[32768];
+                size_t path_length = strlen(host_path);
+                if (path_length < sizeof(parent_path)) {
+                    memcpy(parent_path, host_path, path_length + 1u);
+                    char *slash = strrchr(parent_path, '/');
+                    char *backslash = strrchr(parent_path, '\\');
+                    if (backslash && (!slash || backslash > slash)) slash = backslash;
+                    if (slash) {
+                        *slash = '\0';
+                        if (ensure_directory_tree(parent_path))
+                            (void)profile_write_value(host_path, section, key, seeded);
+                    }
+                }
+            }
+            if (getenv("AC1_GRAPHICS_PRESET_TRACE"))
+                fprintf(stderr, "AC1 graphics preset: %s/%s=%u (was %u)\n",
+                        section, key, preset_value, result);
+            result = preset_value;
+        }
         cpu->eax = result;
         last_error = file_opened ? 0u : ((errno == ENOENT) ? 2u : 5u);
         if (trace_imports)
