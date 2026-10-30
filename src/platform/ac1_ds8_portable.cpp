@@ -25,10 +25,11 @@ struct Buffer {
     uint32_t flags = 0, rate = 44100, frequency = 44100, align = 4;
     int32_t volume = 0, pan = 0;
     bool playing = false, looping = false, locked = false;
+    bool resources_acquired = false;
     uint32_t lock[4]{};
     uint64_t last_ns = 0, frames = 0, remainder = 0;
     std::array<uint32_t, 16> spatial{}, pending{};
-    std::array<uint32_t, 15> listener{}, pending_listener{};
+    std::array<uint32_t, 16> listener{}, pending_listener{};
     std::vector<std::pair<uint32_t, uint32_t>> notifications;
     Buffer() {
         uint16_t fmt[] = {1, 2, 44100, 0, 45328, 2, 4, 16, 0};
@@ -38,10 +39,10 @@ struct Buffer {
         float one = 1, billion = 1e9f;
         std::memcpy(&spatial[13], &one, 4);
         std::memcpy(&spatial[14], &billion, 4);
-        listener[0] = 60;
+        listener[0] = 64;
         std::memcpy(&listener[9], &one, 4);
         std::memcpy(&listener[11], &one, 4);
-        for (unsigned i = 12; i < 15; ++i)
+        for (unsigned i = 13; i < 16; ++i)
             std::memcpy(&listener[i], &one, 4);
         pending = spatial;
         pending_listener = listener;
@@ -123,6 +124,7 @@ void signal(uint32_t e) {
         fail("notification event is invalid or closed");
 }
 void stopped(Buffer &b) {
+    b.resources_acquired = false;
     for (auto n : b.notifications)
         if (n.first == UINT32_MAX)
             signal(n.second);
@@ -185,7 +187,7 @@ unsigned iid_kind(const uint32_t *g) {
                                         {0xc50a7e93, 0x4834f395, 0xa97ff69e, 0x6609e59d},
                                         {0x279afa85, 0x11ce4981, 0x200021a5, 0x60e50baf},
                                         {0x279afa84, 0x11ce4981, 0x200021a5, 0x60e50baf},
-                                        {0x6825a449, 0x4d827524, 0xe3500f92, 0x1eabba6a},
+                                        {0x6825a449, 0x4d827524, 0xe3500f92, 0x1eabb36a},
                                         {0x279afa86, 0x11ce4981, 0x200021a5, 0x60e50baf},
                                         {0xb0210783, 0x11d089cd, 0xa00008af, 0x16cd25c9}};
     for (unsigned i = 0; i < 7; ++i)
@@ -247,6 +249,8 @@ extern "C" int ac1_ds8_argument_count(uint32_t t) {
     static const int spatial[] = {2, 3, 2, 2, 2, 2, 2, 2, 2, 3, 4, 5, 3, 3, 3, 3, 5, 5};
     if (k == 2)
         return dev[s - 3];
+    if (k == 5 && s == 22)
+        return 4; // AcquireResources(this, flags, effect count, result codes).
     if (k == 3 || k == 5)
         return s < 21 ? buf[s - 3] : -2;
     if (k == 4)
@@ -379,6 +383,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
                 return fail("duplicate source invalid");
             auto b = std::make_shared<Buffer>(*src->second.buffer);
             b->playing = b->locked = false;
+            b->resources_acquired = false;
             b->frames = b->remainder = 0;
             b->notifications.clear();
             uint32_t duplicate = wrap(3, b);
@@ -409,6 +414,18 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
     }
     if (!o.buffer)
         return fail("interface has no buffer");
+    if (k == 5 && s == 22) {
+        if (a[1] || a[2])
+            return fail("AcquireResources supports only flags=0 and zero effects");
+        if (!(o.buffer->flags & 0x40000u)) {
+            *hr = 0x88780032; // DSERR_INVALIDCALL: not a LOCDEFER buffer (native oracle).
+            return 1;
+        }
+        // Software PCM storage was acquired when the buffer was created. No FX
+        // resources or result-code entries exist for this no-effects request.
+        o.buffer->resources_acquired = true;
+        return 1;
+    }
     Buffer &b = *o.buffer;
     update(b);
     if (error[0])
@@ -435,7 +452,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
     if (k == 4 || k == 6) {
         uint32_t *current = k == 4 ? b.listener.data() : b.spatial.data();
         uint32_t *pending = k == 4 ? b.pending_listener.data() : b.pending.data();
-        unsigned size = k == 4 ? 60 : 64;
+        unsigned size = 64; // Both DS3DLISTENER and DS3DBUFFER are pack-4, 64 bytes.
         if (s == 3) {
             uint32_t caller_size;
             if (!read(a[1], &caller_size, 4) || caller_size != size)
@@ -465,7 +482,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
             return 1;
         }
         // Getters and setters use the documented pack-4 DS3D structures.
-        static const unsigned loff[] = {12, 14, 7, 1, 13, 4};        // listener getters 4..9
+        static const unsigned loff[] = {13, 15, 7, 1, 14, 4};        // listener getters 4..9
         static const unsigned boff[] = {7, 9, 12, 14, 13, 15, 1, 4}; // buffer getters 4..11
         bool get = s < (k == 4 ? 10u : 12u);
         unsigned index = get ? s - 4 : s - (k == 4 ? 11 : 13);
@@ -529,7 +546,8 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
         return put(a[1], s == 6   ? uint32_t(b.volume)
                          : s == 7 ? uint32_t(b.pan)
                          : s == 8 ? b.frequency
-                                  : (b.playing ? 1u : 0u) | (b.playing && b.looping ? 4u : 0u));
+                                  : (b.playing ? 1u : 0u) | (b.playing && b.looping ? 4u : 0u) |
+                                    ((b.flags & 0x40000u) && b.resources_acquired ? 0x10u : 0u));
     if (s == 10) {
         *hr = 0x88780082;
         return 1;
@@ -569,16 +587,26 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
         return 1;
     }
     if (s == 12) {
-        if (a[1] || a[2] || a[3] & ~1u) {
+        const uint32_t flags = a[3];
+        const bool deferred = (b.flags & 0x40000u) != 0;
+        if (a[1] || (flags & ~0x3fu) || (!deferred && (a[2] || (flags & ~1u))) ||
+            (flags & 6u) == 6u || (flags & 24u) == 24u) {
             *hr = invalid;
             return 1;
         }
+        if (flags & 2u) { // Hardware-only allocation is unavailable on this software backend.
+            *hr = 0x88780032; // Matches native Windows without hardware mixing resources.
+            return 1;
+        }
+        // Software voices already own PCM storage; no hardware voice must be
+        // evicted for the valid deferred-buffer priority/termination hints.
         if (!b.playing)
             for (auto pos : b.notifications)
                 if (pos.first == cursor)
                     signal(pos.second);
         b.frames %= bytes / b.align;
         b.playing = true;
+        b.resources_acquired = true;
         b.looping = a[3] & 1;
         b.last_ns = now();
         return error[0] ? -1 : 1;
@@ -616,6 +644,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
         return 1;
     }
     if (s == 18) {
+        b.resources_acquired = false;
         if (b.playing) {
             b.playing = false;
             stopped(b);

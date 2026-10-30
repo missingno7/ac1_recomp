@@ -1787,6 +1787,13 @@ static int dispatch_ds8_method(CPU *cpu, uint32_t target)
     uint32_t result = 0u;
     int dispatched = ac1_ds8_dispatch(target, arguments,
                                       (uint32_t)argument_count, &result);
+    if (trace_imports && dispatched == AC1_DS8_HANDLED && (result & 0x80000000u))
+        fprintf(stderr,
+                "AC1 DirectSound failure: token=0x%08x eip=0x%08x HRESULT=0x%08x argc=%d arg1=0x%08x arg2=0x%08x arg3=0x%08x\n",
+                target, cpu->eip, result, argument_count,
+                argument_count > 1 ? arguments[1] : 0u,
+                argument_count > 2 ? arguments[2] : 0u,
+                argument_count > 3 ? arguments[3] : 0u);
     if (dispatched != AC1_DS8_HANDLED) {
         last_error = dispatched == AC1_DS8_METHOD_UNSUPPORTED ? 120u : 87u;
         char message[256];

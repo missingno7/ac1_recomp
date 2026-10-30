@@ -90,6 +90,33 @@ static void sound() {
     uint32_t desc = data({36, 0x90, 2000, 0, fmt, 0, 0, 0, 0});
     assert(!call(true, dev, 3, {desc, out, 0}));
     uint32_t b = get(out);
+    // SDK IID_IDirectSoundBuffer8: 6825A449-7524-4D82-920F-50E36AB3AB1E.
+    uint32_t buffer8 = qi(b, {0x6825a449, 0x4d827524, 0xe3500f92, 0x1eabb36a});
+    assert(buffer8 && !call(true, buffer8, 9, {out}) && get(out) == 0);
+    assert(call(true, buffer8, 22, {0, 0, 0}) == 0x88780032); // Non-LOCDEFER native result.
+    uint32_t deferred_desc = data({36, 0x40090, 2000, 0, fmt, 0, 0, 0, 0});
+    assert(!call(true, dev, 3, {deferred_desc, out, 0}));
+    uint32_t deferred = get(out);
+    uint32_t deferred8 = qi(deferred, {0x6825a449, 0x4d827524, 0xe3500f92, 0x1eabb36a});
+    assert(!call(true, deferred8, 9, {out}) && get(out) == 0);
+    for (uint32_t flags : {0u, 1u, 4u, 5u, 8u, 12u, 16u, 32u, 33u}) {
+        assert(!call(true, deferred8, 12, {0, 1, flags}));
+        assert(!call(true, deferred8, 9, {out}) && get(out) == (0x11u | (flags & 1 ? 4u : 0u)));
+        assert(!call(true, deferred8, 18));
+    }
+    assert(call(true, deferred8, 12, {0, 1, 2}) == 0x88780032); // No hardware mixing.
+    for (uint32_t flags : {6u, 24u, 128u})
+        assert(call(true, deferred8, 12, {0, 1, flags}) == 0x80070057);
+    assert(call(true, buffer8, 12, {0, 1, 0}) == 0x80070057); // Priority needs LOCDEFER.
+    assert(!call(true, deferred8, 22, {0, 0, 0})); // No effects/results; software resources.
+    assert(!call(true, deferred8, 9, {out}) && get(out) == 0x10);
+    assert(!call(true, deferred8, 18));
+    assert(!call(true, deferred8, 9, {out}) && get(out) == 0);
+    uint32_t effects_args[] = {deferred8, 0, 1, out}, effects_hr = 0;
+    assert(ac1_ds8_dispatch(get(get(deferred8) + 22 * 4), effects_args, 4, &effects_hr) < 0);
+    assert(std::strstr(ac1_ds8_last_error(), "zero effects"));
+    assert(call(true, deferred8, 2) == 0 && call(true, deferred, 2) == 0);
+    assert(call(true, buffer8, 2) == 0);
     uint32_t io = alloc(nullptr, 32, 4);
     assert(!call(true, b, 11, {1996, 8, io, io + 4, io + 8, io + 12, 0}));
     assert(get(io + 4) == 4 && get(io + 12) == 4);
@@ -120,6 +147,28 @@ static void sound() {
     put(io + 4, 0xdeadbeef);
     assert(!call(true, spatial, 4, {io, io + 8}));
     assert(get(io) == 90 && get(io + 8) == 180 && get(io + 4) == 0xdeadbeef);
+    uint32_t primary_desc = data({36, 0x11, 0, 0, 0, 0, 0, 0, 0});
+    assert(!call(true, dev, 3, {primary_desc, out, 0}));
+    uint32_t primary = get(out);
+    uint32_t listener = qi(primary, {0x279afa84, 0x11ce4981, 0x200021a5, 0x60e50baf});
+    uint32_t params = alloc(nullptr, 68, 4);
+    put(params, 64);
+    put(params + 64, 0xdeadbeef);
+    assert(!call(true, listener, 3, {params}));
+    assert(get(params + 36) == 0x3f800000 && get(params + 44) == 0x3f800000);
+    assert(get(params + 48) == 0 && get(params + 52) == 0x3f800000);
+    assert(get(params + 56) == 0x3f800000 && get(params + 60) == 0x3f800000);
+    put(params + 52, 0x3f000000); // distance 0.5, rolloff 2, Doppler 3 at SDK offsets.
+    put(params + 56, 0x40000000);
+    put(params + 60, 0x40400000);
+    assert(!call(true, listener, 10, {params, 1}));
+    assert(!call(true, listener, 4, {io}) && get(io) == 0x3f800000); // Deferred.
+    assert(!call(true, listener, 17));
+    assert(!call(true, listener, 4, {io}) && get(io) == 0x3f000000);
+    assert(!call(true, listener, 8, {io}) && get(io) == 0x40000000);
+    assert(!call(true, listener, 5, {io}) && get(io) == 0x40400000);
+    assert(!call(true, listener, 3, {params}) && get(params + 64) == 0xdeadbeef);
+    assert(call(true, listener, 2) == 0 && call(true, primary, 2) == 0);
     assert(!call(true, dev, 5, {b, out}));
     uint32_t dup = get(out);
     assert(call(true, notify, 2) == 0);
