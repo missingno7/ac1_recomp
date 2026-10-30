@@ -54,6 +54,7 @@ public final class LauncherActivity extends Activity {
     private static native void nativeKey(int dik, boolean down);
     private static native void nativeMouse(int dx, int dy, int wheel, int buttons);
     private static native void nativeResetInput();
+    private static native void nativeAudioPause(boolean paused);
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
@@ -177,8 +178,14 @@ public final class LauncherActivity extends Activity {
     }
 
     @Override protected void onPause() {
+        nativeAudioPause(true);
         nativeResetInput();
         super.onPause();
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        nativeAudioPause(false);
     }
 
     private void refreshRunEnabled() {

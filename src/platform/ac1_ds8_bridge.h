@@ -39,8 +39,10 @@ typedef struct ac1_ds8_callbacks {
     ac1_ds8_guest_free_fn guest_free;
     ac1_ds8_guest_hwnd_to_host_fn guest_hwnd_to_host;
     ac1_ds8_log_fn log;
-    /* Portable backend: called under the guest scheduler baton, never from
-     * an audio thread. Optional clock injection also supports focused tests. */
+    /* Portable backend: signal_event runs under the guest scheduler baton,
+     * never from an audio thread. Optional monotonic_ns injection supports
+     * focused tests; it must also be safe on lifecycle control threads (it is
+     * never called by the real-time mixer callback). */
     int (*signal_event)(void *context, uint32_t guest_event);
     uint64_t (*monotonic_ns)(void *context);
 } ac1_ds8_callbacks;

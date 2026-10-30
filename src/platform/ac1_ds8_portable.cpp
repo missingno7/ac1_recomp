@@ -1,11 +1,14 @@
-/* Clock-driven DirectSound backend. Sample ownership and notification servicing
+/* Portable DirectSound mixer. Sample ownership and notification servicing
  * follow recomp-kit dx/dsound.cpp, Copyright (c) 2026 veritr1x, MIT.
- * See LICENSE.recomp-kit.txt. This first Android backend is explicitly silent.
+ * See LICENSE.recomp-kit.txt.
  * All guest access is through the existing bridge; no native COM pointers leak. */
 #include "ac1_ds8_bridge.h"
+#include "ac1_audio_mixer.h"
+#include "ac1_bink_native.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -17,6 +20,9 @@ namespace {
 constexpr uint32_t invalid = 0x80070057, nointerface = 0x80004002;
 struct Samples {
     uint32_t address = 0, bytes = 0;
+    // Published only at Unlock, under the bridge mutex and guest baton. The
+    // audio thread never resolves or touches the writable guest allocation.
+    std::vector<uint8_t> pcm;
     ~Samples();
 };
 struct Buffer {
@@ -28,6 +34,16 @@ struct Buffer {
     bool resources_acquired = false;
     uint32_t lock[4]{};
     uint64_t last_ns = 0, frames = 0, remainder = 0;
+    double render_frame = 0;
+    struct Span {
+        uint64_t begin, end;
+        double source, step;
+    };
+    std::array<Span, 128> spans{};
+    unsigned span_head = 0, span_count = 0;
+    uint64_t visit = 0;
+    bool stop_pending = false;
+    std::vector<uint8_t> notify_pending;
     std::array<uint32_t, 16> spatial{}, pending{};
     std::array<uint32_t, 16> listener{}, pending_listener{};
     std::vector<std::pair<uint32_t, uint32_t>> notifications;
@@ -58,6 +74,21 @@ std::map<uint32_t, Proxy> objects;
 std::recursive_mutex mutex;
 thread_local char error[256];
 uint32_t speaker = 4;
+bool output_active = false, output_paused = false;
+uint64_t visit = 0;
+const char *mixer_fault = nullptr; // Set on the audio thread; reported on guest service.
+struct BinkTrack {
+    uint32_t rate = 0, channels = 0;
+    uint64_t submitted = 0;
+    std::vector<int16_t> pcm; // Four seconds; allocated only on the guest thread.
+};
+struct BinkRecord {
+    bool paused = false;
+    double seconds = 0;
+    uint64_t last_ns = 0;
+    std::map<uint32_t, BinkTrack> tracks;
+};
+std::map<uint32_t, BinkRecord> movies;
 int fail(const char *s) {
     std::snprintf(error, sizeof(error), "DirectSound portable: %s", s);
     return -1;
@@ -123,47 +154,173 @@ void signal(uint32_t e) {
     if (!cb.signal_event || !cb.signal_event(ctx, e))
         fail("notification event is invalid or closed");
 }
-void stopped(Buffer &b) {
+void stopped(Buffer &b, bool audio = false) {
     b.resources_acquired = false;
+    if (audio) {
+        b.stop_pending = true;
+        return;
+    }
     for (auto n : b.notifications)
         if (n.first == UINT32_MAX)
             signal(n.second);
 }
-void update(Buffer &b) {
-    uint64_t t = now();
-    if (!b.playing) {
-        b.last_ns = t;
-        return;
-    }
-    uint64_t dt = t - b.last_ns;
-    b.last_ns = t;
-    uint64_t scaled = (dt % 1000000000) * b.frequency + b.remainder;
-    uint64_t advance = dt / 1000000000 * b.frequency + scaled / 1000000000;
-    b.remainder = scaled % 1000000000;
+void advance(Buffer &b, uint64_t after, bool audio) {
     uint64_t total = b.samples ? b.samples->bytes / b.align : 0;
     if (!total)
         return;
-    uint64_t before = b.frames, after = before + advance;
+    uint64_t before = b.frames;
     if (!b.looping)
         after = std::min(after, total);
-    for (auto n : b.notifications)
+    for (size_t i = 0; i < b.notifications.size(); ++i) {
+        auto n = b.notifications[i];
         if (n.first != UINT32_MAX) {
             uint64_t pos = n.first / b.align, next = (before / total) * total + pos;
             if (next <= before)
                 next += total;
-            if (next <= after)
-                signal(n.second);
+            if (next <= after) {
+                if (audio)
+                    b.notify_pending[i] = 1;
+                else
+                    signal(n.second);
+            }
         }
+    }
     b.frames = after;
     if (!b.looping && after == total) {
         b.playing = false;
-        stopped(b);
+        stopped(b, audio);
     }
+}
+void clock_update(Buffer &b, bool defer_events) {
+    uint64_t t = now(), dt = t - b.last_ns;
+    b.last_ns = t;
+    if (!b.playing || output_active || output_paused)
+        return;
+    uint64_t scaled = (dt % 1000000000) * b.frequency + b.remainder;
+    uint64_t count = dt / 1000000000 * b.frequency + scaled / 1000000000;
+    b.remainder = scaled % 1000000000;
+    advance(b, b.frames + count, defer_events);
+    b.render_frame = double(b.frames);
+}
+void update(Buffer &b) {
+    for (size_t i = 0; i < b.notify_pending.size(); ++i)
+        if (b.notify_pending[i]) {
+            signal(b.notifications[i].second);
+            b.notify_pending[i] = 0;
+        }
+    if (b.stop_pending) {
+        stopped(b);
+        b.stop_pending = false;
+    }
+    clock_update(b, false);
+}
+void reset_render(Buffer &b) {
+    b.span_head = b.span_count = 0;
+    b.render_frame = double(b.frames);
+}
+template <class F> void each_buffer(F fn) {
+    ++visit;
+    for (auto &o : objects)
+        if (o.second.buffer && o.second.buffer->visit != visit) {
+            o.second.buffer->visit = visit;
+            fn(*o.second.buffer);
+        }
+}
+void consume(uint64_t presented) {
+    each_buffer([&](Buffer &b) {
+        while (b.span_count) {
+            auto &s = b.spans[b.span_head];
+            if (presented <= s.begin)
+                break;
+            double source = s.source + double(std::min(presented, s.end) - s.begin) * s.step;
+            if (b.playing)
+                advance(b, uint64_t(source + 1e-7), true);
+            if (presented < s.end)
+                break;
+            b.span_head = (b.span_head + 1) % b.spans.size();
+            --b.span_count;
+        }
+    });
+}
+float scalar(const std::array<uint32_t, 16> &v, unsigned i) {
+    float f;
+    std::memcpy(&f, &v[i], 4);
+    return f;
+}
+bool valid3d(const std::array<uint32_t, 16> &v, bool listener) {
+    for (unsigned i = 1; i < 16; ++i)
+        if ((listener || i <= 6 || (i >= 9 && i <= 11) || i == 13 || i == 14) &&
+            !std::isfinite(scalar(v, i)))
+            return false;
+    if (listener)
+        return scalar(v, 13) > 0 && scalar(v, 14) >= 0 && scalar(v, 14) <= 10 &&
+               scalar(v, 15) >= 0 && scalar(v, 15) <= 10;
+    return v[7] <= 360 && v[8] <= 360 && int32_t(v[12]) >= -10000 && int32_t(v[12]) <= 0 &&
+           scalar(v, 13) > 0 && scalar(v, 14) >= scalar(v, 13) && v[15] <= 2;
+}
+float db(int32_t hundredths) {
+    return hundredths <= -10000 ? 0.f : std::pow(10.f, float(hundredths) / 2000.f);
+}
+void gains(const Buffer &b, const std::array<uint32_t, 16> &listener, float &l, float &r) {
+    float gain = db(b.volume), pan = float(b.pan) / 10000.f;
+    if ((b.flags & 0x10) && b.spatial[15] != 2) { // NORMAL / HEADRELATIVE / DISABLE.
+        double delta[3];
+        for (unsigned i = 0; i < 3; ++i)
+            delta[i] =
+                double(scalar(b.spatial, 1 + i)) - (b.spatial[15] == 1 ? 0. : scalar(listener, 1 + i));
+        double distance = std::hypot(delta[0],delta[1],delta[2]);
+        double minimum = scalar(b.spatial, 13), maximum = scalar(b.spatial, 14);
+        // DS distances are in world units; distance factor converts BOTH the
+        // minimum distance and displacement to metres and cancels in the ratio.
+        if ((b.flags & 0x20000) && distance >= maximum)
+            gain = 0;
+        double effective =
+            minimum + (std::clamp(distance, minimum, maximum) - minimum) * scalar(listener, 14);
+        gain *= minimum / std::max(minimum, effective);
+        // Listener right = up cross front (DirectSound's left-handed space).
+        double right[3] = {1, 0, 0};
+        if (b.spatial[15] == 0) {
+            double f[3], u[3];
+            for (unsigned i = 0; i < 3; ++i) {
+                f[i] = scalar(listener, 7 + i);
+                u[i] = scalar(listener, 10 + i);
+            }
+            right[0] = u[1] * f[2] - u[2] * f[1];
+            right[1] = u[2] * f[0] - u[0] * f[2];
+            right[2] = u[0] * f[1] - u[1] * f[0];
+        }
+        double length = std::hypot(right[0],right[1],right[2]);
+        pan = distance > 0 && length > 0
+                  ? (delta[0] * right[0] + delta[1] * right[1] + delta[2] * right[2]) /
+                        (distance * length)
+                  : 0;
+    }
+    pan = std::clamp(pan, -1.f, 1.f);
+    l = gain * db(int32_t(-10000 * std::max(0.f, pan)));
+    r = gain * db(int32_t(10000 * std::min(0.f, pan)));
+}
+float sample(const Buffer &b, uint64_t frame, unsigned channel) {
+    const unsigned channels = b.format[2], bits = b.format[14];
+    size_t index = size_t(frame) * b.align + (channels == 1 ? 0 : channel) * bits / 8;
+    const uint8_t *p = b.samples->pcm.data() + index;
+    if (bits == 8)
+        return (int(*p) - 128) / 128.f;
+    int16_t value;
+    std::memcpy(&value, p, 2);
+    return value / 32768.f;
+}
+void movie_clock(BinkRecord &m) {
+    uint64_t t = now();
+    if (!output_active && !output_paused && !m.paused)
+        m.seconds += double(t - m.last_ns) / 1e9;
+    m.last_ns = t;
 }
 bool setformat(Buffer &b, uint32_t address) {
     std::array<uint8_t, 18> f;
-    if (!read(address, f.data(), 18))
+    if (!read(address, f.data(), 18)) {
+        fail("WAVEFORMATEX input unmapped (18 bytes required)");
         return false;
+    }
     uint16_t tag, ch, align, bits, extra;
     uint32_t rate, bytes;
     std::memcpy(&tag, f.data(), 2);
@@ -174,8 +331,16 @@ bool setformat(Buffer &b, uint32_t address) {
     std::memcpy(&bits, f.data() + 14, 2);
     std::memcpy(&extra, f.data() + 16, 2);
     if (tag != 1 || (ch != 1 && ch != 2) || (bits != 8 && bits != 16) || align != ch * bits / 8 ||
-        !rate || rate > 200000 || bytes != rate * align || extra)
+        !rate || rate > 200000 || bytes != rate * align || extra) {
+        char message[224];
+        std::snprintf(message, sizeof(message),
+                      "unsupported PCM format: tag=%u channels=%u bits=%u rate=%u byteRate=%u "
+                      "align=%u cbSize=%u; require tag=1, mono/stereo 8/16-bit, rate 1..200000, "
+                      "exact byte/block rate, cbSize=0",
+                      tag, ch, bits, rate, bytes, align, extra);
+        fail(message);
         return false;
+    }
     update(b);
     b.format = f;
     b.align = align;
@@ -196,6 +361,192 @@ unsigned iid_kind(const uint32_t *g) {
     return 0;
 }
 } // namespace
+extern "C" void ac1_audio_output_active(int active) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    each_buffer([&](Buffer &b) {
+        clock_update(b, true);
+        reset_render(b);
+    });
+    for (auto &m : movies)
+        movie_clock(m.second);
+    output_active = active != 0;
+}
+extern "C" void ac1_audio_output_paused(int paused) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    each_buffer([](Buffer &b) {
+        // Lifecycle calls have no guest baton. Leave pending notifications for
+        // service; never call update() or other guest callbacks here.
+        clock_update(b, true);
+    });
+    for (auto &m : movies)
+        movie_clock(m.second);
+    output_paused = paused != 0;
+}
+extern "C" void ac1_audio_consume(uint64_t presented) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    consume(presented);
+}
+extern "C" void ac1_audio_render(float *out, uint32_t count, uint32_t rate, uint64_t first,
+                                 uint64_t presented) {
+    std::fill_n(out, size_t(count) * 2, 0.f);
+    std::unique_lock<std::recursive_mutex> lock(mutex, std::try_to_lock);
+    if (!lock || !output_active || output_paused || !rate)
+        return;
+    consume(presented);
+    float master = 1;
+    const std::array<uint32_t, 16> *listener = nullptr;
+    each_buffer([&](Buffer &b) {
+        if (b.flags & 1) {
+            master = db(b.volume);
+            listener = &b.listener;
+        }
+    });
+    each_buffer([&](Buffer &b) {
+        if (!b.playing)
+            return;
+        uint64_t total = b.samples->bytes / b.align;
+        if (!b.looping && b.render_frame >= total)
+            return;
+        if (b.span_count == b.spans.size()) {
+            mixer_fault = "consumption history exhausted (128 outstanding parameter changes)";
+            return;
+        }
+        double start = b.render_frame, step = double(b.frequency) / rate;
+        float left, right;
+        gains(b, listener ? *listener : b.listener, left, right);
+        uint32_t rendered = 0;
+        for (; rendered < count; ++rendered) {
+            double position = start + rendered * step;
+            if (!b.looping && position >= total)
+                break;
+            if (b.flags & 1)
+                continue; // Primary cursors still follow device consumption.
+            uint64_t frame = uint64_t(position), a = frame % total;
+            uint64_t next = b.looping ? (a + 1) % total : std::min(a + 1, total - 1);
+            float fraction = float(position - frame);
+            float l = sample(b, a, 0), r = sample(b, a, 1);
+            out[rendered * 2] += (l + (sample(b, next, 0) - l) * fraction) * left;
+            out[rendered * 2 + 1] += (r + (sample(b, next, 1) - r) * fraction) * right;
+        }
+        b.render_frame = start + rendered * step;
+        if (rendered) {
+            if (b.span_count) {
+                auto &last = b.spans[(b.span_head + b.span_count - 1) % b.spans.size()];
+                if (last.end == first && last.step == step &&
+                    std::abs(last.source + double(last.end - last.begin) * step - start) < 1e-6) {
+                    last.end += rendered;
+                    return;
+                }
+            }
+            b.spans[(b.span_head + b.span_count) % b.spans.size()] = {first, first + rendered,
+                                                                      start, step};
+            ++b.span_count;
+        }
+    });
+    for (auto &entry : movies) {
+        auto &m = entry.second;
+        if (m.paused)
+            continue;
+        for (auto &track : m.tracks) {
+            auto &v = track.second;
+            uint64_t capacity = v.pcm.size() / v.channels;
+            for (uint32_t i = 0; i < count; ++i) {
+                double pos = (m.seconds + double(i) / rate) * v.rate;
+                uint64_t a = uint64_t(pos + 1e-7);
+                if (a >= v.submitted || v.submitted - a > capacity)
+                    continue; // underrun / late track
+                uint64_t next = std::min(a + 1, v.submitted - 1);
+                float fraction = float(std::max(0., pos - double(a)));
+                for (unsigned ch = 0; ch < 2; ++ch) {
+                    unsigned c = v.channels == 1 ? 0 : ch;
+                    float x = v.pcm[(a % capacity) * v.channels + c] / 32768.f;
+                    float y = v.pcm[(next % capacity) * v.channels + c] / 32768.f;
+                    out[i * 2 + ch] += x + (y - x) * fraction;
+                }
+            }
+        }
+        m.seconds += double(count) / rate;
+    }
+    for (size_t i = 0; i < size_t(count) * 2; ++i)
+        out[i] = std::clamp(out[i] * master, -1.f, 1.f);
+}
+extern "C" int ac1_audio_bink_submit(uint32_t record, uint32_t track, const int16_t *pcm,
+                                     size_t frames, uint32_t rate, uint32_t channels,
+                                     uint64_t pts) {
+#ifdef __ANDROID__
+    ac1_audio_device_service();
+#endif
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    if (!record || !pcm || !frames || rate < 100 || rate > 200000 ||
+        (channels != 1 && channels != 2) || frames > size_t(rate) * 4) {
+        fail("Bink PCM requires record, nonempty s16 mono/stereo, 100..200000 Hz, chunk <=4 "
+             "seconds");
+        return 0;
+    }
+    if (!movies.count(record) && movies.size() >= 16) {
+        fail("Bink mixer record limit (16)");
+        return 0;
+    }
+#ifndef __ANDROID__
+    if (!output_active && movies.empty())
+        std::fprintf(
+            stderr,
+            "AC1 portable Bink audio: no device adapter; explicit clock-driven silent fallback\n");
+#endif
+    auto &m = movies[record];
+    if (!m.last_ns)
+        m.last_ns = now();
+    movie_clock(m);
+    if (!m.tracks.count(track) && m.tracks.size() >= 8) {
+        fail("Bink mixer track limit (8 per record)");
+        return 0;
+    }
+    auto &v = m.tracks[track];
+    if (!v.rate) {
+        v.rate = rate;
+        v.channels = channels;
+        v.pcm.resize(size_t(rate) * channels * 4);
+    }
+    if (v.rate != rate || v.channels != channels || pts != v.submitted * 1000000 / rate) {
+        fail("Bink PCM format changed or noncontiguous PTS (STOP required before rewind)");
+        return 0;
+    }
+    uint64_t retired = uint64_t(m.seconds * rate), end = v.submitted + frames;
+    // Activity pause does not suspend the guest video clock. Retire PCM that
+    // continues to be decoded in the background, rather than growing a stale
+    // queue or killing playback after four seconds. Explicit BinkPause still
+    // retains its queue because the decoder stops submitting while paused.
+    if (output_paused) {
+        m.seconds = std::max(m.seconds, double(end) / rate);
+        retired = std::max(retired, end);
+    }
+    if (end > retired && end - retired > uint64_t(rate) * 4) {
+        fail("Bink mixer queue exceeds four seconds; output is not consuming PCM");
+        return 0;
+    }
+    for (size_t i = 0; i < frames; ++i)
+        for (unsigned c = 0; c < channels; ++c)
+            v.pcm[((v.submitted + i) % (uint64_t(rate) * 4)) * channels + c] =
+                pcm[i * channels + c];
+    v.submitted = end;
+    return 1;
+}
+extern "C" void ac1_audio_bink_control(uint32_t record, int event) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    auto it = movies.find(record);
+    if (event != AC1_BINK_AUDIO_STOP && event != AC1_BINK_AUDIO_PAUSE &&
+        event != AC1_BINK_AUDIO_RESUME) {
+        mixer_fault = "unknown Bink audio control event";
+        return;
+    }
+    if (it == movies.end())
+        return;
+    movie_clock(it->second);
+    if (event == AC1_BINK_AUDIO_STOP)
+        movies.erase(it);
+    else
+        it->second.paused = event == AC1_BINK_AUDIO_PAUSE;
+}
 extern "C" int ac1_ds8_configure(const ac1_ds8_callbacks *c, void *p) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     if (!c || c->struct_size < sizeof(*c) || !c->guest_alloc || !c->guest_free ||
@@ -205,9 +556,13 @@ extern "C" int ac1_ds8_configure(const ac1_ds8_callbacks *c, void *p) {
     ctx = p;
     error[0] = 0;
     speaker = 4;
+    mixer_fault = nullptr;
     return 1;
 }
 extern "C" int ac1_ds8_create8(uint32_t guid, uint32_t out, uint32_t outer, uint32_t *hr) {
+#ifdef __ANDROID__
+    ac1_audio_device_service();
+#endif
     std::lock_guard<std::recursive_mutex> lock(mutex);
     if (!hr || !mem(out, 4, 2))
         return fail("Create8 output is unmapped");
@@ -232,7 +587,8 @@ extern "C" int ac1_ds8_create8(uint32_t guid, uint32_t out, uint32_t outer, uint
         return -1;
     word(out, obj);
     *hr = 0;
-    std::fprintf(stderr, "AC1 DirectSound: clock-driven silent backend (no AAudio output)\n");
+    std::fprintf(stderr, "AC1 DirectSound: portable PCM mixer (%s)\n",
+                 output_active ? "device consumption cursors" : "no device; clock fallback");
     return 1;
 }
 extern "C" int ac1_ds8_argument_count(uint32_t t) {
@@ -262,8 +618,13 @@ extern "C" int ac1_ds8_argument_count(uint32_t t) {
     return -2;
 }
 extern "C" int ac1_ds8_service(void) {
+#ifdef __ANDROID__
+    ac1_audio_device_service();
+#endif
     std::lock_guard<std::recursive_mutex> lock(mutex);
     error[0] = 0;
+    if (mixer_fault)
+        return fail(mixer_fault);
     // Aliases share a Buffer; update's elapsed time is zero on subsequent aliases.
     for (auto &o : objects)
         if (o.second.buffer)
@@ -273,6 +634,8 @@ extern "C" int ac1_ds8_service(void) {
 extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint32_t *hr) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     error[0] = 0;
+    if (mixer_fault)
+        return fail(mixer_fault);
     int count = ac1_ds8_argument_count(t);
     if (!count)
         return 0;
@@ -339,10 +702,18 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
             }
             auto b = std::make_shared<Buffer>();
             b->flags = d[1];
-            if (d[4] && !setformat(*b, d[4])) {
-                *hr = 0x88780064;
-                return 1;
+            if (d[4] && !setformat(*b, d[4]))
+                return -1;
+            if ((d[1] & ~0x0007c3ffu) || (d[1] & (0x4u | 0x200u))) {
+                char message[160];
+                std::snprintf(message, sizeof(message),
+                              "CreateSoundBuffer flags=0x%08x: unknown capability, hardware-only "
+                              "or CTRLFX unsupported",
+                              d[1]);
+                return fail(message);
             }
+            if ((d[1] & 0x10) && !(d[1] & 1) && b->format[2] != 1)
+                return fail("CreateSoundBuffer CTRL3D requires mono PCM");
             if (!(d[1] & 1) && !d[4]) {
                 *hr = invalid;
                 return 1;
@@ -359,6 +730,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
             if (!pcm)
                 return fail("sample allocation failed");
             std::memset(pcm, b->format[14] == 8 ? 128 : 0, bytes);
+            b->samples->pcm.resize(bytes, b->format[14] == 8 ? 128 : 0);
             uint32_t obj = wrap(3, b);
             if (!obj)
                 return -1;
@@ -386,6 +758,9 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
             b->resources_acquired = false;
             b->frames = b->remainder = 0;
             b->notifications.clear();
+            b->notify_pending.clear();
+            b->stop_pending = false;
+            reset_render(*b);
             uint32_t duplicate = wrap(3, b);
             if (!duplicate)
                 return fail("duplicate allocation failed");
@@ -447,6 +822,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
             list.emplace_back(p[2 * i], p[2 * i + 1]);
         }
         b.notifications = std::move(list);
+        b.notify_pending.assign(b.notifications.size(), 0);
         return 1;
     }
     if (k == 4 || k == 6) {
@@ -471,14 +847,15 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
             return 1;
         }
         if (s == (k == 4 ? 10u : 12u)) {
-            uint32_t data[16];
-            if (!read(a[1], data, size) || data[0] != size)
+            std::array<uint32_t, 16> data;
+            if (!read(a[1], data.data(), size) || data[0] != size)
                 return fail("3D parameter size/range invalid");
-            std::memcpy(pending, data, size);
+            if (a[2] > 1 || !valid3d(data, k == 4))
+                return fail("3D parameters require finite values, positive ordered min/max "
+                            "distance, mode 0..2, rolloff/Doppler 0..10, apply 0..1");
+            std::memcpy(pending, data.data(), size);
             if (!a[2])
-                std::memcpy(current, data, size);
-            else if (a[2] != 1)
-                *hr = invalid;
+                std::memcpy(current, data.data(), size);
             return 1;
         }
         // Getters and setters use the documented pack-4 DS3D structures.
@@ -506,6 +883,12 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
                 *hr = invalid;
                 return 1;
             }
+            std::array<uint32_t, 16> candidate;
+            std::memcpy(candidate.data(), pending, size);
+            std::memcpy(candidate.data() + off, a + 1, words * 4);
+            if (!valid3d(candidate, k == 4))
+                return fail("3D setter requires finite values, positive ordered min/max distance, "
+                            "mode 0..2 and rolloff/Doppler 0..10");
             std::memcpy(pending + off, a + 1, words * 4);
             if (!apply)
                 std::memcpy(current + off, a + 1, words * 4);
@@ -559,8 +942,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
         }
         uint32_t offset = a[1], length = a[2];
         if (a[7] & ~3u) {
-            *hr = invalid;
-            return 1;
+            return fail("Lock flags: only FROMWRITECURSOR=1 and ENTIREBUFFER=2 supported");
         }
         if (a[7] & 1)
             offset = (cursor + b.frequency / 100 * b.align) % bytes;
@@ -591,10 +973,18 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
         const bool deferred = (b.flags & 0x40000u) != 0;
         if (a[1] || (flags & ~0x3fu) || (!deferred && (a[2] || (flags & ~1u))) ||
             (flags & 6u) == 6u || (flags & 24u) == 24u) {
+            std::fprintf(
+                stderr,
+                "AC1 DirectSound Play rejected: reserved=%u priority=%u flags=0x%08x LOCDEFER=%u "
+                "(allowed flags 0x3f, exclusive allocation/termination hints)\n",
+                a[1], a[2], flags, unsigned(deferred));
+            fail("Play: reserved must be zero; priority/hints require LOCDEFER; allocation and "
+                 "termination pairs are exclusive; flags outside 0x3f unsupported");
             *hr = invalid;
             return 1;
         }
         if (flags & 2u) { // Hardware-only allocation is unavailable on this software backend.
+            fail("Play LOCHARDWARE unsupported: only software mixing resources available");
             *hr = 0x88780032; // Matches native Windows without hardware mixing resources.
             return 1;
         }
@@ -604,7 +994,10 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
             for (auto pos : b.notifications)
                 if (pos.first == cursor)
                     signal(pos.second);
-        b.frames %= bytes / b.align;
+        if (!b.playing) {
+            b.frames %= bytes / b.align;
+            reset_render(b);
+        }
         b.playing = true;
         b.resources_acquired = true;
         b.looping = a[3] & 1;
@@ -618,11 +1011,14 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
         }
         b.frames = a[1] / b.align;
         b.remainder = 0;
+        reset_render(b);
         return 1;
     }
     if (s == 14) {
-        if (!(b.flags & 1) || !setformat(b, a[1]))
+        if (!(b.flags & 1))
             *hr = 0x88780064;
+        else if (!setformat(b, a[1]))
+            return -1;
         return 1;
     }
     if (s == 15 || s == 16) {
@@ -649,6 +1045,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
             b.playing = false;
             stopped(b);
         }
+        reset_render(b);
         return error[0] ? -1 : 1;
     }
     if (s == 19) {
@@ -656,6 +1053,11 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
             *hr = invalid;
             return 1;
         }
+        for (unsigned i : {0u, 2u})
+            if (b.lock[i + 1] &&
+                !read(b.lock[i], b.samples->pcm.data() + b.lock[i] - b.samples->address,
+                      b.lock[i + 1]))
+                return fail("Unlock PCM range unmapped during snapshot");
         b.locked = false;
         return 1;
     }
@@ -664,12 +1066,18 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
     return fail("unsupported buffer method");
 }
 extern "C" void ac1_ds8_shutdown(void) {
+#ifdef __ANDROID__
+    ac1_audio_device_shutdown();
+#endif
     std::lock_guard<std::recursive_mutex> lock(mutex);
     for (auto &o : objects) {
         cb.guest_free(ctx, o.second.table);
         cb.guest_free(ctx, o.first);
     }
     objects.clear();
+    movies.clear();
+    output_active = false;
+    mixer_fault = nullptr;
     cb = {};
     ctx = nullptr;
 }

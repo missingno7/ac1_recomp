@@ -14,6 +14,7 @@
 
 #include "ac1_runtime.h"
 #include "ac1_input_script.h"
+#include "ac1_audio_mixer.h"
 
 #define AC1_LOG_TAG "AC1Recomp"
 static _Thread_local char bridge_error[512];
@@ -40,6 +41,10 @@ Java_org_ac1_recomp_LauncherActivity_nativeMouse(JNIEnv *env, jclass type, jint 
 JNIEXPORT void JNICALL
 Java_org_ac1_recomp_LauncherActivity_nativeResetInput(JNIEnv *env, jclass type) {
     (void)env; (void)type; ac1_input_physical_reset();
+}
+JNIEXPORT void JNICALL
+Java_org_ac1_recomp_LauncherActivity_nativeAudioPause(JNIEnv *env, jclass type, jboolean paused) {
+    (void)env; (void)type; ac1_audio_device_pause(paused);
 }
 
 extern void *Direct3DCreate9(uint32_t sdk_version);
