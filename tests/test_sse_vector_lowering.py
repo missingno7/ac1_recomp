@@ -1,4 +1,4 @@
-"""Vector-member SSE lowering and stack-only EIP markers."""
+"""Vector-member SSE lowering and the guest-EIP markers the lifter keeps."""
 import shutil
 import subprocess
 import unittest
@@ -120,43 +120,29 @@ class SSEVectorLoweringTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertIn(f'{len(table)} SSE vector-lowering cases x 4096 states match the lane lowering', run.stdout)
 
-    def test_stack_only_instructions_drop_their_eip_store(self):
+    def test_eip_is_recorded_at_entries_transfers_and_after_calls(self):
         from capstone.x86 import X86_OP_IMM, X86_OP_MEM
         from lift32_cpu import Lifter
-        # push ebp; mov ebp,esp; mov eax,[ebp+8]; mov eax,[eax]; mov [esp+4],eax; push eax;
-        # movss xmm0,[esp+8]; mov ecx,fs:[0]; pop ecx; pop ebp; ret
-        raw = bytes.fromhex('558bec8b45088b0089442404 50f30f10442408648b0d00000000595dc3'.replace(' ', ''))
+        # push ebp; mov ebp,esp; mov eax,[ebp+8]; mov eax,[eax]; test eax,eax; je next; div ecx; call next;
+        # mov [esp+4],eax; mov ecx,fs:[0]; pop ebp; ret
+        raw = bytes.fromhex('558bec8b45088b0085c07400f7f1e80000000089442404648b0d000000005dc3')
         read = lambda va, n: raw[va - 0x401000:va - 0x401000 + n]
         lifter = Lifter('synthetic EIP fixture', 0x1000, read)
         instructions = list(lifter.md.disasm(raw, 0x401000))
         spec = {'address': 0x401000, 'size': len(raw), 'blocks': [{'start': 0x401000, 'end': 0x401000 + len(raw),
                 'instructions': [[i.address, i.size] for i in instructions]}]}
         body = lift.lift_exact_function(lifter, spec, read, X86_OP_IMM, X86_OP_MEM)
-        stack = {i.address for i in instructions
-                 if i.mnemonic in ('pop',) or i.op_str in ('eax, dword ptr [ebp + 8]', 'dword ptr [esp + 4], eax',
-                                                           'eax', 'xmm0, dword ptr [esp + 8]')}
-        self.assertEqual(len(stack), 6)
+        recorded = {0x401000, 0x40100A, 0x40100C, 0x40100E, 0x401013, 0x40101F}   # entry, je, div, call, after call, ret
+        self.assertEqual([i.address for i in instructions if i.mnemonic in ('je', 'div', 'call', 'ret')],
+                         [0x40100A, 0x40100C, 0x40100E, 0x40101F])
         for insn in instructions:
             marker = f'    AC1_SET_GUEST_EIP(c, 0x{insn.address:08X}u);'
             with self.subTest(insn=f'{insn.mnemonic} {insn.op_str}'):
-                self.assertIn(marker + (lift.STACK_EIP_TAG if insn.address in stack else '') + '\n', body + '\n')
-        dropped = lift.drop_stack_eip_markers(body)
-        self.assertEqual(dropped.count('AC1_SET_GUEST_EIP'), len(instructions) - len(stack))
-        self.assertNotIn(lift.STACK_EIP_TAG, dropped)
-
-    def test_frameless_ebp_accesses_keep_their_eip(self):
-        from capstone.x86 import X86_OP_IMM, X86_OP_MEM
-        from lift32_cpu import Lifter
-        raw = bytes.fromhex('8bc08b45088b442404c3')   # mov eax,eax; mov eax,[ebp+8]; mov eax,[esp+4]; ret
-        read = lambda va, n: raw[va - 0x401000:va - 0x401000 + n]
-        lifter = Lifter('synthetic EIP fixture', 0x1000, read)
-        instructions = list(lifter.md.disasm(raw, 0x401000))
-        spec = {'address': 0x401000, 'size': len(raw), 'blocks': [{'start': 0x401000, 'end': 0x401000 + len(raw),
-                'instructions': [[i.address, i.size] for i in instructions]}]}
-        dropped = lift.drop_stack_eip_markers(lift.lift_exact_function(lifter, spec, read, X86_OP_IMM, X86_OP_MEM))
-        self.assertIn('AC1_SET_GUEST_EIP(c, 0x00401002u);', dropped)   # EBP is not this function's frame
-        self.assertNotIn('AC1_SET_GUEST_EIP(c, 0x00401005u);', dropped)   # [esp + 4]
-        self.assertIn('AC1_SET_GUEST_EIP(c, 0x00401009u);', dropped)   # ret
+                tag = '' if insn.address in recorded else lift.UNRECORDED_EIP_TAG
+                self.assertIn(marker + tag + '\n', body + '\n')
+        dropped = lift.drop_unrecorded_eip_markers(body)
+        self.assertEqual(dropped.count('AC1_SET_GUEST_EIP'), len(recorded))
+        self.assertNotIn(lift.UNRECORDED_EIP_TAG, dropped)
 
 
 if __name__ == '__main__':

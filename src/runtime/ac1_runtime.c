@@ -7426,9 +7426,9 @@ uint8_t *ac1_direct_arena;
 #ifdef _WIN32
 /* Direct accesses to unmapped guest pages fault in host code. Report the
  * guest address and instruction before the default crash handling runs.
- * Stack-only instructions do not record their EIP (tools/lift_ac1.py), so a
- * fault there shows the previous recorded instruction of the same function;
- * the host PC resolves the exact generated line with the build's symbols. */
+ * Generated code records EIP only at function entries, transfers and after
+ * calls (tools/lift_ac1.py), so guest-eip names the last of those; the host
+ * PC resolves the exact generated line with the build's symbols. */
 static LONG CALLBACK ac1_direct_fault_handler(EXCEPTION_POINTERS *info)
 {
     const EXCEPTION_RECORD *record = info->ExceptionRecord;

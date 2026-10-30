@@ -211,44 +211,25 @@ SSE_VECTOR_PUNPCK = {f'punpck{half}{w}': (bits, half == 'h') for half in ('l', '
                      for w, bits in (('bw', 8), ('wd', 16), ('dq', 32), ('qdq', 64))}
 
 
-# The guest EIP is recorded for diagnostics (fault reports, dispatch and
-# profiler attribution); nothing guest-visible reads it. Its store is also a
-# store through the CPU pointer, which GCC must assume may alias guest memory,
-# so it stops GCC forwarding a guest-stack store to the reload that follows
-# (spill-and-reload sequences the original compiler wrote). Instructions whose
-# only memory accesses are to the stack therefore leave the previous EIP in
-# place; heap accesses, transfers and everything else still record theirs.
-STACK_EIP_TAG = ' /* stack */'
-STACK_EIP_MARKER = re.compile(r'^    AC1_SET_GUEST_EIP\(c, 0x[0-9A-F]{8}u\);' + re.escape(STACK_EIP_TAG) + r'\n', re.M)
-STACK_IMPLICIT = frozenset({'push', 'pop', 'pushal', 'popal', 'pushfd', 'popfd', 'leave'})
-EIP_ALWAYS = frozenset({'call', 'jmp', 'ret', 'retn', 'int', 'int3', 'into', 'iretd', 'div', 'idiv', 'bound'})
+# The guest EIP is recorded for diagnostics: dispatch and import call sites,
+# stop reports, the profiler's guest attribution. Nothing guest-visible reads
+# it, and a direct-memory fault report carries the host PC, which the build's
+# symbols resolve to the exact generated line. The store goes through the CPU
+# pointer, which GCC must assume may alias guest memory, so storing it before
+# every guest access stopped GCC forwarding a stack store to its reload and
+# kept every value in memory across the next access. EIP is recorded at the
+# function entry, at every control transfer, at division (which may stop with
+# a report) and after each call. Every instruction keeps its marker until the
+# codegen passes, which group instructions by it, are done.
+UNRECORDED_EIP_TAG = ' /* unrecorded */'
+UNRECORDED_EIP_MARKER = re.compile(
+    r'^    AC1_SET_GUEST_EIP\(c, 0x[0-9A-F]{8}u\);' + re.escape(UNRECORDED_EIP_TAG) + r'\n', re.M)
+EIP_RECORDED = frozenset({'call', 'jmp', 'ret', 'retn', 'int', 'int3', 'into', 'iretd', 'div', 'idiv', 'bound'})
 
 
-def frame_pointer_entry(decoded: dict, address: int) -> bool:
-    """push ebp; mov ebp, esp at the entry: EBP addresses this function's frame."""
-    first = decoded.get(address)
-    second = decoded.get(address + 1)
-    return (first is not None and second is not None and first.mnemonic == 'push' and
-            first.op_str == 'ebp' and second.mnemonic == 'mov' and second.op_str == 'ebp, esp')
-
-
-def records_guest_eip(lifter, insn, frame_ebp: bool) -> bool:
-    from capstone.x86 import X86_OP_MEM
-
-    m = insn.mnemonic
-    if m in EIP_ALWAYS or m.startswith(('j', 'loop')):
-        return True
-    memory = [op for op in insn.operands if op.type == X86_OP_MEM]
-    if not memory:
-        return m not in STACK_IMPLICIT
-    stack = ('esp', 'ebp') if frame_ebp else ('esp',)
-    return any(op.mem.segment or not op.mem.base or lifter.md.reg_name(op.mem.base) not in stack
-               for op in memory) or m in ('lea', 'nop')
-
-
-def drop_stack_eip_markers(body: str) -> str:
-    """Remove the EIP stores of stack-only instructions once no pass needs their markers."""
-    return STACK_EIP_MARKER.sub('', body)
+def drop_unrecorded_eip_markers(body: str) -> str:
+    """Remove the EIP stores the lifter tagged as unrecorded once no pass needs their markers."""
+    return UNRECORDED_EIP_MARKER.sub('', body)
 
 
 # A lane assignment statement on an XMM register or an initialized copy of one.
@@ -3634,6 +3615,19 @@ LOCAL_GPR_FREE_HELPERS = frozenset({
     'ac1_x87_integer_native', 'ac1_x87_integer_native_slow',
 })
 LOCAL_ESP_HELPERS = frozenset({'push32', 'pop32'})
+# push/pop as arithmetic on ESP plus one guest store or load, so ESP stays a
+# local: the helpers move ESP through c->esp, a store and reload on the ESP
+# dependency chain of every push. The value is read before ESP moves, as PUSH
+# does; a popped ESP takes the loaded value. Other forms keep the helpers.
+LOCAL_PUSH = re.compile(r'(?:^|(?<=[;{}]))(\s*)push32\(c, ((?:(?!\bpop32\()[^;])*)\);', re.M)
+LOCAL_POP = re.compile(r'(?:^|(?<=[;{}]))(\s*)(c->(?:eax|ecx|edx|ebx|esp|ebp|esi|edi)) = (?:\(uint32_t\)\()?pop32\(c\)\)?;', re.M)
+LOCAL_POP_DISCARD = re.compile(r'(?:^|(?<=[;{}]))(\s*)\(void\)pop32\(c\);', re.M)
+
+
+def local_stack_operations(body: str) -> str:
+    body = LOCAL_PUSH.sub(lambda m: f'{m[1]}{{ uint32_t _ac1_push = {m[2]}; c->esp -= 4u; wr32(c->esp, _ac1_push); }}', body)
+    body = LOCAL_POP.sub(lambda m: f'{m[1]}{{ uint32_t _ac1_pop = rd32(c->esp); c->esp += 4u; {m[2]} = _ac1_pop; }}', body)
+    return LOCAL_POP_DISCARD.sub(lambda m: f'{m[1]}c->esp += 4u;', body)
 def validate_region_bindings(entries, functions, lifted, read_va, md):
     specs = {f['address']: f for f in functions}
     result = {}
@@ -3863,11 +3857,14 @@ def local_register_function(body: str) -> str:
     clean=re.sub(r'/\*.*?\*/','',body,flags=re.S)
     names='|'.join(registers)
     if re.search(r'(?:^|[=(,;{?:]|\*\))\s*&\s*\(*\s*c->(?:'+names+r')\b',clean,re.M):return body
+    original=body
+    body=local_stack_operations(body)
+    clean=re.sub(r'/\*.*?\*/','',body,flags=re.S)
     referenced=set(re.findall(r'\bc->('+names+r')\b',clean))
     stack='|'.join(sorted(LOCAL_ESP_HELPERS))
     if re.search(r'\b(?:'+stack+r')\(c(?=[,)])',clean):referenced.add('esp')
     registers=[r for r in registers if r in referenced]
-    if not registers:return body
+    if not registers:return original
     all_regs=set(registers)
     gpr=re.compile(r'\bc->('+'|'.join(registers)+r')\b')
     def spill(dirty):return ' '.join(f'c->{r} = _ac1_regs.{r};' for r in registers if r in dirty)
@@ -4348,7 +4345,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     for index, address in enumerate(lifted):
         if address in count_entries:
             bodies[index] = profile_count_entry(bodies[index], address)
-    bodies = [drop_stack_eip_markers(declare_local_memory_base(body)) for body in bodies]
+    bodies = [drop_unrecorded_eip_markers(declare_local_memory_base(body)) for body in bodies]
     if translation_unit_buckets < 0:
         raise ValueError("translation_unit_buckets must be zero or positive")
     if not translation_unit_buckets and functions_per_tu < 1:
@@ -4558,15 +4555,12 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
     output = [f"void L_{address:08X}(CPU *c)", "{"]
     entry_jump = entry_guard_lines(address, [insn.address for insn in insns])
     output.extend(entry_jump)
-    frame_ebp = frame_pointer_entry(decoded, address)
     for index, insn in enumerate(insns):
         if insn.address in labels or (entry_jump and insn.address == address):
             output.append(f"L_{insn.address:08X}:")
-        # Every instruction keeps its marker: the codegen passes group by it.
-        # Stack-only markers are dropped after them (drop_stack_eip_markers).
-        recorded = (insn.address == address or (index and insns[index - 1].mnemonic == 'call') or
-                    records_guest_eip(lifter, insn, frame_ebp))
-        output.append(f"    AC1_SET_GUEST_EIP(c, 0x{insn.address:08X}u);" + ('' if recorded else STACK_EIP_TAG))
+        recorded = (insn.address == address or insn.mnemonic in EIP_RECORDED or
+                    insn.mnemonic.startswith(('j', 'loop')) or (index and insns[index - 1].mnemonic == 'call'))
+        output.append(f"    AC1_SET_GUEST_EIP(c, 0x{insn.address:08X}u);" + ('' if recorded else UNRECORDED_EIP_TAG))
         if insn.address in register_switches:
             # Read the architectural register, not the table a second time:
             # intervening instructions may have changed memory since the MOV.

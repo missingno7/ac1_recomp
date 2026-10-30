@@ -36,6 +36,29 @@ class LocalRegisterTests(unittest.TestCase):
         self.assertIn('4096 dirty CFG full CPU and observer cases',run.stdout)
 
     @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
+    def test_push_and_pop_move_the_local_esp(self):
+        import test_codegen_flags as flags
+        source=flags.function(
+            'push32(c, c->eax);', 'push32(c, c->esp);', 'push32(c, 0x12345678u);',
+            'c->ebx = (uint32_t)(pop32(c));', '(void)pop32(c);', 'c->ecx = pop32(c);',
+            'push32(c, rd32((c->esp + 0x00000004u)));', 'opaque(c);', 'push32(c, c->esp);',
+            'c->esp = (uint32_t)(pop32(c));', 'push32(c, c->edx);', 'c->esp += 4; return;')
+        optimized=lift.local_register_function(source)
+        self.assertNotIn('push32(',optimized)
+        self.assertNotIn('pop32(',optimized)
+        self.assertNotIn('c->esp = _ac1_regs.esp;\n    AC1_SET_GUEST_EIP(c, 0x00401001u);',optimized)
+        generated='#include "cpu.h"\n#define AC1_SET_GUEST_EIP(c,va) ((c)->eip=(va))\nvoid opaque(CPU *);\n'
+        generated+=source.replace('void L_00401000(','void plain_L_00401000(',1)+'\n'
+        generated+=optimized.replace('void L_00401000(','void local_L_00401000(',1)+'\n'
+        work=ROOT/'work/local-regs-tests';work.mkdir(parents=True,exist_ok=True)
+        path=work/'stack.c';path.write_text(generated);exe=path.with_suffix('.exe')
+        subprocess.run(['gcc','-O2','-std=c11','-fwrapv','-fno-strict-aliasing','-DAC1_DIRECT_MEMORY',
+            '-I',str(lift.prepare_test_runtime()),str(path),str(ROOT/'tests/local_stack_semantics.c'),
+            '-o',str(exe)],check=True,capture_output=True,timeout=60)
+        run=subprocess.run([str(exe)],check=True,capture_output=True,text=True,timeout=30)
+        self.assertIn('4096 local push/pop CPU and stack memory cases passed',run.stdout)
+
+    @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
     def test_xmm_locals_match_full_cpu_at_calls_and_returns(self):
         import test_codegen_flags as flags
         source=flags.function(
@@ -110,8 +133,12 @@ class LocalRegisterTests(unittest.TestCase):
             '    RECOMP_TODO(0x401002, "unknown");', '    c->esp += 4; return;', '}'])
         body = lift.local_register_function(source)
         self.assertIn('_ac1_regs.eax = flags_add_m(c, _ac1_regs.eax', body)
-        self.assertIn('_ac1_regs.ebx = pop32(c)', body)
-        self.assertIn('_ac1_regs.esp = c->esp; __asm__', body)
+        # POP is arithmetic on the local ESP, so the taken edge reloads nothing.
+        self.assertIn('_ac1_regs.ebx = _ac1_pop; } if (c->zf) {  __asm__', body)
+        # A POP the rewrite leaves to the helper still moves ESP through c->esp.
+        helper = lift.local_register_function(source.replace('c->ebx = pop32(c);', 'wr32(c->ebx, pop32(c));'))
+        self.assertIn('wr32(_ac1_regs.ebx, pop32(c))', helper)
+        self.assertIn('_ac1_regs.esp = c->esp; __asm__', helper)
         self.assertIn('c->esp = _ac1_regs.esp;\n    AC1_SET_GUEST_EIP(c, 0x00401002', body)
         for text in ('/* fs:[0] */', 'setjmp(c->opaque);', 'longjmp(c->opaque);'):
             unsafe = source.replace('    c->esp += 4; return;', '    ' + text + ' return;')
@@ -153,7 +180,8 @@ class LocalRegisterTests(unittest.TestCase):
         plain=lift.flag_liveness_function(lift.lift_exact_function(lifter,spec,read,X86_OP_IMM,X86_OP_MEM))
         local=lift.local_register_function(plain)
         self.assertNotIn('memcpy(',local)
-        self.assertIn('c->esp = (uint32_t)(pop32(c))',local)
+        self.assertIn('_ac1_regs.esp = _ac1_pop;',local)   # POP ESP takes the loaded value
+        self.assertNotIn('pop32(',local)
         # The shift helper no longer forces a complete CPU synchronization.
         self.assertIn('op_sar(c, _ac1_regs.eax',local)
         source='#include "cpu.h"\n#define AC1_SET_GUEST_EIP(c,va) ((c)->eip=(va))\n'
