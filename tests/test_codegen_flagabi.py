@@ -16,6 +16,48 @@ def function(address, *instructions):
 
 class FlagAbiTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
+    def test_combined_locals_and_abi_keep_region_oracles_closed_and_continuations_scoped(self):
+        import pefile
+        from capstone import Cs, CS_ARCH_X86, CS_MODE_32
+        image=bytearray(0x2000)
+        code={0x401000:bytes.fromhex('e8fb000000eb0083c400c3'),
+              0x401100:bytes.fromhex('83c001c3'),
+              0x401200:bytes.fromhex('e8fbfdffff83c400c3')}
+        specs=[];md=Cs(CS_ARCH_X86,CS_MODE_32)
+        for address,raw in code.items():
+            image[address-0x400000:address-0x400000+len(raw)]=raw
+            instructions=list(md.disasm(raw,address))
+            specs.append(dict(address=address,size=len(raw),instruction_count=len(instructions),
+                blocks=[dict(start=i.address,end=i.address+i.size,
+                    instructions=[[i.address,i.size]]) for i in instructions]))
+        fake=SimpleNamespace(OPTIONAL_HEADER=SimpleNamespace(ImageBase=0x400000,SizeOfImage=0x3000,
+            DATA_DIRECTORY=[SimpleNamespace(VirtualAddress=0)]*16),
+            get_data=lambda offset,size:bytes(image[offset:offset+size]),close=lambda:None)
+        region={0x401000:dict(boundary='0x00401007',context_bytes=64,
+            members=[dict(address=hex(va)) for va in (0x401000,0x401100)],
+            implementation='test_region',plan='test_prepare',pending='test_pending')}
+        work=common.ROOT/'work/flagabi-region-tests';work.mkdir(parents=True,exist_ok=True)
+        with patch.object(pefile,'PE',return_value=fake), \
+             patch.object(lift,'validate_region_bindings',return_value=region):
+            result=lift.emit_lift(work/'synthetic.exe',lift.DUKE_DEFAULT,specs,work,1,
+                flag_liveness='abi',local_regs='all')
+        region_source=(work/'initial_region_00401000.c').read_text()
+        self.assertNotIn('ac1_abi_',region_source)
+        self.assertNotIn('_ac1_regs',region_source)
+        self.assertIn('ac1_region_00401000_m_00401100(c)',region_source)
+        sources='\n'.join((work/name).read_text() for name in result['translation_units'])
+        self.assertIn('ac1_abi_00401100',sources)
+        self.assertNotIn('ac1_abi_00401000',sources)  # preserve the native entry wrapper
+        runtime=lift.prepare_test_runtime()
+        for direct in (False,True):
+            for name in result['translation_units']:
+                subprocess.run(['gcc','-O2','-std=c11','-Werror=implicit-function-declaration',
+                    *(['-DAC1_DIRECT_MEMORY'] if direct else []),
+                    '-I',str(runtime),'-I',str(common.ROOT/'src/runtime'),'-I',str(work),
+                    '-c',str(work/name),'-o',str(work/(name+'.obj'))],
+                    check=True,capture_output=True,timeout=60)
+
+    @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
     def test_real_emitter_keeps_private_symbols_out_of_dispatch_table(self):
         import pefile
         from capstone import Cs, CS_ARCH_X86, CS_MODE_32

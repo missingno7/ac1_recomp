@@ -3923,9 +3923,17 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
             bodies[index], direct_callees[address], sites = specialize_direct_calls(bodies[index], successful)
             direct_sites += sites
     abi_private, abi_report = {}, None
+    # Region oracles are a closed call graph, and continuations split a body at
+    # a guest label. Keep their independent CFG form before private ABI symbols
+    # or function-local GPR declarations can enter those copied/split bodies.
+    region_mode = 'cfg' if flag_liveness == 'abi' else flag_liveness
+    region_members = {int(member['address'], 0) for entry in regions.values()
+                      for member in entry['members']}
+    region_bodies = [flag_liveness_function(body, region_mode) if address in region_members else ''
+                     for address, body in zip(lifted, bodies)] if regions else []
     if flag_liveness == 'abi':
         public, abi_private, abi_report = flag_abi_program(
-            dict(zip(lifted, bodies)), pinned=set(bindings), private_variants=True)
+            dict(zip(lifted, bodies)), pinned=set(bindings) | set(regions), private_variants=True)
         bodies = [public[a] for a in lifted]
     elif flag_liveness != 'off':
         bodies = [flag_liveness_function(body, flag_liveness) for body in bodies]
@@ -3946,7 +3954,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
             bodies[index] += '\n\n' + abi_private[address]
     # Keep L_VA as the one public entry for direct transfers AND the dispatch
     # table. Retain a private, callable translated oracle behind that entry.
-    region_bodies = [declare_local_memory_base(body) for body in bodies] if regions else []
+    region_bodies = [declare_local_memory_base(body) for body in region_bodies]
     for index, address in enumerate(lifted):
         if address in bindings:
             bodies[index] = wrap_native_binding(bodies[index], address, bindings[address])
