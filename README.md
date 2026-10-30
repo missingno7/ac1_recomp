@@ -212,3 +212,20 @@ The original random-number initialization acquires the real Windows Base Cryptog
 The standalone Android DXVK Native dependency builds with `ports/dxvk_android/build.ps1`, producing an AArch64 shared library with all 54 built-in shaders validated. Android CMake links the D3D9 bridge, and the Java/JNI `SurfaceView` handoff has passed compile checks; the latest runtime C source also compiles to an ARM64 object. No new APK has been assembled from these updates, and Android has not been run on a device. The only APK is the older frozen checkpoint documented in [Android instructions](docs/android.md). See [graphics integration](docs/graphics.md), [binary findings](docs/binary.md), [architecture decision](docs/architecture.md), [NFSU2 reuse findings](docs/nfs-reuse.md), and [runtime source notices](src/runtime/NOTICE.md). Duke and Mafia sources were inspected locally, including Mafia's uncommitted changes. NFSU2 provides the primary reference for the D3D9 COM bridge and DXVK Native integration.
 
 Original executables, `.forge` assets, generated game translations and local binaries/APKs are excluded from Git. The APK contains translated proprietary code and is a private diagnostic build; no game data is packaged. No existing reference project or original game source files are modified by the build.
+
+## Benchmarking
+
+Run `tools/bench_gameplay.ps1` for the host gameplay benchmark; measurement windows default to 60 seconds. Startup is detected from the D3D9 present counter, and the measurement frame is recorded in each run. Runs that stop before gameplay are marked failed with the tail of `startup.log` and are excluded from performance statistics. NVIDIA GPU sampling resolves `nvidia-smi.exe` from PATH, System32, or the standard NVSMI install directory.
+
+For drift-resistant A/B comparisons, pass `-Compare` and optional stripped binaries `-Binary` and `-BinaryB`. Without a binary for a side, that side uses the normal build settings; side B can override them with `-DirectMemoryB ON|OFF`, `-TraceEipB ON|OFF`, `-ForceInlineB ON|OFF`, and `-LiftArgsB`. `-Env` and `-EnvB` apply per-side runtime environment overrides. The script runs A then B for each pair and writes one comparison directory with per-side summary statistics and paired median deltas. Use `-AllowBusy` only when other workloads cannot be paused; the result records that override.
+
+Example using existing stripped binaries:
+
+```powershell
+& tools/bench_gameplay.ps1 -Compare -Runs 2 -Seconds 30 `
+  -Binary 'work/bench/bin/67a86f7de563-25a4476d867c/ac1_startup.exe' `
+  -BinaryB 'work/bench/bin/67a86f7de563-25a4476d867c/ac1_startup.exe' `
+  -Env @{ AC1_DISPATCH_FAST = '0' }
+```
+
+The two-side environment overrides can also be supplied as `-EnvB @{ AC1_DISPATCH_FAST = '0' }`. Use `tools/bench_report.py <comparison-directory>` to print an existing comparison.

@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""Compare immutable AC1 gameplay benchmark result directories."""
-import json
+"""Summarize AC1 gameplay runs and interleaved comparisons."""
 import argparse
-import math
-import re
+import json
 import statistics
 import sys
 from pathlib import Path
@@ -16,8 +14,112 @@ def read(path):
     return json.loads(p.read_text(encoding="utf-8-sig"))
 
 
-def vals(data, key):
+def percentile(values, q):
+    if not values:
+        return None
+    x = (len(values) - 1) * q
+    lo = int(x)
+    return values[lo] + (values[min(lo + 1, len(values) - 1)] - values[lo]) * (x - lo)
+
+
+def internal_run(run, seconds):
+    log_path = run / "startup.log"
+    log = log_path.read_text(errors="replace") if log_path.exists() else ""
+    captures = list((run / "captures").glob("present_*.bmp"))
+    profile = run / "profile"
+    snapshots = []
+    if profile.exists():
+        for jf in profile.glob("raw_*.json"):
+            try:
+                data = json.loads(jf.read_text())
+                if data.get("mode") == "frames":
+                    snapshots.append(data)
+            except (OSError, ValueError):
+                pass
+    snapshots.sort(key=lambda d: d.get("start", 0))
+    frames = sorted((int(t), int(d["frequency"])) for d in snapshots for t in d.get("frames", []))
+    start_index = 2047  # zero-based index; first measured Present is frame 2048
+    start_tick = frames[start_index][0] if len(frames) > start_index else None
+    freq = frames[start_index][1] if start_tick is not None else 1
+    window = [t for t, f in frames if start_tick is not None and start_tick <= t <= start_tick + seconds * freq]
+    intervals = sorted((window[i] - window[i - 1]) / freq * 1000 for i in range(1, len(window)))
+    traces = []
+    import re
+    for a, b in re.findall(r"present_calls=(\d+) draw_calls=(\d+)", log):
+        traces.append((int(a), int(b)))
+    proof = [c for c in captures if int(re.search(r"present_(\d+)", c.name).group(1)) >= start_index]
+    reached = len(window) >= 30 and bool(proof) and any(draw > 0 for _, draw in traces)
+    capture_rows = []
+    for line in log.splitlines():
+        m = re.search(r"present_(\d+)\.bmp .*draw_calls=(\d+)", line)
+        if m:
+            capture_rows.append((int(m.group(1)), int(m.group(2))))
+    eligible = [row for row in capture_rows if row[0] >= start_index]
+    draws = (eligible[-1][1] - eligible[-2][1]) / max(1, eligible[-1][0] - eligible[-2][0]) if len(eligible) >= 2 else None
+    gpu_samples = []
+    gpu_path = run / "gpu.csv"
+    if gpu_path.exists():
+        for line in gpu_path.read_text(errors="replace").splitlines():
+            m = re.match(r"\s*(\d+)\s*,\s*(\d+)", line)
+            if m:
+                gpu_samples.append({"utilization_percent": int(m.group(1)), "graphics_clock_mhz": int(m.group(2))})
+    stop_lines = [line for line in log.splitlines() if "AC1 guest stop" in line]
+    frame_times = intervals
+    return {
+        "reached_gameplay": reached, "gameplay_start_present_index": start_index + 1 if start_tick is not None else None,
+        "frames_in_window": len(window), "fps": 1000 / statistics.mean(frame_times) if frame_times else None,
+        "measurement_elapsed_seconds": (window[-1] - window[0]) / freq if len(window) > 1 else 0.0,
+        "frametime_mean_ms": statistics.mean(frame_times) if frame_times else None,
+        "frametime_p50_ms": percentile(frame_times, .5), "frametime_p95_ms": percentile(frame_times, .95),
+        "frametime_p99_ms": percentile(frame_times, .99), "frametime_min_ms": min(frame_times) if frame_times else None,
+        "frametime_max_ms": max(frame_times) if frame_times else None, "draws_per_frame": draws,
+        "process_cpu_seconds": None, "cpu_utilization_cores": None, "top_threads": [],
+        "gpu_utilization_percent": statistics.mean(s["utilization_percent"] for s in gpu_samples) if gpu_samples else None,
+        "gpu_samples": gpu_samples, "scene_proof": [str(c.relative_to(run)) for c in proof],
+        "profile_snapshots": len(snapshots), "present_trace_points": traces,
+        "failure": None if reached else {"reason": "gameplay start not reached", "guest_stop_lines": stop_lines,
+                                         "startup_log_tail": log.splitlines()[-12:]}
+    }
+
+
+def successful(data, key):
     return [r[key] for r in data.get("runs", []) if r.get("reached_gameplay") and isinstance(r.get(key), (int, float))]
+
+
+def stats(values):
+    values = sorted(values)
+    return {"n": len(values), "median": statistics.median(values) if values else None,
+            "min": min(values) if values else None, "max": max(values) if values else None,
+            "p95": percentile(values, .95), "p99": percentile(values, .99)}
+
+
+def comparison_text(d):
+    lines = ["# AC1 interleaved gameplay comparison", "", f"- Pair count: {d['pair_count']}; A failures: {d['A']['failures']}; B failures: {d['B']['failures']}", f"- Busy-host override: {d.get('host_load_override', False)}", ""]
+    for side in ("A", "B"):
+        lines.append(f"## {side}: {d[side]['label']}")
+        for key, label in (("fps", "FPS"), ("frametime_mean_ms", "mean frame time ms"),
+                           ("frametime_p95_ms", "p95 ms"), ("frametime_p99_ms", "p99 ms"),
+                           ("cpu_utilization_cores", "CPU cores"), ("gpu_utilization_percent", "GPU %")):
+            s = d[side].get("stats", {}).get(key) or stats(successful(d[side], key))
+            lines.append(f"- {label}: median={s['median']}, min={s['min']}, max={s['max']}, p95={s['p95']}, p99={s['p99']} (n={s['n']})")
+        for run in d[side].get("runs", []):
+            if not run.get("reached_gameplay"):
+                failure = run.get("failure") or {}
+                stop = failure.get("guest_stop_lines") or []
+                lines.append(f"- Failed run {run.get('run')}: {stop[-1] if stop else failure.get('reason', 'gameplay not reached')}")
+        lines.append("")
+    lines.append("## Paired median deltas (B - A)")
+    for key, label in (("fps", "FPS"), ("frametime_mean_ms", "mean frame time ms"),
+                       ("frametime_p95_ms", "p95 ms"), ("frametime_p99_ms", "p99 ms"),
+                       ("cpu_utilization_cores", "CPU cores"), ("gpu_utilization_percent", "GPU %")):
+        delta = d.get("paired_deltas", {}).get(key)
+        if delta is None:
+            pairs = [(a.get(key), b.get(key)) for a, b in zip(d["A"].get("runs", []), d["B"].get("runs", []))
+                     if a.get("reached_gameplay") and b.get("reached_gameplay") and isinstance(a.get(key), (int, float)) and isinstance(b.get(key), (int, float))]
+            delta = statistics.median([y - x for x, y in pairs]) if pairs else None
+        lines.append(f"- {label}: {delta} (valid pairs={sum(1 for a, b in zip(d['A'].get('runs', []), d['B'].get('runs', [])) if a.get('reached_gameplay') and b.get('reached_gameplay'))})")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def main():
@@ -26,99 +128,33 @@ def main():
         p.add_argument("--internal-run", type=Path, required=True)
         p.add_argument("--seconds", type=int, required=True)
         args = p.parse_args()
-        run = args.internal_run
-        log = (run / "startup.log").read_text(errors="replace") if (run / "startup.log").exists() else ""
-        traces = [(int(a), int(b)) for a, b in re.findall(r"present_calls=(\d+) draw_calls=(\d+)", log)]
-        caps = list((run / "captures").glob("present_*.bmp"))
-        pg = run / "profile"
-        jsons = sorted(pg.glob("raw_*.json"), key=lambda x: x.stat().st_mtime) if pg.exists() else []
-        data = []
-        for jf in jsons:
-            try:
-                d = json.loads(jf.read_text())
-                if d.get("mode") == "frames": data.append(d)
-            except (OSError, ValueError): pass
-        # Profile emits 10-second snapshots. Each frame timestamp is a successful Present.
-        data.sort(key=lambda d: d["start"])
-        frames = []
-        for d in data:
-            frames.extend((int(t), int(d["frequency"])) for t in d.get("frames", []))
-        frames.sort()
-        # Replay actions end at successful present 1500; 128 frames lets the next scene settle.
-        start_index = 1628
-        start_tick = frames[start_index][0] if len(frames) > start_index else None
-        window = []
-        if start_tick is not None:
-            window = [t for t, f in frames if start_tick <= t <= start_tick + args.seconds * f]
-        proof = [c for c in caps if int(re.search(r"present_(\d+)", c.name).group(1)) >= start_index]
-        reached = len(window) >= 30 and bool(proof) and any(draw > 0 for _, draw in traces)
-        freq = frames[start_index][1] if start_tick is not None else 1
-        intervals = [(window[i]-window[i-1])/freq*1000 for i in range(1, len(window))]
-        measurement_elapsed = (window[-1]-window[0])/freq if len(window)>1 else 0.0
-        intervals.sort()
-        def percentile(q):
-            if not intervals: return None
-            x=(len(intervals)-1)*q; lo=int(x); return intervals[lo]+(intervals[min(lo+1,len(intervals)-1)]-intervals[lo])*(x-lo)
-        run_data = {"reached_gameplay": reached, "gameplay_start_present_index": start_index,
-                    "frames_in_window": len(window), "fps": 1000/statistics.mean(intervals) if intervals else None,
-                    "measurement_elapsed_seconds": measurement_elapsed,
-                    "frametime_mean_ms": statistics.mean(intervals) if intervals else None,
-                    "frametime_p50_ms": percentile(.5), "frametime_p95_ms": percentile(.95),
-                    "frametime_p99_ms": percentile(.99), "frametime_max_ms": max(intervals) if intervals else None,
-                    "draws_per_frame": None, "process_cpu_seconds": None, "cpu_utilization_cores": None,
-                    "top_threads": [], "gpu_utilization_percent": None,
-                    "scene_proof": [str(c.relative_to(run)) for c in proof],
-                    "profile_snapshots": len(data), "present_trace_points": traces}
-        capture_rows=[]
-        for line in log.splitlines():
-            m=re.search(r"present_(\d+)\.bmp .*draw_calls=(\d+)",line)
-            if m: capture_rows.append((int(m.group(1)),int(m.group(2))))
-        eligible=[row for row in capture_rows if row[0]>=start_index]
-        if len(eligible)>=2:
-            x,y=eligible[-2:]; run_data["draws_per_frame"]=(y[1]-x[1])/max(1,y[0]-x[0])
-        gpu = []; gpu_samples=[]
-        if (run/"gpu.csv").exists():
-            for line in (run/"gpu.csv").read_text(errors="replace").splitlines():
-                m=re.match(r"\s*(\d+)\s*,\s*(\d+)", line)
-                if m:
-                    sample={"utilization_percent":int(m.group(1)),"graphics_clock_mhz":int(m.group(2))}
-                    gpu.append(sample["utilization_percent"]); gpu_samples.append(sample)
-        if gpu: run_data["gpu_utilization_percent"] = statistics.mean(gpu)
-        run_data["gpu_samples"] = gpu_samples
-        print(json.dumps(run_data))
+        print(json.dumps(internal_run(args.internal_run, args.seconds)))
         return
     if len(sys.argv) >= 2 and sys.argv[1] == "--summary":
         d = read(sys.argv[2])
-        lines=["# AC1 gameplay benchmark", "", f"- Identity: `{d['identity']['sha']}` / `{d['identity']['config_id']}`; branch `{d['identity']['branch']}`; dirty={d['identity']['dirty']}", f"- Binary SHA-256: `{d['identity']['binary_sha256']}`", f"- Machine: {d['machine']['cpu_model']}; {d['machine']['logical_cores']} logical cores; {d['machine']['physical_memory_bytes']} bytes RAM", f"- Build generator: {d.get('environment',{}).get('actual_build_generator','unknown')}", ""]
-        for r in d['runs']:
-            tops=", ".join(f"{t['tid']}:{t['cpu_seconds']:.2f}s" for t in r.get("top_threads",[])[:5]) or "unavailable"
-            lines.append(f"- Run {r['run']}: reached_gameplay={r.get('reached_gameplay',False)}, FPS={r.get('fps')}, mean/p50/p95/p99/max ms={r.get('frametime_mean_ms')}/{r.get('frametime_p50_ms')}/{r.get('frametime_p95_ms')}/{r.get('frametime_p99_ms')}/{r.get('frametime_max_ms')}, draws/frame={r.get('draws_per_frame')}, CPU={r.get('process_cpu_seconds')}s ({r.get('cpu_utilization_cores')} cores), GPU={r.get('gpu_utilization_percent')}%, top threads={tops}, scene captures={len(r.get('scene_proof',[]))}.")
-        (Path(sys.argv[2]) / "summary.md").write_text("\n".join(lines)+"\n", encoding="utf-8")
-        print("\n".join(lines))
+        if d.get("comparison"):
+            report = comparison_text(d)
+        else:
+            failed = sum(not r.get("reached_gameplay") for r in d.get("runs", []))
+            lines = ["# AC1 gameplay benchmark", "", f"- Identity: `{d['identity']['sha']}` / `{d['identity']['config_id']}`; branch `{d['identity']['branch']}`; dirty={d['identity']['dirty']}", f"- Binary SHA-256: `{d['identity']['binary_sha256']}`", f"- Machine: {d['machine']['cpu_model']}; {d['machine']['logical_cores']} logical cores; {d['machine']['physical_memory_bytes']} bytes RAM", f"- Build generator: {d.get('environment', {}).get('actual_build_generator', 'unknown')}", f"- Failed runs: {failed}", ""]
+            for r in d["runs"]:
+                tops = ", ".join(f"{t['tid']}:{t['cpu_seconds']:.2f}s" for t in r.get("top_threads", [])[:5]) or "unavailable"
+                lines.append(f"- Run {r['run']}: reached_gameplay={r.get('reached_gameplay', False)}, FPS={r.get('fps')}, mean/p50/p95/p99/max ms={r.get('frametime_mean_ms')}/{r.get('frametime_p50_ms')}/{r.get('frametime_p95_ms')}/{r.get('frametime_p99_ms')}/{r.get('frametime_max_ms')}, CPU={r.get('process_cpu_seconds')}s ({r.get('cpu_utilization_cores')} cores), GPU={r.get('gpu_utilization_percent')}%, top threads={tops}, failure={r.get('failure')}")
+            report = "\n".join(lines) + "\n"
+        (Path(sys.argv[2]) / "summary.md").write_text(report, encoding="utf-8")
+        print(report, end="")
+        return
+    if len(sys.argv) == 2 and Path(sys.argv[1], "result.json").exists():
+        d = read(sys.argv[1])
+        print(comparison_text(d) if d.get("comparison") else json.dumps(d, indent=2))
         return
     if len(sys.argv) != 3:
         raise SystemExit("usage: python -B tools/bench_report.py RESULT_DIR_A RESULT_DIR_B")
     a, b = map(read, sys.argv[1:])
-    print(f"A: {a['identity']['sha']} ({a['identity']['branch']}) {a['identity']['config_id']} dirty={a['identity']['dirty']}")
-    print(f"B: {b['identity']['sha']} ({b['identity']['branch']}) {b['identity']['config_id']} dirty={b['identity']['dirty']}")
-    for key, label, lower in (("fps", "FPS", False), ("frametime_mean_ms", "mean ms", True),
-                              ("frametime_p95_ms", "p95 ms", True), ("frametime_p99_ms", "p99 ms", True),
-                              ("draws_per_frame", "draws/frame", False), ("cpu_utilization_cores", "CPU cores", True),
-                              ("gpu_utilization_percent", "GPU %", True)):
-        x, y = vals(a, key), vals(b, key)
-        if not x or not y:
-            print(f"{label}: unavailable (A n={len(x)}, B n={len(y)})")
-            continue
-        ma, mb = statistics.mean(x), statistics.mean(y)
-        sa = statistics.stdev(x) if len(x) > 1 else 0.0
-        sb = statistics.stdev(y) if len(y) > 1 else 0.0
-        overlap = None if len(x) < 2 or len(y) < 2 else not (ma + sa < mb - sb or mb + sb < ma - sa)
-        delta = mb - ma
-        pct = (delta / ma * 100) if ma else 0.0
-        spread_a = f"±{sa:.3f}" if len(x)>1 else "spread unavailable"
-        spread_b = f"±{sb:.3f}" if len(y)>1 else "spread unavailable"
-        overlap_text = str(overlap).lower() if overlap is not None else "unknown (need >=2 runs per side)"
-        print(f"{label}: A {ma:.3f} {spread_a} (n={len(x)}), B {mb:.3f} {spread_b} (n={len(y)}), delta {delta:+.3f} ({pct:+.2f}%), spread_overlap={overlap_text}")
+    for label, data in (("A", a), ("B", b)):
+        print(f"{label}: {data['identity']['sha']} ({data['identity']['branch']}) {data['identity']['config_id']} dirty={data['identity']['dirty']}")
+        for key in ("fps", "frametime_mean_ms", "frametime_p95_ms", "frametime_p99_ms", "cpu_utilization_cores", "gpu_utilization_percent"):
+            print(f"  {key}: {stats(successful(data, key))}")
 
 
 if __name__ == "__main__":
