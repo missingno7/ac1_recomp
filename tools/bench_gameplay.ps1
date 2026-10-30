@@ -9,11 +9,13 @@ param(
     # Runtime A/B on the same binary: extra environment and a result label.
     [hashtable]$Env = @{},
     [string]$EnvJson = '',
+    [string]$EnvFile = '',
     [string]$Binary = '',
     [string]$BinaryB = '',
     [switch]$Compare,
     [hashtable]$EnvB = @{},
     [string]$EnvBJson = '',
+    [string]$EnvBFile = '',
     [string]$DirectMemoryB = '',
     [string]$TraceEipB = '',
     [string]$ForceInlineB = '',
@@ -39,6 +41,12 @@ if ($EnvBJson) {
     $parsedEnvB = ConvertFrom-Json -InputObject $EnvBJson
     foreach ($item in $parsedEnvB.PSObject.Properties) { $EnvB[$item.Name] = [string]$item.Value }
 }
+foreach ($fileSettings in @(@{Path=$EnvFile;Values=$Env},@{Path=$EnvBFile;Values=$EnvB})) {
+    if ($fileSettings.Path) {
+        $parsedEnv = Get-Content -LiteralPath $fileSettings.Path -Raw | ConvertFrom-Json
+        foreach ($item in $parsedEnv.PSObject.Properties) { $fileSettings.Values[$item.Name] = [string]$item.Value }
+    }
+}
 $ownedConfigProc = $null
 if (-not ('AC1BenchThreadTimes' -as [type])) { Add-Type -TypeDefinition @"
 using System; using System.Collections.Generic; using System.Runtime.InteropServices;
@@ -46,8 +54,10 @@ public static class AC1BenchThreadTimes {
  const uint THREAD_QUERY_INFORMATION=0x0040;
  [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr OpenThread(uint access,bool inherit,uint id);
  [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetThreadTimes(IntPtr h,out long create,out long exit,out long kernel,out long user);
+ [DllImport("kernel32.dll",SetLastError=true)] static extern bool QueryProcessCycleTime(IntPtr h,out ulong cycles);
  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
  public static Dictionary<int,ulong> Snapshot(int[] ids) { var d=new Dictionary<int,ulong>(); foreach(int id in ids){IntPtr h=OpenThread(THREAD_QUERY_INFORMATION,false,(uint)id);if(h==IntPtr.Zero)continue;try{long c,e,k,u;if(GetThreadTimes(h,out c,out e,out k,out u))d[id]=(ulong)(k+u);}finally{CloseHandle(h);}}return d; }
+ public static ulong Cycles(IntPtr process) { ulong c; if(!QueryProcessCycleTime(process,out c))throw new System.ComponentModel.Win32Exception();return c; }
 }
 "@ }
 Push-Location $Root
@@ -138,7 +148,8 @@ public static class AC1BenchProcessTree {
         $sideRuns = @{ A=@(); B=@() }
         $sideLabels = @{ A=$(if ($Label) { $Label } else { 'A' }); B='B' }
         for ($pair=1; $pair -le $Runs; $pair++) {
-            foreach ($side in @('A','B')) {
+            # Alternate AB/BA to reduce monotonic shared-host drift bias.
+            foreach ($side in $(if ($pair % 2) { @('A','B') } else { @('B','A') })) {
                 $sideBinary = if ($side -eq 'A') { $Binary } else { $BinaryB }
                 $sideEnv = if ($side -eq 'A') { $Env } else { $EnvB }
                 $sideDir = Join-Path $comparisonDir ("{0}/pair-{1:D2}" -f $side,$pair)
@@ -158,7 +169,13 @@ public static class AC1BenchProcessTree {
                 $childArgs += $(if ($childTrace) { '-TraceEip' } else { '-TraceEip:$false' })
                 $childArgs += $(if ($childInline) { '-ForceInline' } else { '-ForceInline:$false' })
                 if ($childLift) { $childArgs += @('-LiftArgs',$childLift) }
-                if ($sideEnv.Count) { $childArgs += @('-EnvJson',($sideEnv | ConvertTo-Json -Compress)) }
+                if ($sideEnv.Count) {
+                    # Native PowerShell argument marshalling strips inner JSON
+                    # quotes (hex VA strings then cease to be valid JSON).
+                    $sideEnvFile = Join-Path $sideDir 'runtime-env.json'
+                    $sideEnv | ConvertTo-Json | Set-Content -LiteralPath $sideEnvFile -Encoding UTF8
+                    $childArgs += @('-EnvFile',$sideEnvFile)
+                }
                 if ($WaitForQuiet) { $childArgs += '-WaitForQuiet' }
                 if ($AllowBusy) { $childArgs += '-AllowBusy' }
                 & powershell.exe @childArgs
@@ -272,11 +289,12 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
         New-Item -ItemType Directory -Force -Path $envs.AC1_D3D9_CAPTURE_DIR,$profileDir,$profileSource | Out-Null
         $profileBefore = @{}; Get-ChildItem "$profileSource/raw_*.json" -ErrorAction SilentlyContinue | ForEach-Object { $profileBefore[$_.Name] = $_.LastWriteTimeUtc }
         $gpuLog = Join-Path $runDir 'gpu.csv'; $gpuProc = $null
-        $proc = $null; $timer = [Diagnostics.Stopwatch]::StartNew(); $gameTimer = $null; $cpuAtStart = 0.0; $cpuNow = 0.0; $topThreads = @(); $threadLast = @{}; $threadAccum = @{}; $durationReached = $false; $measurementStartFrame = 2048
+        $proc = $null; $timer = [Diagnostics.Stopwatch]::StartNew(); $gameTimer = $null; $cpuAtStart = 0.0; $cpuNow = 0.0; $cyclesAtStart = [uint64]0; $cyclesNow = [uint64]0; $topThreads = @(); $threadLast = @{}; $threadAccum = @{}; $durationReached = $false; $measurementStartFrame = 2048
         $previousEnv = @{}; foreach ($k in $envs.Keys) { $previousEnv[$k] = [Environment]::GetEnvironmentVariable($k,'Process'); [Environment]::SetEnvironmentVariable($k,[string]$envs[$k],'Process') }
         try {
             $proc = Start-Process -FilePath $binaryPath -ArgumentList ('"' + $GameExe + '"') -WorkingDirectory $Root -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $runDir 'stdout.log') -RedirectStandardError (Join-Path $runDir 'startup.log')
             $null = $proc.Handle
+            Write-Host "Run $i launched PID=$($proc.Id), binary=$binaryPath"
             while (-not $proc.WaitForExit($(if ($gameTimer) { 250 } else { 1000 }))) {
                 if (-not $gameTimer) {
                     $traceText = Get-Content -LiteralPath (Join-Path $runDir 'startup.log') -Tail 64 -ErrorAction SilentlyContinue | Out-String
@@ -285,6 +303,7 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
                     if ($presentCounts.Count) { $presentNow = [int]$presentCounts[$presentCounts.Count - 1].Groups[1].Value }
                     if ($presentNow -ge $measurementStartFrame) {
                         $gameTimer = [Diagnostics.Stopwatch]::StartNew(); $cpuAtStart = Get-ProcessCpuSeconds $proc
+                        $cyclesAtStart = [AC1BenchThreadTimes]::Cycles($proc.Handle)
                         $threadLast = Get-ThreadCpuSnapshot $proc
                         if ($gpuAvailable) { $gpuProc = Start-Process -FilePath $gpuTool.Source -ArgumentList @('--query-gpu=utilization.gpu,clocks.gr','--format=csv,noheader,nounits','-lms','500') -PassThru -WindowStyle Hidden -RedirectStandardOutput $gpuLog -RedirectStandardError (Join-Path $runDir 'gpu.err') }
                         Write-Host "Run $i gameplay measurement started at Present $measurementStartFrame."
@@ -312,7 +331,7 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
                 }
                 $topThreads = @($threadAccum.Keys | ForEach-Object { $tid=$_; [ordered]@{ tid=$tid; cpu_seconds=[double]$threadAccum[$tid] } } | Sort-Object cpu_seconds -Descending | Select-Object -First 10)
             } catch { $topThreads = @() }
-            if ($gameTimer) { $cpuNow = Get-ProcessCpuSeconds $proc }
+            if ($gameTimer) { $cpuNow = Get-ProcessCpuSeconds $proc; $cyclesNow = [AC1BenchThreadTimes]::Cycles($proc.Handle) }
             $proc.Refresh()
             if ($durationReached -and -not $proc.HasExited) {
                 # Freeze CPU/GPU accounting at the measurement deadline. The
@@ -341,6 +360,8 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
         $cpuSeconds = [Math]::Max(0, $cpuNow - $cpuAtStart)
         $measurementSeconds = if ($gameTimer) { [Math]::Min($Seconds,$gameTimer.Elapsed.TotalSeconds) } else { 0 }
         $runOut | Add-Member -NotePropertyName process_cpu_seconds -NotePropertyValue $cpuSeconds -Force
+        $runOut | Add-Member -NotePropertyName process_cpu_cycles -NotePropertyValue $(if ($gameTimer) { $cyclesNow-$cyclesAtStart } else { $null }) -Force
+        $runOut | Add-Member -NotePropertyName owned_process_id -NotePropertyValue $proc.Id -Force
         $runOut | Add-Member -NotePropertyName cpu_utilization_cores -NotePropertyValue $(if ($measurementSeconds) { $cpuSeconds/$measurementSeconds } else { $null }) -Force
         $runOut | Add-Member -NotePropertyName top_threads -NotePropertyValue $topThreads -Force
         $runOut | Add-Member -NotePropertyName run -NotePropertyValue $i -Force

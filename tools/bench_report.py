@@ -106,7 +106,8 @@ def comparison_text(d):
     for side in ("A", "B"):
         lines.append(f"## {side}: {d[side]['label']}")
         for key, label in (("fps", "FPS"), ("frametime_mean_ms", "mean frame time ms"),
-                           ("frametime_p95_ms", "p95 ms"), ("frametime_p99_ms", "p99 ms"),
+                           ("frametime_p50_ms", "p50 ms"), ("frametime_p95_ms", "p95 ms"), ("frametime_p99_ms", "p99 ms"),
+                           ("process_cpu_cycles", "process CPU cycles"),
                            ("cpu_utilization_cores", "CPU cores"), ("gpu_utilization_percent", "GPU %")):
             s = d[side].get("stats", {}).get(key) or stats(successful(d[side], key))
             lines.append(f"- {label}: median={s['median']}, min={s['min']}, max={s['max']}, p95={s['p95']}, p99={s['p99']} (n={s['n']})")
@@ -118,7 +119,8 @@ def comparison_text(d):
         lines.append("")
     lines.append("## Paired median deltas (B - A)")
     for key, label in (("fps", "FPS"), ("frametime_mean_ms", "mean frame time ms"),
-                       ("frametime_p95_ms", "p95 ms"), ("frametime_p99_ms", "p99 ms"),
+                       ("frametime_p50_ms", "p50 ms"), ("frametime_p95_ms", "p95 ms"), ("frametime_p99_ms", "p99 ms"),
+                           ("process_cpu_cycles", "process CPU cycles"),
                        ("cpu_utilization_cores", "CPU cores"), ("gpu_utilization_percent", "GPU %")):
         delta = d.get("paired_deltas", {}).get(key)
         if delta is None:

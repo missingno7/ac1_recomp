@@ -32,6 +32,17 @@ count hooks. The phase 1 menu/gameplay evidence and candidate ranking are kept
 privately under `work/engine_prof/`; no subsystem replacement is enabled by this
 profiling work.
 
+The [pinned native palette region](docs/native-regions.md) is now enabled for
+the measured Windows x64 direct-memory/trace-EIP configuration: twenty
+interleaved gameplay pairs measured +2.49% median paired FPS (95% bootstrap
+interval [+1.58%, +5.71%]) and -2.79% cycles/frame. Five unattended gameplay
+replays passed complete CPU, guest-memory and pending-upload comparisons.
+`AC1_NATIVE_REGIONS=0` disables it. Palette reuse remains opt-in after an
+inconclusive comparison; the Hinge/Compress modifier trial remains opt-in after
+a -3.91% regression. ARM64 compilation is verified; these regions have no ARM64
+hardware execution or performance evidence. Raw phase 2 evidence and patches
+remain private under `work/engine_prof/phase2/`.
+
 ## Earlier host checkpoint: first original image (loading screen)
 
 Original code now renders AC1's loading screen on Windows. The translated Bink DLL decodes `videos\LoadingScreen.bik`, and the game draws its progress bar over it through the D3D9 bridge on DXVK. Back-buffer captures show loading progress from 4% at present 4 to 81% at present 64, with 81 original draw calls by then. Evidence: `work/startup_first_image_loading.log` (SHA-256 `77EBD97228EEF25CD839F887B44240EFFD52C690A353E51DF7CCE4D3A6BE0412`) and `work/captures/present_000064.bmp`. This verifies sustained original rendering of the loading screen. Menu, input, audio playback and gameplay are not yet verified.

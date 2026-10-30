@@ -95,6 +95,10 @@ AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token, const uint32_t *args,
 /* Release host COM objects and bridge-owned guest object/vtable allocations. */
 AC1_D3D9_API void ac1_d3d9_shutdown(void);
 AC1_D3D9_API const char *ac1_d3d9_last_error(void);
+/* Native numerical caches may scope entries to one presentation interval and
+ * must discard them on any reset attempt or bridge lifetime change. */
+AC1_D3D9_API uint64_t ac1_d3d9_present_count(void);
+AC1_D3D9_API uint64_t ac1_d3d9_state_epoch(void);
 
 #ifdef __cplusplus
 }

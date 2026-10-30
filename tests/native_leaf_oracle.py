@@ -109,6 +109,7 @@ int main(void){
     subprocess.run([args.compiler, '-O2', '-g', '-DAC1_TRACE_EIP', '-DAC1_DIRECT_MEMORY',
                     '-ffp-contract=off', '-fno-strict-aliasing', '-I'+str(ROOT/'src/runtime'),
                     *flags, str(fixture), str(ROOT/'src/runtime/ac1_native.c'),
+                    str(ROOT/'src/runtime/ac1_native_registry_empty.c'),
                     str(ROOT/'src/runtime/ac1_native_leaf.c'), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
 

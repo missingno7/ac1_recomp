@@ -271,6 +271,7 @@ std::map<std::pair<uint32_t, uintptr_t>, uint32_t> g_guest_handle_by_native;
 std::mutex g_mutex;
 uint64_t g_successful_draw_calls = 0;
 std::atomic<uint64_t> g_successful_present_calls{0};
+std::atomic<uint64_t> g_state_epoch{1};
 bool g_frame_trace_enabled = false;
 bool g_frame_trace_initialized = false;
 bool g_first_draw_reported = false;
@@ -2257,7 +2258,7 @@ HRESULT reset_or_swapchain(GuestObject &object, const uint32_t *args, bool reset
     // Default-pool guest references and outstanding locks remain live. The
     // provider decides Reset success / DEVICELOST / INVALIDCALL; never fake it.
     HRESULT status;
-    if (reset) status = device->Reset(&host);
+    if (reset) { g_state_epoch.fetch_add(1, std::memory_order_relaxed); status = device->Reset(&host); }
     else status = interface_output<IDirect3DSwapChain9>(args[2], ObjectKind::SwapChain,
         [&](auto **out) { return device->CreateAdditionalSwapChain(&host, out); });
     auto updated = guest_present_parameters(host, requested.device_window);
@@ -4155,6 +4156,7 @@ extern "C" AC1_D3D9_API void ac1_d3d9_shutdown(void)
     g_constant_table_allocations.clear();
     g_successful_draw_calls = 0;
     g_successful_present_calls = 0;
+    g_state_epoch.fetch_add(1, std::memory_order_relaxed);
     g_frame_trace_enabled = false;
     g_frame_trace_initialized = false;
     g_first_draw_reported = false;
@@ -4182,4 +4184,8 @@ extern "C" AC1_D3D9_API const char *ac1_d3d9_last_error(void)
 extern "C" AC1_D3D9_API uint64_t ac1_d3d9_present_count(void)
 {
     return g_successful_present_calls.load(std::memory_order_relaxed);
+}
+extern "C" AC1_D3D9_API uint64_t ac1_d3d9_state_epoch(void)
+{
+    return g_state_epoch.load(std::memory_order_relaxed);
 }
