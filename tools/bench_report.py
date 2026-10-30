@@ -185,13 +185,13 @@ def adaptive_decision(deltas, baseline, executed_pairs, min_pairs=3, max_pairs=8
     return {
         "stop": stop, "stop_reason": stop_reason, "verdict": verdict,
         "executed_pairs": int(executed_pairs), "valid_pairs": len(deltas),
-        "paired_delta_median_ms": center,
-        "paired_delta_min_ms": min(deltas) if deltas else None,
-        "paired_delta_max_ms": max(deltas) if deltas else None,
-        "paired_delta_spread_ms": max(deltas) - min(deltas) if deltas else None,
-        "ci95_low_ms": ci_low, "ci95_high_ms": ci_high,
-        "ci95_half_width_ms": half_width,
-        "practical_threshold_ms": practical_threshold,
+        "paired_delta_median": center,
+        "paired_delta_min": min(deltas) if deltas else None,
+        "paired_delta_max": max(deltas) if deltas else None,
+        "paired_delta_spread": max(deltas) - min(deltas) if deltas else None,
+        "ci95_low": ci_low, "ci95_high": ci_high,
+        "ci95_half_width": half_width,
+        "practical_threshold": practical_threshold,
         "practical_percent": practical_percent,
     }
 
@@ -220,8 +220,8 @@ def comparison_text(d):
     if decision:
         lines.extend([
             f"- Adaptive verdict: {decision.get('verdict')}; stop reason: {decision.get('stop_reason')}",
-            f"- Valid paired main-CPU deltas (B - A): n={decision.get('valid_pairs')}, median={decision.get('paired_delta_median_ms')} ms/frame, spread={decision.get('paired_delta_min_ms')}..{decision.get('paired_delta_max_ms')} (range {decision.get('paired_delta_spread_ms')})",
-            f"- 95% bootstrap CI: [{decision.get('ci95_low_ms')}, {decision.get('ci95_high_ms')}] ms/frame; half-width={decision.get('ci95_half_width_ms')}; practical threshold={decision.get('practical_threshold_ms')} ms/frame",
+            f"- Valid paired main-thread cycles/frame deltas (B - A): n={decision.get('valid_pairs')}, median={decision.get('paired_delta_median')}, spread={decision.get('paired_delta_min')}..{decision.get('paired_delta_max')} (range {decision.get('paired_delta_spread')})",
+            f"- 95% bootstrap CI: [{decision.get('ci95_low')}, {decision.get('ci95_high')}] cycles/frame; half-width={decision.get('ci95_half_width')}; practical threshold={decision.get('practical_threshold')} cycles/frame",
             "",
         ])
     side_metrics = (("frametime_mean_ms", "mean frame time ms"),

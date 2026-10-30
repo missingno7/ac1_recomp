@@ -179,21 +179,28 @@ public static class AC1BenchProcessTree {
                     $aRun.input_command_index_start -eq $bRun.input_command_index_start -and
                     $aRun.input_command_index_end -eq $bRun.input_command_index_end
                 $guestA = [double]$aRun.guest_time_elapsed_ns; $guestB = [double]$bRun.guest_time_elapsed_ns
-                $guestComparable = $guestA -gt 0 -and $guestB -gt 0 -and ([Math]::Abs($guestA-$guestB) / [Math]::Max($guestA,$guestB)) -le 0.01
+                # The guest clock follows real frame time, so a faster side legitimately
+                # simulates less guest time over the fixed Present window (A/A runs of one
+                # binary differ by up to 12%). Only a gross difference marks divergence.
+                $guestComparable = $guestA -gt 0 -and $guestB -gt 0 -and ([Math]::Abs($guestA-$guestB) / [Math]::Max($guestA,$guestB)) -le 0.33
                 $capturesPresent = @($aRun.boundary_captures).Count -eq 2 -and @($bRun.boundary_captures).Count -eq 2
                 $observableResultsMatch = $capturesPresent -and (($aRun.boundary_capture_sha256 | ConvertTo-Json -Compress) -eq ($bRun.boundary_capture_sha256 | ConvertTo-Json -Compress))
-                $equivalent = $aRun.reached_workload -and $bRun.reached_workload -and $sameCommands -and $guestComparable -and $observableResultsMatch
+                # Boundary images are evidence only: rendering is not pixel-deterministic,
+                # so identical binaries never produce matching hashes.
+                $equivalent = $aRun.reached_workload -and $bRun.reached_workload -and $sameCommands -and $guestComparable
                 $pairEquivalence += [ordered]@{ pair=$pairIndex+1; equivalent=$equivalent; command_indices_match=$sameCommands; guest_time_comparable=$guestComparable; guest_time_A_ns=$aRun.guest_time_elapsed_ns; guest_time_B_ns=$bRun.guest_time_elapsed_ns; observable_boundary_hashes_match=$observableResultsMatch; captures_A=$aRun.boundary_captures; captures_B=$bRun.boundary_captures }
-                if ($equivalent -and $null -ne $aRun.main_thread_cpu_ms_per_frame -and $null -ne $bRun.main_thread_cpu_ms_per_frame) {
-                    $pairedInputs += [double]$bRun.main_thread_cpu_ms_per_frame - [double]$aRun.main_thread_cpu_ms_per_frame
-                    $baselineInputs += [double]$aRun.main_thread_cpu_ms_per_frame
+                # Decide on per-frame main-thread cycles: CPU ms/frame is quantized to
+                # one 15.625 ms scheduler tick per 16 Presents (~0.98 ms/frame).
+                if ($equivalent -and $null -ne $aRun.main_thread_cycles_per_frame -and $null -ne $bRun.main_thread_cycles_per_frame) {
+                    $pairedInputs += [double]$bRun.main_thread_cycles_per_frame - [double]$aRun.main_thread_cycles_per_frame
+                    $baselineInputs += [double]$aRun.main_thread_cycles_per_frame
                 }
             }
             [ordered]@{ executed_pairs=$pair; deltas=$pairedInputs; baseline=$baselineInputs } |
                 ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $decisionPath -Encoding UTF8
             $decision = (& $Python -B tools/bench_report.py --decision-json $decisionPath `
                 --min-pairs $MinPairs --max-pairs $MaxPairs --practical-percent $PracticalPercent | ConvertFrom-Json)
-            Write-Host "Pair $pair/$MaxPairs ($($pairOrder -join '/')): equivalent=$($pairEquivalence[-1].equivalent), valid=$($decision.valid_pairs), paired main-CPU delta=$($decision.paired_delta_median_ms) ms/frame, verdict=$($decision.verdict)."
+            Write-Host "Pair $pair/$MaxPairs ($($pairOrder -join '/')): equivalent=$($pairEquivalence[-1].equivalent), valid=$($decision.valid_pairs), paired main-thread delta=$($decision.paired_delta_median) cycles/frame, verdict=$($decision.verdict)."
             if ($decision.stop) {
                 Write-Host "Adaptive comparison stopped: $($decision.stop_reason)"
                 break

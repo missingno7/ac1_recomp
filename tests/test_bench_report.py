@@ -73,7 +73,7 @@ class FrameWindowTests(unittest.TestCase):
         result = report.adaptive_decision([9.5, 10.0, 10.5], [250, 252, 251], 3)
         self.assertTrue(result['stop'])
         self.assertEqual(result['verdict'], 'B regression')
-        self.assertGreater(result['ci95_low_ms'], 0)
+        self.assertGreater(result['ci95_low'], 0)
 
     def test_adaptive_decision_stops_as_neutral_with_a_narrow_ci(self):
         result = report.adaptive_decision([0.0, 0.0, 0.0], [250, 250, 250], 3)

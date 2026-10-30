@@ -18,11 +18,14 @@ behavior affect them. POSIX/Android leave cycle and processor columns empty.
 Hardware retired-instruction/cache-miss counters belong in focused investigations
 when available; normal runs avoid that instrumentation.
 
-Workload equivalence is judged from gameplay phase, identical replay command
-indices at both boundaries, and guest-visible time elapsed. Present equality
-alone does not prove equal simulation work. The harness compares hashes of the
-captures at Present 1800 and 2200 as observable-result evidence; these support
-the replay and guest-time checks rather than replacing them. Draw calls,
+Workload equivalence is judged from gameplay phase and identical replay command
+indices at both boundaries, plus a gross guest-time sanity bound (33%). Present
+equality alone does not prove equal simulation work. The guest clock follows
+real frame time, so over a fixed Present window a faster side legitimately
+simulates less guest time: A/A runs of one binary differ by up to 12%. The
+harness records hashes of the captures at Present 1800 and 2200 as evidence
+only; rendering is not pixel-deterministic, and identical binaries never
+produced matching hashes. Draw calls,
 shader uploads, locks, helper/dispatch counts, cycles, and other implementation
 costs are optimization outcomes: the bridge records draw calls, shader-constant
 uploads, and resource locks per Present and reports their per-run totals and A/B
@@ -32,14 +35,22 @@ because an implementation-cost counter differs.
 
 Comparisons (`-Compare`) take `D:\ac1_bench.lock` exclusively. If another worker
 owns it, wait or pass `-Exploratory` to label a non-controlled run. Pairs
-alternate AB/BA; the adaptive interval uses paired main-thread CPU ms/frame and
-reports the 95% bootstrap CI, spread, valid pair count, and stop reason. Per-frame
-cycles/frame distributions are reported alongside CPU time. A/A calibration
-uses the same binary on both sides:
+alternate AB/BA; the adaptive interval uses the paired per-run median of
+main-thread cycles/frame and reports the 95% bootstrap CI, spread, valid pair
+count, and stop reason. CPU ms/frame is still reported, but it is quantized to
+one 15.625 ms scheduler tick per 16 Presents (~0.98 ms/frame, ~3%). A/A
+calibration uses the same binary on both sides:
 
 ```powershell
 tools/bench_gameplay.ps1 -Compare -Binary build/host-relwithdebinfo/ac1_startup.exe -BinaryB build/host-relwithdebinfo/ac1_startup.exe -Runs 1
 ```
+
+The first A/A calibration (main `92d4a98`, eight pairs, CCD0, other processes
+at 1-2% CPU) gave paired cycles/frame deltas with median +0.18%, bootstrap 95%
+CI [-2.6%, +2.9%] and per-run CV 2.0% around ~128M cycles/frame (~31 ms of a
+~31.5 ms frame; the main thread is the critical path). Eight pairs therefore
+resolve effects of roughly 3% or larger; smaller effects need an isolated
+region benchmark or more pairs.
 
 To collect runtime CSV without a benchmark, set `AC1_FRAME_STATS` to a writable
 path. The Android launcher accepts an app-private destination:
