@@ -5,8 +5,8 @@
 #include <stdint.h>
 
 /* Guest memory uses sparse, bounded mappings. Backing storage belongs to caller. */
-/* AC1 startup exceeds the donor's 256-region bookkeeping capacity. */
-#define GUEST_MEMORY_MAX_REGIONS 4096u
+/* One record per 64 KiB reservation across the 4 GiB guest arena. */
+#define GUEST_MEMORY_MAX_REGIONS 65536u
 
 typedef struct guest_address_space guest_address_space;
 /* A process owns the mappings; TLS selects that process, never copies its
