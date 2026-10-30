@@ -51,7 +51,7 @@ def run(label, command, env=None):
 GCC = MINGW / "gcc.exe"
 run("resources", [MINGW / "windres.exe", "tests/ac1_win32_compat_fixture.rc", "-o", OUT / "fixture-res.o"])
 run("fixture-build", [GCC, "-std=gnu11", "-Wall", "-Wextra", "-Werror",
-    "-Isrc/runtime", "tests/ac1_win32_compat_fixture.c", "src/runtime/ac1_files.c",
+    "-Isrc/runtime", "tests/ac1_win32_compat_fixture.c", "src/runtime/ac1_files.c", "src/platform/ac1_gamepad.c",
     OUT / "fixture-res.o", "-o", OUT / "fixture.exe", "-luser32", "-lwinmm"])
 run("fixture", [OUT / "fixture.exe"])
 run("files-build", [GCC, "-std=c11", "-Isrc/runtime", "tests/files_contract.c",

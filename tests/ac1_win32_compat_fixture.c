@@ -245,6 +245,9 @@ static int handle_import(CPU *c, const import_record *i)
     (void)i;
     return 0;
 }
+#include "../src/platform/ac1_gamepad.h"
+/* No replay in this Windows API oracle; test the submitted/native sources. */
+int ac1_input_session_pad(ac1_pad *p, int *c, uint32_t *n) { (void)p;(void)c;(void)n;return 0; }
 #include "ac1_win32_compat.inc"
 
 static unsigned checks, calls;

@@ -186,7 +186,7 @@ if(NOT ANDROID)
   endif()
   if(WIN32)
     add_executable(ac1_input_dinput_contract EXCLUDE_FROM_ALL
-      tests/input_dinput_contract.cpp src/platform/ac1_input_script.cpp)
+      tests/input_dinput_contract.cpp src/platform/ac1_input_script.cpp src/platform/ac1_gamepad.c)
     target_compile_features(ac1_input_dinput_contract PRIVATE cxx_std_17)
     target_link_libraries(ac1_input_dinput_contract PRIVATE user32)
     add_executable(ac1_input_window_contract EXCLUDE_FROM_ALL
@@ -207,7 +207,7 @@ if(NOT ANDROID)
     target_compile_features(ac1_dinput8_smoke PRIVATE cxx_std_17)
     target_link_libraries(ac1_dinput8_smoke PRIVATE ac1_runtime)
     add_executable(ac1_dinput8_state_contract EXCLUDE_FROM_ALL
-      src/platform/tests/dinput8_get_device_state_contract.cpp src/platform/ac1_input_script.cpp)
+      src/platform/tests/dinput8_get_device_state_contract.cpp src/platform/ac1_input_script.cpp src/platform/ac1_gamepad.c)
     target_compile_features(ac1_dinput8_state_contract PRIVATE cxx_std_17)
     target_link_libraries(ac1_dinput8_state_contract PRIVATE user32)
   endif()
