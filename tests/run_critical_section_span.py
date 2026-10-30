@@ -18,7 +18,7 @@ common = [gcc, "-O2", "-g", "-ffunction-sections", "-fdata-sections", "-Isrc/run
 commands = [
     common + ["-fwhole-program", "-Iwork/lift_initial", "-Iwork/lift_bink", "-c",
               "tests/critical_section_span.c", "-o", str(OUT / "fixture.obj")],
-    common + [str(OUT / "fixture.obj"), "src/runtime/guest_memory.c", "src/runtime/guest_clock.c",
+    common + [str(OUT / "fixture.obj"), "src/runtime/guest_memory.c", "src/runtime/guest_clock.c", "src/runtime/ac1_guest_time.c",
               "src/runtime/ac1_files.c", "src/runtime/ac1_profile.c", "-Wl,--gc-sections",
               "-luser32", "-o", str(OUT / "fixture.exe")],
     [str(OUT / "fixture.exe"), *sys.argv[1:]],

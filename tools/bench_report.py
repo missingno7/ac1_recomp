@@ -4,7 +4,6 @@ import argparse
 import csv
 import hashlib
 import json
-import random
 import statistics
 import sys
 from pathlib import Path
@@ -145,29 +144,36 @@ def internal_run(run, seconds=0, workload="gameplay", start_present=1800,
     }
 
 
+# Two-sided 95% Student-t quantiles by degrees of freedom. A bootstrap of the
+# median over three same-sign A/A deltas always "excluded zero" (a 25% false
+# positive rate); the t interval on the mean is conservative for small n.
+T975 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365,
+        8: 2.306, 9: 2.262, 10: 2.228, 12: 2.179, 15: 2.131, 20: 2.086, 30: 2.042}
+
+
+def t975(df):
+    return T975[max(k for k in T975 if k <= df)] if df < 30 else 1.96
+
+
 def adaptive_decision(deltas, baseline, executed_pairs, min_pairs=3, max_pairs=8,
-                      practical_percent=1.0, bootstrap_samples=20000):
+                      practical_percent=1.0):
     deltas = [float(value) for value in deltas if value is not None]
     baseline = [float(value) for value in baseline if value is not None]
     center = statistics.median(deltas) if deltas else None
+    mean = statistics.mean(deltas) if deltas else None
     ci_low = ci_high = half_width = practical_threshold = None
     verdict = "insufficient valid pairs"
     stop_reason = "continue until minimum valid pair count"
     stop = False
     if baseline:
         practical_threshold = statistics.median(baseline) * practical_percent / 100.0
-    if len(deltas) >= min_pairs:
-        rng = random.Random(0xAC1B00 + len(deltas))
-        medians = [statistics.median(rng.choices(deltas, k=len(deltas)))
-                   for _ in range(bootstrap_samples)]
-        medians.sort()
-        ci_low = percentile(medians, 0.025)
-        ci_high = percentile(medians, 0.975)
-        half_width = (ci_high - ci_low) / 2.0
+    if len(deltas) >= max(2, min_pairs):
+        half_width = t975(len(deltas) - 1) * statistics.stdev(deltas) / len(deltas) ** 0.5
+        ci_low, ci_high = mean - half_width, mean + half_width
         if ci_low > 0 or ci_high < 0:
             stop = True
-            verdict = "B regression" if center > 0 else "B improvement"
-            stop_reason = "95% bootstrap CI excludes zero"
+            verdict = "B regression" if mean > 0 else "B improvement"
+            stop_reason = "95% t CI of the mean paired delta excludes zero"
         elif practical_threshold is not None and half_width < practical_threshold:
             stop = True
             verdict = "no meaningful difference"
@@ -185,7 +191,7 @@ def adaptive_decision(deltas, baseline, executed_pairs, min_pairs=3, max_pairs=8
     return {
         "stop": stop, "stop_reason": stop_reason, "verdict": verdict,
         "executed_pairs": int(executed_pairs), "valid_pairs": len(deltas),
-        "paired_delta_median": center,
+        "paired_delta_median": center, "paired_delta_mean": mean,
         "paired_delta_min": min(deltas) if deltas else None,
         "paired_delta_max": max(deltas) if deltas else None,
         "paired_delta_spread": max(deltas) - min(deltas) if deltas else None,
@@ -221,7 +227,7 @@ def comparison_text(d):
         lines.extend([
             f"- Adaptive verdict: {decision.get('verdict')}; stop reason: {decision.get('stop_reason')}",
             f"- Valid paired main-thread cycles/frame deltas (B - A): n={decision.get('valid_pairs')}, median={decision.get('paired_delta_median')}, spread={decision.get('paired_delta_min')}..{decision.get('paired_delta_max')} (range {decision.get('paired_delta_spread')})",
-            f"- 95% bootstrap CI: [{decision.get('ci95_low')}, {decision.get('ci95_high')}] cycles/frame; half-width={decision.get('ci95_half_width')}; practical threshold={decision.get('practical_threshold')} cycles/frame",
+            f"- Mean paired delta {decision.get('paired_delta_mean')}; 95% t CI: [{decision.get('ci95_low')}, {decision.get('ci95_high')}] cycles/frame; half-width={decision.get('ci95_half_width')}; practical threshold={decision.get('practical_threshold')} cycles/frame",
             "",
         ])
     side_metrics = (("frametime_mean_ms", "mean frame time ms"),

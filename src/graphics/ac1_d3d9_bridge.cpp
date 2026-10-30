@@ -10,6 +10,7 @@
 #include "ac1_d3d9_bridge.h"
 extern "C" {
 #include "../runtime/guest_clock.h"
+#include "../runtime/ac1_guest_time.h"
 }
 #include "../platform/ac1_input_script.h"
 #ifdef AC1_PROFILE_HOOKS
@@ -88,7 +89,7 @@ public:
         const double process_cpu = process_cpu_seconds();
         const uint64_t thread_cycles = thread_cycle_count();
         const uint32_t processor = current_processor();
-        const uint64_t guest_ns = guest_monotonic_ns();
+        const uint64_t guest_ns = ac1_guest_time_ns();
         const uint64_t input_command = ac1_input_script_command_index();
         const uint64_t draws = g_successful_draw_calls;
         const uint64_t constant_uploads = g_frame_constant_uploads;
@@ -617,6 +618,7 @@ void trace_frame_success(bool is_present, const char *method)
     if (is_present) {
         g_successful_present_calls.fetch_add(1, std::memory_order_relaxed);
         g_frame_stats.present();
+        ac1_guest_time_present();
     }
 #ifdef AC1_PROFILE_HOOKS
     if (is_present && ac1_profile_frames_enabled) ac1_profile_present();

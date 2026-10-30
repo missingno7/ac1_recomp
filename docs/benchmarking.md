@@ -3,7 +3,16 @@
 `tools/bench_gameplay.ps1` measures the fixed successful-Present range 1800–2200
 (override with `-StartPresent`/`-EndPresent`). Gameplay follows
 `tools/input/to_gameplay.txt`; Present 1800–2200 is the steady WALK segment.
-`-Seconds` is only a safety timeout. The harness pins the game process to CCD0
+`-Seconds` is only a safety timeout. Runs use a deterministic guest clock
+(`-FixedFrameHz 30`, environment `AC1_FIXED_FRAME_HZ`): GetTickCount,
+timeGetTime, QueryPerformanceCounter and GetSystemTimeAsFileTime start at a
+fixed epoch and advance by exactly 1/30 s per Present, so every run simulates
+the same time-step sequence. Host waits and scheduling stay on real time; a
+thread polling the frozen clock more than 2^20 times in one frame is released
+by 1 us per read (reported once). With this clock Presents 1800-2200 cover
+walking through the crowd from the GRAB AND THROW prompt to the cobblestone
+area; `-FixedFrameHz 0` restores real time, where the window starts in the
+Animus white-out and reaches the CAMERA prompt. The harness pins the game process to CCD0
 (logical CPUs 0–15, mask `0x0000FFFF`), disables DXVK vsync, and stops its own
 game process after EndPresent. Stats flush every eight rows and flush immediately
 at EndPresent, preserving the final row without per-frame file writes.
@@ -36,8 +45,9 @@ because an implementation-cost counter differs.
 Comparisons (`-Compare`) take `D:\ac1_bench.lock` exclusively. If another worker
 owns it, wait or pass `-Exploratory` to label a non-controlled run. Pairs
 alternate AB/BA; the adaptive interval uses the paired per-run median of
-main-thread cycles/frame and reports the 95% bootstrap CI, spread, valid pair
-count, and stop reason. CPU ms/frame is still reported, but it is quantized to
+main-thread cycles/frame and reports the 95% Student-t CI of the mean paired
+delta, spread, valid pair count, and stop reason. (A bootstrap CI of the median
+over three same-sign A/A deltas always excluded zero.) CPU ms/frame is still reported, but it is quantized to
 one 15.625 ms scheduler tick per 16 Presents (~0.98 ms/frame, ~3%). A/A
 calibration uses the same binary on both sides:
 
@@ -51,6 +61,12 @@ CI [-2.6%, +2.9%] and per-run CV 2.0% around ~128M cycles/frame (~31 ms of a
 ~31.5 ms frame; the main thread is the critical path). Eight pairs therefore
 resolve effects of roughly 3% or larger; smaller effects need an isolated
 region benchmark or more pairs.
+
+With the fixed frame clock, four of six A/A runs rendered a bit-identical
+Present-1800 frame with identical draw and constant-upload counts; draw-count
+CV fell from 5.5% to 0.56% and run cycles/frame CV from 2.0% to 1.0% (~153M
+cycles/frame, ~23.5 FPS in the heavier crowd window). Three A/A pairs gave
+-1.2%, 95% t CI [-3.5%, +1.1%]: inconclusive, as it should be.
 
 To collect runtime CSV without a benchmark, set `AC1_FRAME_STATS` to a writable
 path. The Android launcher accepts an app-private destination:

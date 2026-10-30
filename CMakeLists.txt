@@ -36,6 +36,7 @@ add_library(ac1_runtime STATIC
   src/runtime/ac1_crypto.c
   src/platform/ac1_gamepad.c
   src/runtime/guest_clock.c
+  src/runtime/ac1_guest_time.c
   src/runtime/guest_memory.c
   src/runtime/pe32_loader.c
   src/runtime/pcrecomp_heap.c

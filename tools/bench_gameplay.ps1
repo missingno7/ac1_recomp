@@ -9,6 +9,8 @@ param(
     [ValidateRange(3, 8)][int]$MaxPairs = 8,
     [ValidateRange(0.1, 50.0)][double]$PracticalPercent = 1.0,
     [ValidateSet('gameplay','menu')][string]$Workload = 'gameplay',
+    # Deterministic guest time: exactly 1/N s per Present (0 = real time).
+    [ValidateRange(0, 1000)][int]$FixedFrameHz = 30,
     [switch]$DirectMemory = $true,
     [switch]$TraceEip = $true,
     [string]$LiftArgs = '',
@@ -149,7 +151,7 @@ public static class AC1BenchProcessTree {
                 }
                 $childArgs = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath,
                     '-Runs','1','-Seconds',[string]$Seconds,'-StartupTimeoutSeconds',[string]$StartupTimeoutSeconds,
-                    '-StartPresent',[string]$StartPresent,'-EndPresent',[string]$EndPresent,'-FrameStatsFlushFrames',[string]$FrameStatsFlushFrames,'-Workload',$Workload,
+                    '-StartPresent',[string]$StartPresent,'-EndPresent',[string]$EndPresent,'-FrameStatsFlushFrames',[string]$FrameStatsFlushFrames,'-Workload',$Workload,'-FixedFrameHz',[string]$FixedFrameHz,
                     '-ResultDirOverride',$sideDir,'-Label',"${side}-pair-${pair}",'-Python',$Python,'-GameExe',$GameExe,'-AllowDirty')
                 if ($sideBinary) { $childArgs += @('-Binary',$sideBinary) }
                 $childDirect = $DirectMemory; $childTrace = $TraceEip; $childInline = $ForceInline; $childLift = $LiftArgs
@@ -208,7 +210,7 @@ public static class AC1BenchProcessTree {
         }
         $comparison = [ordered]@{
             comparison=$true; exploratory=[bool]$Exploratory; lock_acquired=([bool]$benchLockStream); pin_mask='0x0000FFFF'; pair_count=$pair; min_pairs=$MinPairs; max_pairs=$MaxPairs; safety_timeout_seconds=$Seconds
-            start_present=$StartPresent; end_present=$EndPresent; workload_definition='fixed successful Present range; gameplay uses tools/input/to_gameplay.txt'; pair_equivalence=$pairEquivalence
+            start_present=$StartPresent; end_present=$EndPresent; fixed_frame_hz=$FixedFrameHz; workload_definition='fixed successful Present range; gameplay uses tools/input/to_gameplay.txt'; pair_equivalence=$pairEquivalence
             practical_percent=$PracticalPercent; adaptive_decision=$decision; host_load_override=[bool]$AllowBusy
             userdata_seed=$UserdataSeed; workload=$Workload; vsync='off (DXVK d3d9.presentInterval=0)'
             A=[ordered]@{ label=$sideLabels.A; binary=$Binary; runtime_env=$Env; runs=$sideRuns.A; failures=@($sideRuns.A | Where-Object { -not $_.reached_workload }).Count }
@@ -330,6 +332,7 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
         $envs['AC1_FRAME_STATS_FLUSH_FRAMES'] = [string]$FrameStatsFlushFrames
         $envs['AC1_FRAME_STATS_END_PRESENT'] = [string]$EndPresent
         $envs['AC1_PROFILE_FRAMES'] = '0'
+        $envs['AC1_FIXED_FRAME_HZ'] = if ($FixedFrameHz) { [string]$FixedFrameHz } else { '' }
         $envs['AC1_D3D9_CAPTURE_DIR'] = Join-Path $runDir 'captures'
         $envs['AC1_D3D9_CAPTURE_POINTS'] = "$StartPresent,$EndPresent"
         $envs['AC1_D3D9_CAPTURE_EVERY'] = ''
@@ -423,7 +426,7 @@ public static class AC1BenchMemory { [StructLayout(LayoutKind.Sequential,CharSet
     $actualBuildDir = if (Test-Path "build/bench-$key-make/CMakeCache.txt") { "build/bench-$key-make" } else { $buildDir }
     $actualGenerator = 'unknown'
     if (Test-Path "$actualBuildDir/CMakeCache.txt") { $generatorLine = Select-String -Path "$actualBuildDir/CMakeCache.txt" -Pattern '^CMAKE_GENERATOR:INTERNAL=' | Select-Object -First 1; if ($generatorLine) { $actualGenerator = ($generatorLine.Line -split '=',2)[1] } }
-    $obj = [ordered]@{ identity=[ordered]@{ sha=$sha; branch=$branch; dirty=$dirty; dirty_diff_sha256=$dirtyHash; config_id=$cfg; config=$cfgSpec; binary_sha256=$binaryHash; label=$Label; runtime_env=$Env }; machine=$machine; environment=[ordered]@{ workload=$Workload; safety_timeout_seconds=$Seconds; start_present=$StartPresent; end_present=$EndPresent; pin_mask='0x0000FFFF'; l3_domain_masks=$l3DomainMasks; frame_stats_flush_frames=$FrameStatsFlushFrames; startup_timeout_seconds=$StartupTimeoutSeconds; requested_runs=$Runs; replay=if ($Workload -eq 'gameplay') {'tools/input/to_gameplay.txt'} else {'none (menu remains idle)'}; profile='runtime-frame-stats'; profiler='none'; vsync='off (DXVK d3d9.presentInterval=0)'; host_load_override=[bool]$AllowBusy; actual_build_generator=$actualGenerator; gpu_sampling='not sampled' }; runs=$runsOut }
+    $obj = [ordered]@{ identity=[ordered]@{ sha=$sha; branch=$branch; dirty=$dirty; dirty_diff_sha256=$dirtyHash; config_id=$cfg; config=$cfgSpec; binary_sha256=$binaryHash; label=$Label; runtime_env=$Env }; machine=$machine; environment=[ordered]@{ workload=$Workload; fixed_frame_hz=$FixedFrameHz; safety_timeout_seconds=$Seconds; start_present=$StartPresent; end_present=$EndPresent; pin_mask='0x0000FFFF'; l3_domain_masks=$l3DomainMasks; frame_stats_flush_frames=$FrameStatsFlushFrames; startup_timeout_seconds=$StartupTimeoutSeconds; requested_runs=$Runs; replay=if ($Workload -eq 'gameplay') {'tools/input/to_gameplay.txt'} else {'none (menu remains idle)'}; profile='runtime-frame-stats'; profiler='none'; vsync='off (DXVK d3d9.presentInterval=0)'; host_load_override=[bool]$AllowBusy; actual_build_generator=$actualGenerator; gpu_sampling='not sampled' }; runs=$runsOut }
     $obj | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $resultDir 'result.json') -Encoding UTF8
     & $Python -B tools/bench_report.py --summary $resultDir
     Write-Host "Benchmark evidence: $resultDir"

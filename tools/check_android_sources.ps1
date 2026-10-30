@@ -19,7 +19,7 @@ $common = @('--target=aarch64-linux-android29', '-fsyntax-only', '-fPIC',
     "-I$DxvkInclude/windows", "-I$DxvkInclude/directx", "-I$FFmpegConfigInclude", "-I$FFmpegInclude")
 $sources = @(
     'src/runtime/ac1_runtime.c', 'src/runtime/ac1_profile.c', 'src/runtime/ac1_network.c',
-    'src/runtime/ac1_files.c', 'src/runtime/ac1_crypto.c', 'src/runtime/guest_clock.c',
+    'src/runtime/ac1_files.c', 'src/runtime/ac1_crypto.c', 'src/runtime/guest_clock.c', 'src/runtime/ac1_guest_time.c',
     'src/runtime/guest_memory.c', 'src/runtime/pe32_loader.c', 'src/runtime/pcrecomp_heap.c',
     'src/platform/ac1_audio_win32.c', 'src/platform/ac1_ds8_portable.cpp',
     'src/platform/ac1_dinput8_portable.cpp', 'src/platform/ac1_input_script.cpp',

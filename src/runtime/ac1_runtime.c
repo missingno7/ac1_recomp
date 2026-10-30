@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include "ac1_runtime.h"
+#include "ac1_guest_time.h"
 #include "ac1_profile.h"
 #include "ac1_native.h"
 #include "ac1_virtual_query.h"
@@ -2596,7 +2597,7 @@ static int handle_heap_import(CPU *cpu, const import_record *import)
         return 1;
     }
     if (!strcmp(name, "GetTickCount")) {
-        cpu->eax = (uint32_t)(guest_monotonic_ns() / UINT64_C(1000000));
+        cpu->eax = (uint32_t)(ac1_guest_time_ns() / UINT64_C(1000000));
         return_stdcall(cpu, 0);
         return 1;
     }
@@ -4836,7 +4837,7 @@ static int handle_clock_import(CPU *cpu, const import_record *import)
          * requests are scheduling hints; valid periods report TIMERR_NOERROR
          * and zero reports TIMERR_NOCANDO (97), as winmm does. */
         if (!strcmp(import->name, "timeGetTime")) {
-            cpu->eax = (uint32_t)(guest_monotonic_ns() / UINT64_C(1000000));
+            cpu->eax = (uint32_t)(ac1_guest_time_ns() / UINT64_C(1000000));
             return_stdcall(cpu, 0u);
             return 1;
         }
@@ -4864,6 +4865,18 @@ static int handle_clock_import(CPU *cpu, const import_record *import)
 #else
         value = UINT64_C(1000000000);
 #endif
+    } else if (!strcmp(import->name, "QueryPerformanceCounter") && ac1_guest_time_fixed()) {
+        /* Fixed frame clock in the frequency QueryPerformanceFrequency reports. */
+        const uint64_t ns = ac1_guest_time_ns();
+#ifdef _WIN32
+        LARGE_INTEGER frequency;
+        if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
+            stop_guest("performance counter frequency failed", import->token);
+        const uint64_t rate = (uint64_t)frequency.QuadPart;
+#else
+        const uint64_t rate = UINT64_C(1000000000);
+#endif
+        value = ns / UINT64_C(1000000000) * rate + ns % UINT64_C(1000000000) * rate / UINT64_C(1000000000);
     } else if (!strcmp(import->name, "QueryPerformanceCounter")) {
 #ifdef _WIN32
         LARGE_INTEGER counter;
@@ -5958,11 +5971,16 @@ static int handle_import(CPU *cpu, const import_record *import)
     if (!guest_memory_try_ptr(output, 8))
         stop_guest("GetSystemTimeAsFileTime output is unmapped", import->token);
 
+    uint64_t filetime;
+    if (ac1_guest_time_fixed()) {
+        /* 2008-04-08 12:00 UTC plus elapsed fixed guest time. */
+        filetime = UINT64_C(128521296000000000) + ac1_guest_time_ns() / 100u;
+    } else {
 #ifdef _WIN32
     FILETIME host_filetime;
     GetSystemTimeAsFileTime(&host_filetime);
-    uint64_t filetime = ((uint64_t)host_filetime.dwHighDateTime << 32) |
-                        host_filetime.dwLowDateTime;
+    filetime = ((uint64_t)host_filetime.dwHighDateTime << 32) |
+               host_filetime.dwLowDateTime;
 #else
     struct timespec now;
     if (clock_gettime(CLOCK_REALTIME, &now))
@@ -5971,9 +5989,10 @@ static int handle_import(CPU *cpu, const import_record *import)
     if (now.tv_sec < 0 ||
         (uint64_t)now.tv_sec > UINT64_MAX / UINT64_C(10000000) - epoch_delta)
         stop_guest("host UTC clock is outside FILETIME range", import->token);
-    uint64_t filetime = ((uint64_t)now.tv_sec + epoch_delta) * UINT64_C(10000000) +
-                        (uint64_t)now.tv_nsec / 100u;
+    filetime = ((uint64_t)now.tv_sec + epoch_delta) * UINT64_C(10000000) +
+               (uint64_t)now.tv_nsec / 100u;
 #endif
+    }
     wr32(output, (uint32_t)filetime);
     wr32(output + 4u, (uint32_t)(filetime >> 32));
     return_stdcall(cpu, 4u);
