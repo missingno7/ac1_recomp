@@ -54,7 +54,9 @@ static unsigned seed=0x584735;
 static unsigned rng(void){seed^=seed<<13;seed^=seed>>17;return seed^=seed<<5;}
 int main(void){
 '''
-    source += f'_putenv_s("AC1_NATIVE_VERIFY","{args.cases}"); ac1_native_init();\n'
+    source += ('_putenv_s("AC1_NATIVE_OVERRIDES","1");\n' +
+               f'_putenv_s("AC1_NATIVE_VERIFY","{args.cases}"); ac1_native_init();\n')
+    source += f'const uint64_t expected_checked = {args.cases}u;\n'
     source += 'wr32(0x1680f90,0x3f800000);\n'
     # One additional call exercises the NULL eligibility plan after the budget.
     source += f'for(unsigned i=0;i<{args.cases+1};++i){{\n'
@@ -90,6 +92,12 @@ int main(void){
   memset(memory+0x28000,0,64);
 #endif
   ac1_native_invoke(&c,&binding_0042EE70,oracle_0042EE70);
+ }
+ for(size_t k=0;k<ac1_native_binding_count;++k){
+   ac1_native_binding *b=ac1_native_bindings[k];
+   if(!b->enabled || b->checked != expected_checked || b->fallbacks){
+     fprintf(stderr,"native oracle has incomplete coverage for binding %08x\n",b->va);return 1;
+   }
  }
  ac1_native_shutdown(); puts("native leaf differential oracle passed"); return 0;
 }
