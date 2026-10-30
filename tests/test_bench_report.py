@@ -1,6 +1,5 @@
-"""Incomplete periodic flushes and guest stops must not become timing evidence."""
+"""Short runtime windows and adaptive pair decisions are reported correctly."""
 import importlib.util
-import json
 from pathlib import Path
 import unittest
 
@@ -11,45 +10,40 @@ spec.loader.exec_module(report)
 
 
 class FrameWindowTests(unittest.TestCase):
-    def fixture(self, name, retained_seconds, stop=False, dropped=0):
+    def fixture(self, name, retained_seconds, stop=False):
         path = ROOT / 'work/bench-report-tests' / name
         (path / 'captures').mkdir(parents=True, exist_ok=True)
-        (path / 'profile').mkdir(exist_ok=True)
-        (path / 'captures/present_002048.bmp').write_bytes(b'synthetic scene marker')
-        (path / 'startup.log').write_text('present_calls=2048 draw_calls=100\n' +
+        (path / 'captures/present_001300.bmp').write_bytes(b'synthetic scene marker')
+        (path / 'startup.log').write_text('AC1 D3D9 capture: present_001300.bmp (draw_calls=100)\n' +
                                          ('AC1 guest stop: synthetic stop\n' if stop else ''))
-        frames = list(range(2047)) + [2047 + i * 40 for i in range(int(retained_seconds * 25) + 1)]
-        (path / 'profile/raw_0.json').write_text(json.dumps({
-            'mode': 'frames', 'frequency': 1000, 'start': 0, 'frames': frames, 'frame_dropped': dropped}))
-        count = int(retained_seconds * 25) + 1
+        count = int(retained_seconds * 25)
         rows = ['present_index,wall_ms,main_thread_cpu_ms,process_cpu_ms']
-        rows.extend(f'{2048 + i},40,5,10' for i in range(1, count + 1))
+        rows.extend(f'{1316 + i},40,5,10' for i in range(count))
         (path / 'frame-stats.csv').write_text('\n'.join(rows) + '\n')
-        return report.internal_run(path, 60)
+        return report.internal_run(path, 30, 'gameplay', 1316, 1300, 8)
 
-    def test_periodic_flush_truncation_is_a_failure(self):
-        result = self.fixture('truncated', 53.8)
+    def test_short_runtime_frame_window_is_a_failure(self):
+        result = self.fixture('truncated', 25)
         self.assertFalse(result['reached_gameplay'])
         self.assertFalse(result['full_frame_window'])
-        self.assertIn('incomplete 60-second', result['failure']['reason'])
+        self.assertIn('incomplete 30-second', result['failure']['reason'])
 
-    def test_post_deadline_flush_preserves_exact_measurement_window(self):
-        result = self.fixture('complete', 72)
+    def test_short_periodic_flush_tolerance_keeps_a_complete_window(self):
+        result = self.fixture('complete', 31)
         self.assertTrue(result['reached_gameplay'])
         self.assertTrue(result['full_frame_window'])
-        self.assertEqual(result['measurement_elapsed_seconds'], 60)
+        self.assertEqual(result['measurement_elapsed_seconds'], 30)
         self.assertEqual(result['fps'], 25)
-        self.assertEqual(result['frames_in_window'], 1500)
+        self.assertEqual(result['frames_in_window'], 750)
         self.assertAlmostEqual(result['main_thread_cpu_ms_per_frame'], 5)
         self.assertAlmostEqual(result['process_cpu_ms_per_frame'], 10)
 
-    def test_guest_stop_and_lost_frames_are_failures(self):
-        self.assertFalse(self.fixture('stopped', 72, stop=True)['reached_gameplay'])
-        self.assertFalse(self.fixture('dropped', 72, dropped=1)['reached_gameplay'])
+    def test_guest_stop_is_a_failure(self):
+        self.assertFalse(self.fixture('stopped', 31, stop=True)['reached_gameplay'])
 
     def test_menu_workload_is_successful_without_claiming_gameplay(self):
-        self.fixture('menu', 72)
-        result = report.internal_run(ROOT / 'work/bench-report-tests/menu', 60, 'menu')
+        self.fixture('menu', 31)
+        result = report.internal_run(ROOT / 'work/bench-report-tests/menu', 30, 'menu', 1316, 1300, 8)
         self.assertTrue(result['reached_workload'])
         self.assertFalse(result['reached_gameplay'])
 
@@ -60,6 +54,23 @@ class FrameWindowTests(unittest.TestCase):
         text = report.comparison_text({'pair_count': 1, 'workload': 'gameplay',
             'A': side(5.0), 'B': side(7.0), 'paired_deltas': {}, 'vsync': 'off'})
         self.assertIn('main CPU median ms/frame: 2.0', text)
+
+    def test_adaptive_decision_stops_for_a_clear_difference(self):
+        result = report.adaptive_decision([9.5, 10.0, 10.5], [250, 252, 251], 3)
+        self.assertTrue(result['stop'])
+        self.assertEqual(result['verdict'], 'B regression')
+        self.assertGreater(result['ci95_low_ms'], 0)
+
+    def test_adaptive_decision_stops_as_neutral_with_a_narrow_ci(self):
+        result = report.adaptive_decision([0.0, 0.0, 0.0], [250, 250, 250], 3)
+        self.assertTrue(result['stop'])
+        self.assertEqual(result['verdict'], 'no meaningful difference')
+
+    def test_adaptive_decision_runs_to_maximum_when_inconclusive(self):
+        result = report.adaptive_decision([-3.0, 0.0, 3.0], [250, 250, 250], 8)
+        self.assertTrue(result['stop'])
+        self.assertEqual(result['executed_pairs'], 8)
+        self.assertEqual(result['stop_reason'], 'maximum pairs reached')
 
 
 if __name__ == '__main__':

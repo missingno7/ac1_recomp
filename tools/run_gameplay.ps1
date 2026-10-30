@@ -1,6 +1,6 @@
 param(
     [string]$Script = 'tools/input/to_gameplay.txt',
-    [ValidateRange(0, 86400)][int]$Seconds = 0,
+    [ValidateRange(0, 86400)][int]$Seconds = 45,
     [Alias('Env')][hashtable]$Environment = @{},
     [string]$GameExe = 'C:\Program Files (x86)\GOG.com\Assassins Creed\AssassinsCreed_Dx9.exe',
     [string]$OutputDirectory = '',
