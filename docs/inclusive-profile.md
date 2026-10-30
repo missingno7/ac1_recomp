@@ -24,6 +24,15 @@ overrides either rate. Native non-guest threads retain the existing separate
 flat sampler and have zero-depth stack records. Sampling captures are not FPS
 benchmarks.
 
+The report also lists host self symbols, their nearest extant guest callers,
+and native chains. Executable/COFF symbols are exact function names; stripped
+DLLs use explicitly marked nearest-export names, with instruction offsets in
+the chains. Large offsets can be private functions, not the named export.
+All resolution happens offline. Profiling counters themselves use MinGW
+emulated TLS: `dispatch -> __emutls_get_address -> pthread_getspecific` can be
+sampler-enabled accounting, so inspect the callsite before treating it as
+production overhead. Gameplay A/B runs keep `AC1_PROFILE=0`.
+
 Each `stacks_N.bin` record corresponds to the same ordinal in `raw_N.bin`:
 little-endian uint32 depth, uint32 status, uint64 suspension ticks, followed by
 96 uint64 PCs, leaf first. Unused PCs are zero. Return PCs are adjusted by one

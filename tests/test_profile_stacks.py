@@ -72,6 +72,9 @@ def main():
     assert max(shares.values())-min(shares.values())<1e-8, shares
     expected_path=['00401000','00402000','00402000','00403000']
     assert any(r['path']==expected_path and r['self_ms']>0 for r in report['trees'])
+    assert all(r['path'] for r in report['host_chains']), 'empty native chain'
+    assert abs(sum(r['ms'] for r in report['host_symbols']) -
+               sum(r['ms'] for r in report['host_callers'])) < 1e-8
     print(f'PASS: {good}/{total} nested guest chains, no truncated walks; disabled emits nothing')
 
 if __name__ == '__main__': main()

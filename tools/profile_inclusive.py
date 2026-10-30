@@ -11,9 +11,11 @@ import argparse
 import bisect
 from collections import Counter, defaultdict
 import json
+import re
+import subprocess
 from pathlib import Path
 import struct
-from profile_report import SAMPLE, GUEST, category, load_symbols, syscall_parked, percentile, thread_cpu
+from profile_report import SAMPLE, GUEST, category, load_symbols, pe_exports, syscall_parked, percentile, thread_cpu
 
 def analyze(capture, exe, low_seconds=0, seconds=60, present=None):
     captures = [(p, json.loads(p.read_text())) for p in capture.glob('raw_*.json')]
@@ -35,6 +37,7 @@ def analyze(capture, exe, low_seconds=0, seconds=60, present=None):
     cpus = {tid:max(0,value-before.get(tid,0))/10000 for tid,value in thread_cpu(bounds[-1]).items()}
     rvas,names = load_symbols(exe,'C:/msys64/mingw64/bin/nm.exe')
     symbol_cache = {}
+    external_symbols = {}
     def symbolize(pc, modules):
         if pc in symbol_cache: return symbol_cache[pc]
         for m in modules:
@@ -45,7 +48,25 @@ def analyze(capture, exe, low_seconds=0, seconds=60, present=None):
                     name=names[i] if i>=0 else '[unknown exe]'
                     match=GUEST.search(name)
                     result=(name,category(name),f'{int(match[1],16):08X}' if match else None)
-                else: result=(mod+'+0x'+format(pc-m['base'],'x'),'external: '+mod,None)
+                else:
+                    if m['path'] not in external_symbols:
+                        try:
+                            # Stripped system DLLs have no COFF table. Avoid
+                            # spawning nm just to print its "no symbols" error.
+                            with Path(m['path']).open('rb') as stream:
+                                header = stream.read(4096)
+                            pe = struct.unpack_from('<I', header, 0x3c)[0]
+                            table, count = struct.unpack_from('<II', header, pe+12)
+                            if not table or not count: raise ValueError('stripped DLL')
+                            external_symbols[m['path']] = (*load_symbols(Path(m['path']), 'C:/msys64/mingw64/bin/nm.exe'), 'COFF')
+                        except (OSError, ValueError, struct.error, subprocess.CalledProcessError):
+                            exports = pe_exports(m['path'])
+                            external_symbols[m['path']] = ([r for r,n in exports], [n for r,n in exports], 'nearest export')
+                    starts, labels, source = external_symbols[m['path']]
+                    rva = pc-m['base']
+                    i = bisect.bisect_right(starts, rva)-1
+                    label = (labels[i] if source == 'COFF' else f'{labels[i]}+0x{rva-starts[i]:x} [nearest export]') if i>=0 else f'+0x{rva:x}'
+                    result=(mod+'!'+label,'external: '+mod,None)
                 symbol_cache[pc]=result
                 return result
         return ('[unknown image]','unknown',None)
@@ -55,6 +76,8 @@ def analyze(capture, exe, low_seconds=0, seconds=60, present=None):
     parked_tree=defaultdict(Counter); alltree=defaultdict(Counter)
     tree_self=defaultdict(Counter); inc_details=defaultdict(Counter)
     statuses=Counter(); suspensions=[]; coverage=Counter(); pause_ms=Counter()
+    host_symbols=defaultdict(Counter); host_callers=defaultdict(Counter)
+    host_chains=defaultdict(Counter)
     for path,d in captures:
         if d['end']<low or d['start']>high: continue
         fmt=struct.Struct('<IIQ'+'Q'*d['stack_depth'])
@@ -88,6 +111,15 @@ def analyze(capture, exe, low_seconds=0, seconds=60, present=None):
                 for i in range(1,len(rootpath)+1): parked_tree[tid][rootpath[:i]]+=1
             if not flags&1 or parked: continue
             running[tid]+=1; categories[tid][leaf[1]]+=1
+            if not leaf[2]:
+                # Group exported functions across instruction offsets, retaining
+                # exact nearest-export offsets in the native chains below.
+                host_name=re.sub(r'\+0x[0-9a-f]+ \[nearest export\]$', ' [nearest export]', leaf[0])
+                host_symbols[tid][host_name]+=1
+                host_callers[tid][(host_name,chain[0] if chain else '[no guest frame]')]+=1
+                native_chain=tuple(symbolize(pc,d['modules'])[0] for pc in pcs[:depth]
+                                   if not symbolize(pc,d['modules'])[2])
+                host_chains[tid][native_chain[:8] or (leaf[0],)]+=1
             coverage['active']+=1; coverage['with_guest_chain']+=bool(chain)
             if guest: coverage['registered_guest_active']+=1; coverage['registered_with_chain']+=bool(chain)
             if leaf[2]: body[tid][leaf[2]]+=1
@@ -115,8 +147,8 @@ def analyze(capture, exe, low_seconds=0, seconds=60, present=None):
     tree_self_ms=weighted(tree_self)
     host_details=defaultdict(dict)
     for (va,cat),ms in weighted(inc_details).items(): host_details[va][cat]=ms
-    def rows(counter):
-        return [{'va':k,'ms':v,'cpu_percent':100*v/max(total_cpu,1),
+    def rows(counter, key='va'):
+        return [{key:k,'ms':v,'cpu_percent':100*v/max(total_cpu,1),
                  'ms_per_frame':v/max(len(selected_frames)-1,1)} for k,v in counter.most_common()]
     selected_frames=[f for f in frames if low<=f<high]
     intervals=sorted((b-a)*1000/hz for a,b in zip(selected_frames,selected_frames[1:]))
@@ -150,6 +182,11 @@ def analyze(capture, exe, low_seconds=0, seconds=60, present=None):
             'suspend_ms_p50_p95_p99':[percentile(sorted(suspensions),q) for q in (.5,.95,.99)],
             'inclusive':rows(inclusive),'self_with_host':rows(selftime),'self_body':rows(bodies),
             'categories':dict(cats),'host_details_samples':dict(details),
+            'host_symbols':rows(weighted(host_symbols), 'symbol'),
+            'host_callers':[{'symbol':n,'guest':va,'ms':ms,'cpu_percent':100*ms/max(total_cpu,1)}
+                            for (n,va),ms in weighted(host_callers).most_common()],
+            'host_chains':[{'path':list(p),'ms':ms,'cpu_percent':100*ms/max(total_cpu,1)}
+                           for p,ms in weighted(host_chains).most_common()],
             'inclusive_host_ms':dict(host_details),
             'trees':[{'path':list(k),'ms':v,'cpu_percent':100*v/max(total_cpu,1),
                       'self_ms':tree_self_ms[k]} for k,v in trees.most_common()],
@@ -164,6 +201,12 @@ def text_report(d):
         for r in d[key][:45]: lines.append(f"  {r['cpu_percent']:7.3f}% {r['ms_per_frame']:8.3f} ms/frame  {r['va']}")
     lines.append('Inclusive subtree roots (overlapping paths)')
     for r in d['trees'][:100]: lines.append(f"  {r['cpu_percent']:7.3f}% {' > '.join(r['path'])}")
+    lines.append('Host self symbols (system DLL fallback is explicitly nearest-export + offset)')
+    for r in d['host_symbols'][:80]: lines.append(f"  {r['cpu_percent']:7.3f}% {r['ms_per_frame']:8.3f} ms/frame  {r['symbol']}")
+    lines.append('Host self symbols by nearest extant guest caller')
+    for r in d['host_callers'][:80]: lines.append(f"  {r['cpu_percent']:7.3f}% {r['symbol']} <- {r['guest']}")
+    lines.append('Host chains (leaf first, guest frames omitted)')
+    for r in d['host_chains'][:80]: lines.append(f"  {r['cpu_percent']:7.3f}% {' < '.join(r['path'])}")
     return '\n'.join(lines)+'\n'
 
 def main():
