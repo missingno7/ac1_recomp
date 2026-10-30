@@ -1,7 +1,8 @@
-/* In-process Windows x64 sampler. Only GetThreadContext/QueryThreadCycleTime,
- * fixed-size copies and ResumeThread occur while a target is suspended.
- * In particular module enumeration, allocation and all I/O happen afterwards.
- * Samples are statistical CPU-activity observations, not stack unwinds. */
+/* In-process Windows x64 sampler. While suspended: context/cycle queries,
+ * fixed-size copies, optional static-table RtlVirtualUnwind, then resume.
+ * Module enumeration, allocation, symbolization and all I/O happen afterwards.
+ * AC1_PROFILE_STACKS adds no generated-code or guest-thread work. Explicit
+ * count builds separately insert selected entry counters, never timers. */
 #include "ac1_profile.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,19 @@ int ac1_profile_enabled, ac1_profile_frames_enabled;
 #define MAX_MODULES 4096
 #define SAMPLE_CAP 262144
 #define FRAME_CAP 65536
+#define STACK_DEPTH 96
+typedef struct {
+    uint32_t depth, status; /* 1=depth cap, 2=unknown image, 4=bad stack progression */
+    uint64_t suspension_ticks;
+    uint64_t pc[STACK_DEPTH]; /* leaf first, return PCs adjusted by -1 */
+} stack_sample;
+static stack_sample *stacks;
+static int stacks_enabled;
+#define COUNT_ENTRIES 32
+static uint32_t count_targets[COUNT_ENTRIES];
+static unsigned count_target_count;
+static volatile LONG64 entry_counts[COUNT_ENTRIES];
+static uint64_t *frame_counts;
 _Thread_local ac1_profile_counts *ac1_profile_current;
 typedef struct {
     uint64_t tick, rip, cycles;
@@ -38,7 +52,13 @@ typedef struct { DWORD tid; HANDLE handle; ULONG64 cycles; int baseline; unsigne
 typedef struct { DWORD tid; uint64_t first, last; } cpu_info;
 static cpu_info cpu_history[MAX_THREADS];
 static unsigned cpu_count;
-typedef struct { uint64_t base, size, tick; char path[1024]; int active; } module_info;
+typedef struct {
+    uint64_t base, size, tick;
+    char path[1024]; int active;
+    HMODULE held;
+    PRUNTIME_FUNCTION unwind;
+    unsigned unwind_count;
+} module_info;
 static guest_info guests[MAX_GUESTS];
 static thread_info threads[MAX_THREADS];
 static module_info modules[MAX_MODULES];
@@ -52,6 +72,7 @@ static DWORD sampler_id, native_sampler_id;
 static SRWLOCK records_lock=SRWLOCK_INIT;
 static SRWLOCK suspension_gate=SRWLOCK_INIT;
 static uint64_t frequency, start_tick, interval_start, dropped, errors, frame_dropped;
+static uint64_t sample_period_ticks;
 static double interval_seconds;
 static char output_dir[32768];
 static uint64_t wait_stubs[32];
@@ -95,6 +116,19 @@ static unsigned remember_module(uint64_t base, uint64_t size, const char *path, 
     if (module_count==MAX_MODULES) { ++errors; return 0; }
     module_info *m=&modules[module_count++];
     m->base=base; m->size=size; m->tick=tick; m->active=1;
+    /* Outside suspension: cache static tables. Do not call loader/table lookup
+     * APIs from the unwinder (dynamic/JIT function tables are not supported). */
+    m->held=NULL; m->unwind=NULL; m->unwind_count=0;
+    if(stacks_enabled && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                          (LPCWSTR)(uintptr_t)base,&m->held)) {
+        /* Keep unwind/code pages live until the samplers join. Profiling thus
+         * delays DLL unload; default/flat execution retains original lifetime. */
+        IMAGE_DOS_HEADER *dos=(IMAGE_DOS_HEADER *)(uintptr_t)base;
+        IMAGE_NT_HEADERS *nt=(IMAGE_NT_HEADERS *)(uintptr_t)(base+dos->e_lfanew);
+        IMAGE_DATA_DIRECTORY d=nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        m->unwind=d.VirtualAddress ? (PRUNTIME_FUNCTION)(uintptr_t)(base+d.VirtualAddress) : NULL;
+        m->unwind_count=d.Size/sizeof(RUNTIME_FUNCTION);
+    }
     snprintf(m->path,sizeof(m->path),"%s",path);
     return module_count;
 }
@@ -149,6 +183,37 @@ static void refresh_threads(void)
     } while(Thread32Next(snap,&te));
     CloseHandle(snap);
 }
+static void unwind_sample(CONTEXT context, stack_sample *out)
+{
+    /* Only fixed-table lookup, stack loads and RtlVirtualUnwind(NHANDLER).
+     * This never executes an exception handler, symbolizes or allocates.
+     * The suspension gate keeps our module snapshot stable. */
+    uint64_t first_rsp=context.Rsp;
+    while(context.Rip && out->depth<STACK_DEPTH) {
+        uint64_t pc=context.Rip-(out->depth!=0), old_rsp=context.Rsp;
+        out->pc[out->depth++]=pc;
+        module_info *m=NULL;
+        for(unsigned i=0;i<module_count;++i)
+            if(modules[i].active && pc>=modules[i].base && pc-modules[i].base<modules[i].size) { m=&modules[i]; break; }
+        if(!m || !m->held) { out->status|=2; break; }
+        unsigned lo=0, hi=m->unwind_count;
+        while(lo<hi) {
+            unsigned mid=lo+(hi-lo)/2;
+            if(m->unwind[mid].BeginAddress<=pc-m->base) lo=mid+1; else hi=mid;
+        }
+        PRUNTIME_FUNCTION fn=lo ? &m->unwind[lo-1] : NULL;
+        if(fn && pc-m->base<fn->EndAddress) {
+            PVOID data; DWORD64 frame;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER,m->base,pc,fn,&context,&data,&frame,NULL);
+        } else {
+            /* Windows x64 leaf ABI, no unwind record. */
+            context.Rip=*(const uint64_t *)(uintptr_t)context.Rsp;
+            context.Rsp+=8;
+        }
+        if(context.Rsp<=old_rsp || context.Rsp-first_rsp>16u*1024u*1024u) { out->status|=4; break; }
+    }
+    if(out->depth==STACK_DEPTH && context.Rip) out->status|=1;
+}
 static void take_samples(int native)
 {
     AcquireSRWLockShared(&records_lock);
@@ -162,10 +227,12 @@ static void take_samples(int native)
             if((DWORD)InterlockedCompareExchange(&guests[j].tid,0,0)==t->tid &&
                !InterlockedCompareExchange(&guests[j].finished,0,0)) { g=&guests[j]; slot=j; break; }
         if((g==NULL)!=native || InterlockedCompareExchange(&t->busy,1,0)) continue;
-        CONTEXT context; memset(&context,0,sizeof(context)); context.ContextFlags=CONTEXT_CONTROL;
+        CONTEXT context; memset(&context,0,sizeof(context)); context.ContextFlags=stacks_enabled && g ? CONTEXT_FULL : CONTEXT_CONTROL;
         sample s={0}; s.tick=now(); s.tid=t->tid;
+        stack_sample stack={0};
         ac1_profile_counts counts={0};
         AcquireSRWLockShared(&suspension_gate);
+        s.tick=now(); /* exclude waiting for the sampler's flush gate */
         if(SuspendThread(t->handle)==(DWORD)-1) {
             ReleaseSRWLockShared(&suspension_gate);
             if(WaitForSingleObject(t->handle,0)!=WAIT_OBJECT_0) {
@@ -185,7 +252,9 @@ static void take_samples(int native)
             if(*(const volatile unsigned *)g->owner==slot) s.flags|=2;
             counts=g->counts;
         }
+        if(ok && stacks_enabled && g) unwind_sample(context,&stack);
         DWORD resumed=ResumeThread(t->handle);
+        if(stacks_enabled) stack.suspension_ticks=now()-s.tick;
         ReleaseSRWLockShared(&suspension_gate);
         /* TARGET RESUMED */
         AcquireSRWLockExclusive(&records_lock);
@@ -199,7 +268,11 @@ static void take_samples(int native)
         for(unsigned j=0;j<wait_stub_count;++j)
             if(s.rip>=wait_stubs[j] && s.rip-wait_stubs[j]<32) { s.flags|=8; break; }
         s.module=module_at(s.rip,s.tick,0);
-        if(sample_count<SAMPLE_CAP) samples[sample_count++]=s; else ++dropped;
+        if(sample_count<SAMPLE_CAP) {
+            samples[sample_count]=s;
+            if(stacks_enabled) stacks[sample_count]=stack;
+            ++sample_count;
+        } else ++dropped;
         ReleaseSRWLockExclusive(&records_lock);
         InterlockedExchange(&t->busy,0);
     }
@@ -214,6 +287,7 @@ static void flush(uint64_t end)
 {
     AcquireSRWLockExclusive(&suspension_gate);
     AcquireSRWLockExclusive(&records_lock);
+    uint64_t written=(uint64_t)InterlockedCompareExchange64(&frame_write,0,0);
     for(unsigned i=0;i<sample_count;++i)
         if(!samples[i].module) samples[i].module=module_at(samples[i].rip,samples[i].tick,1);
     char path[32768]; snprintf(path,sizeof(path),"%s/raw_%u.bin",output_dir,sequence);
@@ -221,11 +295,34 @@ static void flush(uint64_t end)
     if(!f) { fprintf(stderr,"AC1 profile: cannot write %s\n",path); ++errors; ReleaseSRWLockExclusive(&records_lock); ReleaseSRWLockExclusive(&suspension_gate); return; }
     if(fwrite(samples,sizeof(sample),sample_count,f)!=sample_count) ++errors;
     fclose(f);
+    if(frame_counts) {
+        snprintf(path,sizeof(path),"%s/counts_%u.bin",output_dir,sequence);
+        f=fopen(path,"wb");
+        if(!f) ++errors;
+        else {
+            uint64_t end_frame=written;
+            uint64_t begin_frame=frame_read;
+            if(end_frame-begin_frame>FRAME_CAP) begin_frame=end_frame-FRAME_CAP;
+            for(uint64_t n=begin_frame;n<end_frame;++n) {
+                if(fwrite(&n,sizeof(n),1,f)!=1 ||
+                   fwrite(frame_counts+(n%FRAME_CAP)*count_target_count,sizeof(uint64_t),count_target_count,f)!=count_target_count) ++errors;
+            }
+            fclose(f);
+        }
+    }
+    if(stacks_enabled) {
+        snprintf(path,sizeof(path),"%s/stacks_%u.bin",output_dir,sequence);
+        f=fopen(path,"wb");
+        if(!f) ++errors;
+        else { if(fwrite(stacks,sizeof(stack_sample),sample_count,f)!=sample_count) ++errors; fclose(f); }
+    }
     snprintf(path,sizeof(path),"%s/raw_%u.json",output_dir,sequence++);
     f=fopen(path,"w"); if(!f) { ++errors; ReleaseSRWLockExclusive(&records_lock); ReleaseSRWLockExclusive(&suspension_gate); return; }
     fprintf(f,"{\"version\":1,\"pid\":%lu,\"mode\":\"%s\",\"frequency\":%llu,\"run_start\":%llu,\"start\":%llu,\"end\":%llu,\"samples\":%u,\"dropped\":%llu,\"errors\":%llu,\"sampler_tid\":%lu,\"modules\":[",(unsigned long)GetCurrentProcessId(),ac1_profile_enabled?"sampling":"frames",(unsigned long long)frequency,(unsigned long long)start_tick,(unsigned long long)interval_start,(unsigned long long)end,sample_count,(unsigned long long)dropped,(unsigned long long)errors,(unsigned long)sampler_id);
     for(unsigned i=0;i<module_count;++i) { module_info *m=&modules[i]; if(i) fputc(',',f); fprintf(f,"{\"base\":%llu,\"size\":%llu,\"tick\":%llu,\"path\":",(unsigned long long)m->base,(unsigned long long)m->size,(unsigned long long)m->tick); json_string(f,m->path); fputc('}',f); }
-    fprintf(f,"],\"threads\":[");
+    fprintf(f,"],\"count_targets\":[");
+    for(unsigned i=0;i<count_target_count;++i) fprintf(f,"%s%u",i?",":"",count_targets[i]);
+    fprintf(f,"],\"stack_depth\":%u,\"stack_record_bytes\":%u,\"threads\":[",stacks_enabled?STACK_DEPTH:0,stacks_enabled?(unsigned)sizeof(stack_sample):0);
     for(unsigned i=0;i<thread_count;++i) cpu_history[threads[i].cpu_index].last=cpu_time(threads[i].handle);
     for(unsigned i=0;i<cpu_count;++i) {
         if(i) fputc(',',f);
@@ -243,7 +340,6 @@ static void flush(uint64_t end)
         fprintf(f,"],\"io_wait_completions\":%llu}",(unsigned long long)c.io_wait_completions);
     }
     fprintf(f,"],\"frames\":["); comma=0;
-    uint64_t written=(uint64_t)InterlockedCompareExchange64(&frame_write,0,0);
     if(written-frame_read>FRAME_CAP) { frame_dropped+=written-frame_read-FRAME_CAP; frame_read=written-FRAME_CAP; }
     while(frame_read<written) { if(comma++) fputc(',',f); fprintf(f,"%llu",(unsigned long long)frames[frame_read++%FRAME_CAP]); }
     fprintf(f,"],\"present_count\":%llu,\"frame_dropped\":%llu,\"sampler_cpu_100ns\":%llu}\n",(unsigned long long)written,(unsigned long long)frame_dropped,(unsigned long long)(cpu_time(GetCurrentThread())+(native_sampler?cpu_time(native_sampler):0))); fclose(f);
@@ -281,8 +377,8 @@ static DWORD WINAPI sample_thread(void *unused)
         int full=sample_count+thread_count>=SAMPLE_CAP;
         ReleaseSRWLockShared(&records_lock);
         if(tick-interval_start>=(uint64_t)(interval_seconds*frequency) || full) flush(tick);
-        deadline+=ac1_profile_enabled ? frequency/1000 : frequency/10;
-        if(deadline<=tick) deadline=tick+frequency/1000;
+        deadline+=ac1_profile_enabled ? sample_period_ticks : frequency/10;
+        if(deadline<=tick) deadline=tick+sample_period_ticks;
         LARGE_INTEGER due; due.QuadPart=-(LONGLONG)((deadline-tick)*10000000/frequency);
         if(!timer || !SetWaitableTimer(timer,&due,0,NULL,NULL,FALSE)) {
             if(WaitForSingleObject(stop_event,1)==WAIT_OBJECT_0) break;
@@ -301,6 +397,19 @@ void ac1_profile_init(void)
     const char *setting=getenv("AC1_PROFILE"), *frames_only=getenv("AC1_PROFILE_FRAMES");
     if(!(setting && !strcmp(setting,"1")) && !(frames_only && !strcmp(frames_only,"1"))) return;
     memset(guests,0,sizeof(guests)); ac1_profile_current=NULL; current_guest=NULL; cpu_count=0;
+    count_target_count=0;
+    for(unsigned i=0;i<COUNT_ENTRIES;++i) entry_counts[i]=0;
+    const char *targets=getenv("AC1_PROFILE_COUNTS");
+    while(targets && *targets) {
+        char *end; unsigned long target=strtoul(targets,&end,16);
+        if(end==targets || (*end && *end!=',') || target>UINT32_MAX || count_target_count==COUNT_ENTRIES) {
+            fprintf(stderr,"AC1 profile: invalid AC1_PROFILE_COUNTS near '%s' (max %u entries)\n",targets,COUNT_ENTRIES); exit(9);
+        }
+        for(unsigned i=0;i<count_target_count;++i) if(count_targets[i]==target) {
+            fprintf(stderr,"AC1 profile: duplicate count target %08lx\n",target); exit(9);
+        }
+        count_targets[count_target_count++]=(uint32_t)target; targets=*end ? end+1 : end;
+    }
     thread_count=module_count=sample_count=sequence=0; frame_read=0; frame_write=0; dropped=errors=frame_dropped=0;
     LARGE_INTEGER f; QueryPerformanceFrequency(&f); frequency=f.QuadPart;
     start_tick=interval_start=now();
@@ -325,8 +434,22 @@ void ac1_profile_init(void)
         FindClose(find);
     }
     samples=(sample *)VirtualAlloc(NULL,sizeof(sample)*SAMPLE_CAP,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+    const char *stack_setting=getenv("AC1_PROFILE_STACKS");
+    stacks_enabled=setting && !strcmp(setting,"1") && stack_setting && !strcmp(stack_setting,"1");
+    unsigned sample_hz=stacks_enabled ? 250u : 1000u;
+    const char *rate=getenv("AC1_PROFILE_HZ");
+    if(rate) {
+        char *end; unsigned long n=strtoul(rate,&end,10);
+        if(end==rate || *end || n<25 || n>2000) {
+            fprintf(stderr,"AC1 profile: AC1_PROFILE_HZ must be 25..2000, got '%s'\n",rate); exit(9);
+        }
+        sample_hz=(unsigned)n;
+    }
+    sample_period_ticks=frequency/sample_hz;
+    if(stacks_enabled) stacks=(stack_sample *)VirtualAlloc(NULL,sizeof(stack_sample)*SAMPLE_CAP,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
+    if(count_target_count) frame_counts=(uint64_t *)VirtualAlloc(NULL,sizeof(uint64_t)*FRAME_CAP*count_target_count,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
     stop_event=CreateEventW(NULL,TRUE,FALSE,NULL);
-    if(!samples || !stop_event) { fprintf(stderr,"AC1 profile: allocation/event failed %lu\n",GetLastError()); ac1_profile_shutdown(); return; }
+    if(!samples || !stop_event || (stacks_enabled && !stacks) || (count_target_count && !frame_counts)) { fprintf(stderr,"AC1 profile: allocation/event failed %lu\n",GetLastError()); ac1_profile_shutdown(); return; }
     ac1_profile_enabled=setting && !strcmp(setting,"1"); ac1_profile_frames_enabled=1;
     native_sampler_id=0;
     if(ac1_profile_enabled) {
@@ -373,7 +496,18 @@ void ac1_profile_present(void)
 {
     /* Guest Present calls are serialized by the baton. Publish after writing. */
     uint64_t index=(uint64_t)InterlockedCompareExchange64(&frame_write,0,0);
+    if(frame_counts) for(unsigned i=0;i<count_target_count;++i)
+        frame_counts[(index%FRAME_CAP)*count_target_count+i]=(uint64_t)InterlockedCompareExchange64(&entry_counts[i],0,0);
     frames[index%FRAME_CAP]=now(); InterlockedExchange64(&frame_write,(LONG64)(index+1));
+}
+void ac1_profile_entry(uint32_t target)
+{
+    if(!count_target_count) return;
+    for(unsigned i=0;i<count_target_count;++i) if(count_targets[i]==target) {
+        InterlockedIncrement64(&entry_counts[i]); return;
+    }
+    fprintf(stderr,"AC1 profile: count-instrumented entry %08x absent from AC1_PROFILE_COUNTS\n",target);
+    exit(9);
 }
 void ac1_profile_shutdown(void)
 {
@@ -382,6 +516,12 @@ void ac1_profile_shutdown(void)
     ac1_profile_enabled=ac1_profile_frames_enabled=0;
     if(stop_event) { CloseHandle(stop_event); stop_event=NULL; }
     if(samples) { VirtualFree(samples,0,MEM_RELEASE); samples=NULL; }
+    if(stacks) { VirtualFree(stacks,0,MEM_RELEASE); stacks=NULL; }
+    if(frame_counts) { VirtualFree(frame_counts,0,MEM_RELEASE); frame_counts=NULL; }
+    count_target_count=0;
+    for(unsigned i=0;i<module_count;++i)
+        if(modules[i].held) { FreeLibrary(modules[i].held); modules[i].held=NULL; }
+    stacks_enabled=0;
 }
 #else
 void ac1_profile_init(void) {}
@@ -393,4 +533,5 @@ void ac1_profile_wait_end(uint64_t s) { (void)s; }
 void ac1_profile_handoff(ac1_handoff_cause c) { (void)c; }
 void ac1_profile_transfer(uint64_t ns) { (void)ns; }
 void ac1_profile_present(void) {}
+void ac1_profile_entry(uint32_t target) { (void)target; }
 #endif

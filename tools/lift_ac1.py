@@ -3302,10 +3302,25 @@ def local_register_selection(selection: str, lifted: set[int]) -> set[int]:
     return selected
 
 
+def profile_count_entry(body: str, address: int) -> str:
+    """Count public entries in a dedicated build; normal bodies stay identical.
+
+    Applied after native wrapping so direct calls and indirect dispatch count
+    once, including native fallbacks. This mode is for counts, never timing.
+    """
+    pattern = rf'(void L_{address:08X}\(CPU \*c\)\s*\{{)'
+    replacement = (r'\1\n    extern void ac1_profile_entry(uint32_t);\n'
+                   f'    ac1_profile_entry(0x{address:08X}u);')
+    result, count = re.subn(pattern, replacement, body)
+    if count != 1:
+        raise ValueError(f'profile count entry 0x{address:08X}: expected one public definition, got {count}')
+    return result
+
+
 def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: Path,
               functions_per_tu: int, translation_unit_buckets: int = 0,
               emission_cache=None, direct_calls: bool = True, native_overrides=None,
-              flag_liveness: str = 'off', local_regs: str = 'off') -> dict:
+              flag_liveness: str = 'off', local_regs: str = 'off', profile_counts=()) -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
@@ -3468,6 +3483,13 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     for index, address in enumerate(lifted):
         if address in bindings:
             bodies[index] = wrap_native_binding(bodies[index], address, bindings[address])
+    count_entries = set(profile_counts)
+    if len(count_entries) > 32 or count_entries - set(lifted):
+        raise ValueError('profile counts require at most 32 successfully lifted entries: ' +
+                         ', '.join(f'0x{a:08X}' for a in sorted(count_entries-set(lifted))))
+    for index, address in enumerate(lifted):
+        if address in count_entries:
+            bodies[index] = profile_count_entry(bodies[index], address)
     if translation_unit_buckets < 0:
         raise ValueError("translation_unit_buckets must be zero or positive")
     if not translation_unit_buckets and functions_per_tu < 1:
@@ -3579,6 +3601,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "instruction_counts": instruction_counts,
         "relocation_entries": len(reloc_vas),
         "direct_call_sites": direct_sites,
+        "profile_count_entries": [f'{a:08X}' for a in sorted(count_entries)],
         "direct_callee_declarations": direct_prototypes,
         "native_overrides": [f"0x{a:08X}" for a in sorted(bindings)],
         'local_regs': {'requested': local_regs, 'admitted_count': local_count,
@@ -3718,6 +3741,8 @@ def main() -> int:
                         help='constant-mask intra-function flag liveness; off restores eager flags')
     parser.add_argument("--no-direct-calls", action="store_true",
                         help="keep constant main-catalog transfers in dispatch for A/B comparisons")
+    parser.add_argument('--profile-count-entries', default='',
+                        help='comma-separated hex entries to instrument in a dedicated count-only build (max 32)')
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--pcrecomp", type=Path)
     parser.add_argument("--python", type=Path)
@@ -3923,7 +3948,8 @@ def main() -> int:
                                 functions_per_tu, translation_unit_buckets,
                                 emission_cache, direct_calls=not args.no_direct_calls,
                                 native_overrides=config.get('native_overrides', []),
-                                flag_liveness=args.flag_liveness, local_regs=args.local_regs)
+                                flag_liveness=args.flag_liveness, local_regs=args.local_regs,
+                                profile_counts=[int(s, 16) for s in args.profile_count_entries.split(',') if s])
     except Exception:
         if emission_cache is not None:
             emission_cache.close()
@@ -3942,6 +3968,7 @@ def main() -> int:
         "flag_liveness": args.flag_liveness,
         "local_regs": lift_result["local_regs"],
         "direct_call_sites": lift_result["direct_call_sites"],
+        "profile_count_entries": lift_result['profile_count_entries'],
         "direct_callee_declarations": lift_result["direct_callee_declarations"],
         "native_overrides": lift_result["native_overrides"],
         "translation_unit_buckets": lift_result["translation_unit_buckets"],
