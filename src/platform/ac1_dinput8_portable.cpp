@@ -1,6 +1,7 @@
 /* Portable system keyboard/mouse DirectInput8 proxies using the bridge ABI. */
 #include "ac1_dinput8_bridge.h"
 #include "ac1_input_script.h"
+#include "ac1_pad_discovery.h"
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -173,6 +174,7 @@ extern "C" int ac1_dinput8_argument_count(uint32_t t) {
         case 8:
         case 25:
             return 1;
+        case 5:
         case 9:
             return 3;
         case 11:
@@ -236,6 +238,10 @@ extern "C" int ac1_dinput8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, u
             *hr = 0x80040110;
             return 1;
         }
+        if(ac1_pad_is_discovery(g)) {
+            uint32_t obj=wrap(k+2,3);if(!obj)return fail("Xbox discovery allocation failed");
+            word(a[2],obj);return 1;
+        }
         unsigned input = g[0] == 0x6f1d2b61 ? 1 : g[0] == 0x6f1d2b60 ? 2 : 0;
         if (!input || g[1] != 0x11cfd5a0 || g[2] != 0x4544c7bf || g[3] != 0x5453) {
             *hr = 0x80040154;
@@ -247,6 +253,16 @@ extern "C" int ac1_dinput8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, u
         word(a[2], obj);
         return 1;
     }
+    if (o.input == 3 && s > 2) {
+        if(s==5 && a[1]==24) {
+            uint32_t prop[5];
+            if(!read(a[2],prop,20)||prop[0]!=20||prop[1]!=16||prop[2]||prop[3])
+                return fail("Xbox discovery DIPROP_VIDPID requires 20-byte DIPH_DEVICE property");
+            prop[4]=0x028e045e;
+            return write(a[2],prop,20)?1:fail("Xbox discovery property output unmapped");
+        }
+        return fail("Xbox discovery only supports DIPROP_VIDPID; gameplay uses XInput");
+    }
     if (s == 4) {
         pending.clear();
         pending_size = k <= 3 ? 0x44c : 0x240;
@@ -254,6 +270,9 @@ extern "C" int ac1_dinput8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, u
         if (k == 2 || k == 4)
             return fail("ANSI enumeration is unsupported");
         if (k == 3) {
+            if ((!a[1] || a[1] == 4 || a[1] == 0x15) && ac1_pad_discovery_connected()) {
+                size_t base=pending.size();record(0x44c);ac1_pad_discovery_record(pending.data()+base);
+            }
             if (!a[1] || a[1] == 3 || a[1] == 0x13)
                 device(1);
             if (!a[1] || a[1] == 2 || a[1] == 0x12)

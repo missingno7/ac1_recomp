@@ -3,6 +3,7 @@
  * (copyright 2026 veritr1x, MIT; LICENSE.recomp-kit.txt). Host pointers and
  * host module handles never enter guest memory. This file is included once. */
 #include <limits.h>
+#include "../platform/ac1_gamepad.h"
 #ifndef _WIN32
 #include <dirent.h>
 #include <fcntl.h>
@@ -2275,31 +2276,9 @@ static int handle_win32_compat_import(CPU *cpu, const import_record *import)
                               : ordinal == 3 ? 4
                                              : 20,
                               import);
-        uint32_t result = 1167;
-#ifdef _WIN32
-        HMODULE module = LoadLibraryExA("xinput1_3.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (module) {
-            FARPROC p = GetProcAddress(module, (LPCSTR)(uintptr_t)ordinal);
-            if (p) {
-                if (ordinal == 4) {
-                    typedef DWORD(WINAPI * caps_fn)(DWORD, DWORD, XINPUT_CAPABILITIES *);
-                    caps_fn fn;
-                    memcpy(&fn, &p, sizeof(fn));
-                    result = fn(user, flags, buffer);
-                } else {
-                    typedef DWORD(WINAPI * state_fn)(DWORD, void *);
-                    state_fn fn;
-                    memcpy(&fn, &p, sizeof(fn));
-                    result = fn(user, buffer);
-                }
-            }
-            FreeLibrary(module);
-        }
-#else
-        (void)user;
-        (void)flags;
-        (void)buffer;
-#endif
+        uint32_t result = ordinal == 2 ? ac1_pad_get_state(user, buffer)
+                          : ordinal == 3 ? ac1_pad_set_state(user, buffer)
+                                         : ac1_pad_get_caps(user, flags, buffer);
         return wc_return(cpu, result, ordinal == 4 ? 3 : 2);
     }
     if (import->by_ordinal)

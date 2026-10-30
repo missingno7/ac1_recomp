@@ -1,0 +1,37 @@
+# AC1 title -> selected profile (or create Replay) -> main menu -> Continue/New Game.
+# Timing is in successful presents. DI state and WM key messages are generated together.
+# Keep the cursor away from menu rows so keyboard selection remains stable.
+at 0 pad connect
+at 0 mouse move 30 30
+at 200 tap RETURN 3
+at 400 tap RETURN 3
+# If Create New Profile was selected, enter its name. Existing-profile menus ignore text.
+at 500 tap R 2
++8 tap E 2
++8 tap P 2
++8 tap L 2
++8 tap A 2
++8 tap Y 2
+at 650 tap RETURN 3
+at 900 tap RETURN 3
+at 1200 tap RETURN 3
+at 1500 tap RETURN 3
+
+# Original-game movement, camera and contextual actions; raw XInput, positive Y up.
+at 1700 pad stick left 0 26000
+at 1850 pad stick right 16000 0
+at 1950 pad stick right 0 0
+at 2050 pad trigger RT 255
+at 2050 pad button A down
+at 2200 pad button A up
+at 2200 pad trigger RT 0
+at 2200 pad stick left 0 0
+at 2300 pad button Y down
+at 2303 pad button Y up
+at 2350 pad trigger LT 255
+at 2353 pad trigger LT 0
+at 2400 pad button X down
+at 2403 pad button X up
+at 2450 pad button B down
+at 2453 pad button B up
+at 2500 pad release

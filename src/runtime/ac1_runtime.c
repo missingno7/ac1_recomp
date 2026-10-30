@@ -18,6 +18,7 @@
 #include "bink_dispatch.h"
 #include "bink_module.h"
 #include "ac1_fingerprint.h"
+#include "../platform/ac1_pad_discovery.h"
 #include "../platform/ac1_audio_win32.h"
 #if defined(AC1_HOST_D3D9)
 #include "../graphics/ac1_d3d9_bridge.h"
@@ -3614,6 +3615,14 @@ static int handle_profile_import(CPU *cpu, const import_record *import)
          (value[0] == '\'' && value[value_length - 1u] == '\''))) {
         memmove(value, value + 1u, value_length - 2u);
         value[value_length - 2u] = '\0';
+    }
+    /* AC1 normally persists a manually selected device name. Prefer its real
+     * PadXenon scheme for the shared XInput source without rewriting game data. */
+    const char *pad_default = getenv("AC1_PAD_AUTOSELECT");
+    if (!strcmp(section,"Input") && !strcmp(key,"SelectedInput") &&
+        (!pad_default || strcmp(pad_default,"0")) && ac1_pad_discovery_connected()) {
+        snprintf(value,sizeof(value),"%s",AC1_PAD_PRODUCT_NAME);
+        fprintf(stderr,"AC1 input: selecting original controller scheme: %s\n",value);
     }
     if (capacity) {
         char *output = (char *)guest_memory_try_ptr(output_address, capacity);

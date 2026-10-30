@@ -3,6 +3,7 @@
 #define NOMINMAX
 #include "ac1_dinput8_bridge.h"
 #include "ac1_input_script.h"
+#include "ac1_pad_discovery.h"
 
 #include <windows.h>
 #include <dinput.h>
@@ -303,6 +304,7 @@ int method_argument_count(uint32_t token)
         return 4; /* CreateDevice(this, guid, output, outer). */
     if (kind == ObjectKind::InputW && slot == 4u)
         return 5; /* EnumDevices(this, type, callback, ref, flags). */
+    if (kind == ObjectKind::DeviceW && slot == 5u) return 3; /* GetProperty */
     if (kind == ObjectKind::DeviceW && slot == 4u)
         return 4; /* EnumObjects(this, callback, ref, flags). */
     if (kind == ObjectKind::DeviceW && slot == 7u)
@@ -395,9 +397,18 @@ int invoke_enum_objects(GuestObject &object, const uint32_t *args,
     return AC1_DINPUT8_HANDLED;
 }
 
+/* A discovery-only COM node. PadXenon never asks it for gameplay state. */
+class PadDiscovery final : public IUnknown {
+    ULONG refs = 1;
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void **out) override { if(out)*out=nullptr;return E_NOINTERFACE; }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+    ULONG STDMETHODCALLTYPE Release() override { ULONG n=--refs;if(!n)delete this;return n; }
+};
 struct EnumDevicesCollector {
     PendingEnumBatch *batch = nullptr;
     bool failed = false;
+    bool replace_pads = false;
 };
 
 BOOL CALLBACK collect_device_instance_w(LPCDIDEVICEINSTANCEW instance,
@@ -408,6 +419,7 @@ BOOL CALLBACK collect_device_instance_w(LPCDIDEVICEINSTANCEW instance,
         if (collector) collector->failed = true;
         return DIENUM_STOP;
     }
+    if (collector->replace_pads && (GET_DIDEVICE_TYPE(instance->dwDevType) == DI8DEVTYPE_GAMEPAD || GET_DIDEVICE_TYPE(instance->dwDevType) == DI8DEVTYPE_JOYSTICK)) return DIENUM_CONTINUE;
     if (!append_enum_record(collector->batch, instance)) {
         collector->failed = true;
         return DIENUM_STOP;
@@ -440,9 +452,14 @@ int invoke_enum_devices(GuestObject &object, const uint32_t *args,
     }
     PendingEnumBatch &batch = pending->second;
     batch.record_size = sizeof(DIDEVICEINSTANCEW);
-    EnumDevicesCollector collector{&batch, false};
+    const bool pad = ac1_pad_discovery_connected();
+    EnumDevicesCollector collector{&batch, false, pad};
     const HRESULT result = reinterpret_cast<IDirectInput8W *>(object.native)
         ->EnumDevices(args[1], collect_device_instance_w, &collector, args[4]);
+    if (SUCCEEDED(result) && pad && (args[1] == DI8DEVCLASS_ALL || args[1] == DI8DEVCLASS_GAMECTRL || args[1] == DI8DEVTYPE_GAMEPAD)) {
+        DIDEVICEINSTANCEW instance{};ac1_pad_discovery_record(&instance);
+        if (!append_enum_record(&batch,&instance)) collector.failed=true;
+    }
     batch.native_hresult = result;
     if (collector.failed) {
         g_pending_enum_batches.erase(pending);
@@ -680,6 +697,12 @@ int invoke_create_device(GuestObject &object, const uint32_t *args,
         return AC1_DINPUT8_ERROR;
     }
     *output = 0u;
+    if (ac1_pad_is_discovery(reinterpret_cast<const uint32_t *>(&device_guid))) {
+        if(object.kind != ObjectKind::InputW) { *result_out=DIERR_UNSUPPORTED;return AC1_DINPUT8_HANDLED; }
+        uint32_t address=wrap_native(new PadDiscovery, ObjectKind::DeviceW);
+        if(!address)return AC1_DINPUT8_ERROR;
+        g_objects.at(address).input_kind=3;*output=address;*result_out=DI_OK;return AC1_DINPUT8_HANDLED;
+    }
     HRESULT result = E_NOINTERFACE;
     IUnknown *native = nullptr;
     if (object.kind == ObjectKind::InputA) {
@@ -838,6 +861,19 @@ extern "C" int ac1_dinput8_dispatch(uint32_t token, const uint32_t *args,
         return AC1_DINPUT8_ERROR;
     }
     GuestObject &object = found->second;
+    if (object.input_kind == 3 && slot > 2u) {
+        if(slot == 5u && args[1] == 24u) {
+            uint32_t property[5];
+            if(!guest_read(args[2],property,20) || property[0]!=20 || property[1]!=16 || property[2] || property[3]) {
+                set_error("Xbox discovery DIPROP_VIDPID expects a 20-byte DIPH_DEVICE property");return AC1_DINPUT8_ERROR;
+            }
+            property[4]=0x028e045e;
+            if(!guest_write(args[2],property,20))return AC1_DINPUT8_ERROR;
+            *result_out=DI_OK;return AC1_DINPUT8_HANDLED;
+        }
+        set_error("Xbox discovery node supports only DIPROP_VIDPID; gameplay uses XInput");return AC1_DINPUT8_METHOD_UNSUPPORTED;
+    }
+    if (slot == 5u) { set_error("GetProperty is only implemented for the Xbox discovery node");return AC1_DINPUT8_METHOD_UNSUPPORTED; }
     if (slot == 0u) return invoke_query_interface(object, args, result_out);
     if (slot == 1u) {
         if (!object.guest_references) {

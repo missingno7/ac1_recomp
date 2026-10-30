@@ -83,3 +83,10 @@ and [MMX state-management description](https://www.intel.com/content/dam/support
 Native and generated-code checks are in `tests/run_mmx_general.py` and
 `tests/run_mmx_havok.py`; generated functions and oracle binaries stay private
 under `work/`.
+
+`src/platform/ac1_gamepad.c` reuses the XInput wire layouts, button masks,
+packet-state and disconnected-device design from the local recomp-kit
+`dx/xinput.cpp`, copyright 2026 veritr1x, MIT. The full license is retained in
+`LICENSE.recomp-kit.txt`. The AC1 discovery node and controller-selection policy
+follow the pinned executable's existing DirectInput-to-PadXenon branch; actual
+controller gameplay continues to execute the original translated game functions.

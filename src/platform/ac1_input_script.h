@@ -2,6 +2,7 @@
 #define AC1_INPUT_SCRIPT_H
 #include <stddef.h>
 #include <stdint.h>
+#include "ac1_gamepad.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -17,6 +18,7 @@ void ac1_input_free(ac1_input_script *script);
 void ac1_input_advance(ac1_input_script *script, uint64_t present);
 int ac1_input_pop(ac1_input_script *script, ac1_input_message *message);
 void ac1_input_keyboard(ac1_input_script *script, uint8_t state[256]);
+void ac1_input_pad(ac1_input_script *script, ac1_pad *out, int *connected, uint32_t *packet);
 void ac1_input_mouse(ac1_input_script *script, void *state, size_t size);
 int ac1_input_key_code(const char *name); /* DIK_NAME, NAME, or numeric DIK. */
 uint32_t ac1_input_key_vk(unsigned dik);

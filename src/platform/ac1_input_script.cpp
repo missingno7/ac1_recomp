@@ -175,7 +175,7 @@ int32_t signed_number(const std::string &s) {
         throw std::runtime_error("signed integer out of range: " + s);
     return static_cast<int32_t>(v);
 }
-enum Type { Key, Dik, Move, Button, MouseState, Wm };
+enum Type { Key, Dik, Move, Button, MouseState, Wm, PadConnect, PadButton, PadStick, PadTrigger, PadRelease };
 struct Event {
     uint64_t frame;
     Type type;
@@ -197,6 +197,9 @@ struct ac1_input_script {
     std::vector<Event> keyboard_samples, mouse_samples;
     std::array<uint8_t, 256> keys{}, vk{};
     std::array<uint8_t, 20> mouse{};
+    ac1_pad pad{};
+    int pad_connected = 0;
+    uint32_t pad_packet = 0;
     int32_t x = 0, y = 0;
     std::deque<ac1_input_message> messages;
 };
@@ -350,6 +353,36 @@ extern "C" ac1_input_script *ac1_input_parse(const char *text, char *error, size
                         throw std::runtime_error("invalid tap duration");
                     s->events.push_back({frame + duration, Key, static_cast<uint32_t>(k), 0});
                 }
+            } else if (command == "pad") {
+                if (pos == t.size()) throw std::runtime_error("missing pad command");
+                std::string sub = t[pos++];
+                if (sub == "connect" || sub == "disconnect" || sub == "release") {
+                    need(0);
+                    s->events.push_back({frame, sub == "release" ? PadRelease : PadConnect,
+                                         uint32_t(sub == "connect")});
+                } else if (sub == "button") {
+                    need(2);
+                    static const char *buttons[] = {"UP","DOWN","LEFT","RIGHT","START","BACK",
+                        "LS","RS","LB","RB",nullptr,nullptr,"A","B","X","Y"};
+                    unsigned bit = 16;
+                    for (unsigned i=0;i<16;++i) if (buttons[i] && t[pos] == buttons[i]) bit=i;
+                    if (bit == 16) throw std::runtime_error("unknown pad button: " + t[pos]);
+                    s->events.push_back({frame, PadButton, 1u << bit, state(t[pos+1])});
+                } else if (sub == "stick") {
+                    need(3);
+                    if (t[pos] != "left" && t[pos] != "right")
+                        throw std::runtime_error("pad stick left|right X Y");
+                    int x=signed_number(t[pos+1]), y=signed_number(t[pos+2]);
+                    if (x < -32768 || x > 32767 || y < -32768 || y > 32767)
+                        throw std::runtime_error("pad stick requires int16 raw values");
+                    s->events.push_back({frame, PadStick, uint32_t(t[pos] == "right"), uint32_t(x), uint32_t(y)});
+                } else if (sub == "trigger") {
+                    need(2);
+                    if (t[pos] != "LT" && t[pos] != "RT")
+                        throw std::runtime_error("pad trigger LT|RT 0..255");
+                    s->events.push_back({frame, PadTrigger, uint32_t(t[pos] == "RT"),
+                                         uint32_t(number(t[pos+1],255))});
+                } else throw std::runtime_error("unknown pad command: " + sub);
             } else if (command == "mouse") {
                 if (pos == t.size())
                     throw std::runtime_error("missing mouse command");
@@ -448,7 +481,24 @@ extern "C" void ac1_input_advance(ac1_input_script *s, uint64_t frame) {
     s->frame = frame;
     while (s->next < s->events.size() && s->events[s->next].frame <= frame) {
         const Event &e = s->events[s->next++];
+        ac1_pad old_pad = s->pad;
+        int old_connected = s->pad_connected;
         switch (e.type) {
+        case PadConnect:
+            s->pad_connected = e.a;
+            s->pad = {};
+            break;
+        case PadRelease: s->pad = {}; break;
+        case PadButton:
+            s->pad.buttons = e.b ? s->pad.buttons | e.a : s->pad.buttons & ~e.a;
+            break;
+        case PadStick:
+            if (e.a) { s->pad.rx = int16_t(e.b); s->pad.ry = int16_t(e.c); }
+            else { s->pad.lx = int16_t(e.b); s->pad.ly = int16_t(e.c); }
+            break;
+        case PadTrigger:
+            if (e.a) s->pad.rt = uint8_t(e.b); else s->pad.lt = uint8_t(e.b);
+            break;
         case Key: {
             bool was = (s->keys[e.a] & 0x80) != 0;
             s->keys[e.a] = static_cast<uint8_t>(e.b);
@@ -496,6 +546,8 @@ extern "C" void ac1_input_advance(ac1_input_script *s, uint64_t frame) {
             message(s, e.a, e.b, e.c);
             break;
         }
+        if (old_connected != s->pad_connected || std::memcmp(&old_pad, &s->pad, sizeof(old_pad)))
+            ++s->pad_packet;
     }
 }
 extern "C" int ac1_input_pop(ac1_input_script *s, ac1_input_message *m) {
@@ -780,4 +832,19 @@ extern "C" const ac1_input_message *ac1_input_dispatch_state(const ac1_input_mes
     const ac1_input_message *previous = dispatch;
     dispatch = m;
     return previous;
+}
+
+extern "C" void ac1_input_pad(ac1_input_script *s, ac1_pad *out, int *connected, uint32_t *packet) {
+    *out = s->pad; *connected = s->pad_connected; *packet = s->pad_packet;
+}
+extern "C" int ac1_input_session_pad(ac1_pad *out, int *connected, uint32_t *packet) {
+    char error[1024];
+    if (!ac1_input_session_init(error, sizeof(error))) {
+        std::fprintf(stderr, "AC1 XInput: %s\n", error); std::abort();
+    }
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (!session) return 0;
+    tick();
+    ac1_input_pad(session, out, connected, packet);
+    return 1;
 }
