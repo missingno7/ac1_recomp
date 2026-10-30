@@ -50,6 +50,50 @@ Java_org_ac1_recomp_LauncherActivity_nativeAudioPause(JNIEnv *env, jclass type, 
 extern void *Direct3DCreate9(uint32_t sdk_version);
 extern void dxvkAndroidSetWindow(ANativeWindow *window);
 extern void *dxvkAndroidGetWindowHandle(void);
+extern void dxvkAndroidSetRenderSize(uint32_t width, uint32_t height);
+
+/* Render at the display aspect: AC1_RENDER_SIZE=WxH, else display height
+ * capped at 720 lines (GPU cost) with the matching even width. */
+static void select_render_size(uint32_t *width, uint32_t *height) {
+    int32_t screen_width, screen_height;
+    const char *display = getenv("AC1_DISPLAY_SIZE"); /* physical display, set by the launcher */
+    if (!display || sscanf(display, "%dx%d", &screen_width, &screen_height) != 2 ||
+        screen_width <= 0 || screen_height <= 0)
+        ac1_android_surface_size(&screen_width, &screen_height);
+    if (screen_width < screen_height) { int32_t t = screen_width; screen_width = screen_height; screen_height = t; }
+    const char *setting = getenv("AC1_RENDER_SIZE");
+    unsigned w = 0, h = 0;
+    if (setting && sscanf(setting, "%ux%u", &w, &h) == 2 && w >= 320 && h >= 240 && w <= 8192 && h <= 8192) {
+        *width = w; *height = h; return;
+    }
+    h = screen_height > 720 ? 720u : (unsigned)screen_height;
+    w = (unsigned)(((uint64_t)screen_width * h / (unsigned)screen_height) & ~UINT64_C(1));
+    *width = w; *height = h;
+}
+
+/* A fresh profile has no [Graphics] section and AC1 then picks 640x480.
+ * Seed the display size once; the game rewrites the file with its choice. */
+static void seed_graphics_settings(const char *userdata, uint32_t width, uint32_t height) {
+    static const char *const parts[] = {"roaming", "Ubisoft", "Assassin's Creed"};
+    char path[4096];
+    size_t length = (size_t)snprintf(path, sizeof(path), "%s", userdata);
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]) && length < sizeof(path); ++i) {
+        length += (size_t)snprintf(path + length, sizeof(path) - length, "/%s", parts[i]);
+        if (mkdir(path, 0700) != 0 && errno != EEXIST) return;
+    }
+    if (length + 16u >= sizeof(path)) return;
+    strcat(path, "/Assassin.ini");
+    char existing[8192] = {0};
+    FILE *file = fopen(path, "rb");
+    if (file) { fread(existing, 1, sizeof(existing) - 1u, file); fclose(file); }
+    if (strstr(existing, "[Graphics]")) return;
+    file = fopen(path, "wb");
+    if (!file) return;
+    fprintf(file, "[Graphics]\r\nFullscreen=1\r\nDisplayWidth=%u\r\nDisplayHeight=%u\r\nRefreshRate=60\r\n%s",
+            width, height, existing);
+    fclose(file);
+    __android_log_print(ANDROID_LOG_INFO, AC1_LOG_TAG, "Seeded %ux%u graphics settings", width, height);
+}
 
 void *ac1_android_d3d9_factory(void *context, uint32_t sdk_version) {
     (void)context;
@@ -115,6 +159,13 @@ Java_org_ac1_recomp_LauncherActivity_nativeRun(JNIEnv *env, jclass type,
     else unsetenv("AC1_INPUT_SCRIPT");
     unsetenv("AC1_INPUT_RECORD");
     setenv("AC1_D3D9_FORCE_WINDOWED", "1", 1);
+    /* Like the host gameplay launchers: worker loops legitimately exceed the
+     * startup-diagnostic dispatch budget once the device runs at speed. */
+    setenv("AC1_DISPATCH_LIMIT", "0", 1);
+    uint32_t render_width, render_height;
+    select_render_size(&render_width, &render_height);
+    dxvkAndroidSetRenderSize(render_width, render_height);
+    seed_graphics_settings(userdata, render_width, render_height);
     __android_log_print(ANDROID_LOG_INFO, AC1_LOG_TAG, "Calling original startup for %s", path);
     int result;
     if (!ac1_set_userdata_root(userdata)) {

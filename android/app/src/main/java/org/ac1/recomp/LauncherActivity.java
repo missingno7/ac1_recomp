@@ -4,7 +4,12 @@ import android.app.Activity;
 import android.content.Intent;
 import android.net.Uri;
 import android.provider.DocumentsContract;
+import android.graphics.Rect;
+import android.os.Build;
+import android.util.DisplayMetrics;
 import android.os.Bundle;
+import android.system.ErrnoException;
+import android.system.Os;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import android.widget.Button;
@@ -16,6 +21,11 @@ import android.view.SurfaceView;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.InputDevice;
+import android.view.View;
+import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -44,6 +54,7 @@ public final class LauncherActivity extends Activity {
     private boolean skipIntros;
     private boolean traceImports;
     private String inputScript;
+    private String environment;
 
     static { System.loadLibrary(LIB_NAME); }
 
@@ -62,6 +73,7 @@ public final class LauncherActivity extends Activity {
         skipIntros = getIntent().getBooleanExtra("skip_intros", false);
         traceImports = getIntent().getBooleanExtra("trace_imports", false);
         inputScript = getIntent().getStringExtra("input_script");
+        environment = getIntent().getStringExtra("env");
         status = new TextView(this);
         status.setText("Select the folder containing your legally obtained Assassin's Creed installation. Its files will be copied into app-private storage.");
         status.setTextSize(16);
@@ -276,12 +288,73 @@ public final class LauncherActivity extends Activity {
         }
     }
 
+    /** While the guest runs, the surface owns the whole display: launcher views and system bars hide. */
+    /** Diagnostic runtime settings from `--es env "AC1_X=1,DXVK_Y=2"`; only AC1_ and DXVK_ keys. */
+    private static void applyEnvironment(String settings) throws ErrnoException {
+        if (settings == null || settings.isEmpty()) return;
+        for (String setting : settings.split(",")) {
+            int split = setting.indexOf('=');
+            String key = split > 0 ? setting.substring(0, split) : "";
+            if (!key.matches("(AC1|DXVK)_[A-Z0-9_]+"))
+                throw new IllegalArgumentException("env accepts AC1_/DXVK_ KEY=VALUE pairs: " + setting);
+            Os.setenv(key, setting.substring(split + 1), true);
+        }
+    }
+
+    @SuppressWarnings("deprecation") // API 29 has no WindowMetrics.
+    private String physicalDisplaySize() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Rect bounds = getWindowManager().getMaximumWindowMetrics().getBounds();
+            return bounds.width() + "x" + bounds.height();
+        }
+        DisplayMetrics metrics = new DisplayMetrics();
+        getWindowManager().getDefaultDisplay().getRealMetrics(metrics);
+        return metrics.widthPixels + "x" + metrics.heightPixels;
+    }
+
+    @SuppressWarnings("deprecation") // API 29 has no WindowInsetsController.
+    private void setGameMode(boolean game) {
+        int launcher = game ? View.GONE : View.VISIBLE;
+        status.setVisibility(launcher);
+        choose.setVisibility(launcher);
+        run.setVisibility(launcher);
+        Window window = getWindow();
+        if (game) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        WindowManager.LayoutParams attributes = window.getAttributes();
+        attributes.layoutInDisplayCutoutMode = game
+            ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT;
+        window.setAttributes(attributes);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(!game);
+            WindowInsetsController controller = window.getInsetsController();
+            if (controller != null) {
+                if (game) {
+                    controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                    controller.hide(WindowInsets.Type.systemBars());
+                } else {
+                    controller.show(WindowInsets.Type.systemBars());
+                }
+            }
+        } else {
+            window.getDecorView().setSystemUiVisibility(game
+                ? View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN
+                  | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                  | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                : View.SYSTEM_UI_FLAG_VISIBLE);
+        }
+    }
+
     private void runGuest() {
         if (busy || !surfaceReady || exeFile == null || !exeFile.isFile()) return;
         busy = true;
         run.setEnabled(false);
         choose.setEnabled(false);
         status.setText("Tap the surface for Enter; keyboard/gamepad enabled. Calling the original executable through the native startup harness…");
+        setGameMode(true);
+        // The surface resizes asynchronously after the launcher views hide.
+        final String displaySize = physicalDisplaySize();
         worker.execute(() -> {
             final int result;
             final String detail;
@@ -297,15 +370,18 @@ public final class LauncherActivity extends Activity {
                     if (!script.isFile()) throw new IllegalArgumentException("Missing input script: " + script);
                     scriptPath = script.getCanonicalPath();
                 }
+                Os.setenv("AC1_DISPLAY_SIZE", displaySize, true);
+                applyEnvironment(environment);
                 result = nativeRun(exeFile.getAbsolutePath(), userdata.getCanonicalPath(), scriptPath,
                                    skipIntros, traceImports);
                 detail = nativeLastError();
             }
             catch (Throwable error) {
-                runOnUiThread(() -> { busy = false; status.setText("Native startup failed: " + error); refreshRunEnabled(); });
+                runOnUiThread(() -> { busy = false; setGameMode(false); status.setText("Native startup failed: " + error); refreshRunEnabled(); });
                 return;
             }
             runOnUiThread(() -> {
+                setGameMode(false);
                 status.setText("Native startup returned " + result + (detail == null || detail.isEmpty() ? "" : "\n" + detail));
                 busy = false;
                 refreshRunEnabled();
