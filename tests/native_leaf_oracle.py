@@ -55,7 +55,8 @@ int main(void){
 '''
     source += f'_putenv_s("AC1_NATIVE_VERIFY","{args.cases}"); ac1_native_init();\n'
     source += 'wr32(0x1680f90,0x3f800000);\n'
-    source += f'for(unsigned i=0;i<{args.cases};++i){{\n'
+    # One additional call exercises the NULL eligibility plan after the budget.
+    source += f'for(unsigned i=0;i<{args.cases+1};++i){{\n'
     source += r'''
   CPU c; memset(&c,0x5a,sizeof(c));c.calls=0;c.esp=0x10000+(rng()&15);c.ebp=rng();
   for(unsigned k=0;k<3;++k){

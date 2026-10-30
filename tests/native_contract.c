@@ -7,13 +7,14 @@ static unsigned char memory[4096];
 static jmp_buf trap;
 static char diagnostic[512];
 static unsigned translated_calls, native_calls;
-void guest_execution_read(uint32_t a, void *o, size_t n) { assert(a+n <= sizeof(memory)); memcpy(o, memory+a, n); }
-void guest_execution_write(uint32_t a, const void *v, size_t n) { assert(a+n <= sizeof(memory)); memcpy(memory+a, v, n); }
+void guest_execution_read(uint32_t a, void *o, size_t n) { assert(n <= 16 && a+n <= sizeof(memory)); memcpy(o, memory+a, n); }
+void guest_execution_write(uint32_t a, const void *v, size_t n) { assert(n <= 16 && a+n <= sizeof(memory)); memcpy(memory+a, v, n); }
 void ac1_unsupported_instruction(uint32_t va, const char *s) {
     snprintf(diagnostic, sizeof(diagnostic), "%08x: %s", va, s); longjmp(trap, 1);
 }
 static int plan(const CPU *c, ac1_native_plan *p) {
     (void)c;
+    if (!p) return 1; /* Production calls validate without collecting writes. */
     /* Alias/merge/adjacency and disjoint stack writes. */
     ac1_native_add_range(p, 100, 8); ac1_native_add_range(p, 104, 12);
     ac1_native_add_range(p, 116, 4); ac1_native_add_range(p, 300, 4);

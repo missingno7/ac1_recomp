@@ -64,7 +64,8 @@ static unsigned extraordinary_lane(uint32_t address) {
     return 0;
 }
 static int decline(ac1_native_plan *plan, uint32_t a, const char *reason) {
-    plan->decline_address=a; plan->decline_reason=reason; return 0;
+    if (plan) { plan->decline_address=a; plan->decline_reason=reason; }
+    return 0;
 }
 static int check_vector(ac1_native_plan *plan, uint32_t a) {
     unsigned bad=extraordinary_lane(a);
@@ -86,8 +87,10 @@ int ac1_native_01176DE0_plan(const CPU *c, ac1_native_plan *plan) {
     }
     if (!check_vector(plan,0x01A44C90u)) return 0;
     if (!ordinary_bits(rd32(0x01680F90u))) return decline(plan,0x01680F90u,"homogeneous constant outside native float contract");
-    ac1_native_add_range(plan, base, 48);
-    ac1_native_add_range(plan, c->esp-4, 4);
+    if (plan) {
+        ac1_native_add_range(plan, base, 48);
+        ac1_native_add_range(plan, c->esp-4, 4);
+    }
     return 1;
 }
 
@@ -135,9 +138,11 @@ int ac1_native_00653400_plan(const CPU *c, ac1_native_plan *plan) {
         if (overlaps(a,64,base,c->esp+16u-base)) return decline(plan,a,"matrix aliases stack scratch/arguments/saved EBP");
         if (k != 4) for (unsigned row=0; row<4; ++row) if (!check_vector(plan,a+row*16)) return 0;
     }
-    ac1_native_add_range(plan, base, 32);
-    ac1_native_add_range(plan, c->esp-4, 4);
-    ac1_native_add_range(plan, rd32(c->esp+4), 64);
+    if (plan) {
+        ac1_native_add_range(plan, base, 32);
+        ac1_native_add_range(plan, c->esp-4, 4);
+        ac1_native_add_range(plan, rd32(c->esp+4), 64);
+    }
     return 1;
 }
 
@@ -175,8 +180,10 @@ int ac1_native_0042EE70_plan(const CPU *c, ac1_native_plan *plan) {
         if (overlaps(a,16,c->esp-16,40)) return decline(plan,a,"vector aliases the stack argument/saved EBP area");
         if (k != 4 && !check_vector(plan,a)) return 0;
     }
-    ac1_native_add_range(plan,c->esp-4,4);
-    ac1_native_add_range(plan,rd32(c->esp+4),16);
+    if (plan) {
+        ac1_native_add_range(plan,c->esp-4,4);
+        ac1_native_add_range(plan,rd32(c->esp+4),16);
+    }
     return 1;
 }
 

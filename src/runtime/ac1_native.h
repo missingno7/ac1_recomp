@@ -18,6 +18,8 @@ typedef struct {
     uint32_t va;
     const char *name;
     void (*body)(CPU *);
+    /* NULL plan: eligibility only. Non-NULL: also collect writes/rejection
+     * detail. Plans are pure and may be repeated for a rejection diagnostic. */
     int (*plan)(const CPU *, ac1_native_plan *);
     int enabled;
     uint64_t calls, checked, fallbacks;

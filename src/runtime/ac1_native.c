@@ -10,6 +10,21 @@ static uint64_t verify_limit;
 static int report_stats;
 static int initialized;
 
+/* Checked scalar copies accept at most 16 bytes, while audited write sets
+ * can span multiple vectors and adjacent guest mappings. */
+static void read_span(uint32_t address, unsigned char *out, size_t size) {
+    for (size_t n=0; n<size;) {
+        size_t width = size-n < 16 ? size-n : 16;
+        guest_execution_read(address+(uint32_t)n, out+n, width); n+=width;
+    }
+}
+static void write_span(uint32_t address, const unsigned char *in, size_t size) {
+    for (size_t n=0; n<size;) {
+        size_t width = size-n < 16 ? size-n : 16;
+        guest_execution_write(address+(uint32_t)n, in+n, width); n+=width;
+    }
+}
+
 static void failure(uint32_t va, const char *reason) {
     ac1_unsupported_instruction(va, reason);
     abort(); /* Isolated fixtures need not provide the runtime's longjmp. */
@@ -86,15 +101,21 @@ void ac1_native_add_range(ac1_native_plan *p, uint32_t address, size_t size) {
 
 void ac1_native_invoke(CPU *c, ac1_native_binding *b, void (*translated)(CPU *)) {
     if (!b->enabled) { translated(c); return; }
-    ac1_native_plan plan = {0};
-    if (!b->plan(c, &plan)) {
+    int checking = b->checked < verify_limit;
+    ac1_native_plan plan;
+    if (checking) memset(&plan, 0, sizeof(plan));
+    if (!b->plan(c, checking ? &plan : NULL)) {
+        if (!checking && !b->fallbacks) {
+            memset(&plan, 0, sizeof(plan));
+            (void)b->plan(c, &plan); /* Collect the first rejection's detail. */
+        }
         if (!b->fallbacks++) fprintf(stderr, "[native] 0x%08" PRIX32 " %s: %s at 0x%08" PRIX32 "; using translated body\n",
                 b->va, b->name, plan.decline_reason ? plan.decline_reason : "input outside native contract",
                 plan.decline_address);
         translated(c); return;
     }
     ++b->calls;
-    if (b->checked >= verify_limit) { b->body(c); return; }
+    if (!checking) { b->body(c); return; }
     size_t size = 0;
     for (unsigned i = 0; i < plan.count; ++i) {
         if (plan.ranges[i].size > 16u*1024u*1024u-size)
@@ -108,7 +129,7 @@ void ac1_native_invoke(CPU *c, ac1_native_binding *b, void (*translated)(CPU *))
     }
     size_t offset = 0;
     for (unsigned i = 0; i < plan.count; ++i) {
-        guest_execution_read(plan.ranges[i].address, before+offset, plan.ranges[i].size);
+        read_span(plan.ranges[i].address, before+offset, plan.ranges[i].size);
         offset += plan.ranges[i].size;
     }
     CPU reference;
@@ -116,8 +137,8 @@ void ac1_native_invoke(CPU *c, ac1_native_binding *b, void (*translated)(CPU *))
     translated(&reference);
     offset = 0;
     for (unsigned i = 0; i < plan.count; ++i) {
-        guest_execution_read(plan.ranges[i].address, expected+offset, plan.ranges[i].size);
-        guest_execution_write(plan.ranges[i].address, before+offset, plan.ranges[i].size);
+        read_span(plan.ranges[i].address, expected+offset, plan.ranges[i].size);
+        write_span(plan.ranges[i].address, before+offset, plan.ranges[i].size);
         offset += plan.ranges[i].size;
     }
     b->body(c);
@@ -135,7 +156,7 @@ void ac1_native_invoke(CPU *c, ac1_native_binding *b, void (*translated)(CPU *))
     offset = 0;
     for (unsigned i = 0; i < plan.count; ++i) {
         ac1_native_range r = plan.ranges[i];
-        guest_execution_read(r.address, before+offset, r.size);
+        read_span(r.address, before+offset, r.size);
         for (size_t k = 0; k < r.size; ++k) if (before[offset+k] != expected[offset+k]) {
             char message[256];
             snprintf(message, sizeof(message), "native %s call=%" PRIu64 " memory[0x%08x] expected=%02x actual=%02x range=0x%08x+%zu",
