@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "opacity": 0.58,
+  "cameraSensitivity": 0.5,
+  "controls": [
+    {"id":"move", "label":"MOVE", "x":0.14, "y":0.73, "r":0.125},
+    {"id":"LT", "label":"Target lock", "x":0.15, "y":0.43, "r":0.060},
+    {"id":"RT", "label":"High profile", "x":0.77, "y":0.43, "r":0.065},
+    {"id":"rtLock", "label":"RT lock", "x":0.85, "y":0.33, "r":0.036},
+    {"id":"A", "label":"Legs / Blend", "x":0.87, "y":0.86, "r":0.060},
+    {"id":"B", "label":"Empty hand", "x":0.94, "y":0.71, "r":0.060},
+    {"id":"X", "label":"Weapon", "x":0.80, "y":0.71, "r":0.060},
+    {"id":"Y", "label":"Head", "x":0.87, "y":0.56, "r":0.060},
+    {"id":"weapons", "label":"Weapons", "x":0.30, "y":0.82, "r":0.048},
+    {"id":"BACK", "label":"Map", "x":0.43, "y":0.09, "r":0.032},
+    {"id":"START", "label":"Pause", "x":0.57, "y":0.09, "r":0.032},
+    {"id":"RS", "label":"Center", "x":0.68, "y":0.85, "r":0.034},
+    {"id":"hide", "label":"Hide pad", "x":0.50, "y":0.09, "r":0.030}
+  ],
+  "camera": {"left":0.48, "top":0.20, "right":0.98, "bottom":0.96},
+  "weapons": [
+    {"id":"UP", "label":"Blade", "x":0.30, "y":0.58, "r":0.044},
+    {"id":"LEFT", "label":"Knives", "x":0.24, "y":0.70, "r":0.044},
+    {"id":"RIGHT", "label":"Sword", "x":0.36, "y":0.70, "r":0.044},
+    {"id":"DOWN", "label":"Fists", "x":0.30, "y":0.82, "r":0.044}
+  ]
+}

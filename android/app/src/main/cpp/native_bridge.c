@@ -14,6 +14,7 @@
 
 #include "ac1_runtime.h"
 #include "ac1_input_script.h"
+#include "ac1_gamepad.h"
 #include "ac1_audio_mixer.h"
 
 #define AC1_LOG_TAG "AC1Recomp"
@@ -42,7 +43,7 @@ Java_org_ac1_recomp_LauncherActivity_nativeMouse(JNIEnv *env, jclass type, jint 
 }
 JNIEXPORT void JNICALL
 Java_org_ac1_recomp_LauncherActivity_nativeResetInput(JNIEnv *env, jclass type) {
-    (void)env; (void)type; ac1_input_physical_reset();
+    (void)env; (void)type; ac1_input_physical_reset(); ac1_pad_reset();
 }
 JNIEXPORT void JNICALL
 Java_org_ac1_recomp_LauncherActivity_nativeAudioPause(JNIEnv *env, jclass type, jboolean paused) {
@@ -228,4 +229,13 @@ Java_org_ac1_recomp_LauncherActivity_nativeLastError(JNIEnv *env, jclass type) {
     __android_log_print(ANDROID_LOG_INFO, AC1_LOG_TAG, "Startup boundary: %s",
                         *detail ? detail : "none");
     return (*env)->NewStringUTF(env, detail);
+}
+
+JNIEXPORT void JNICALL
+Java_org_ac1_recomp_LauncherActivity_nativePad(JNIEnv *env, jclass type, jboolean connected,
+        jint buttons, jint lt, jint rt, jint lx, jint ly, jint rx, jint ry) {
+    (void)env; (void)type;
+    ac1_pad pad = {(uint16_t)buttons, (uint8_t)lt, (uint8_t)rt,
+                   (int16_t)lx, (int16_t)ly, (int16_t)rx, (int16_t)ry};
+    ac1_pad_submit(0, connected, &pad);
 }
