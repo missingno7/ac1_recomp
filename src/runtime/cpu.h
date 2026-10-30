@@ -194,13 +194,11 @@ static inline void ac1_x87_set_tag(CPU *c, unsigned reg, unsigned tag) {
 extern uint8_t *ac1_direct_arena;
 AC1_ACCESSOR_INLINE void ac1_direct_read(uint32_t a, void *o, size_t w)
 {
-    if (__builtin_expect(ac1_direct_arena != NULL, 1)) memcpy(o, ac1_direct_arena + a, w);
-    else (guest_execution_read)(a, o, w);
+    memcpy(o, ac1_direct_arena + a, w);
 }
 AC1_ACCESSOR_INLINE void ac1_direct_write(uint32_t a, const void *i, size_t w)
 {
-    if (__builtin_expect(ac1_direct_arena != NULL, 1)) memcpy(ac1_direct_arena + a, i, w);
-    else (guest_execution_write)(a, i, w);
+    memcpy(ac1_direct_arena + a, i, w);
 }
 #define guest_execution_read(a, o, w) ac1_direct_read((a), (o), (w))
 #define guest_execution_write(a, i, w) ac1_direct_write((a), (i), (w))
@@ -209,7 +207,7 @@ AC1_ACCESSOR_INLINE void ac1_direct_write(uint32_t a, const void *i, size_t w)
  * Unaligned operands keep the checked path and its diagnostic. */
 AC1_ACCESSOR_INLINE uint32_t *ac1_direct_atomic_cell(uint32_t a)
 {
-    return (ac1_direct_arena && !(a & 3u)) ? (uint32_t *)(ac1_direct_arena + a) : NULL;
+    return !(a & 3u) ? (uint32_t *)(ac1_direct_arena + a) : NULL;
 }
 AC1_ACCESSOR_INLINE uint32_t ac1_direct_xadd32(uint32_t a, uint32_t v)
 {
@@ -1132,4 +1130,241 @@ AC1_X87_INTEGER_INLINE uint64_t ac1_x87_integer(CPU *c, double value, unsigned b
     return (uint64_t)(int64_t)result;
 }
 
+
+/* AC1_LOCAL_MEMORY_HELPERS */
+#if defined(AC1_DIRECT_MEMORY)
+AC1_ACCESSOR_INLINE void ac1_base_ac1_direct_read(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, void *o, size_t w);
+AC1_ACCESSOR_INLINE void ac1_base_ac1_direct_write(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, const void *i, size_t w);
+AC1_ACCESSOR_INLINE uint32_t *ac1_base_ac1_direct_atomic_cell(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a);
+AC1_ACCESSOR_INLINE uint32_t ac1_base_ac1_direct_xadd32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint32_t v);
+AC1_ACCESSOR_INLINE uint32_t ac1_base_ac1_direct_cmpxchg32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint32_t compare, uint32_t value);
+AC1_ACCESSOR_INLINE uint32_t ac1_base_ac1_direct_xchg32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint32_t v);
+AC1_ACCESSOR_INLINE uint8_t ac1_base_rd8(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a);
+AC1_ACCESSOR_INLINE uint16_t ac1_base_rd16(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a);
+AC1_ACCESSOR_INLINE uint32_t ac1_base_rd32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a);
+AC1_ACCESSOR_INLINE void ac1_base_wr8(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint8_t v);
+AC1_ACCESSOR_INLINE void ac1_base_wr16(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint16_t v);
+AC1_ACCESSOR_INLINE void ac1_base_wr32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint32_t v);
+AC1_ACCESSOR_INLINE uint64_t ac1_base_rd64(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a);
+AC1_ACCESSOR_INLINE void ac1_base_wr64(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint64_t v);
+static inline uint32_t ac1_base_atomic_xadd32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint32_t v);
+static inline uint32_t ac1_base_atomic_cmpxchg32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint32_t cmp, uint32_t nv);
+static inline uint32_t ac1_base_atomic_xchg32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint32_t v);
+AC1_ACCESSOR_INLINE void ac1_base_push32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, CPU *c, uint32_t v);
+AC1_ACCESSOR_INLINE uint32_t ac1_base_pop32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, CPU *c);
+static inline double ac1_base_rdf32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a);
+static inline double ac1_base_rdf64(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a);
+static inline double ac1_base_rdi16(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a);
+static inline double ac1_base_rdi32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a);
+static inline double ac1_base_rdi64(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a);
+static inline void   ac1_base_wrf32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, double v);
+static inline void   ac1_base_wrf64(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, double v);
+static inline void   ac1_base_wri32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, double v);
+static inline void   ac1_base_wri16(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, double v);
+static inline void   ac1_base_wri64(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, double v);
+static inline float  ac1_base_rdss(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a);
+static inline double ac1_base_rdsd(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a);
+static inline XMM    ac1_base_rdxm(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a);
+static inline void   ac1_base_wrss(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, float  v);
+static inline void   ac1_base_wrsd(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, double v);
+static inline void   ac1_base_wrxm(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, XMM    v);
+static inline uint32_t ac1_base_bit_string_op(uint8_t * const _ac1_base, const CPU * const _ac1_observer, CPU *c, uint32_t addr, int32_t idx, int op);
+static inline double ac1_base_rdf80(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a);
+static inline void ac1_base_wrf80(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, double v);
+static inline void ac1_base_ac1_x87_store_env(uint8_t * const _ac1_base, const CPU * const _ac1_observer, CPU *c, uint32_t a);
+static inline void ac1_base_ac1_x87_load_env(uint8_t * const _ac1_base, const CPU * const _ac1_observer, CPU *c, uint32_t a);
+static inline void ac1_base_ac1_x87_save(uint8_t * const _ac1_base, const CPU * const _ac1_observer, CPU *c, uint32_t a);
+static inline void ac1_base_ac1_x87_restore(uint8_t * const _ac1_base, const CPU * const _ac1_observer, CPU *c, uint32_t a);
+AC1_ACCESSOR_INLINE void ac1_base_ac1_direct_read(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, void *o, size_t w) {
+
+    __asm__ __volatile__("" : : "m"(_ac1_observer->eip));
+    memcpy(o, _ac1_base + a, w);
+}
+AC1_ACCESSOR_INLINE void ac1_base_ac1_direct_write(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, const void *i, size_t w) {
+
+    __asm__ __volatile__("" : : "m"(_ac1_observer->eip));
+    memcpy(_ac1_base + a, i, w);
+}
+AC1_ACCESSOR_INLINE uint32_t *ac1_base_ac1_direct_atomic_cell(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a) {
+
+    __asm__ __volatile__("" : : "m"(_ac1_observer->eip));
+    return !(a & 3u) ? (uint32_t *)(_ac1_base + a) : NULL;
+}
+AC1_ACCESSOR_INLINE uint32_t ac1_base_ac1_direct_xadd32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint32_t v) {
+
+    uint32_t *cell = ac1_base_ac1_direct_atomic_cell(_ac1_base, _ac1_observer, a);
+    return cell ? __atomic_fetch_add(cell, v, __ATOMIC_SEQ_CST) : (guest_atomic_xadd32)(a, v);
+}
+AC1_ACCESSOR_INLINE uint32_t ac1_base_ac1_direct_cmpxchg32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint32_t compare, uint32_t value) {
+
+    uint32_t *cell = ac1_base_ac1_direct_atomic_cell(_ac1_base, _ac1_observer, a);
+    if (!cell) return (guest_atomic_cmpxchg32)(a, compare, value);
+    __atomic_compare_exchange_n(cell, &compare, value, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return compare;  /* the previous value, as CMPXCHG leaves it in EAX */
+}
+AC1_ACCESSOR_INLINE uint32_t ac1_base_ac1_direct_xchg32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint32_t v) {
+
+    uint32_t *cell = ac1_base_ac1_direct_atomic_cell(_ac1_base, _ac1_observer, a);
+    return cell ? __atomic_exchange_n(cell, v, __ATOMIC_SEQ_CST) : (guest_atomic_xchg32)(a, v);
+}
+AC1_ACCESSOR_INLINE uint8_t ac1_base_rd8(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a) {
+ uint8_t v; ac1_base_ac1_direct_read(_ac1_base, _ac1_observer, a, &v, 1); return v; }
+AC1_ACCESSOR_INLINE uint16_t ac1_base_rd16(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a) {
+ uint16_t v; ac1_base_ac1_direct_read(_ac1_base, _ac1_observer, a, &v, 2); return v; }
+AC1_ACCESSOR_INLINE uint32_t ac1_base_rd32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a) {
+ uint32_t v; ac1_base_ac1_direct_read(_ac1_base, _ac1_observer, a, &v, 4); return v; }
+AC1_ACCESSOR_INLINE void ac1_base_wr8(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint8_t v) {
+ ac1_base_ac1_direct_write(_ac1_base, _ac1_observer, a, &v, 1); }
+AC1_ACCESSOR_INLINE void ac1_base_wr16(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint16_t v) {
+ ac1_base_ac1_direct_write(_ac1_base, _ac1_observer, a, &v, 2); }
+AC1_ACCESSOR_INLINE void ac1_base_wr32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint32_t v) {
+ ac1_base_ac1_direct_write(_ac1_base, _ac1_observer, a, &v, 4); }
+AC1_ACCESSOR_INLINE uint64_t ac1_base_rd64(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a) {
+ uint64_t v; ac1_base_ac1_direct_read(_ac1_base, _ac1_observer, a, &v, 8); return v; }
+AC1_ACCESSOR_INLINE void ac1_base_wr64(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint64_t v) {
+ ac1_base_ac1_direct_write(_ac1_base, _ac1_observer, a, &v, 8); }
+static inline uint32_t ac1_base_atomic_xadd32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint32_t v) {
+ return ac1_base_ac1_direct_xadd32(_ac1_base, _ac1_observer, a, v); }
+static inline uint32_t ac1_base_atomic_cmpxchg32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint32_t cmp, uint32_t nv) {
+ return ac1_base_ac1_direct_cmpxchg32(_ac1_base, _ac1_observer, a, cmp, nv); }
+static inline uint32_t ac1_base_atomic_xchg32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint32_t v) {
+ return ac1_base_ac1_direct_xchg32(_ac1_base, _ac1_observer, a, v); }
+AC1_ACCESSOR_INLINE void ac1_base_push32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, CPU *c, uint32_t v) {
+ c->esp -= 4; ac1_base_wr32(_ac1_base, _ac1_observer, STACK_BASE(c) + c->esp, v); }
+AC1_ACCESSOR_INLINE uint32_t ac1_base_pop32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, CPU *c) {
+ uint32_t v = ac1_base_rd32(_ac1_base, _ac1_observer, STACK_BASE(c) + c->esp); c->esp += 4; return v; }
+static inline double ac1_base_rdf32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a) {
+ float  f; ac1_base_ac1_direct_read(_ac1_base, _ac1_observer, a, &f, 4); return (double)f; }
+static inline double ac1_base_rdf64(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a) {
+ double d; ac1_base_ac1_direct_read(_ac1_base, _ac1_observer, a, &d, 8); return d; }
+static inline double ac1_base_rdi16(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a) {
+ int16_t i; ac1_base_ac1_direct_read(_ac1_base, _ac1_observer, a, &i, 2); return (double)i; }
+static inline double ac1_base_rdi32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a) {
+ int32_t i; ac1_base_ac1_direct_read(_ac1_base, _ac1_observer, a, &i, 4); return (double)i; }
+static inline double ac1_base_rdi64(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a) {
+ int64_t i; ac1_base_ac1_direct_read(_ac1_base, _ac1_observer, a, &i, 8); return (double)i; }
+static inline void   ac1_base_wrf32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, double v) {
+ float  f = (float)v; ac1_base_ac1_direct_write(_ac1_base, _ac1_observer, a, &f, 4); }
+static inline void   ac1_base_wrf64(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, double v) {
+ ac1_base_ac1_direct_write(_ac1_base, _ac1_observer, a, &v, 8); }
+static inline void   ac1_base_wri32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, double v) {
+ int32_t i = (int32_t)nearbyint(v); ac1_base_ac1_direct_write(_ac1_base, _ac1_observer, a, &i, 4); }
+static inline void   ac1_base_wri16(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, double v) {
+ int16_t i = (int16_t)nearbyint(v); ac1_base_ac1_direct_write(_ac1_base, _ac1_observer, a, &i, 2); }
+static inline void   ac1_base_wri64(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, double v) {
+ int64_t i = (int64_t)nearbyint(v); ac1_base_ac1_direct_write(_ac1_base, _ac1_observer, a, &i, 8); }
+static inline float  ac1_base_rdss(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a) {
+ float  f; ac1_base_ac1_direct_read(_ac1_base, _ac1_observer, a, &f, 4); return f; }
+static inline double ac1_base_rdsd(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a) {
+ double d; ac1_base_ac1_direct_read(_ac1_base, _ac1_observer, a, &d, 8); return d; }
+static inline XMM    ac1_base_rdxm(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a) {
+ XMM x;    ac1_base_ac1_direct_read(_ac1_base, _ac1_observer, a, &x, 16); return x; }
+static inline void   ac1_base_wrss(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, float  v) {
+ ac1_base_ac1_direct_write(_ac1_base, _ac1_observer, a, &v, 4); }
+static inline void   ac1_base_wrsd(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, double v) {
+ ac1_base_ac1_direct_write(_ac1_base, _ac1_observer, a, &v, 8); }
+static inline void   ac1_base_wrxm(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, XMM    v) {
+ ac1_base_ac1_direct_write(_ac1_base, _ac1_observer, a, &v, 16); }
+static inline uint32_t ac1_base_bit_string_op(uint8_t * const _ac1_base, const CPU * const _ac1_observer, CPU *c, uint32_t addr, int32_t idx, int op) {
+
+    uint32_t a = addr + 4u * (uint32_t)(idx >> 5);
+    unsigned b = (unsigned)(idx & 31);
+    uint32_t w = ac1_base_rd32(_ac1_base, _ac1_observer, a);
+    c->cf = (w >> b) & 1u;
+    if      (op == 1) w |=  (1u << b);
+    else if (op == 2) w &= ~(1u << b);
+    else if (op == 3) w ^=  (1u << b);
+    if (op) ac1_base_wr32(_ac1_base, _ac1_observer, a, w);
+    return c->cf;
+}
+static inline double ac1_base_rdf80(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a) {
+
+    unsigned char b[10];
+    ac1_base_ac1_direct_read(_ac1_base, _ac1_observer, a, b, 10);
+
+    uint64_t mant;
+    uint16_t se;
+    memcpy(&mant, b, 8);
+    memcpy(&se, b + 8, 2);
+
+    int sign = (se >> 15) & 1;
+    int exp  = se & 0x7FFF;
+
+    if (exp == 0 && mant == 0) return sign ? -0.0 : 0.0;
+    if (exp == 0x7FFF) {
+        if (mant << 1) return (double)NAN;
+        return sign ? -(double)INFINITY : (double)INFINITY;
+    }
+    double m = (double)mant * 5.4210108624275222e-20;   /* 2^-64 */
+    return ldexp(sign ? -m : m, exp - 16383 + 1);
+}
+static inline void ac1_base_wrf80(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, double v) {
+
+    unsigned char b[10];
+    uint64_t mant = 0;
+    uint16_t se = 0;
+
+    memset(b, 0, sizeof b);
+    if (v != v) {                                   /* NaN */
+        se = 0x7FFF; mant = 0xC000000000000000ull;
+    } else if (v == (double)INFINITY || v == -(double)INFINITY) {
+        se = 0x7FFF; mant = 0x8000000000000000ull;
+        if (v < 0) se |= 0x8000;
+    } else if (v != 0.0) {
+        int e;
+        double m = frexp(signbit(v) ? -v : v, &e);   /* m in [0.5, 1) */
+        mant = (uint64_t)ldexp(m, 64);
+        se = (uint16_t)((e - 1 + 16383) & 0x7FFF);
+        if (signbit(v)) se |= 0x8000;
+    } else if (signbit(v)) {
+        se = 0x8000;                                 /* -0.0: mantissa 0, sign set */
+    }
+    memcpy(b, &mant, 8);
+    memcpy(b + 8, &se, 2);
+    ac1_base_ac1_direct_write(_ac1_base, _ac1_observer, a, b, 10);
+}
+static inline void ac1_base_ac1_x87_store_env(uint8_t * const _ac1_base, const CPU * const _ac1_observer, CPU *c, uint32_t a) {
+
+    ac1_fp_init(c);
+    ac1_base_wr32(_ac1_base, _ac1_observer, a,0xffff0000u|c->fpu_cw); ac1_base_wr32(_ac1_base, _ac1_observer, a+4,0xffff0000u|ac1_x87_status(c));
+    ac1_base_wr32(_ac1_base, _ac1_observer, a+8,0xffff0000u|ac1_x87_tags(c)); ac1_base_wr32(_ac1_base, _ac1_observer, a+12,c->fpu_ip);
+    ac1_base_wr32(_ac1_base, _ac1_observer, a+16,(uint32_t)c->fpu_cs|((uint32_t)(c->fpu_opcode&0x7ffu)<<16));
+    ac1_base_wr32(_ac1_base, _ac1_observer, a+20,c->fpu_dp); ac1_base_wr32(_ac1_base, _ac1_observer, a+24,0xffff0000u|c->fpu_ds);
+    c->fpu_cw |= 0x3fu; /* FNSTENV masks exceptions after storing the old CW. */
+}
+static inline void ac1_base_ac1_x87_load_env(uint8_t * const _ac1_base, const CPU * const _ac1_observer, CPU *c, uint32_t a) {
+
+    ac1_fp_init(c);
+    c->fpu_cw=ac1_base_rd16(_ac1_base, _ac1_observer, a); c->fpu_sw=ac1_base_rd16(_ac1_base, _ac1_observer, a+4); c->fpu_tw=ac1_base_rd16(_ac1_base, _ac1_observer, a+8);
+    c->fpu_top=(int)((c->fpu_sw>>11)&7u);
+    c->fpu_ip=ac1_base_rd32(_ac1_base, _ac1_observer, a+12); c->fpu_cs=ac1_base_rd16(_ac1_base, _ac1_observer, a+16); c->fpu_opcode=ac1_base_rd16(_ac1_base, _ac1_observer, a+18)&0x7ffu;
+    c->fpu_dp=ac1_base_rd32(_ac1_base, _ac1_observer, a+20); c->fpu_ds=ac1_base_rd16(_ac1_base, _ac1_observer, a+24);
+    if(c->fpu_tw==0xffffu) c->mmx_active=0;
+}
+static inline void ac1_base_ac1_x87_save(uint8_t * const _ac1_base, const CPU * const _ac1_observer, CPU *c, uint32_t a) {
+
+    ac1_base_ac1_x87_store_env(_ac1_base, _ac1_observer, c,a);
+    for(unsigned i=0;i<8;++i) {
+        unsigned reg=((unsigned)c->fpu_top+i)&7u;
+        if((c->mmx_physical & (1u<<reg)) && !(c->x87_dirty & (1u<<reg))) {
+            ac1_base_wr64(_ac1_base, _ac1_observer, a+28+i*10,c->mmx[reg]); ac1_base_wr16(_ac1_base, _ac1_observer, a+36+i*10,c->mmx_exp[reg]);
+        }
+        else ac1_base_wrf80(_ac1_base, _ac1_observer, a+28+i*10,c->st[reg]);
+    }
+    ac1_x87_reset(c);
+}
+static inline void ac1_base_ac1_x87_restore(uint8_t * const _ac1_base, const CPU * const _ac1_observer, CPU *c, uint32_t a) {
+
+    ac1_base_ac1_x87_load_env(_ac1_base, _ac1_observer, c,a);
+    unsigned mmx_image=c->fpu_top==0, mmx_payload=0;
+    for(unsigned i=0;i<8;++i) {
+        unsigned reg=((unsigned)c->fpu_top+i)&7u;
+        c->mmx[reg]=ac1_base_rd64(_ac1_base, _ac1_observer, a+28+i*10); c->st[reg]=ac1_base_rdf80(_ac1_base, _ac1_observer, a+28+i*10);
+        c->mmx_exp[reg]=ac1_base_rd16(_ac1_base, _ac1_observer, a+36+i*10);
+        if(((c->fpu_tw>>(reg*2))&3u)==3u) mmx_image=0;
+        if(c->mmx_exp[reg]==0xffffu) mmx_payload=1;
+    }
+    c->mmx_active=(uint8_t)(mmx_image && mmx_payload); c->x87_dirty=0; c->mmx_physical=0xffu;
+}
+#endif
 #endif /* PCRECOMP_CPU_H */

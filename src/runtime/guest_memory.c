@@ -10,6 +10,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #ifdef _WIN32
 #include <windows.h>
@@ -60,7 +61,18 @@ guest_address_space *guest_address_space_create_direct(void)
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     s->arena = p == MAP_FAILED ? NULL : p;
 #endif
-    if (!s->arena) { free(s); return NULL; }
+    if (!s->arena) {
+#ifdef _WIN32
+        unsigned long native_error = GetLastError();
+        fprintf(stderr, "AC1 direct arena reservation failed: bytes=%llu guard=%zu VirtualAlloc error=%lu\n",
+                (unsigned long long)(ARENA_BYTES+s->page_size), s->page_size, native_error);
+#else
+        int native_error = errno;
+        fprintf(stderr, "AC1 direct arena reservation failed: bytes=%llu guard=%zu mmap errno=%d (%s)\n",
+                (unsigned long long)(ARENA_BYTES+s->page_size), s->page_size, native_error, strerror(native_error));
+#endif
+        free(s); return NULL;
+    }
     return s;
 }
 
