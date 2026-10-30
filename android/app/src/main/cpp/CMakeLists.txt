@@ -56,3 +56,6 @@ add_library(ac1_dxvk_android SHARED IMPORTED GLOBAL)
 set_target_properties(ac1_dxvk_android PROPERTIES
     IMPORTED_LOCATION "${AC1_DXVK_ANDROID_LIBRARY}")
 target_link_libraries(ac1_android PRIVATE ac1_runtime ac1_dxvk_android android log dl vulkan aaudio)
+# Keep static-archive symbols local: FFmpeg's AArch64 NEON code addresses its
+# tables PC-relatively, which lld rejects for preemptible exported symbols.
+target_link_options(ac1_android PRIVATE -Wl,--exclude-libs,ALL)
