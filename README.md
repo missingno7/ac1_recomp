@@ -254,4 +254,6 @@ list such as `-LocalRegs '0051DD60,00428540'` selects individual functions. The 
 selection with `--local-regs`. Preparation checks both selected modes in its report.
 The benchmark preserves a complete frame window by draining the periodic profiler after CPU/GPU accounting stops;
 incomplete windows, guest stops and dropped frame samples fail its audit. See [codegen evidence](docs/codegen.md)
-for generated/compiled counts, correctness runs, immutable binary hashes and the interleaved baseline/flags result.
+for generated/compiled counts, correctness runs, immutable binary hashes and both interleaved comparisons.
+Median paired FPS changes were +5.97% for CFG flags and -53.19% for broad locals in this tutorial replay.
+Flags stay enabled; locals stay off pending lower synchronization overhead and another measured comparison.

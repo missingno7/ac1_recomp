@@ -225,7 +225,9 @@ behavior was unchanged. Android hardware execution is not claimed.
 ### Baseline versus flags: corrected interleaved result
 
 Three A/B pairs, each with a 60-second measurement window; native overrides
-retain their default enabled configuration and verification/sampling are off.
+retain their default disabled configuration (`AC1_NATIVE_OVERRIDES` unset),
+and verification/sampling are off. Correctness replays explicitly enable the
+native bindings and their verifier instead.
 Both immutable debug-stripped executables are named `ac1_startup.exe` in separate
 private directories. Host: Ryzen 9 7950X3D, 32 logical CPUs, 64 GiB RAM. Other
 work shares the host; `-AllowBusy` is recorded. Medians [minimum, maximum]:
@@ -261,4 +263,164 @@ functions with no discovery/lift failures and the same two known instruction
 TODOs. Flags stripped SHA-256:
 `86d6a9ab1a14b24b0fffb4de97f6a7941d596d3e7878b8528be034a4e72c0d12`.
 
-Production LREGS remains the next separately measured step.
+## Register locals: admission and CPU boundaries
+
+`tools/lift_ac1.py --local-regs off|all|VA,...` and the build script's
+`-LocalRegs` select GPR promotion. The default is `off`; a comma-separated list
+uses eight-digit hexadecimal guest entries, optionally prefixed with `0x`.
+Malformed or unlifted selections fail with a diagnostic. The selected mode is
+part of preparation freshness checking. The `all` build admits **88,523**
+functions and excludes **13,472** segmented/SEH/nonlocal-resumption functions.
+The original failing RNG entry `007BFD40` is admitted.
+
+An unescaped local aggregate contains EAX/ECX/EDX/EBX/ESP/EBP/ESI/EDI. Its
+32-byte layout is checked against the pinned CPU prefix. Builtin copies permit
+GCC scalar replacement; actual host-register allocation remains the compiler's
+choice. Every public C entry loads its own locals. Guest entries represented
+by separate public functions therefore get their own initialization; internal
+labels share their function's local state.
+
+Only audited GPR-free flag helpers and the EIP setter run with pending local
+GPR values. Other CPU uses execute the whole instruction against the CPU after
+a spill, then reload. Taken internal edges from such instructions reload before
+jumping, covering paths that bypass the ordinary reload. Direct/indirect guest
+calls, imports, tail dispatches, returns and diagnostic escapes synchronize
+state. Complete comment removal preserves executable code following leading
+comments, including indirect import tails. Empty compiler memory barriers on
+local gotos preserve guest polling-load ordering across backedges. Flags, XMM
+and x87 state continue to use their established CPU representation/helpers.
+
+The initial LREGS unit suite passes **65 tests**, including per-function
+selection, the safe-helper audit, synthetic leading-comment import tails with
+flags off/on, nested/direct/tail calls and register switches. Existing real
+audio/Bink/MMX/PUSHAD/POPAD/x87 oracles also pass with both passes explicitly
+enabled. Full gameplay and incremental interleaved evidence follow separately.
+
+The standalone native-leaf fixture previously inherited the default-disabled
+override selection, allowing a misleading success with zero comparisons. It
+now explicitly enables all bindings and rejects incomplete comparison budgets
+or fallbacks. Rechecks of hash-verified raw cache bodies with baseline and CFG
+flags, and of the full generated locals catalog, each complete **200,000
+partial-alias comparisons per binding**, plus **10,000 portable comparisons
+per binding**, with no fallback. Earlier zero-comparison logs are superseded
+by `work/codegen/rechecked-baseline-flags-oracles.log` and
+`lregs-{native,portable}-oracle-verified.log`. Gameplay's explicit override
+selection was already correct.
+
+The same five compiled objects show why fewer CPU expressions alone are not
+enough to justify enabling this pass:
+
+| VA | Host instructions: flags -> locals | CPU loads/stores: locals (proved) | Flag store sites | Parity folds | Function bytes: flags -> locals |
+|---|---:|---:|---:|---:|---:|
+| `004F5A70` | 5,113 -> 5,643 | 580 / 746 | 78 | 12 | 23,680 -> 26,496 |
+| `00428540` | 1,397 -> 1,493 | 168 / 206 | 6 | 1 | 7,136 -> 7,744 |
+| `0051DD60` | 371 -> 482 | 44 / 60 | 21 | 3 | 1,344 -> 1,872 |
+| `00841BA0` | 778 -> 956 | 66 / 126 | 44 | 4 | 3,040 -> 3,904 |
+| `004F2390` | 961 -> 997 | 122 / 164 | 18 | 3 | 4,464 -> 4,608 |
+
+All sampled x87 helper calls remain inlined. GPR synchronization introduces
+copies and can alter optimization of other CPU fields; even flag-store counts
+can rise despite identical flag masks. CPU counts have the same conservative
+proven-base definition as the baseline. Private evidence is
+`work/codegen/lregs-{facts,object-facts}.json` and `lregs-<VA>.{c,asm}`.
+
+The full flags-plus-locals build completed with **531.83 seconds** of input
+preparation and **1,415.79 seconds** of configure/compile/link. The stripped PE
+contains **278,643,894 bytes**, including **268,373,096 bytes** of `.text`.
+This increases `.text` by 12.05% from flags alone. Its immutable SHA-256 is
+`9b156b55f5affa25ed2c033cf6e4c9b5c2fe14edb1fafbe78c6a626ca29fcdfa`.
+GCC reduced debug variable tracking for a large function; compilation and
+linking completed. The baseline executable was removed before creating this
+second retained stripped variant; its numerical and replay evidence remains.
+
+Five **120-second** locals replays completed without a guest stop, through
+final captured Presents **2600, 2600, 2600, 2800 and 2600**. All 15 native
+verifier budgets completed 1,000 CPU/write-set comparisons. The standalone
+contracts, 65 unit tests and final lifter self-test pass. The first 75-second
+attempt reached a rendered world at Present 2048 without a stop but missed the
+audit's 2200 capture threshold; it is retained separately in `lregs-short` and
+does not count among the five. The longer runs use the unchanged executable.
+The contact sheet shows the same close camera/world/character view, with NPC
+and tutorial timing variation; run four's final capture is a saving transition.
+First gameplay/final captures and hash inventories remain under
+`work/codegen/lregs/`, together with `audit.json` and `verification-audit.json`.
+
+### Flags versus flags plus locals: interleaved result
+
+The same repaired harness ran three new A/B pairs with 60-second windows,
+`-AllowBusy`, the same input replay, and no concurrent build/test work from
+this task. Native overrides remain at their default disabled selection. All
+six runs pass the scene-proof, full-retained-window, no-stop and no-drop audit;
+their hashes match the immutable binaries above. Minimum retained coverage is
+**63.865280 seconds**. Minimum first-to-last included frame span is
+**58.387410 seconds**: long boundary frames leave fewer complete intervals
+inside the nominal window. The reporter computes FPS from complete intervals
+within that window; profiler padding contributes no measured frames or CPU.
+
+| Variant | FPS | p95 ms | p99 ms | CPU cores |
+|---|---:|---:|---:|---:|
+| Flags CFG | 26.29 [26.28, 27.07] | 43.78 [43.20, 44.80] | 47.16 [46.37, 47.47] | 1.100 [1.083, 1.100] |
+| Flags CFG + locals all | 12.50 [11.76, 12.67] | 88.83 [86.55, 94.93] | 96.67 [95.96, 106.31] | 1.050 [1.050, 1.050] |
+
+| Pair | Flags FPS | Flags + locals FPS | Paired change |
+|---|---:|---:|---:|
+| 1 | 27.07 | 12.67 | -53.19% |
+| 2 | 26.28 | 12.50 | -52.42% |
+| 3 | 26.29 | 11.76 | -55.28% |
+
+Median paired change: **-14.40 FPS / -53.19%**. Paired p95/p99 changes are
+**+45.05/+49.59 ms**, with **-0.050 CPU cores**. This cohort measures the
+incremental locals effect; do not compare its flags median directly with the
+earlier cohort to infer another effect. Shared-host load, the tutorial replay
+and its varying animation/saving transitions limit generalization.
+
+Visual boundary audit adds a material limitation: at the same Present 2048,
+the flags-only captures show a tiled/tutorial area while the locals captures
+show the cobblestone area. The replay is unattended and its progression is not
+locked to an identical simulation state. Both render the expected character
+and world, but exact scene equivalence is **not established**. These numbers
+are observed paired replay results, not an isolated same-scene codegen-cost
+estimate. The boundary contact sheet is `work/codegen/bench-lregs-contact.png`.
+Resolving progression differences belongs in the next locals investigation.
+
+The broad conservative locals pass is a **performance regression**, despite
+passing the observed correctness checks. It remains **off by default**;
+CFG flags remain enabled. The object samples demonstrate extra synchronization
+and larger code, consistent with this result, but do not independently assign
+the slowdown to any one cause. A next experiment should lower stack operations
+against local ESP and reduce proven-unnecessary boundary copies, then admit
+functions selectively and repeat this protocol before enabling locals.
+
+| Variant | Stripped PE bytes | `.text` bytes | Configure/compile/link seconds | Input preparation seconds |
+|---|---:|---:|---:|---:|
+| Baseline | 254,480,143 | 244,335,512 | 1,292.35 | 0.97 (already generated) |
+| Flags CFG | 249,464,192 | 239,521,720 | 1,259.76 | 437.59 |
+| Flags CFG + locals all | 278,643,894 | 268,373,096 | 1,415.79 | 531.83 |
+
+Compile/preparation times are observed wall times, not paired performance
+claims. Raw result and audit:
+`work/codegen/bench-lregs/{result.json,A,B}` and `bench-lregs-audit.json`.
+The two retained stripped variants are flags and flags-plus-locals. No Android
+hardware execution is claimed.
+
+Reproduction (build each variant once, preserve its stripped executable before
+building the next, keep the same `ac1_startup.exe` basename in separate folders):
+
+```powershell
+tools/build.ps1 -BuildType RelWithDebInfo -Jobs 10 -FlagLiveness off -LocalRegs off
+tools/build.ps1 -BuildType RelWithDebInfo -Jobs 10 -FlagLiveness cfg -LocalRegs off
+tools/build.ps1 -BuildType RelWithDebInfo -Jobs 10 -FlagLiveness cfg -LocalRegs all
+tools/bench_gameplay.ps1 -Compare -Runs 3 -Seconds 60 -Binary <baseline> -BinaryB <flags> -AllowBusy
+tools/bench_gameplay.ps1 -Compare -Runs 3 -Seconds 60 -Binary <flags> -BinaryB <flags-and-locals> -AllowBusy
+```
+
+The local measurements also used `-AllowDirty` because shared worktree Git
+metadata is read-only. Focused commits live in `work/codegen-commits.git` and
+are exported as `work/codegen.bundle`, based on `786ecf1`. Generated CPU headers
+are excluded along with game/generated C, logs, captures and build products;
+`tools/prepare_runtime.py` regenerates the masked helpers from pinned inputs.
+Unneeded captures were pruned after writing SHA-256 inventories; benchmark
+boundary images remain and both audits still pass. No task-owned game,
+compiler or GPU-sampler process remains. Automatic approval review rejected
+recursive removal of the obsolete **152,357-byte** compiler-probe directory
+`work/codegen/baseline-probe`; that small directory is retained.
