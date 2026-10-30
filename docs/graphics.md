@@ -24,11 +24,36 @@ upstream's KHR-extension check. These are genuine requirements in the
 Raw evidence is `work/render/vulkan-probe/capabilities.txt`; reproduce with
 `ports/dxvk_android/probe.ps1 -Serial <adb-serial>`.
 
-DXVK 3.1 is not yet ported or verified on the phone. App-local Mesa Turnip via
-libadrenotools is the proposed alternative; its capabilities must be measured
-through the imported loader. See the [renderer migration notes](../ports/dxvk_android/README.md).
-The existing 1.9.2b build remains available. World geometry and video are still
-open issues; no successful fix or new-provider FPS result is claimed.
+Official DXVK 3.1 is now ported and compiled for Android ARM64 and x86_64.
+The new WsiDriver/WsiBootstrap backend preserves the native-window, render-size
+and loader-injection exports. The NDK build compiles dxbc-spirv and validates
+28 built-in shaders for Vulkan 1.3 with scalar block layout. Both stripped
+providers pass ELF/symbol inspection. The custom 1.9.2b pipeline-cache code and
+supplemental Vulkan headers have been removed; the active headers come from
+the pinned upstream submodules. See [renderer pins/notices](../ports/dxvk_android/NOTICE.md).
+
+ARM64 JNI defaults to Mesa Turnip through libadrenotools, checks the selected
+driver identity and rejects silent system fallback. The APK extracts its
+native libraries (`useLegacyPackaging=true`); its package includes the driver
+and all five support/hook libraries from `work/build/turnip-arm64/package/`.
+DXVK's shader cache and Mesa's cache directory are set to app-private userdata.
+The loader is initialized before DXVK; the renderer itself does not link the
+system Vulkan loader. No shared runtime or launcher source was changed.
+
+The complete debug APK packaged successfully. Native JNI/bridge compilation
+and linking passed using the current CMake commands; the Windows bridge TU
+also compiled without warnings. Gradle's native Ninja step hung in the
+sandbox, so the changed units and link were executed directly and Gradle's
+existing prebuilt-library path was used for packaging. Build evidence is
+`work/render/dxvk31-build.log`, `dxvk31-arm64-final.log`, `dxvk31-x86-build.log`,
+`native31-incremental.log`, `bridge-windows-compile.log` and
+`apk31-final-package.log`.
+
+Phone rendering verification is blocked by adb disconnection; the separate
+Turnip shell probe also found no connected device. World geometry, shadows,
+HUD video and gameplay FPS remain unverified with this provider. No successful
+rendering fix or FPS improvement is claimed. See the
+[renderer build and integration commands](../ports/dxvk_android/README.md).
 
 Opt-in `AC1_D3D9_TRACE_CAPS=1` bridge diagnostics log CheckDeviceFormat requests
 and results, the complete adapter caps payload, and vertex declaration elements.

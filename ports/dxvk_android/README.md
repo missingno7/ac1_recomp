@@ -1,62 +1,82 @@
-# DXVK Native for AC1 Android
+# Official DXVK 3.1 for AC1 Android
 
-## Upstream 3.1 migration feasibility (2026-10-30)
+The Android D3D9 provider builds official upstream DXVK `v3.1`, commit
+`70d7508c01201ed3d4bfb33da42ba834eafe3857`, matching the host release.
+The standalone DXVK Native 1.9.2b recipe has been replaced. The pinned
+submodules, including `dxbc-spirv` and its SPIR-V headers, are checked by
+`prepare.py`. See [NOTICE.md](NOTICE.md) for pins and licenses.
 
-The migration target is official upstream [`v3.1`](https://github.com/doitsujin/dxvk/tree/v3.1),
-commit `70d7508c01201ed3d4bfb33da42ba834eafe3857` (annotated tag object
-`a1596f766f236244686c0c0fffba4416f0e185b1`). The existing build below still uses
-1.9.2b; it has **not** been replaced by 3.1.
+Downloaded source stays under `work/deps/dxvk-3.1-turnip/`; platform changes
+are applied to `work/dxvk/prepared-3.1/`. Normal builds use the official Git
+checkout and recursive submodules. In restricted environments, a connected
+GitHub snapshot may populate a submodule with `AC1_SOURCE_SNAPSHOT.json`;
+preparation checks the revision and each file's pinned Git blob SHA. No
+downloaded source, generated shaders, binaries or game files belong in commits.
 
-An NDK-built probe ran on the Samsung Galaxy S24 Ultra / Adreno 750 / Android 16.
-The proprietary driver advertises Vulkan 1.3.128 and 256-byte push constants.
-All queried mandatory core feature bits pass, but `maintenance5` and
-`maintenance6` are false, and these required extensions are absent:
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File ports/dxvk_android/build.ps1 -Abi arm64-v8a
+# Optional cross-build, without launching an emulator:
+powershell -NoProfile -ExecutionPolicy Bypass -File ports/dxvk_android/build.ps1 -Abi x86_64
+```
 
-- `VK_KHR_maintenance5`
-- `VK_KHR_maintenance6`
-- `VK_KHR_load_store_op_none` (the driver exposes only `VK_EXT_load_store_op_none`)
+The default builder is MinGW Makefiles (`C:/msys64/mingw64/bin/mingw32-make.exe`);
+`-Builder Ninja` is also supported. Both use NDK 28.2.13676358. The build compiles
+and validates 28 built-in shaders for Vulkan 1.3 with scalar block layout.
+Build trees are `work/build/dxvk31-android-<abi>-<builder>/`; the stripped provider
+is published as `work/build/dxvk-android-<abi>/libac1_dxvk_android.so` for the app.
+The ARM64 and x86_64 providers have compiled successfully. Compilation alone
+does not establish phone rendering.
 
-The requirements were checked against the pinned release's
-[`getFeatureList` and compatibility checks](https://github.com/doitsujin/dxvk/blob/70d7508c01201ed3d4bfb33da42ba834eafe3857/src/dxvk/dxvk_device_info.cpp),
-as well as its Vulkan profile. The release's API minimum is Vulkan 1.3;
-the missing extensions prevent this driver from qualifying. Do not bypass
-the checks or advertise unsupported functionality.
+## WSI, loader and cache
 
-Reproduce the read-only query (no emulator or game data upload):
+`android_wsi.cpp` implements upstream `WsiDriver`/`WsiBootstrap`, registered as
+`Android`, with ANativeWindow surfaces, monitor/mode enumeration, window
+lifetime and compositor buffer sizing. It preserves `Direct3DCreate9`,
+`dxvkAndroidSetWindow`, `dxvkAndroidGetWindowHandle`, `dxvkAndroidSetRenderSize`,
+`dxvkAndroidSetInstanceProcAddr` and `dxvkAndroidGetInstanceProcAddr`.
+The loader must be selected before the first DXVK instance. All instance,
+device and surface entry points use that loader; the provider has no dynamic
+dependency on the system `libvulkan.so`.
+
+JNI sets `DXVK_WSI_DRIVER=Android`. ARM64 defaults to
+`AC1_VULKAN_DRIVER=turnip`, loading the pinned `ports/turnip/` package in-process
+through libadrenotools. It verifies the actual driver is Mesa Turnip and rejects
+silent system fallback. An explicit `AC1_VULKAN_DRIVER=system` is available for
+diagnostics; this phone's current system driver fails the mandatory-extension
+checks. Unknown selections, missing libraries, loader failures and device
+enumeration failures produce precise startup/logcat diagnostics.
+
+The APK uses `useLegacyPackaging=true`: both hooks and the driver are extracted
+to the app's installed native-library directory. Gradle requires all six ARM64
+Turnip package libraries under `work/build/turnip-arm64/package/arm64-v8a/`.
+JNI locates its own extracted library directory with `dladdr`, without launcher
+changes. Keep the Turnip worker's dependency sources and notices with any
+redistribution; its optional integration patch is not needed by this port.
+
+`DXVK_SHADER_CACHE_PATH` and `MESA_SHADER_CACHE_DIR` point to app-private
+userdata. DXVK 3.1 uses its own `.dxvk.bin`/`.dxvk.lut` cache; the 1.9.2b custom
+pipeline-cache implementation and supplemental Vulkan headers were removed.
+The game installation remains read-only.
+
+## Phone capability checkpoint
+
+The NDK probe ran on the Galaxy S24 Ultra / Adreno 750 / Android 16. The
+proprietary driver reports Vulkan 1.3.128, 256-byte push constants and the
+queried mandatory core feature bits, but lacks `VK_KHR_maintenance5`,
+`VK_KHR_maintenance6` and `VK_KHR_load_store_op_none`. Both maintenance feature
+bits are zero. Its EXT load/store variant does not satisfy the KHR check in
+the pinned upstream release. No requirements are bypassed by this port.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File ports/dxvk_android/probe.ps1 -Serial <adb-serial>
 ```
 
-Without `-Serial`, this only compiles the ARM64 executable. Output goes to
-ignored `work/render/vulkan-probe/`; exit 2 means the query succeeded but found
-no compatible candidate. It creates no Vulkan device or surface and therefore
-does not establish renderer operation.
+That probe queries the system loader, not imported Turnip; exit 2 means no
+compatible candidate. The Turnip worker supplies a separate selected-loader
+probe under `ports/turnip/probe/`. Its device result and a real APK replay are
+required before claiming compatibility, rendering correctness or FPS.
 
-The alternative under evaluation is app-local Mesa Turnip through
-[`libadrenotools`](https://github.com/bylaws/libadrenotools). Its documented API
-supports rootless ARM64 driver loading. That requires packaged hook libraries,
-`useLegacyPackaging = true`, and an internal app-private driver directory;
-external game storage cannot hold executable driver libraries. A selected
-Turnip build must be pinned, licensed, and probed through its loader before
-claiming compatibility. No Turnip integration or DXVK 3.1 phone run is verified.
-
-The implementation work includes the new upstream WSI platform interface,
-NDK/C++ build changes and pinned submodules (including `dxbc-spirv`), retaining
-the existing surface/render-size exports, and moving 3.1's shader cache to
-app-private userdata. The old state/pipeline-cache implementation must not be
-assumed compatible with the new release.
-
-## Existing 1.9.2b build
-
-This is AC1's Android D3D9 backend, adapted from the Android WSI and build recipe in `codepdbh/nfsu2-recompiled` (MIT per that repository's README; copyright attribution: codepdbh). It fetches DXVK Native `native-1.9.2b` at `c8dc91fabd00cac11d697ccf07426e798393cd40` into ignored `work/deps`, applies the Android preparation recipe into ignored `work/dxvk/prepared`, generates Vulkan 1.1 built-in shaders with the Android NDK's `glslc` plus `spirv-val`, and builds an ARM64 shared library.
-
-Build with the installed Android SDK/NDK:
-
-```powershell
-.\ports\dxvk_android\build.ps1
-```
-
-This only builds the renderer dependency. AC1 still needs a guest D3D9 COM bridge and an Android surface/lifecycle connection. The exported native API needed by that bridge is `Direct3DCreate9`; `dxvkAndroidSetWindow`, `dxvkAndroidGetWindowHandle`, and `dxvkAndroidSetRenderSize` connect the host surface. Guest COM pointers must remain 32-bit handles/vtable tokens in guest memory, mapped to 64-bit DXVK interfaces by a separate host-side table.
-
-The NFSU2-authored adaptations retain the MIT notice in `LICENSE.nfsu2.txt`. DXVK Native is zlib-licensed (`DXVK-LICENSE`). Its bundled Windows/DirectX headers include Wine-derived material under LGPL-2.1-or-later; keep their notices with any redistribution. The supplemental Vulkan Android/Xlib headers retain Apache-2.0 notices. This port contains no game assets or generated game code. See `docs/graphics.md` for current integration limits.
+At this checkpoint the complete APK has packaged successfully, but the phone
+disconnected from adb before its Turnip run. World geometry, shadows, HUD
+video and FPS remain unverified with the new provider. Evidence and review
+patches are under ignored `work/render/`; see [docs/graphics.md](../../docs/graphics.md).
