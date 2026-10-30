@@ -731,6 +731,12 @@ AC1_XMM_LANE_SETTER(vu16, ac1_v8u16, uint16_t)
 AC1_XMM_LANE_SETTER(vi16, ac1_v8i16, int16_t)
 AC1_XMM_LANE_SETTER(vu8, ac1_v16u8, uint8_t)
 AC1_XMM_LANE_SETTER(vi8, ac1_v16i8, int8_t)
+/* A 16-byte stack load assembled from lane values the lifter forwarded from
+ * the stores just before it (tools/lift_ac1.py, StackLaneForwarding). */
+static inline uint32_t ac1_f32_bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static inline XMM ac1_xmm_from_u32(uint32_t l0, uint32_t l1, uint32_t l2, uint32_t l3) {
+    XMM x; x.vu32 = (ac1_v4u32){ l0, l1, l2, l3 }; return x;
+}
 /* CVTPS2PD reads the low two floats; CVTPD2PS zeroes the upper two lanes. */
 static inline ac1_v2f64 ac1_cvtps2pd(ac1_v4f32 s) { return (ac1_v2f64){ s[0], s[1] }; }
 static inline ac1_v4f32 ac1_cvtpd2ps(ac1_v2f64 s) {

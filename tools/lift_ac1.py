@@ -232,6 +232,124 @@ def drop_unrecorded_eip_markers(body: str) -> str:
     return UNRECORDED_EIP_MARKER.sub('', body)
 
 
+# The original compiler builds __m128 values on the stack: 4-byte stores
+# (movss, mov dword) and then one 16-byte load (movaps, movups or a packed op
+# with a memory source). A CPU cannot forward several narrow stores into one
+# wide load, so that load waits for the stores to commit. Within a block,
+# with ESP followed through push/pop/add/sub, the lifter knows which lanes
+# were just written and assembles the load from their values; lanes it does
+# not know are 4-byte loads, which forward. The stores still happen. Any other
+# memory write it cannot place, a call, a label or an ESP change it cannot
+# follow ends the tracking, so a forwarded value is the one memory holds.
+MEMORY_OPERAND_ZERO_READS = frozenset({
+    'cmp', 'test', 'bt', 'push', 'call', 'jmp', 'nop', 'lea', 'prefetchnta', 'prefetcht0', 'prefetcht1',
+    'prefetcht2', 'fld', 'fild', 'fbld', 'fadd', 'fsub', 'fsubr', 'fmul', 'fdiv', 'fdivr', 'fcom', 'fcomp',
+    'ficom', 'ficomp', 'fiadd', 'fisub', 'fisubr', 'fimul', 'fidiv', 'fidivr', 'fldcw', 'fldenv', 'frstor',
+    'fxrstor'})
+MEMORY_UNPLACEABLE_WRITES = frozenset({
+    'fxsave', 'fnsave', 'fsave', 'fnstenv', 'fstenv', 'maskmovq', 'maskmovdqu', 'enter', 'pushal', 'pushfd',
+    'int', 'int3', 'into'})
+STACK_TRACKING_ENDS = frozenset({'call', 'jmp', 'ret', 'retn', 'iretd', 'leave', 'enter', 'pushal', 'popal',
+                                 'pushfd', 'popfd', 'int', 'int3', 'into'})
+
+
+class StackLaneForwarding:
+    """Per-function state: 4-byte stack stores whose values a 16-byte load may take.
+
+    step() runs right before an instruction's lines are appended to the
+    function's output. A store's value is captured into a 32-bit local only
+    when a later load uses it, by prefixing the store's first emitted line.
+    """
+
+    def __init__(self, lifter, output: list[str]):
+        from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
+        self.lifter, self.output = lifter, output
+        self.IMM, self.MEM, self.REG = X86_OP_IMM, X86_OP_MEM, X86_OP_REG
+        self.declarations = []
+        self.reset()
+
+    def reset(self):
+        self.delta = 0          # ESP relative to where tracking started
+        self.lanes = {}         # stack offset -> (local name, value, output line of the store)
+
+    def register(self, op) -> str:
+        return self.lifter.md.reg_name(op.reg) if op.type == self.REG else ''
+
+    def stack_offset(self, op):
+        if op.type != self.MEM or op.mem.segment or op.mem.index or self.lifter.md.reg_name(op.mem.base) != 'esp':
+            return None
+        return self.delta + op.mem.disp
+
+    def clear(self, start, size):
+        for offset in [o for o in self.lanes if o < start + size and start < o + 4]:
+            del self.lanes[offset]
+
+    def step(self, insn, lines: list[str], block_start: bool) -> list[str]:
+        if block_start:
+            self.reset()
+        m, ops = insn.mnemonic, insn.operands
+        memory = [(i, op) for i, op in enumerate(ops) if op.type == self.MEM]
+        load = next((op for i, op in memory if i > 0 and op.size == 16), None)
+        if load is not None and self.stack_offset(load) is not None:
+            lines = self.forward(insn, load, lines)
+        written = [op for i, op in memory if i == 0 and m not in MEMORY_OPERAND_ZERO_READS]
+        if m in ('xchg', 'xadd', 'cmpxchg'):
+            written = [op for _, op in memory]
+        if m in MEMORY_UNPLACEABLE_WRITES:
+            self.lanes = {}
+        for op in written:
+            start = self.stack_offset(op)
+            if start is None:       # a write the lifter cannot place may alias the frame
+                self.lanes = {}
+                continue
+            self.clear(start, op.size)
+            if op.size != 4 or len(ops) != 2 or m not in ('movss', 'mov'):
+                continue
+            source = ops[1]
+            if m == 'movss' and self.lifter._is_xmm(source):
+                value = f'ac1_f32_bits(c->xmm[{self.lifter._xi(source)}].f32[0])'
+            elif m == 'mov' and source.type == self.IMM:
+                value = f'0x{source.imm & 0xFFFFFFFF:08X}u'
+            elif m == 'mov' and self.register(source) in ('eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi'):
+                value = f'c->{self.register(source)}'
+            else:
+                continue
+            self.lanes[start] = (f'_ac1_lane_{insn.address:08X}', value, len(self.output))
+        if m == 'push':
+            self.delta -= 4
+            self.clear(self.delta, 4)
+        elif m == 'pop' and ops and ops[0].type == self.REG and self.register(ops[0]) != 'esp':
+            self.delta += 4
+        elif m in ('add', 'sub') and len(ops) == 2 and self.register(ops[0]) == 'esp' and ops[1].type == self.IMM:
+            self.delta += ops[1].imm if m == 'add' else -ops[1].imm
+        elif m in STACK_TRACKING_ENDS or m == 'pop' or (
+                ops and self.register(ops[0]) == 'esp' and m not in ('cmp', 'test', 'push')):
+            self.reset()
+        return lines
+
+    def forward(self, insn, load, lines: list[str]) -> list[str]:
+        start = self.stack_offset(load)
+        hits = [o for o in self.lanes if o < start + 16 and start < o + 4]
+        if not hits or any((o - start) % 4 or o < start or o + 4 > start + 16 for o in hits):
+            return lines
+        read = f'rdxm({self.lifter.addr_expr(insn, load)})'
+        text = '\n'.join(lines)
+        if text.count(read) != 1:
+            return lines
+        values = []
+        for i in range(4):
+            lane = self.lanes.get(start + 4 * i)
+            if lane is None:
+                values.append(f'rd32((c->esp + 0x{(load.mem.disp + 4 * i) & 0xFFFFFFFF:08X}u))')
+                continue
+            name, value, line = lane
+            if name not in self.declarations:
+                self.declarations.append(name)
+                self.output[line] = f'    {name} = {value};' + self.output[line][3:]
+            values.append(name)
+        return text.replace(read, f'ac1_xmm_from_u32({", ".join(values)})').split('\n')
+
+
 # A lane assignment statement on an XMM register or an initialized copy of one.
 XMM_LANE_WRITE = re.compile(
     r'(?:^|(?<=[;{}]))(\s*)((?:c->xmm\[\d\]|_ac1_xmm\d|_[sd])\.(v(?:f32|f64|u8|i8|u16|i16|u32|i32|u64|i64)))'
@@ -4555,6 +4673,7 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
     output = [f"void L_{address:08X}(CPU *c)", "{"]
     entry_jump = entry_guard_lines(address, [insn.address for insn in insns])
     output.extend(entry_jump)
+    lanes = StackLaneForwarding(lifter, output)
     for index, insn in enumerate(insns):
         if insn.address in labels or (entry_jump and insn.address == address):
             output.append(f"L_{insn.address:08X}:")
@@ -4594,12 +4713,16 @@ def lift_exact_function(lifter, spec: dict, read_va, X86_OP_IMM: int, X86_OP_MEM
                 st_index = lifter._st_idx(insn.operands[0])  # not `index`: the loop uses it below
                 prefix.append(f"ac1_x87_set_tag(c,(unsigned)(c->fpu_top+{st_index})&7u,0);")
             translated = prefix + translated
+        translated = lanes.step(insn, translated, insn.address in labels or insn.address == address)
         for line in translated:
             output.append(f"    {line:<60} /* {insn.address:08X}: {insn.mnemonic} {insn.op_str} */")
         next_decoded = insns[index + 1].address if index + 1 < len(insns) else None
         target = fallthrough_target(insn.mnemonic, insn.address + insn.size, next_decoded)
         if target is not None:
             output.append(f"    dispatch(c, 0x{target:08X}u); return;")
+            lanes.reset()
+    if lanes.declarations:
+        output.insert(2, "    uint32_t " + ", ".join(lanes.declarations) + ";")
     output.append("}")
     return xmm_vector_lanes("\n".join(output))
 
