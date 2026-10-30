@@ -8,7 +8,7 @@ param(
     [switch]$PrepareOnly,
     [switch]$CheckRepeat,
     [switch]$Run,
-    [ValidateSet('off', 'straight', 'cfg')][string]$FlagLiveness = 'cfg',
+    [ValidateSet('off', 'straight', 'cfg', 'abi')][string]$FlagLiveness = 'cfg',
     [string]$LocalRegs = 'off',
     # Checked per-access guest memory (diagnosable bad pointers) instead of the direct arena.
     [switch]$CheckedMemory,
