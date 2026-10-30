@@ -276,6 +276,9 @@ extern "C" void ac1_android_surface_size(int32_t *w, int32_t *h) {
     *h = 720;
 }
 static bool key_dispatched;
+static unsigned monitor_calls;
+static bool monitor_continue = true;
+static std::array<int32_t, 4> monitor_rect;
 static int window_read(void *, uint32_t a, void *p, size_t n) {
     auto q = resolve(nullptr, a, n, 1);
     if (!q)
@@ -295,8 +298,15 @@ static int window_alloc(void *, size_t n, uint32_t *a) {
     return 1;
 }
 static uint32_t thread_id(void *) { return 1; }
-static int wndproc(void *, CPU *, uint32_t proc, uint32_t, uint32_t msg, uint32_t wp, uint32_t lp,
+static int wndproc(void *, CPU *, uint32_t proc, uint32_t handle, uint32_t msg, uint32_t wp, uint32_t lp,
                    uint32_t *out) {
+    if (proc == 0x23456789) {
+        assert(handle == 1 && msg == 0 && lp == 0x8765);
+        assert(!std::memcmp(ram.data() + wp, monitor_rect.data(), 16));
+        ++monitor_calls;
+        *out = monitor_continue;
+        return 1;
+    }
     assert(proc == 0x12345678);
     *out = msg == 0x81 ? 1 : 0;
     if (msg == 0x81) {
@@ -343,6 +353,22 @@ static void window() {
     uint32_t win = invoke("CreateWindowExA", {0, 1, 0, 0, 0, 0, 1280, 720, 0, 0, 0x400000, 0});
     assert(win);
     assert(ac1_window_win32_resolve_hwnd(w, win));
+    assert(invoke("GetSystemMetrics", {23}) == 0); // SM_SWAPBUTTON, matches host oracle.
+    monitor_rect = {0, 0, 1280, 720};
+    size_t before_enum = allocations.size();
+    assert(invoke("EnumDisplayMonitors", {0, 0, 0x23456789, 0x8765}) == 1);
+    assert(monitor_calls == 1 && allocations.size() == before_enum);
+    uint32_t clip = data({uint32_t(-10), 10, 640, 800});
+    monitor_rect = {0, 10, 640, 720};
+    assert(invoke("EnumDisplayMonitors", {0, clip, 0x23456789, 0x8765}) == 1);
+    assert(monitor_calls == 2);
+    put(clip, 1280);
+    assert(invoke("EnumDisplayMonitors", {0, clip, 0x23456789, 0x8765}) == 1);
+    assert(monitor_calls == 2); // Empty intersection delivers no callback.
+    monitor_rect = {0, 0, 1280, 720};
+    monitor_continue = false;
+    assert(invoke("EnumDisplayMonitors", {0, 0, 0x23456789, 0x8765}) == 0);
+    assert(monitor_calls == 3);
     uint32_t rect = alloc(nullptr, 28, 4);
     assert(invoke("GetClientRect", {win, rect}) == 1 && get(rect + 8) == 1280 &&
            get(rect + 12) == 720);

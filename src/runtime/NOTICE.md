@@ -25,6 +25,10 @@ enumeration in `ac1_runtime.c` follow recomp-kit `runtime/kernel32.cpp`'s
 `GetSystemDirectoryA` and `logical_drive_strings` buffer-size contracts,
 copyright 2026 veritr1x, MIT; see `LICENSE.recomp-kit.txt`.
 
+Android single-monitor enumeration in `src/platform/ac1_window_android.c`
+adapts recomp-kit `runtime/user32_vcl.cpp`'s `enum_monitors` clipping and
+callback approach, copyright 2026 veritr1x, MIT; see `LICENSE.recomp-kit.txt`.
+
 Native Bink decoding links FFmpeg 8.1 (official n8.1 commit
 9047fa1b084f76b1b4d065af2d743df1b40dfb56), copyright the FFmpeg developers and
 individual source authors, under LGPL version 2.1 or later. The selected build

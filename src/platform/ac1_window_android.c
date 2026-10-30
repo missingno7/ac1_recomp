@@ -90,7 +90,7 @@ int ac1_window_win32_call(ac1_window_win32 *w, CPU *cpu, const char *name, uint3
              IS("DestroyWindow") || IS("IsWindow") || IS("IsWindowVisible") || IS("IsIconic") ||
              IS("GetDC"))
         argc = 1;
-    else if (IS("DefWindowProcA"))
+    else if (IS("DefWindowProcA") || IS("EnumDisplayMonitors"))
         argc = 4;
     else if (IS("PeekMessageA"))
         argc = 5;
@@ -106,7 +106,32 @@ int ac1_window_win32_call(ac1_window_win32 *w, CPU *cpu, const char *name, uint3
     }
     if (argc && !rd(w, cpu->esp + 4, a, argc * 4))
         goto bad;
-    if (IS("LoadCursorA")) {
+    if (IS("EnumDisplayMonitors")) {
+        /* Single-monitor callback/clipping follows recomp-kit user32_vcl.cpp
+         * (MIT). Handle 1 agrees with ports/dxvk_android/android_wsi.cpp. */
+        if (a[0]) {
+            snprintf(error, cap, "Android EnumDisplayMonitors: unsupported HDC=0x%08x", a[0]);
+            return -1;
+        }
+        if (!a[2]) goto bad;
+        int32_t rect[4] = {0, 0, w->width, w->height};
+        if (a[1]) {
+            int32_t clip[4];
+            if (!rd(w, a[1], clip, sizeof(clip))) goto bad;
+            for (unsigned i = 0; i < 4; ++i)
+                if (i < 2 ? clip[i] > rect[i] : clip[i] < rect[i]) rect[i] = clip[i];
+        }
+        result = 1;
+        if (rect[0] < rect[2] && rect[1] < rect[3]) {
+            uint32_t address = 0, value = 0;
+            if (!w->cb.allocate_guest(w->cb.context, sizeof(rect), &address)) goto bad;
+            int ok = wr(w, address, rect, sizeof(rect)) &&
+                w->cb.invoke_wndproc(w->cb.context, cpu, a[2], 1, 0, address, a[3], &value);
+            w->cb.free_guest(w->cb.context, address);
+            if (!ok) goto bad;
+            result = value != 0;
+        }
+    } else if (IS("LoadCursorA")) {
         if (a[0] || a[1] < 32512 || a[1] > 32672)
             goto unsupported;
         result = 0xe5100000u + a[1];
@@ -277,8 +302,12 @@ int ac1_window_win32_call(ac1_window_win32 *w, CPU *cpu, const char *name, uint3
         case 43:
             result = 3;
             break;
+        case 23: /* SM_SWAPBUTTON: standard left/right physical mouse mapping. */
+            result = 0;
+            break;
         default:
-            goto unsupported;
+            snprintf(error, cap, "Android USER32 GetSystemMetrics: unsupported index=%u", a[0]);
+            return -1;
         }
     } else if (IS("GetDC"))
         result = 0xe5200001;
