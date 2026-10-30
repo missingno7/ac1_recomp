@@ -15,7 +15,7 @@ WORK = ROOT / "work/mmx_evidence/oracle"
 sys.dont_write_bytecode = True
 
 
-def run(*, flag_liveness='off', local_regs='off'):
+def run(*, flag_liveness='off', local_regs='off', x87_inline=False):
     if local_regs not in ('off','all'):
         raise ValueError('MMX oracle local_regs must be off or all')
     start = time.perf_counter()
@@ -34,6 +34,7 @@ def run(*, flag_liveness='off', local_regs='off'):
     if not cc or not cxx or not shutil.which("objcopy"):
         raise RuntimeError("gcc, g++ and objcopy are required for native MMX oracle checks")
 
+    inline_options = ['-DAC1_FORCE_INLINE_X87=1'] if x87_inline else []
     operations = []
     binary = ("movq paddb paddw paddd paddq psubb psubw psubd psubq paddsb paddsw psubsb psubsw "
               "paddusb paddusw psubusb psubusw pand pandn por pxor pcmpeqb pcmpeqw pcmpeqd "
@@ -147,14 +148,14 @@ def run(*, flag_liveness='off', local_regs='off'):
     objects=[]
     for index, unit in enumerate([WORK / "ops.c", *units]):
         obj=WORK / f"generated_{index}.o"
-        command=[cc,"-std=c11","-O2","-Wall","-Wextra","-Werror","-fwrapv","-fno-strict-aliasing",
+        command=[cc,*inline_options,"-std=c11","-O2","-Wall","-Wextra","-Werror","-fwrapv","-fno-strict-aliasing",
                  "-I",str(include),"-c",str(unit),"-o",str(obj)]
         result=subprocess.run(command,capture_output=True,text=True)
         if result.returncode:
             raise RuntimeError(result.stdout+result.stderr)
         commands.append(command);objects.append(obj)
     exe=WORK / "compare.exe"
-    command=[cxx,"-std=c++17","-O2","-Wall","-Wextra","-Werror","-I",str(include),"-I",str(WORK),
+    command=[cxx,*inline_options,"-std=c++17","-O2","-Wall","-Wextra","-Werror","-I",str(include),"-I",str(WORK),
              str(ROOT / "tests/mmx_general_native.cpp"),*[str(obj) for obj in objects],"-o",str(exe)]
     commands.append(command)
     result=subprocess.run(command,capture_output=True,text=True)
@@ -165,7 +166,7 @@ def run(*, flag_liveness='off', local_regs='off'):
     if result.returncode:
         raise RuntimeError(result.stdout+result.stderr)
     report={"operations":len(operations),"output":result.stdout,"commands":commands,
-            "flag_liveness":flag_liveness,"local_regs":local_regs,
+            "flag_liveness":flag_liveness,"local_regs":local_regs,"x87_inline":x87_inline,
             "seconds":round(time.perf_counter()-start,3)}
     (WORK / "report.json").write_text(json.dumps(report,indent=2)+"\n")
     print(result.stdout.strip())
@@ -177,5 +178,6 @@ if __name__ == "__main__":
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--flag-liveness',choices=('off','straight','cfg'),default='off')
     parser.add_argument('--local-regs',choices=('off','all'),default='off')
+    parser.add_argument('--x87-inline',action='store_true')
     args=parser.parse_args()
-    run(flag_liveness=args.flag_liveness,local_regs=args.local_regs)
+    run(flag_liveness=args.flag_liveness,local_regs=args.local_regs,x87_inline=args.x87_inline)

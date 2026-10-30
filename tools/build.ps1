@@ -10,6 +10,7 @@ param(
     [switch]$Run,
     [ValidateSet('off', 'straight', 'cfg', 'abi')][string]$FlagLiveness = 'cfg',
     [string]$LocalRegs = 'off',
+    [switch]$X87Inline,
     # Checked per-access guest memory (diagnosable bad pointers) instead of the direct arena.
     [switch]$CheckedMemory,
     [string]$GameExe = 'C:\Program Files (x86)\GOG.com\Assassins Creed\AssassinsCreed_Dx9.exe',
@@ -71,6 +72,7 @@ try {
     $MakeProgram = if ($Generator -eq 'MinGW Makefiles') { 'C:/msys64/mingw64/bin/mingw32-make.exe' } else { $Ninja }
     $ConfigureArgs = @('-S', '.', '-B', $BuildDir, '-G', $Generator, "-DCMAKE_MAKE_PROGRAM=$MakeProgram", "-DCMAKE_BUILD_TYPE=$BuildType")
     # Explicit, because an option default never overrides an existing CMake cache entry.
+    $ConfigureArgs += "-DAC1_FORCE_INLINE_X87=$(if ($X87Inline) { 'ON' } else { 'OFF' })"
     $ConfigureArgs += "-DAC1_DIRECT_MEMORY=$(if ($CheckedMemory) { 'OFF' } else { 'ON' })"
     if ($Target -eq 'Host') {
         $ConfigureArgs += '-DCMAKE_C_COMPILER=C:/msys64/mingw64/bin/gcc.exe'
