@@ -5004,9 +5004,16 @@ static int handle_import(CPU *cpu, const import_record *import)
         cpu->eax = (uint32_t)GetWindowsDirectoryA(output, capacity);
         if (!cpu->eax) last_error = (uint32_t)GetLastError();
 #else
-        (void)output_address;
-        (void)capacity;
-        stop_guest("GetWindowsDirectoryA is unavailable without a Windows host", import->token);
+        /* Virtual guest directory; no host Windows installation is exposed.
+         * Buffer sizing follows recomp-kit runtime/kernel32.cpp (MIT). */
+        static const char directory[] = "C:\\WINDOWS";
+        cpu->eax = sizeof(directory);
+        if (capacity >= sizeof(directory)) {
+            char *output = (char *)guest_memory_try_ptr(output_address, sizeof(directory));
+            if (!output) stop_guest("GetWindowsDirectoryA output is unmapped", import->token);
+            memcpy(output, directory, sizeof(directory));
+            cpu->eax = sizeof(directory) - 1u;
+        }
 #endif
         return_stdcall(cpu, 8u);
         return 1;
@@ -5024,9 +5031,14 @@ static int handle_import(CPU *cpu, const import_record *import)
         cpu->eax = (uint32_t)GetSystemDirectoryA(output, capacity);
         if (!cpu->eax) last_error = (uint32_t)GetLastError();
 #else
-        (void)output_address;
-        (void)capacity;
-        stop_guest("GetSystemDirectoryA is unavailable without a Windows host", import->token);
+        static const char directory[] = "C:\\WINDOWS\\system32";
+        cpu->eax = sizeof(directory);
+        if (capacity >= sizeof(directory)) {
+            char *output = (char *)guest_memory_try_ptr(output_address, sizeof(directory));
+            if (!output) stop_guest("GetSystemDirectoryA output is unmapped", import->token);
+            memcpy(output, directory, sizeof(directory));
+            cpu->eax = sizeof(directory) - 1u;
+        }
 #endif
         return_stdcall(cpu, 8u);
         return 1;
@@ -5257,8 +5269,19 @@ static int handle_import(CPU *cpu, const import_record *import)
             result = native_result;
             last_error = capacity ? 122u : 0u; /* ERROR_INSUFFICIENT_BUFFER */
         }
+#elif defined(__ANDROID__)
+        /* Enumerate the virtual drive containing C:\AC1, as in recomp-kit's
+         * logical_drive_strings. MULTI_SZ includes a second trailing NUL. */
+        static const char drives[] = "C:\\\0";
+        result = sizeof(drives);
+        if (capacity >= sizeof(drives)) {
+            void *output = guest_memory_try_ptr(output_address, sizeof(drives));
+            if (!output) stop_guest("GetLogicalDriveStringsA output is unmapped", import->token);
+            memcpy(output, drives, sizeof(drives));
+            result = sizeof(drives) - 1u;
+        }
 #else
-        /* Android/POSIX has no Win32 logical drives to enumerate. Return the
+        /* POSIX has no Win32 logical drives to enumerate. Return the
          * documented failure shape, rather than claiming a synthetic drive. */
         if (capacity) {
             uint8_t *output = (uint8_t *)guest_memory_try_ptr(output_address, capacity);
