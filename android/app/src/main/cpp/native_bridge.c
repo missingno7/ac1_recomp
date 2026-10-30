@@ -86,7 +86,8 @@ Java_org_ac1_recomp_LauncherActivity_nativeSetSurface(JNIEnv *env, jclass type,
 JNIEXPORT jint JNICALL
 Java_org_ac1_recomp_LauncherActivity_nativeRun(JNIEnv *env, jclass type,
                                                jstring exe_path, jstring userdata_path,
-                                               jstring script_path) {
+                                               jstring script_path, jboolean skip_intros,
+                                               jboolean trace_imports) {
     (void)type;
     if (exe_path == NULL || userdata_path == NULL) {
         snprintf(bridge_error, sizeof(bridge_error), "Executable or userdata path is missing");
@@ -108,7 +109,6 @@ Java_org_ac1_recomp_LauncherActivity_nativeRun(JNIEnv *env, jclass type,
     if (script && *script) setenv("AC1_INPUT_SCRIPT", script, 1);
     else unsetenv("AC1_INPUT_SCRIPT");
     unsetenv("AC1_INPUT_RECORD");
-    setenv("AC1_TRACE_IMPORTS", "1", 1);
     setenv("AC1_D3D9_FORCE_WINDOWED", "1", 1);
     __android_log_print(ANDROID_LOG_INFO, AC1_LOG_TAG, "Calling original startup for %s", path);
     int result;
@@ -117,6 +117,15 @@ Java_org_ac1_recomp_LauncherActivity_nativeRun(JNIEnv *env, jclass type,
         result = -3;
     } else if (setenv("DXVK_STATE_CACHE_PATH", userdata, 1) != 0) {
         snprintf(bridge_error, sizeof(bridge_error), "Cannot configure app-private DXVK state cache: %s", strerror(errno));
+        result = -3;
+    } else if (setenv("AC1_TRACE_IMPORTS", trace_imports ? "1" : "0", 1) != 0) {
+        snprintf(bridge_error, sizeof(bridge_error), "Cannot configure import tracing: %s", strerror(errno));
+        result = -3;
+    } else if ((skip_intros ? setenv("AC1_HIDE_FILES",
+                   "videos\\UBI_LOGO.bik;videos\\Ubisoft_Presents.bik;"
+                   "videos\\Warning_Disclaimer.bik;videos\\DemoIntro.bik", 1)
+                           : unsetenv("AC1_HIDE_FILES")) != 0) {
+        snprintf(bridge_error, sizeof(bridge_error), "Cannot configure intro visibility: %s", strerror(errno));
         result = -3;
     } else {
         char log_path[32768];

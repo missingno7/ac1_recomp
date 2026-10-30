@@ -41,11 +41,14 @@ public final class LauncherActivity extends Activity {
     private boolean surfaceReady;
     private boolean busy;
     private boolean autoRun;
+    private boolean skipIntros;
+    private boolean traceImports;
     private String inputScript;
 
     static { System.loadLibrary(LIB_NAME); }
 
-    private static native int nativeRun(String exePath, String userdataPath, String scriptPath);
+    private static native int nativeRun(String exePath, String userdataPath, String scriptPath,
+                                       boolean skipIntros, boolean traceImports);
     private static native String nativeLastError();
     private static native boolean nativeSetSurface(Surface surface);
     private static native void nativeKey(int dik, boolean down);
@@ -55,6 +58,8 @@ public final class LauncherActivity extends Activity {
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         autoRun = getIntent().getBooleanExtra("run", false);
+        skipIntros = getIntent().getBooleanExtra("skip_intros", false);
+        traceImports = getIntent().getBooleanExtra("trace_imports", false);
         inputScript = getIntent().getStringExtra("input_script");
         status = new TextView(this);
         status.setText("Select the folder containing your legally obtained Assassin's Creed installation. Its files will be copied into app-private storage.");
@@ -285,7 +290,8 @@ public final class LauncherActivity extends Activity {
                     if (!script.isFile()) throw new IllegalArgumentException("Missing input script: " + script);
                     scriptPath = script.getCanonicalPath();
                 }
-                result = nativeRun(exeFile.getAbsolutePath(), userdata.getCanonicalPath(), scriptPath);
+                result = nativeRun(exeFile.getAbsolutePath(), userdata.getCanonicalPath(), scriptPath,
+                                   skipIntros, traceImports);
                 detail = nativeLastError();
             }
             catch (Throwable error) {
