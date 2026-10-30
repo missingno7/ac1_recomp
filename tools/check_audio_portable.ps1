@@ -2,12 +2,15 @@
 param(
     [string]$AndroidSdk = "$env:LOCALAPPDATA/Android/Sdk",
     [string]$HostBin = 'C:/msys64/mingw64/bin',
-    [string]$GeneratedDir = "$PSScriptRoot/../work/lift_initial",
-    [string]$BinkGeneratedDir = "$PSScriptRoot/../work/lift_bink"
+    [string]$GeneratedDir = '',
+    [string]$BinkGeneratedDir = ''
 )
 # Small contracts and one-file syntax checks only. No game build or execution.
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path "$PSScriptRoot/..").Path
+# Windows PowerShell leaves $PSScriptRoot empty in parameter defaults.
+if (-not $GeneratedDir) { $GeneratedDir = "$root/work/lift_initial" }
+if (-not $BinkGeneratedDir) { $BinkGeneratedDir = "$root/work/lift_bink" }
 $output = "$root/work/audio"
 New-Item -ItemType Directory -Force $output | Out-Null
 function Check([string]$exe, [string[]]$arguments) {
