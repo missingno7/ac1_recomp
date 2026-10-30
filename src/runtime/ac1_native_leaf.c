@@ -58,9 +58,17 @@ static int ordinary_bits(uint32_t bits) {
      * after overflow; unusual inputs retain the translated implementation. */
     return magnitude <= 0x49800000u && (!magnitude || magnitude >= 0x00800000u);
 }
-static int ordinary_vector(uint32_t address) {
+static unsigned extraordinary_lane(uint32_t address) {
     XMM v = rdxm(address);
-    for (unsigned i=0; i<4; ++i) if (!ordinary_bits(v.u32[i])) return 0;
+    for (unsigned i=0; i<4; ++i) if (!ordinary_bits(v.u32[i])) return i+1;
+    return 0;
+}
+static int decline(ac1_native_plan *plan, uint32_t a, const char *reason) {
+    plan->decline_address=a; plan->decline_reason=reason; return 0;
+}
+static int check_vector(ac1_native_plan *plan, uint32_t a) {
+    unsigned bad=extraordinary_lane(a);
+    if (bad) return decline(plan,a+4*(bad-1),"float is nonfinite, subnormal, or has magnitude above 2^20");
     return 1;
 }
 static int overlaps(uint32_t a, size_t n, uint32_t b, size_t m) {
@@ -68,13 +76,16 @@ static int overlaps(uint32_t a, size_t n, uint32_t b, size_t m) {
 }
 
 int ac1_native_01176DE0_plan(const CPU *c, ac1_native_plan *plan) {
-    if (c->esp < 80 || c->esp > UINT32_MAX-16u) return 0;
+    if (c->esp < 80 || c->esp > UINT32_MAX-16u) return decline(plan,c->esp,"ESP cannot hold the native stack contract");
     uint32_t base = ((c->esp-4u)&~15u)-48u;
     for (unsigned k=4; k<=12; k+=4) {
         uint32_t a = rd32(c->esp+k);
-        if (a > UINT32_MAX-16u || overlaps(a,16,base,c->esp-base) || !ordinary_vector(a)) return 0;
+        if (a > UINT32_MAX-16u) return decline(plan,a,"16-byte vector wraps the guest address space");
+        if (overlaps(a,16,base,c->esp-base)) return decline(plan,a,"input vector aliases stack scratch/saved EBP");
+        if (!check_vector(plan,a)) return 0;
     }
-    if (!ordinary_vector(0x01A44C90u) || !ordinary_bits(rd32(0x01680F90u))) return 0;
+    if (!check_vector(plan,0x01A44C90u)) return 0;
+    if (!ordinary_bits(rd32(0x01680F90u))) return decline(plan,0x01680F90u,"homogeneous constant outside native float contract");
     ac1_native_add_range(plan, base, 48);
     ac1_native_add_range(plan, c->esp-4, 4);
     return 1;
@@ -116,12 +127,13 @@ void ac1_native_01176DE0(CPU *c) {
 }
 
 int ac1_native_00653400_plan(const CPU *c, ac1_native_plan *plan) {
-    if (c->esp < 64 || c->esp > UINT32_MAX-16u) return 0;
+    if (c->esp < 64 || c->esp > UINT32_MAX-16u) return decline(plan,c->esp,"ESP cannot hold the native stack contract");
     uint32_t base = ((c->esp-4u)&~15u)-32u;
     for (unsigned k=4; k<=12; k+=4) {
         uint32_t a = rd32(c->esp+k);
-        if (a > UINT32_MAX-64u || overlaps(a,64,base,c->esp+16u-base)) return 0;
-        if (k != 4) for (unsigned row=0; row<4; ++row) if (!ordinary_vector(a+row*16)) return 0;
+        if (a > UINT32_MAX-64u) return decline(plan,a,"64-byte matrix wraps the guest address space");
+        if (overlaps(a,64,base,c->esp+16u-base)) return decline(plan,a,"matrix aliases stack scratch/arguments/saved EBP");
+        if (k != 4) for (unsigned row=0; row<4; ++row) if (!check_vector(plan,a+row*16)) return 0;
     }
     ac1_native_add_range(plan, base, 32);
     ac1_native_add_range(plan, c->esp-4, 4);
@@ -156,11 +168,12 @@ void ac1_native_00653400(CPU *c) {
 }
 
 int ac1_native_0042EE70_plan(const CPU *c, ac1_native_plan *plan) {
-    if (c->esp < 32 || c->esp > UINT32_MAX-24u) return 0;
+    if (c->esp < 32 || c->esp > UINT32_MAX-24u) return decline(plan,c->esp,"ESP cannot hold the native stack contract");
     for (unsigned k=4; k<=20; k+=4) {
         uint32_t a=rd32(c->esp+k);
-        if (a > UINT32_MAX-16u || overlaps(a,16,c->esp-16,40)) return 0;
-        if (k != 4 && !ordinary_vector(a)) return 0;
+        if (a > UINT32_MAX-16u) return decline(plan,a,"16-byte vector wraps the guest address space");
+        if (overlaps(a,16,c->esp-16,40)) return decline(plan,a,"vector aliases the stack argument/saved EBP area");
+        if (k != 4 && !check_vector(plan,a)) return 0;
     }
     ac1_native_add_range(plan,c->esp-4,4);
     ac1_native_add_range(plan,rd32(c->esp+4),16);

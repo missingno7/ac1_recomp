@@ -88,7 +88,9 @@ void ac1_native_invoke(CPU *c, ac1_native_binding *b, void (*translated)(CPU *))
     if (!b->enabled) { translated(c); return; }
     ac1_native_plan plan = {0};
     if (!b->plan(c, &plan)) {
-        if (!b->fallbacks++) fprintf(stderr, "[native] 0x%08" PRIX32 " %s: input outside native contract; using translated body\n", b->va, b->name);
+        if (!b->fallbacks++) fprintf(stderr, "[native] 0x%08" PRIX32 " %s: %s at 0x%08" PRIX32 "; using translated body\n",
+                b->va, b->name, plan.decline_reason ? plan.decline_reason : "input outside native contract",
+                plan.decline_address);
         translated(c); return;
     }
     ++b->calls;

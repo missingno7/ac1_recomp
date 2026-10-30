@@ -11,6 +11,8 @@ typedef struct { uint32_t address; size_t size; } ac1_native_range;
 typedef struct {
     ac1_native_range ranges[AC1_NATIVE_MAX_RANGES];
     unsigned count;
+    const char *decline_reason;
+    uint32_t decline_address;
 } ac1_native_plan;
 typedef struct {
     uint32_t va;
