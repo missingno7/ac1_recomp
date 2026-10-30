@@ -6,6 +6,151 @@ guest runtime for `arm64-v8a`. Its native layer connects an Android
 DXVK's `Direct3DCreate9` factory. The x86_64 emulator smoke test below supersedes
 the historical compile-only checkpoints. ARM64 phone execution remains unverified.
 
+## Optimized native APK (2026-10-30)
+
+The debug APK keeps its debug signing and Java debugging, while CMake uses
+`RelWithDebInfo` (`-O2 -g -DNDEBUG`) for native code on both `arm64-v8a` and
+`x86_64`. The Android source override no longer forces generated game code to
+`-O0`; wrapping arithmetic, aliasing and floating-point contraction settings
+are retained. Both ABI compile databases were checked: all 1,036 entries use
+`-O2`, with no `-O0`. This is configuration evidence for ARM64, not a phone run.
+
+Use `tools/build_android.ps1` as the entry point. If Ninja cannot spawn child
+processes in the sandbox, the same entry point can configure and build the
+same CMake targets through MinGW Make and let Gradle package/sign the result:
+
+```powershell
+$env:GRADLE_USER_HOME = "$PWD/work/emu/gradle" # private cached dependencies
+.\tools\build_android.ps1 -Abi x86_64 -Jobs 12 -NativeBuilder Make
+# If Make is outside PATH, add -Make C:/msys64/mingw64/bin/mingw32-make.exe.
+# Phones use -Abi arm64-v8a; the default builder remains Gradle/CMake.
+```
+
+The entry point records native-build plus packaging duration, APK size and
+packaged/unstripped runtime sizes in
+`work/android_symbols/<abi>/build-metrics.json`. The unstripped
+`libac1_android.so` is retained alongside it for symbolization. Gradle strips
+the packaged copy. All symbols, build outputs and evidence remain ignored.
+
+Measured title APK x86_64 sizes: 255,420,904 bytes packaged runtime, 2,114,200,296
+bytes with symbols, and 258,443,166 bytes for the APK. The first optimized
+native build plus packaging took 850.359 seconds; an unchanged rebuild and
+fresh packaging took 20.452 seconds. Removing the previous APK before Gradle
+packaging avoids unused ZIP gaps left by a shrinking native library (the first
+incremental package was 682,559,390 bytes). The prior Debug APK was
+1,362,225,542 bytes and its runtime library was 679,663,488 bytes.
+`work/emu2/first-optimized-build-metrics.json` preserves the first build;
+`work/emu2/title-build-metrics.json` records the fresh title package. Its
+unstripped library is retained in
+`work/android_symbols/x86_64/title-measurement/`; the latest build uses the
+parent symbols directory.
+`llvm-readelf -S` confirms the packaged ELF has no `.debug_*`/`.symtab` sections.
+
+The same idle replay (`to_title_smoke.txt`) reached **Press Any Key To Continue**
+with optimized native code: `work/emu2/optimized-title.png`, private trace
+`work/emu2/optimized-title-startup.log`, line 12187:
+`AC1 input clock: present=350 ms=669452`. The earlier Debug checkpoint was
+`present=350 ms=907573`: 907.573 to 669.452 seconds (26.2% less elapsed time).
+First Present changed from 630.220 to 387.243 seconds. The retained clear
+title capture is at 679.5 seconds of host-wall time. These are single emulator smoke runs with the
+same idle replay and installed data. Startup crypto work varies between runs,
+so this elapsed change is not an isolated optimization benchmark or an ARM64
+phone performance measurement.
+No guest stop occurred during the optimized title run. The later replay-launch
+build took 30.649 seconds and packages a 255,421,080-byte runtime with a
+2,114,200,864-byte unstripped copy; the aligned APK remains 258,443,166 bytes.
+`work/emu2/native-artifact-check.json` verifies matching ELF build IDs between
+packaged code and retained symbols, an exact SHA-256 match with the APK's
+runtime entry, and no packaged debug sections.
+
+Import tracing is now opt-in with `--ez trace_imports true`; the default
+keeps the existing native-call fast path enabled. `AC1_TRACE_EIP` and precise
+unknown-import/instruction stops remain enabled. With the same idle script
+and visible intros, the default reached the title prompt at
+`present=400 ms=591747` (line 166 of `work/emu2/fast-title-startup.log`).
+`work/emu2/fast-title.png` is the clear capture at 609.734 seconds of host-wall
+time; the preceding 591.953-second sample already shows the prompt faintly.
+First Present was `present=1 ms=346657` (line 145). The earlier 669.452-second
+optimized checkpoint retained import tracing; the Debug baseline was
+907.573 seconds. The runs include variable original crypto work and are smoke
+measurements, not isolated compiler benchmarks.
+
+For the Windows replay's menu timing, launch with `--ez skip_intros true`:
+
+```powershell
+$adb = "$env:LOCALAPPDATA/Android/Sdk/platform-tools/adb.exe"
+& $adb -e shell am force-stop org.ac1.recomp
+& $adb -e shell am start -n org.ac1.recomp/.LauncherActivity --ez run true --es input_script to_gameplay.txt --ez skip_intros true
+```
+
+This opt-in maps to the existing `AC1_HIDE_FILES` service for exactly
+`videos\UBI_LOGO.bik`, `videos\Ubisoft_Presents.bik`,
+`videos\Warning_Disclaimer.bik` and `videos\DemoIntro.bik`. The guest sees
+`ERROR_FILE_NOT_FOUND`; imported files are unchanged. Without the extra,
+intros remain visible (as in the title measurement). JNI reports environment
+configuration failures. Java/x86_64 native compilation and ARM64 JNI syntax
+checks pass. With intros present, Enter at present 200 was consumed during
+video playback, so Enter 400 only reached the profile selector and name input
+500 arrived too early (`work/emu2/profile-timing-mismatch.png` and its trace).
+The subsequent run uses the unchanged supplied replay with the same intro
+visibility as the Windows host.
+
+The first new-game run passed profile text entry, creation and selection of
+NEW, then exited natively during level loading. Its last input clock was
+`present=1050 ms=3092103`; `work/emu2/new-game-crash-logcat.log` and
+`tombstone_05.txt` locate the null guest store at `0x00A900A9` inside
+`0x00A90090`. The original caller obtains that object from the 52-byte pool.
+Allocation diagnostics now retain failed heap/virtual arguments and null
+original-allocator results without changing their guest-visible return values.
+
+The diagnostic run confirmed the capacity failure in the running APK:
+`work/emu2/region-native.log` reaches exactly 4,096 live records, followed by
+`VirtualAlloc` failures at guest `0x007A2648` (128 KiB and 64 KiB, error 8)
+and null original-allocator returns. The process then exits, with its last
+clock `present=1075 ms=3649215`. The paired evidence is
+`work/emu2/gameplay-limit-startup.log` and `gameplay-limit-logcat.log`.
+The probe reads the process's region count without modifying guest memory.
+The expanded-registry APK passes this boundary in the actual unchanged replay:
+`work/emu2/region-cap-native.log` records 4,096, 4,097 and continued growth
+beyond 4,124 mappings with no allocation failure or native exit. Its paired
+trace is `work/emu2/capacity-past-limit-startup.log`, last clock
+`present=1075 ms=3775560`.
+
+A Windows oracle accepts 8,192 simultaneous page reservations, while the old
+guest registry rejects reservation 4,097 despite available address space.
+The preparation recipe now allows 65,536 records, one per 64 KiB reservation
+across the 4 GiB guest arena, retaining the donor's pinned inputs. The scalar
+memory contract covers 8,192 separate allocations, exact bounds, release,
+reused gaps and zero-filled recommit; it passes on Windows and the x86_64
+emulator (`work/emu2/memory-capacity-*.log`). Windows runtime syntax and ARM64
+runtime/memory syntax checks pass. No full Windows host build was run.
+
+The full expanded-registry rebuild took 875.239 seconds. The APK remains
+258,443,166 bytes, with a 255,422,856-byte packaged runtime and
+2,114,210,488-byte retained symbol copy. An unchanged rebuild/repack through
+the same entry point takes 17.3 seconds and exits zero.
+`work/emu2/capacity-artifact-check.json` verifies the actual ELF contains
+65,536 allocation records, its APK entry matches the stripped output, its
+build ID matches the unstripped symbols, and debug sections are absent from
+the package. The derived runtime header is produced by the build entry point;
+patches contain the preparation recipe and handwritten tests rather than the
+generated header.
+
+**3D tutorial gameplay frame verified:** `work/emu2/gameplay-verified.png`
+shows the original character and nearby NPCs on textured tile, shadows and
+the WALK tutorial prompt. It is an unchanged copy of
+`gameplay-cap-long-288.png`. Its paired private trace,
+`work/emu2/gameplay-verified-startup.log`, line 213, ends at
+`AC1 input clock: present=1175 ms=4940141`; the read-only counter reached
+1190 during capture review. There is no guest stop, failed allocation,
+runtime return or native crash in the retained trace/logcat. Region monitoring
+reached 4,160 live mappings. The original `to_gameplay.txt` was unchanged;
+`skip_intros=true` matches the Windows host's hidden intro files. Frame counts
+identify this run; exact parity with the host checkpoint is not claimed.
+This verifies a rendered tutorial frame, not movement or audio playback.
+Observers were stopped and the app was force-stopped after evidence collection.
+ARM64 configuration/syntax checks do not constitute phone execution.
+
 ## x86_64 emulator smoke test (2026-10-30)
 
 AVD `AC1Api36`, serial `emulator-5554`, answers adb as root and reports Android
@@ -37,7 +182,7 @@ $appUid = (& $adb -e shell stat -c %u /data/data/org.ac1.recomp).Trim()
 & $adb -e shell chown -R "${appUid}:${appUid}" /sdcard/Android/data/org.ac1.recomp/files/game /sdcard/Android/data/org.ac1.recomp/files/input_scripts
 & $adb -e shell am force-stop org.ac1.recomp
 & $adb -e logcat -c
-& $adb -e shell am start -n org.ac1.recomp/.LauncherActivity --ez run true --es input_script to_gameplay.txt
+& $adb -e shell am start -n org.ac1.recomp/.LauncherActivity --ez run true --es input_script to_gameplay.txt --ez skip_intros true
 & $adb -e shell cat /data/data/org.ac1.recomp/files/userdata/startup.log
 & $adb -e logcat -d -s AC1Recomp DEBUG AndroidRuntime
 # Use binary-safe redirection in cmd, or subprocess stdout opened as wb in Python.
