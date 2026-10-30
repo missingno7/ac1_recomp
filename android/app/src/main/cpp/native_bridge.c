@@ -3,6 +3,7 @@
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <stdint.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
@@ -113,6 +114,9 @@ Java_org_ac1_recomp_LauncherActivity_nativeRun(JNIEnv *env, jclass type,
     int result;
     if (!ac1_set_userdata_root(userdata)) {
         snprintf(bridge_error, sizeof(bridge_error), "Invalid app-private userdata directory: %.400s", userdata);
+        result = -3;
+    } else if (setenv("DXVK_STATE_CACHE_PATH", userdata, 1) != 0) {
+        snprintf(bridge_error, sizeof(bridge_error), "Cannot configure app-private DXVK state cache: %s", strerror(errno));
         result = -3;
     } else {
         char log_path[32768];
