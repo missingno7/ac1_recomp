@@ -157,7 +157,7 @@ static void signal_boundary_contract(void)
     DeleteCriticalSection(&fixture.mutex);
 }
 
-static void critical_section_contract(void)
+static void critical_section_contract(uint32_t address)
 {
     reset_fixture(3);
     InitializeCriticalSection(&fixture.mutex);
@@ -171,14 +171,14 @@ static void critical_section_contract(void)
     for(unsigned i=0;i<7;++i) {
         active_guest_thread=&fixture.threads[slots[i]];
         CPU *cpu=&active_guest_thread->cpu;
-        cpu->esp=0x10000; wr32(cpu->esp,0x1234); wr32(cpu->esp+4,0x10100);
+        cpu->esp=0x10000; wr32(cpu->esp,0x1234); wr32(cpu->esp+4,address);
         strcpy(import.name,calls[i]);
         CHECK(handle_critical_section_import(cpu,&import));
         if(i==3) CHECK(fixture.threads[1].blocked && fixture.threads[2].blocked);
-        if(i==4) CHECK(rd32(0x1010c)==101 && !fixture.threads[1].blocked && fixture.threads[2].blocked);
-        if(i==5) CHECK(rd32(0x1010c)==102 && !fixture.threads[2].blocked);
+        if(i==4) CHECK(rd32(address+12u)==101 && !fixture.threads[1].blocked && fixture.threads[2].blocked);
+        if(i==5) CHECK(rd32(address+12u)==102 && !fixture.threads[2].blocked);
     }
-    CHECK(rd32(0x1010c)==0 && rd32(0x10104)==UINT32_MAX);
+    CHECK(rd32(address+12u)==0 && rd32(address+4u)==UINT32_MAX);
     DeleteCriticalSection(&fixture.mutex);
 }
 
@@ -260,7 +260,12 @@ int main(void)
     CHECK(guest_memory_allocate(0x10000,0x1000));
     event_contract();
     signal_boundary_contract();
-    critical_section_contract();
+    critical_section_contract(0x10100u);
+    CHECK(guest_memory_allocate(0x25740000u,0x10000u));
+    CHECK(guest_memory_allocate(0x25750000u,0x10000u));
+    critical_section_contract(0x2574fff0u);
+    guest_memory_release(0x25740000u);
+    guest_memory_release(0x25750000u);
     quantum_contract();
     transfer_contract(space);
     sync_objects_destroy();

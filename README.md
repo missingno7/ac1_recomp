@@ -4,7 +4,20 @@ This repository builds and executes a statically translated portion of the origi
 
 Android preparation on `android-prep`: current runtime/platform/JNI ARM64 syntax checks and Java compilation pass; portable silent DS8 and keyboard/gamepad/touch/replay adapters are wired. No game-code build or device execution was performed. ARM64 FFmpeg archives and portable D3DX remain required; see the [current Android audit and post-benchmark commands](docs/android.md#current-preparation-android-prep-2026-10-29).
 
-## Current host checkpoint: first original image (loading screen)
+## Critical-section span investigation (2026-10-30)
+
+The intermittent loading stop at `0x007a568e` is a runtime bounds-check bug:
+the 24-byte critical section can cross two live adjacent guest allocations.
+The first local diagnostic replay reproduced it with all six words readable.
+The fix validates the entire guest span and initializes/deletes it with guest
+word writes. Native Windows, direct/checked-memory and scheduler contracts pass.
+Ten consecutive 60-second replays of one fixed RelWithDebInfo/direct-memory
+binary completed without a guest stop; tutorial-scene captures and a real
+cross-region Initialize/Enter/Leave sequence are retained under `work/cs/`.
+One final capture is white; the detailed evidence and validation limits are in
+[the investigation record](docs/critical-section-span.md).
+
+## Earlier host checkpoint: first original image (loading screen)
 
 Original code now renders AC1's loading screen on Windows. The translated Bink DLL decodes `videos\LoadingScreen.bik`, and the game draws its progress bar over it through the D3D9 bridge on DXVK. Back-buffer captures show loading progress from 4% at present 4 to 81% at present 64, with 81 original draw calls by then. Evidence: `work/startup_first_image_loading.log` (SHA-256 `77EBD97228EEF25CD839F887B44240EFFD52C690A353E51DF7CCE4D3A6BE0412`) and `work/captures/present_000064.bmp`. This verifies sustained original rendering of the loading screen. Menu, input, audio playback and gameplay are not yet verified.
 

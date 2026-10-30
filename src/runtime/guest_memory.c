@@ -1,4 +1,5 @@
 #include "guest_memory.h"
+#include "ac1_memory_diagnostics.h"
 #ifdef AC1_PROFILE_HOOKS
 #include "ac1_profile.h"
 #else
@@ -168,6 +169,25 @@ static size_t ac1_region_floor(uint32_t address)
         else high = mid;
     }
     return low ? low - 1 : SIZE_MAX;
+}
+
+void ac1_guest_memory_dump_span(uint32_t address, size_t width)
+{
+    int wraps = width > UINT64_C(0x100000000) - address;
+    uint64_t end = wraps ? UINT64_C(0x100000000) : (uint64_t)address + width;
+    fprintf(stderr, "AC1 memory span: address=0x%08x width=%zu wraps=%d direct=%d regions=%zu\n",
+            address, width, wraps, guest_memory_is_direct(),
+            selected_memory ? current_memory.count : 0u);
+    if (!selected_memory) return;
+    size_t floor = ac1_region_floor(address);
+    size_t first = floor == SIZE_MAX ? 0 : floor ? floor - 1 : 0;
+    /* Include the neighbours so holes and independent backing are visible. */
+    for (size_t i = first; i < current_memory.count; ++i) {
+        const guest_memory_region_t *r = &current_memory.regions[i];
+        fprintf(stderr, "AC1 memory region: index=%zu base=0x%08x end=0x%llx backing=%p\n",
+                i, r->base, (unsigned long long)((uint64_t)r->base + r->size), (void *)r->data);
+        if ((uint64_t)r->base >= end) break;
+    }
 }
 
 void guest_memory_add(uint8_t *backing, uint32_t guest_base, uint64_t size)

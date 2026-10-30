@@ -22,8 +22,12 @@ From PowerShell, extra environment values can be passed as a hashtable:
     ./tools/run_gameplay.ps1 -Seconds 300 -Environment @{ AC1_PROFILE = '1' }
 
 The launcher inherits other environment values, restores its own overrides,
-records logs/captures/run.json under work/gameplay/, and kills its own game at
-the timeout. It invokes tools/build.ps1 -BuildType RelWithDebInfo -Jobs 16.
+records logs/captures/run.json (including the executable SHA-256) under
+work/gameplay/, and kills its own game at the timeout. It invokes
+tools/build.ps1 -BuildType RelWithDebInfo -Jobs 6; override with -Jobs.
+After a completed build, -SkipBuild repeats the binary in
+build/host-relwithdebinfo without another build. Give each run its own
+-OutputDirectory when comparing executions of the same binary.
 If the Ninja compiler ABI probe stalls without output for 30 seconds, it kills
 that build process tree and uses the same prepared sources and CMake targets
 with MinGW Makefiles. No shared SDK or reference checkout is changed.
