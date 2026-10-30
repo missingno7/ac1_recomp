@@ -1,10 +1,148 @@
-# Android ARM64 startup build
+# Android startup build
 
 The Android app packages real generated AC1 startup functions and the portable
 guest runtime for `arm64-v8a`. Its native layer connects an Android
 `SurfaceView` to DXVK Native WSI, provides the AC1 D3D9 COM bridge, and imports
-DXVK's `Direct3DCreate9` factory. This wiring has compile evidence only; there
-has been no Android device run.
+DXVK's `Direct3DCreate9` factory. The x86_64 emulator smoke test below supersedes
+the historical compile-only checkpoints. ARM64 phone execution remains unverified.
+
+## x86_64 emulator smoke test (2026-10-30)
+
+AVD `AC1Api36`, serial `emulator-5554`, answers adb as root and reports Android
+16/API 36, x86_64 and `PAGE_SIZE=4096`. It uses the host GPU through gfxstream;
+the emulator is a correctness smoke target, with no phone performance claim.
+The ARM64 and emulator builds use the same runtime sources.
+
+**Title screen verified on the final APK:** `work/emu/final-title.png` shows
+the original animated menu and **Press Any Key To Continue**. Its private trace
+is `final-title-startup.log` (including `present=350`, line 12047). There is no
+guest stop or DirectSound failure in that capture. `smoke-manifest.json` under
+`work/emu/` fingerprints the local APK, source changes and evidence.
+Sound remains explicitly silent, and this is not ARM64 phone/gameplay evidence.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/build_android.ps1 -Abi x86_64 -Jobs 12
+$adb = "$env:LOCALAPPDATA/Android/Sdk/platform-tools/adb.exe"
+& $adb -e shell echo ok
+# Always replace in place: uninstall removes the imported game data.
+& $adb -e install -r android/app/build/outputs/apk/debug/app-debug.apk
+& $adb -e shell am start -n org.ac1.recomp/.LauncherActivity
+& $adb -e root
+& $adb -e wait-for-device
+& $adb -e shell mkdir -p /sdcard/Android/data/org.ac1.recomp/files/game /sdcard/Android/data/org.ac1.recomp/files/input_scripts
+& $adb -e push 'C:/Program Files (x86)/GOG.com/Assassins Creed/.' /sdcard/Android/data/org.ac1.recomp/files/game/
+& $adb -e push tools/input/to_gameplay.txt /sdcard/Android/data/org.ac1.recomp/files/input_scripts/to_gameplay.txt
+# Root adb pushes need the installed app UID, not root ownership.
+$appUid = (& $adb -e shell stat -c %u /data/data/org.ac1.recomp).Trim()
+& $adb -e shell chown -R "${appUid}:${appUid}" /sdcard/Android/data/org.ac1.recomp/files/game /sdcard/Android/data/org.ac1.recomp/files/input_scripts
+& $adb -e shell am force-stop org.ac1.recomp
+& $adb -e logcat -c
+& $adb -e shell am start -n org.ac1.recomp/.LauncherActivity --ez run true --es input_script to_gameplay.txt
+& $adb -e shell cat /data/data/org.ac1.recomp/files/userdata/startup.log
+& $adb -e logcat -d -s AC1Recomp DEBUG AndroidRuntime
+# Use binary-safe redirection in cmd, or subprocess stdout opened as wb in Python.
+New-Item -ItemType Directory -Force work/emu | Out-Null
+cmd /c '"%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe" -e exec-out screencap -p > work\emu\shot.png'
+```
+
+In Git Bash set `MSYS_NO_PATHCONV=1` for adb. This session reused the already
+imported game/replay data and verified replacement installation and launch;
+the push/chown sequence documents provisioning and was not repeated.
+
+Observed fixes: virtual `C:\WINDOWS` and `C:\WINDOWS\system32` queries allow
+translated Bink DLL attach to finish. Enumerating the mapped `C:` drive fixes
+the null `game:` namespace lookup at guest `0x009A6AAA`; startup then reaches
+DirectSound and replay initialization. The actual Buffer8 query at `0x007FCAAF`
+exposed a transposed GUID byte in the portable backend, corrected against the
+SDK's IID. Unknown GUIDs still return `E_NOINTERFACE`, and failed DirectSound
+HRESULTs now include the COM token and guest callsite in the trace.
+
+The next run completed crypto initialization and archive reads, then overflowed
+an Android native worker stack in the recursive original loader (`0x0093C740`;
+fault in `dispatch`'s prologue, 180 native frames in logcat). The default stack
+was about 1 MiB and x86_64 debug `dispatch` reserves about 4 KiB per call.
+POSIX guest workers now reserve 64 MiB with checked pthread attributes; the
+Java startup executor requests the same stack size. This allocation is separate
+from guest x86 stack sizing and retains the 4096-call depth diagnostic.
+The rerun passes that loader boundary. `/proc` maps in
+`work/emu/stacks-maps.log` confirm approximately 64 MiB native guest-worker
+stacks and a 65 MiB Java startup stack (including platform overhead).
+It reaches `CreateWindowExA` and then the observed `GetSystemMetrics(23)`
+(`SM_SWAPBUTTON`) at guest `0x004021D2`. A native Windows oracle reports zero;
+Android now reports the same standard left/right mouse mapping. Unsupported
+metric indices still stop and now include the exact index in the diagnostic.
+The portable contract includes this query; window source passes Windows and
+ARM64/API29 syntax checks.
+
+With that metric implemented, the original startup enters DXVK Vulkan device
+initialization. The next observed abort was DXVK's filesystem exception while
+creating an empty state-cache directory. JNI now sets `DXVK_STATE_CACHE_PATH`
+to the validated private `userdata` directory before calling the runtime and
+reports `setenv` failures. No cache writes target the imported game directory.
+`work/emu/metrics-final-startup.log` and `metrics-final-logcat.log` preserve the
+abort. The subsequent APK rebuild also incorporates the separately implemented
+portable D3DX bridge merged in `8426e68`; this smoke-test work adds no D3DX code.
+
+The rerun creates `app_process64.dxvk-cache` and `vulkan_pipelines.bin` in
+private userdata and passes original D3DX texture/shader-table calls. Its next
+stop is `USER32!EnumDisplayMonitors` at guest `0x00A0B530`, recorded in
+`work/emu/cache-final-startup.log` (screenshot `cache-final.png`). Android now
+enumerates the single SurfaceView monitor using WSI's handle 1 and the existing
+four-argument guest callback marshaller. Clipped/empty rectangles, callback stop
+and temporary allocation cleanup pass the portable contract. Non-null HDCs
+remain an explicit diagnostic. Windows and ARM64/API29 window syntax checks pass.
+
+The monitor rerun renders the original loading screen at **89%**:
+`work/emu/monitors-final.png`. Its trace records Bink `DoFrame=89` and
+`CopyToBuffer=3` before the next exact stop at `0x007F9C62`: portable DS8 expected
+a 60-byte `DS3DLISTENER` but the SDK and guest use 64 bytes. Listener storage,
+default orientation and distance/rolloff/Doppler offsets now match that layout.
+Full-parameter/deferred-commit and scalar getter contracts pass, including a
+guard beyond the 64-byte output; Windows and ARM64 DS8 syntax checks pass.
+This is emulator rendering evidence; the title screen and ARM64 phone remain
+unverified at this checkpoint.
+
+With the listener correction, startup completes loading and renders the full
+opening video (`work/emu/listener-progress-2.png`, `title-sequence-20.png`).
+The next observed call is Buffer8 `AcquireResources(0, 0, NULL)` at
+`0x0081B388`. The portable backend now acquires its software PCM resources for
+the observed `DSBCAPS_LOCDEFER` buffer, reports `DSBSTATUS_LOCSOFTWARE`, and
+releases that status on Stop/natural completion. A Windows native-DLL oracle
+confirms `S_OK`, status `0x10`, Stop status zero, and `DSERR_INVALIDCALL` for
+ordinary buffers (`work/emu/dsound-oracle*.log`). Effects/other flags remain an
+explicit unsupported profile; [the API contract](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ee418057(v=vs.85))
+allows zero effect/result entries. Deferred resource/status contracts pass.
+
+The run also exposed an Android replay-clock bug: successful-Present counting
+was accidentally inside the Windows-only frame-trace branch. The counter now
+increments on every platform. A dedicated idle script,
+`work/emu/to_title_smoke.txt` (only `at 0 mouse move 30 30`), was pushed with app
+ownership and selected for the next run so automatic Enter events cannot skip
+the title screenshot. The supplied `to_gameplay.txt` remains available.
+
+The title run also exposed nonfatal `Play` retries caused by rejecting valid
+priorities/voice flags on deferred buffers. The final sound correction matches
+muted Windows native-DLL oracles for software allocation, priority and
+termination hints; incompatible flags and hardware-only requests retain the
+native failure shapes. Contract tests cover these results. See
+[DirectSound Play](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ee418074(v=vs.85)).
+
+Windows syntax checks used MinGW GCC with `AC1_HOST_D3D9`, `AC1_NATIVE_BINK`,
+direct-memory/profile/EIP definitions and `src/runtime`, `src/platform`,
+`work/lift_initial`, `work/lift_bink` includes. The host compile database was
+absent; no host build was run. The portable DS8/input/window contract passes,
+including the observed canonical Buffer8 IID query and release.
+Both changed runtime sources also pass ARM64/API29 syntax checks; this does not
+establish a new ARM64 APK or phone run.
+
+The sandbox denies shared Gradle-cache writes. Its cached wrapper/dependencies
+were copied into ignored `work/emu/gradle` and selected with `GRADLE_USER_HOME`.
+The normal build then stalled in Ninja before compiler execution. For this
+session, the existing compile database and Ninja link command were executed
+directly, the changed objects replaced in the runtime archive, and offline
+Gradle `assembleDebug -Pac1Abi=x86_64` packaged the rebuilt library with
+`-x 'configureCMakeDebug[x86_64]' -x 'buildCMakeDebug[x86_64]'`. Private command
+helpers and build/install/run evidence are under `work/emu/`.
 
 ## Build
 
