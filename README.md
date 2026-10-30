@@ -13,6 +13,12 @@ passes; this input change has no phone/emulator verification. The 3120x1440
 layout preview is `work/gamepad/overlay.png`. See [bindings, settings and
 verification commands](docs/gamepad.md).
 
+Android profile creation now has a Keyboard button and committed-text input
+through the original PC key/ToUnicode path. A host replay visibly enters
+`Altaïr42`, corrects it with Backspace and confirms with Enter or pad A; see
+[profile text evidence and limits](docs/profile-text.md). Phone IME verification
+is still pending.
+
 ## Android ARM64 hardware run (2026-10-30)
 
 On a Galaxy S24 Ultra (SM-S928B, Snapdragon 8 Gen 3, Adreno 750, Android 16) the ARM64 APK runs the original executable through the replay into the 3D tutorial: first present at ~4.4 s, present 1175 at ~34 s (host: 3.5 s / 7.1 s), full-screen 1560x720 render at the display aspect, AAudio output with 0 xruns. Rendering is incomplete: with the inherited DXVK-native 1.9.2b backend, characters and HUD draw but world geometry, shadows and the HUD Bink panel are missing (the host renders them correctly). The stock Qualcomm driver lacks `VK_KHR_maintenance5/6` and `VK_KHR_load_store_op_none` required by upstream DXVK 3.1 (`ports/dxvk_android/vulkan_probe.c`), so the Android backend is moving to DXVK 3.1 with Mesa Turnip loaded in-process via libadrenotools (Snapdragon/Adreno only for now). Gameplay runs at ~8 FPS at 1560x720 with 1.9.2b; the GPU is ~14% busy and the main guest thread is CPU-bound yet averaged 1.77 GHz (prime core 3.4 GHz), which `AC1_CPU_AFFINITY` (default: high-capacity cores) targets. Phone diagnostics: `--es env "AC1_X=..,DXVK_Y=.."` sets runtime settings; `AC1_RENDER_SIZE=WxH` overrides the render size.

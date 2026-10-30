@@ -546,6 +546,11 @@ XInput. Without one, the AC1 touch overlay supplies the same controller state;
 A/B/X/Y are Legs/Empty hand/Weapon/Head, RT is high profile and LT is target lock.
 The old touch-Enter and gamepad keyboard/mouse mappings are removed. See
 [bindings, layout configuration and host replay evidence](gamepad.md).
+For profile names, tap the upper-right Keyboard button. It opens Android's IME
+and forwards committed text, Backspace and Enter through AC1's PC input path;
+it stays available with a physical pad attached. See [profile-name entry and
+host evidence](profile-text.md). IME behavior still needs phone verification.
+
 The replay follows successful presents and does not bypass initialization or
 the remaining D3DX stop. The existing dispatch budget still applies. Force-stop
 terminates a guest stuck in a native/game loop; Activity destruction cannot
