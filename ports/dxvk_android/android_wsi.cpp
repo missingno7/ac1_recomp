@@ -4,6 +4,7 @@
 #include <android/log.h>
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include "src/wsi/wsi_platform.h"
@@ -11,8 +12,12 @@
 
 namespace {
 std::mutex windowMutex;
+std::condition_variable windowChanged;
 ANativeWindow* currentWindow = nullptr;
-uintptr_t windowGeneration = 0x1000;
+// One HWND for the game window's lifetime. D3D9 swapchains keep the handle
+// they were created with, so a new handle per Android surface could never be
+// presented to again after the app returned from the background.
+const HWND gameHandle = reinterpret_cast<HWND>(uintptr_t{0x1001});
 HWND currentHandle = nullptr;
 uint32_t screenWidth=1280, screenHeight=720;
 uint32_t renderWidth=0, renderHeight=0, bufferWidth=0, bufferHeight=0;
@@ -40,7 +45,8 @@ extern "C" void dxvkAndroidSetWindow(ANativeWindow* window) {
   if(currentWindow) ANativeWindow_release(currentWindow);
   currentWindow=window; bufferWidth=bufferHeight=0;
   if(window&&renderWidth&&renderHeight&&renderWidth<screenWidth&&renderHeight<screenHeight) setBufferSize(renderWidth,renderHeight);
-  currentHandle=window?reinterpret_cast<HWND>(++windowGeneration):nullptr;
+  if(window) currentHandle=gameHandle;
+  windowChanged.notify_all();
 }
 
 namespace dxvk::wsi {
@@ -98,8 +104,11 @@ public:
   bool isOccluded(HWND w) override { return !isWindow(w); }
   void updateFullscreenWindow(HMONITOR,HWND,bool) override {}
   VkResult createSurface(HWND w,PFN_vkGetInstanceProcAddr proc,VkInstance instance,VkSurfaceKHR* surface) override {
-    std::lock_guard<std::mutex> lock(windowMutex);
-    if(!currentWindow||w!=currentHandle)return VK_ERROR_SURFACE_LOST_KHR;
+    std::unique_lock<std::mutex> lock(windowMutex);
+    if(!currentHandle||w!=currentHandle)return VK_ERROR_SURFACE_LOST_KHR;
+    // Without an Android surface (app in the background) the presenting game
+    // thread waits here, pausing the game instead of failing every frame.
+    windowChanged.wait(lock,[]{ return currentWindow!=nullptr; });
     auto create=reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(proc(instance,"vkCreateAndroidSurfaceKHR"));
     if(!create)return VK_ERROR_EXTENSION_NOT_PRESENT;
     VkAndroidSurfaceCreateInfoKHR info{VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR};info.window=currentWindow;

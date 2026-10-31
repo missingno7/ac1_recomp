@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -19,6 +20,7 @@
 
 #define AC1_LOG_TAG "AC1Recomp"
 static _Thread_local char bridge_error[512];
+static atomic_int guest_running;
 static pthread_mutex_t window_mutex = PTHREAD_MUTEX_INITIALIZER;
 static ANativeWindow *current_window;
 
@@ -135,12 +137,8 @@ Java_org_ac1_recomp_LauncherActivity_nativeSetSurface(JNIEnv *env, jclass type,
     return JNI_TRUE;
 }
 
-JNIEXPORT jint JNICALL
-Java_org_ac1_recomp_LauncherActivity_nativeRun(JNIEnv *env, jclass type,
-                                               jstring exe_path, jstring userdata_path,
-                                               jstring script_path, jboolean skip_intros,
-                                               jboolean trace_imports) {
-    (void)type;
+static jint run_original(JNIEnv *env, jstring exe_path, jstring userdata_path,
+                         jstring script_path, jboolean skip_intros, jboolean trace_imports) {
     if (exe_path == NULL || userdata_path == NULL) {
         snprintf(bridge_error, sizeof(bridge_error), "Executable or userdata path is missing");
         return -1;
@@ -220,6 +218,25 @@ Java_org_ac1_recomp_LauncherActivity_nativeRun(JNIEnv *env, jclass type,
     (*env)->ReleaseStringUTFChars(env, exe_path, path);
     if (script) (*env)->ReleaseStringUTFChars(env, script_path, script);
     return (jint)result;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_ac1_recomp_LauncherActivity_nativeRun(JNIEnv *env, jclass type,
+                                               jstring exe_path, jstring userdata_path,
+                                               jstring script_path, jboolean skip_intros,
+                                               jboolean trace_imports) {
+    (void)type;
+    /* The runtime is process-global; a second guest (for example from a
+     * recreated activity) would share and corrupt the running one's state. */
+    if (atomic_exchange(&guest_running, 1)) {
+        snprintf(bridge_error, sizeof(bridge_error),
+                 "AC1 is already running in this process; a second guest was refused");
+        return -5;
+    }
+    jint result = run_original(env, exe_path, userdata_path, script_path, skip_intros,
+                               trace_imports);
+    atomic_store(&guest_running, 0);
+    return result;
 }
 
 JNIEXPORT jstring JNICALL

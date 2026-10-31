@@ -8,6 +8,8 @@ import android.graphics.Rect;
 import android.os.Build;
 import android.util.DisplayMetrics;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.system.Os;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -44,8 +46,13 @@ public final class LauncherActivity extends Activity {
     private static final String LIB_NAME = "ac1_android";
     // Lifted C call frames need more native stack than Android's default 1 MiB.
     // This is independent of the emulated x86 stack managed by the runtime.
-    private final ExecutorService worker = Executors.newSingleThreadExecutor(
+    // The native runtime is process-global, so the guest thread outlives any
+    // one activity instance; a recreated activity re-attaches to it.
+    private static final ExecutorService worker = Executors.newSingleThreadExecutor(
         task -> new Thread(null, task, "AC1 startup", 64L * 1024L * 1024L));
+    private static final Handler mainThread = new Handler(Looper.getMainLooper());
+    private static boolean guestRunning; // Main thread only, like current.
+    private static LauncherActivity current;
     private TextView status;
     private Button choose;
     private Button run;
@@ -149,6 +156,12 @@ public final class LauncherActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.0f));
         setContentView(content);
         restoreImportedExe();
+        current = this;
+        if (guestRunning) {
+            busy = true;
+            autoRun = false;
+            setGameMode(true);
+        }
         maybeAutoRun();
     }
 
@@ -246,6 +259,13 @@ public final class LauncherActivity extends Activity {
             return true;
         }
         return super.onGenericMotionEvent(event);
+    }
+
+    @SuppressWarnings("deprecation") // Legacy back dispatch: no OnBackInvokedCallback opt-in.
+    @Override public void onBackPressed() {
+        // Finishing would orphan the running guest; leave the game like Home does.
+        if (gameMode) moveTaskToBack(true);
+        else super.onBackPressed();
     }
 
     @Override protected void onPause() {
@@ -450,6 +470,7 @@ public final class LauncherActivity extends Activity {
         setGameMode(true);
         // The surface resizes asynchronously after the launcher views hide.
         final String displaySize = physicalDisplaySize();
+        guestRunning = true;
         worker.execute(() -> {
             final int result;
             final String detail;
@@ -472,15 +493,23 @@ public final class LauncherActivity extends Activity {
                 detail = nativeLastError();
             }
             catch (Throwable error) {
-                runOnUiThread(() -> { busy = false; setGameMode(false); status.setText("Native startup failed: " + error); refreshRunEnabled(); });
+                guestExited("Native startup failed: " + error);
                 return;
             }
-            runOnUiThread(() -> {
-                setGameMode(false);
-                status.setText("Native startup returned " + result + (detail == null || detail.isEmpty() ? "" : "\n" + detail));
-                busy = false;
-                refreshRunEnabled();
-            });
+            guestExited("Native startup returned " + result + (detail == null || detail.isEmpty() ? "" : "\n" + detail));
+        });
+    }
+
+    // Reports to whichever activity instance is current when the guest exits.
+    private static void guestExited(String message) {
+        mainThread.post(() -> {
+            guestRunning = false;
+            LauncherActivity activity = current;
+            if (activity == null) return;
+            activity.busy = false;
+            activity.setGameMode(false);
+            activity.status.setText(message);
+            activity.refreshRunEnabled();
         });
     }
 
@@ -489,7 +518,7 @@ public final class LauncherActivity extends Activity {
         if (controller != null) controller.setActive(false);
         nativeResetInput();
         nativeSetSurface(null);
-        worker.shutdownNow();
+        if (current == this) current = null;
         super.onDestroy();
     }
 }
