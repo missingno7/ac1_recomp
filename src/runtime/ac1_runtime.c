@@ -179,6 +179,8 @@ static unsigned object_type_descriptor_count;
 static int crt_handoff_logged;
 static int get_adapters_info_deferred_logged;
 static _Thread_local unsigned trace_import_count;
+/* Imports still to trace after a userdata file is created (AC1_TRACE_IMPORTS). */
+static _Thread_local unsigned trace_import_window;
 static _Thread_local unsigned trace_callback_count;
 static _Thread_local unsigned trace_file_read_count;
 /* Cold lifecycle/diagnostic code can still use the active thread. Dispatch
@@ -2973,8 +2975,17 @@ static int handle_stdio_import(CPU *cpu, const import_record *import)
     }
     if (!strcmp(name, "GetFileType")) {
         uint32_t handle = rd32(cpu->esp + 4u);
-        cpu->eax = (handle == AC1_STD_INPUT_HANDLE || handle == AC1_STD_OUTPUT_HANDLE ||
-                    handle == AC1_STD_ERROR_HANDLE) ? 2u : 0u; /* FILE_TYPE_CHAR */
+        intptr_t native;
+        uint32_t error;
+        /* The CRT's _sopen closes and fails any handle reported as
+         * FILE_TYPE_UNKNOWN, which lost every save and profile file. */
+        if (handle == AC1_STD_INPUT_HANDLE || handle == AC1_STD_OUTPUT_HANDLE ||
+            handle == AC1_STD_ERROR_HANDLE)
+            cpu->eax = 2u; /* FILE_TYPE_CHAR */
+        else if (ac1_files_native(guest_files, handle, 0, &native, &error))
+            cpu->eax = 1u; /* FILE_TYPE_DISK */
+        else
+            cpu->eax = 0u;
         if (!cpu->eax) last_error = 6u;
         return_stdcall(cpu, 4u);
         return 1;
@@ -7123,14 +7134,21 @@ void dispatch(CPU *cpu, uint32_t target)
     const import_record *import = find_import(target);
     if (import) {
         ++calls->count;
-        if (trace_imports && trace_import_count < 128u) {
-            if (import->by_ordinal)
-                fprintf(stderr, "AC1 import[%u] eip=0x%08x target=0x%08x %s!#%u\n",
-                        trace_import_count, cpu->eip, target, import->dll, import->ordinal);
-            else
-                fprintf(stderr, "AC1 import[%u] eip=0x%08x target=0x%08x %s!%s\n",
-                        trace_import_count, cpu->eip, target, import->dll, import->name);
-            ++trace_import_count;
+        if (trace_imports) {
+            if (trace_import_count < 128u) {
+                if (import->by_ordinal)
+                    fprintf(stderr, "AC1 import[%u] eip=0x%08x target=0x%08x %s!#%u\n",
+                            trace_import_count, cpu->eip, target, import->dll, import->ordinal);
+                else
+                    fprintf(stderr, "AC1 import[%u] eip=0x%08x target=0x%08x %s!%s\n",
+                            trace_import_count, cpu->eip, target, import->dll, import->name);
+                ++trace_import_count;
+            } else if (trace_import_window) {
+                --trace_import_window;
+                fprintf(stderr, "AC1 import window: ret=0x%08x %s!%s\n",
+                        guest_memory_try_ptr(cpu->esp, 4u) ? rd32(cpu->esp) : 0u, import->dll,
+                        import->by_ordinal ? "#" : import->name);
+            }
         }
         int handled = run_import_handlers(cpu, import);
         if (handled) {

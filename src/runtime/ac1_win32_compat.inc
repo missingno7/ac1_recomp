@@ -538,6 +538,14 @@ static int wc_file_import(CPU *cpu, const import_record *import, wc_state *s)
         uint32_t error;
         int ok = ac1_files_open_userdata(guest_files, root, path, A(2), A(3), A(5), A(6), &handle,
                                          &error);
+        if (trace_imports) {
+            fprintf(stderr,
+                    "AC1 userdata open: path=\"%s\" access=0x%08x share=0x%08x disposition=%u "
+                    "flags=0x%08x handle=0x%08x error=%u ret=0x%08x\n",
+                    path, A(2), A(3), A(5), A(6), handle, error, rd32(cpu->esp));
+            if (A(5) != 3)
+                trace_import_window = 48;
+        }
         if (!ok || A(5) == 2 || A(5) == 4)
             last_error = error;
         RET(handle, 7);
@@ -569,6 +577,9 @@ static int wc_file_import(CPU *cpu, const import_record *import, wc_state *s)
         }
         if (A(4))
             wr32(A(4), count);
+        if (trace_imports)
+            fprintf(stderr, "AC1 userdata write: handle=0x%08x bytes=%u ok=%d written=%u error=%u\n",
+                    A(1), A(3), ok, count, ok ? 0u : last_error);
         RET(ok, 5);
     }
     if (IS("GetFileSize")) {
@@ -658,6 +669,8 @@ static int wc_file_import(CPU *cpu, const import_record *import, wc_state *s)
                 last_error = wc_errno();
 #endif
         }
+        if (trace_imports)
+            fprintf(stderr, "AC1 userdata %s: handle=0x%08x ok=%d\n", import->name, A(1), ok);
         RET(ok, 1);
     }
     if (IS("LockFile") || IS("LockFileEx") || IS("UnlockFile")) {
@@ -1047,6 +1060,9 @@ static int wc_file_import(CPU *cpu, const import_record *import, wc_state *s)
         if (!ok)
             last_error = copy && errno == EEXIST ? 80 : wc_errno();
 #endif
+        if (trace_imports && !get_attr)
+            fprintf(stderr, "AC1 userdata %s: path=\"%s\" ok=%d error=%u\n", import->name, path,
+                    ok, ok ? 0u : last_error);
         RET(ok, args);
     }
 #undef A
