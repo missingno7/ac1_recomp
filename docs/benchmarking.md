@@ -27,6 +27,17 @@ behavior affect them. POSIX/Android leave cycle and processor columns empty.
 Hardware retired-instruction/cache-miss counters belong in focused investigations
 when available; normal runs avoid that instrumentation.
 
+The window is not one steady phase. Near Present 2040 the scene changes (a
+white flash): main-thread cost falls from ~130M to ~65M cycles/frame. Its
+Present index follows real time, not the fixed guest clock, so a faster binary
+reaches it later: `e634876` at Present 2038-2050 in five runs, the flag-contract
+build at 2148-2200+ (the stack step moved it from ~2010 to ~2075). The 1800-2200
+window then holds more heavy frames on the faster side and understates its gain:
+-3.7% there against -10.7% in 2400-2800 for the flag contracts. When a change
+moves the scene change, also compare a window after it in both runs
+(`-StartPresent 2400 -EndPresent 2800`). The white frame at the boundary
+capture is that flash, not breakage.
+
 Workload equivalence is judged from gameplay phase and identical replay command
 indices at both boundaries, plus a gross guest-time sanity bound (33%). Present
 equality alone does not prove equal simulation work. The guest clock follows

@@ -46,6 +46,20 @@ The pose kernel runs 160 -> 118 ticks/bone (byte-identical); in gameplay
 main-thread cycles/frame -4.7% [-8.7%, -0.7%], mean frame time -4.8%, 33.7 ->
 35.1 FPS.
 
+Fourth step: flags across calls. The default flag pass (`-FlagLiveness abi`)
+is a whole-program analysis with one body per function: each function gets
+the flags it reads at entry and the flags its callers read after it returns,
+so calls and returns no longer keep every flag alive, and the 13,472
+exception-frame functions are masked too (the runtime never dispatches guest
+SEH). Logical operations now clear the undefined AF, as QEMU and Bochs do. No
+flag crosses an indirect call or jump; 55% of the 453,272 flag computations
+become dead and 34% keep only ZF (live lanes -88%); `.text` shrinks 17%. The
+pose kernel runs 118 -> 98.6 ticks/bone (byte-identical); in gameplay
+main-thread cycles/frame -3.7% [-5.3%, -2.2%] in the standard window and
+-10.7% [-18.4%, -2.9%] after the scene change that the faster build reaches
+later (see [docs/benchmarking.md](docs/benchmarking.md)). `-FlagLiveness cfg`
+restores the per-function masks.
+
 ## Gamepad and Android touch controller (2026-10-30)
 
 The runtime now feeds AC1's original Xbox controller path from Windows XInput,
@@ -330,9 +344,10 @@ Example using existing stripped binaries:
 
 The two-side environment overrides can also be supplied as `-EnvB @{ AC1_DISPATCH_FAST = '0' }`. Use `tools/bench_report.py <comparison-directory>` to print an existing comparison.
 
-Codegen flag liveness is selected with `tools/build.ps1 -BuildType RelWithDebInfo -Jobs 10 -FlagLiveness cfg`
-(default `cfg`; `off`, `straight` and experimental `abi` are also available), or the lifter's `--flag-liveness` option.
-`abi` retains complete public dispatch contracts and uses private direct-only bodies where returned flags are dead.
+Codegen flag liveness is selected with `tools/build.ps1 -BuildType RelWithDebInfo -Jobs 10 -FlagLiveness abi`
+(default `abi`; `cfg`, `straight` and `off` are also available), or the lifter's `--flag-liveness` option.
+`abi` gives every function whole-program entry and return flag contracts (one body per function); `cfg`
+restores the per-function masks that keep every flag at calls and returns.
 `-LocalRegs` selects function-gated GPR and XMM locals; its default is now `all` (`off` restores
 CPU-struct registers), and an eight-digit hexadecimal list such as `-LocalRegs '0051DD60,00428540'`
 selects individual functions. The lifter accepts the same selection with `--local-regs`.

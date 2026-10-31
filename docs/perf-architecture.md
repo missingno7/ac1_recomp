@@ -286,28 +286,123 @@ What is left in the cone (exploratory profile, harness excluded): x87
 integer stores ~15%, guest memory accessors ~23%, flags kept alive only for
 function exits ~15% (`parity8` 6.5%), calls ~8%.
 
-## 9. Recommendation
+## 9. Fourth step: flags across calls
 
-1. **x87 integer stores.** Every `fist(p)` reloads the control word for the
+**Choice.** The cone's remaining costs (x87 integer stores ~15%, flags kept
+for function exits ~15%, calls ~8%) are one kernel's mix. Game-wide, on the
+main thread of the `e634876` profile (Presents 1800 + 15 s), flag computation
+was the largest avoidable cost: 21.5% (`parity8` 8.7%, masked helpers 10.5%,
+unmasked helpers 2.3%) against 1.5% for x87 integer stores and 8.6% + 3.0% for
+calls and the return checkpoint. Per-function liveness kept every flag alive at
+each call and each return, and the 13,472 functions with `fs:` exception frames
+stayed fully unmasked: 325,865 of ~461k flag computations produced all six
+flags (~2.0M live lanes).
+
+**Design** (`-FlagLiveness abi`, now the default; `cfg` restores the per-function
+masks). One body per function, no copies. `E(F)` is what F reads at entry
+before defining it, `R(F)` what callers read after F returns. A direct call
+reads `E(callee)` and then defines every flag; the demand after it (for a tail
+call, the caller's own `R`) joins `R(callee)`; a return reads `R(F)`. The fixed
+point over all 101,994 bodies starts from zero and only grows.
+
+* Indirect calls and imports (host code may call back) read the entry demand
+  of every possible target, and the demand after them joins `R` of every
+  possible target; indirect jumps likewise. Possible targets are entries whose
+  address the image stores (data sections at any offset, code sections aligned:
+  jump tables) or that lifted code uses as a value, excluding a call's own
+  operand and pushed return address: 67,612 entries. Indirect calls never enter
+  another function's interior (486 such entries are indirect-jump targets only).
+* Imports and native bindings return with the incoming flags (host code never
+  writes them), so demand after them also reads through them. Native entries
+  and region oracles keep the per-function masks.
+* Logical operations clear AF. x86 leaves AF undefined after AND/OR/XOR/TEST;
+  the donor helper preserved it, which carried AF demand backwards through
+  every `test` (from the CRT crash reporter's `pushfd` into every indirect
+  target). The prepared helper now clears it, as QEMU and Bochs do.
+* Shifts and rotates with a constant nonzero count define their flags.
+* A diagnostic stop (`int3`, `RECOMP_TODO`, reserved MXCSR bits) never returns
+  to guest code: it observes nothing and ends its path. Every exact x87
+  instruction begins with `if (!ac1_x87_check(c, va)) return;`; a failing check
+  stops the guest, so that return is dead and `fcomi`/`fucomi` (1,555 sites)
+  define flags unconditionally. The first game lift modeled both as
+  observers: `0x00404040`, an address-taken entry that is a single `int3`, and
+  `fucomi; lahf` at a function entry gave every indirect target an all-flag
+  demand (756k live lanes instead of 236k).
+* Exception-frame functions get contracts too: the runtime never dispatches
+  guest SEH (`RaiseException` accepts only the thread-name protocol; a memory
+  fault stops with a diagnostic), so no handler observes a flag.
+* Any other helper given the CPU, `lahf`/`pushfd` and unknown goto targets
+  observe every flag. Tests audit the helper tables against the prepared
+  header: transparent helpers transitively never name a flag field, and each
+  declared write is a function of the inputs, never of the prior flag (2,442
+  compiled cases).
+
+One vtable-scan seed, `0x00ABABCD`, is the word after a five-slot vtable and
+points at a `je` inside `0x00ABAA40`; as an indirect-jump target its ZF entry
+demand reached every indirect transfer. It is removed from `startup_seeds`
+(a dispatch there would stop with the unknown-target diagnostic).
+
+**Result of the analysis** (game build, lift report `flag_abi`): no flag
+crosses an indirect call or jump in either direction. Nine CRT x87 helpers read
+ZF at entry and two `_fload_withFB` variants return it, all through direct
+calls. Of 453,272 flag computations 250,376 (55%) are dead, 155,947 (34%) keep
+only ZF, 40 keep all six: 235,861 live lanes (-88%). The native bindings need
+no flags either way. `.text` 126.9 -> 105.2 MB (-17%), stripped executable
+130.6 -> 105.2 MB.
+
+| cone | ticks/bone | x64 instructions | stores | AArch64 instructions |
+|---|---:|---:|---:|---:|
+| per-function masks (third-step default) | 116-121 | 2,706 | 507 | 2,272 |
+| **flag contracts** | **98.4-98.8** | **2,145** | **427** | **1,969** |
+
+The cone's 1,950,603 output bones are byte-identical under both fills. A
+compiled whole-program differential (per-function masks, contracts, contracts
+with local registers; direct and dispatch paths, 4,096 random states) compares
+registers, memory, call accounting and the flags the program observes;
+mutations that drop tail-call or import demand fail it. 118 tests and the lifter
+self-test pass.
+
+**Controlled gameplay comparison** (`e634876` against the contract build, fixed
+clock, CCD0, lock; every pair workload-equivalent, B faster in every pair):
+
+| window | pairs | main-thread cycles/frame | mean frame time | FPS |
+|---|---:|---:|---:|---:|
+| 1800-2200 (standard) | 3 | **-3.7%** [-5.3%, -2.2%] | -4.5% [-5.9%, -3.1%] | 35.6 -> 37.2 |
+| 2400-2800 (after the scene change) | 5 | **-10.7%** [-18.4%, -2.9%] | -10.6% [-18.3%, -2.8%] | 56.7 -> 63.3 |
+
+The standard window understates the gain: the scene change near Present 2040
+(cost ~130M -> ~65M cycles/frame, with a white flash) follows real time, so the
+faster build reaches it ~110-160 Presents later and keeps more heavy frames in
+the window (before the change, Presents 1800-2000: -19.9% [-24.2%, -15.5%]; see
+[benchmarking.md](benchmarking.md)). A run to Present 5010 and the intro
+videos show no stop or visual breakage.
+
+## 10. Recommendation
+
+Re-profile the contract build before choosing; the order below is from the
+`e634876` profile with the flag share removed.
+
+1. **Call boundaries** (Pinyon Shift's ABI sync: -11-12% guest
+   instructions; here call/ret 8.6%, return checkpoint 3.0%, dispatch 3.5%).
+   A guest call is ~70 host instructions: accounting, an out-of-line scheduler
+   checkpoint after every return, full GPR/XMM syncs. An inline countdown
+   before the checkpoint is a small runtime change; skipping callee-saved
+   reloads needs an exception list (CRT EH/SEH prologs, `_chkstk`, `longjmp`)
+   or a preservation proof.
+2. **XMM and GPR locals in exception-frame functions** (12% of main-thread
+   CPU, 25% of SSE instructions). The argument used for flags applies: the
+   runtime never dispatches guest SEH or C++ exceptions, so no handler reads a
+   register at a fault.
+3. **x87 integer stores.** Every `fist(p)` reloads the control word for the
    rounding mode, range-checks, converts, re-converts to test exactness and
-   read-modify-writes `c->fpu_sw` for PE (~15% of the cone, the hottest
-   single instruction). Keep RC and the sticky status bits in locals synced
-   at the existing TOP sync points.
-2. **Flags at function exits** (NFSU2's FLAGABI: -4.5% cycles). The existing
-   opt-in mode copies 5,988 private bodies (+11% `.text`); a version without
-   duplication would remove the flags that only exits keep alive (~15% of
-   the cone).
-3. **Call boundaries** (Pinyon Shift's ABI sync: -11-12% guest
-   instructions). A guest call is ~70 host instructions: accounting, an
-   out-of-line scheduler checkpoint after every return, full GPR/XMM syncs.
-   An inline countdown before the checkpoint is a small runtime change;
-   skipping callee-saved reloads needs an exception list (CRT EH/SEH prologs,
-   `_chkstk`, `longjmp`) or a preservation proof.
+   read-modify-writes `c->fpu_sw` for PE (~15% of the cone, 1.5% of the
+   game's main thread). Keep RC and the sticky status bits in locals synced at
+   the existing TOP sync points.
 4. **Frame-slot promotion proper** (store elimination, values across calls)
    for the 47% of main-thread CPU in private-frame functions, plus the 733
    8-byte loads after 4-byte stores. Forwarding already removed the stalls;
    what remains is the stores themselves and reloads across calls.
-5. **XMM and GPR locals in exception-frame functions** (12% of main-thread
-   CPU, 25% of SSE instructions): needs an argument about unwinding.
-6. Keep native x87, the vector lowering and the stack changes under
-   validation on AArch64 hardware, videos and long play.
+5. **Masked shifts.** Constant-count shifts now define flags, but the shift
+   helpers still compute all four (parity included) even when dead.
+6. Keep native x87, the vector lowering, the stack changes and the flag
+   contracts under validation on AArch64 hardware, videos and long play.

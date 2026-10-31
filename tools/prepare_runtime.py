@@ -756,6 +756,20 @@ def x87_inline_helpers(text: str) -> str:
     return text.replace(signature,X87_INTEGER_INLINE+'\nAC1_X87_INTEGER_INLINE uint64_t ac1_x87_integer(',1)
 
 
+def logical_flags_clear_af(text: str) -> str:
+    """AND/OR/XOR/TEST leave AF undefined: clear it, as QEMU and Bochs do.
+
+    The donor preserves AF, which lets an AF demand flow back through every
+    logical operation into whole-program flag contracts.
+    """
+    match = re.search(r'static inline uint32_t flags_logicz\([^)]*\) \{[^{}]*\}', text)
+    old = '    c->cf = 0; c->of = 0; c->sf = (r & s) != 0; c->zf = (r == 0);\n'
+    if not match or match.group(0).count(old) != 1 or '->af' in match.group(0):
+        raise SystemExit('unexpected pinned logical flag helper')
+    helper = match.group(0).replace(old, old.replace('c->of = 0; ', 'c->of = 0; c->af = 0; '))
+    return text.replace(match.group(0), helper, 1)
+
+
 def masked_flag_helpers(text: str) -> str:
     """Clone pinned arithmetic helpers with constant, independently guarded lanes.
 
@@ -782,7 +796,7 @@ def masked_flag_helpers(text: str) -> str:
                 count[0] += 1
                 return f'if (lanes & {bits[assignment.group(1)]}u) {{ ' + assignment.group(0) + ' }'
             body = re.sub(r'c->(cf|pf|af|zf|sf|of)\s*=\s*[^;]+;', guard, body)
-            if count[0] != (5 if name == 'flags_logicz' else 6):
+            if count[0] != 6:
                 raise SystemExit(f'unexpected pinned flag lanes: {name}')
         helpers.append(f'AC1_ACCESSOR_INLINE uint32_t {name}_m({match.group(1)}, unsigned lanes) {{{body}}}')
     marker = '/* ---- x87 FPU ---- */'
@@ -1212,7 +1226,7 @@ void guest_execution_write(uint32_t address, const void *input, size_t width)
                     raise SystemExit(f"unexpected CPU header accessor shape: {name}")
                 text = text.replace(hits[0], hits[0].replace(
                     "static inline ", "AC1_ACCESSOR_INLINE ", 1))
-            text = masked_flag_helpers(text)
+            text = masked_flag_helpers(logical_flags_clear_af(text))
             text = x87_inline_helpers(text)
             text, aliases, base_helpers = local_memory_helpers(text)
             alias_path = output.with_name("ac1_local_memory.h")

@@ -8,7 +8,8 @@ param(
     [switch]$PrepareOnly,
     [switch]$CheckRepeat,
     [switch]$Run,
-    [ValidateSet('off', 'straight', 'cfg', 'abi')][string]$FlagLiveness = 'cfg',
+    # Whole-program flag contracts; 'cfg' restores per-function masks (all flags at calls/returns).
+    [ValidateSet('off', 'straight', 'cfg', 'abi')][string]$FlagLiveness = 'abi',
     # Register locals (GPR+XMM) for every admitted function; 'off' restores CPU-struct registers.
     [string]$LocalRegs = 'all',
     [switch]$X87Inline,

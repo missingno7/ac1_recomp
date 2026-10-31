@@ -417,7 +417,7 @@ static inline uint32_t flags_add(CPU *c, uint32_t a, uint32_t b, int sz) {
 }
 static inline uint32_t flags_logicz(CPU *c, uint32_t r, int sz) {
     uint32_t m = mask_sz(sz), s = sign_sz(sz); r &= m;
-    c->cf = 0; c->of = 0; c->sf = (r & s) != 0; c->zf = (r == 0);
+    c->cf = 0; c->of = 0; c->af = 0; c->sf = (r & s) != 0; c->zf = (r == 0);
     c->pf = parity8((uint8_t)r); return r;
 }
 static inline uint32_t flags_incs(CPU *c, uint32_t a, int sz) {
@@ -626,7 +626,7 @@ AC1_ACCESSOR_INLINE uint32_t flags_sub_m(CPU *c, uint32_t a, uint32_t b, int sz,
 }
 AC1_ACCESSOR_INLINE uint32_t flags_logicz_m(CPU *c, uint32_t r, int sz, unsigned lanes) {
     uint32_t m = mask_sz(sz), s = sign_sz(sz); r &= m;
-    if (lanes & 1u) { c->cf = 0; } if (lanes & 32u) { c->of = 0; } if (lanes & 16u) { c->sf = (r & s) != 0; } if (lanes & 8u) { c->zf = (r == 0); }
+    if (lanes & 1u) { c->cf = 0; } if (lanes & 32u) { c->of = 0; } if (lanes & 4u) { c->af = 0; } if (lanes & 16u) { c->sf = (r & s) != 0; } if (lanes & 8u) { c->zf = (r == 0); }
     if (lanes & 2u) { c->pf = parity8((uint8_t)r); } return r;
 }
 AC1_ACCESSOR_INLINE uint32_t flags_adc_m(CPU *c, uint32_t a, uint32_t b, int sz, unsigned lanes) {

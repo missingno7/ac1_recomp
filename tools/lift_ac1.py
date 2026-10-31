@@ -3326,7 +3326,9 @@ FLAG_ALL = sum(FLAG_BITS.values())
 FLAG_HELPERS = {
     'flags_add': FLAG_ALL, 'flags_sub': FLAG_ALL,
     'flags_adc': FLAG_ALL, 'flags_sbb': FLAG_ALL,
-    'flags_logicz': FLAG_ALL & ~FLAG_BITS['af'],
+    # AF is undefined after AND/OR/XOR/TEST; the prepared helper clears it, as
+    # QEMU and Bochs do, so a logical operation ends any AF demand.
+    'flags_logicz': FLAG_ALL,
     'flags_incs': FLAG_ALL & ~FLAG_BITS['cf'],
     'flags_decs': FLAG_ALL & ~FLAG_BITS['cf'],
 }
@@ -3362,197 +3364,289 @@ def codegen_instruction_groups(body: str):
     return prefix, pending, groups
 
 
-def flag_flow(body, return_live=FLAG_ALL, call_defines=None, mode='cfg'):
-    """Instruction CFG; writes describe emitted helper semantics, not x86 UB."""
-    prefix, pending, groups = codegen_instruction_groups(body)
-    texts = [re.sub(r'/\*.*?\*/', '', '\n'.join(g), flags=re.S) for g in groups]
-    labels = {label: i for i, text in enumerate(texts)
-              for label in re.findall(r'^(L_[0-9A-F]{8}):', text, re.M)}
-    reads, writes, successors, eligible, calls, exits = [], [], [], [], {}, {}
-    for i, text in enumerate(texts):
-        helpers = re.findall(r'\b(flags_\w+)\(c\s*,', text)
-        simple = (len(helpers) == 1 and helpers[0] in FLAG_HELPERS and
-                  not re.search(r'\b(?:if|while|for|goto|return)\b|atomic_', text))
-        write = FLAG_HELPERS[helpers[0]] if simple else 0
-        read = sum(bit for flag, bit in FLAG_BITS.items() if re.search(r'\bc->'+flag+r'\b', text))
-        if any(helper in ('flags_adc', 'flags_sbb') for helper in helpers):
-            read |= FLAG_BITS['cf']
-        direct = re.findall(r'\bAC1_CALL\(c, L_([0-9A-F]{8}), 0x\1u\)', text)
-        direct_call = (len(direct) == 1 and
-                       not re.search(r'\b(?:if|while|for|goto|return)\b', text))
-        if direct_call:
-            target = int(direct[0], 16)
-            calls[i] = target
-            write |= (call_defines or {}).get(target, 0)
-        pointer = re.sub(r'\bc->\w+', 'member', text)
-        safe = '|'.join(FLAG_HELPERS) + '|AC1_SET_GUEST_EIP|push32|pop32'
-        pointer = re.sub(r'\b(?:'+safe+r')\(c(?=[,)])', 'safe(', pointer)
-        opaque = bool(re.search(r'\bc\b|RECOMP_TODO\(|ac1_unsupported_instruction\(', pointer))
-        # AC1_CALL guards/slow paths keep incoming diagnostic flags live. A
-        # proven callee definition can kill successor demands, never this read.
-        if opaque:
-            read = FLAG_ALL
-        if re.search(r'/\*\s*[0-9A-Fa-f]{8}:\s*(?:lahf|pushfd|pushf)\b', '\n'.join(groups[i])):
-            read = FLAG_ALL
-        targets = re.findall(r'\bgoto (L_[0-9A-F]{8});', text)
-        edges = {labels[t] for t in targets if t in labels}
-        terminal = bool(re.search(r'^\s*(?:goto L_[0-9A-F]{8};|(?:dispatch_jmp|guest_ret)\()', text, re.M))
-        plain_return = ('return;' in text and
-                        not re.search(r'\b(?:if|while|for|switch)\b', text))
-        terminal |= plain_return
-        if not terminal and i+1 < len(groups): edges.add(i+1)
-        if 'return;' in text or (i+1 == len(groups) and not terminal):
-            read |= return_live
-            exits[i] = 'escape' if opaque else 'return'
-        if any(t not in labels for t in targets):
-            read = FLAG_ALL
-            exits[i] = 'escape'
-        if terminal and not edges and i not in exits: exits[i] = 'escape'
-        if mode == 'straight' and (targets or i+1 < len(groups) and
-                                  re.search(r'^L_[0-9A-F]{8}:', texts[i+1], re.M)):
-            read = FLAG_ALL
-        reads.append(read); writes.append(write); successors.append(edges); eligible.append(simple)
-    entry = 0
-    guards = re.findall(r'\bgoto (L_[0-9A-F]{8});', '\n'.join(prefix[2:]))
-    if guards:
-        if len(guards) != 1 or guards[0] not in labels:
-            raise ValueError('FLAGABI cannot resolve sparse entry guard')
-        entry = labels[guards[0]]
-    live = [0]*len(groups)
-    changed = True
-    while changed:
-        changed = False
-        for i in reversed(range(len(groups))):
-            out = 0
-            for target in successors[i]: out |= live[target]
-            value = reads[i] | (out & ~writes[i])
-            if value != live[i]: live[i] = value; changed = True
-    after = []
-    for edges in successors:
-        out = 0
-        for target in edges: out |= live[target]
-        after.append(out)
-    return dict(prefix=prefix, pending=pending, groups=groups, reads=reads,
-                writes=writes, successors=successors, eligible=eligible,
-                calls=calls, exits=exits, entry=entry, live=live, after=after)
-
-
-def flag_flow_emit(flow):
-    output = flow['prefix'] + flow['pending']
-    for i, group in enumerate(flow['groups']):
-        if not flow['eligible'][i]: output.extend(group); continue
-        mask = flow['writes'][i] & (flow['after'][i] | flow['reads'][i])
+def flag_flow_emit(prefix, pending, groups, eligible, masks):
+    """Narrow each eligible flags_* helper to the lanes its successors observe."""
+    output = prefix + pending
+    for i, group in enumerate(groups):
+        if not eligible[i]: output.extend(group); continue
         text = '\n'.join(group)
         match = re.search(r'\b('+'|'.join(FLAG_HELPERS)+r')\(c\s*,', text)
         depth, end = 1, match.end()
         while depth and end < len(text):
             depth += (text[end] == '(') - (text[end] == ')')
             end += 1
-        if depth: raise ValueError('unbalanced generated flag helper in FLAGABI')
-        text = text[:end-1] + f', 0x{mask:02X}u' + text[end-1:]
+        if depth: raise ValueError('unbalanced generated flag helper')
+        text = text[:end-1] + f', 0x{masks[i]:02X}u' + text[end-1:]
         text = text[:match.start()] + match.group(1)+'_m' + text[match.start()+len(match.group(1)):]
         output.extend(text.splitlines())
     return '\n'.join(output+['}'])
 
 
-def flag_abi_must_define(flow, definitions):
-    """Intersection of definitions on every reachable return; unknown tails=0."""
-    if not flow['groups']: return 0
-    incoming = {flow['entry']: 0}
-    queue = [flow['entry']]
-    outgoing = {}
-    while queue:
-        i = queue.pop()
-        written = flow['writes'][i]
-        if i in flow['calls']: written |= definitions.get(flow['calls'][i], 0)
-        value = incoming[i] | written
-        outgoing[i] = value
-        for target in flow['successors'][i]:
-            merged = incoming[target] & value if target in incoming else value
-            if target not in incoming or incoming[target] != merged:
-                incoming[target] = merged; queue.append(target)
-    returns = [outgoing[i] if kind == 'return' else 0
-               for i, kind in flow['exits'].items() if i in outgoing]
-    result = FLAG_ALL if returns else 0
-    for value in returns: result &= value
-    return result
+# EFLAGS effects of the other helpers that lifted bodies pass the CPU. The
+# transparent ones (and everything they call) never name a flag field or
+# transfer guest control; tests audit all four tables against the prepared
+# header. Any other helper given the CPU observes every flag.
+FLAG_TRANSPARENT_HELPERS = frozenset({
+    'AC1_SET_GUEST_EIP', 'push32', 'pop32', 'FS_RD32', 'FS_WR32',
+    'fst', 'fpush', 'fpop', 'fcompare', 'fprem_op', 'ac1_fp_init', 'ac1_x87_check',
+    'ac1_x87_set_tag', 'ac1_x87_status', 'ac1_x87_integer', 'ac1_x87_save',
+    'ac1_x87_restore', 'ac1_x87_store_env', 'ac1_x87_load_env', 'ac1_mmx_enter',
+    'ac1_mmx_read', 'ac1_mmx_write', 'ac1_mmx_emms', 'ac1_mmx_from_ps', 'ac1_mmx_to_ps',
+    'guest_rdtsc', 'guest_cpuid',
+})
+FLAG_HELPER_WRITES = {
+    'sse_compare': FLAG_ALL, 'fcompare_eflags': FLAG_ALL, 'eflags_unpack': FLAG_ALL,
+    'do_sahf': FLAG_ALL & ~FLAG_BITS['of'], 'op_bsf': FLAG_BITS['zf'], 'op_bsr': FLAG_BITS['zf'],
+    'bit_string_op': FLAG_BITS['cf'],
+}
+FLAG_HELPER_READS = {'eflags_pack': FLAG_ALL, 'op_rcl': FLAG_BITS['cf'], 'op_rcr': FLAG_BITS['cf']}
+# Shifts and rotates change no flag for a zero count. Value: count argument index.
+FLAG_COUNTED_HELPERS = {'op_shl': 1, 'op_shr': 1, 'op_sar': 1, 'op_rol': 1, 'op_ror': 1,
+                        'op_rcl': 1, 'op_rcr': 1, 'op_shld': 2, 'op_shrd': 2}
+FLAG_DIRECT_CALL = re.compile(r'\bAC1_CALL\(c, L_([0-9A-F]{8}), 0x\1u\)')
+FLAG_DISPATCH = re.compile(r'\bdispatch\(c, (?:0x([0-9A-F]{8})u|[^;]*)\)')
+FLAG_TAIL_CALL = re.compile(r'(?:\bAC1_CALL\(c, L_[0-9A-F]{8}, 0x[0-9A-F]{8}u\)|\bdispatch\(c, [^;]*\));\s*return;')
+FLAG_X87_CHECK = re.compile(r'\bif \(!ac1_x87_check\(c, 0x[0-9A-F]{8}u\)\) return;')
 
 
-def flag_abi_program(bodies, pinned=(), private_variants=False):
-    """Public dispatch entries retain all flags; private bodies require proof.
+def flag_call_arguments(text, start):
+    """Top-level arguments of the call whose argument list begins at text[start]."""
+    depth, arguments = 0, []
+    for i in range(start, len(text)):
+        if text[i] in '([': depth += 1
+        elif text[i] in ')]':
+            if not depth: return arguments + [text[start:i].strip()]
+            depth -= 1
+        elif text[i] == ',' and not depth:
+            arguments.append(text[start:i].strip()); start = i + 1
+    raise ValueError('unbalanced generated helper call')
 
-    No caller proof is inferred from missing observed edges. Optional direct-only
-    copies are separate C functions, never exported through guest dispatch. Each
-    use must have a zero successor demand. Callee definitions reach a monotone
-    fixed point using actual emitted flag semantics (logical AF/INC CF survive).
+
+def flag_counted_writes(text):
+    """Flags certainly written by shifts and rotates with a constant nonzero count."""
+    written = 0
+    for match in re.finditer(r'\b('+'|'.join(FLAG_COUNTED_HELPERS)+r')\(c\s*,', text):
+        name, arguments = match[1], flag_call_arguments(text, match.end())
+        index = FLAG_COUNTED_HELPERS[name]
+        count = re.fullmatch(r'(0x[0-9A-Fa-f]+|\d+)u?', arguments[index]) if len(arguments) > index+1 else None
+        if not count or arguments[-1] not in ('1', '2', '4'): continue
+        count, width = int(count[1], 0), int(arguments[-1])*8
+        if name in ('op_shl', 'op_shr', 'op_sar') and count & 31 or (
+                name in ('op_shld', 'op_shrd') and 0 < count & 31 <= width):
+            written |= FLAG_ALL & ~(FLAG_BITS['af'] | FLAG_BITS['of'])
+        elif name in ('op_rol', 'op_ror') and (count & 31) % width:
+            written |= FLAG_BITS['cf'] | FLAG_BITS['of']
+        elif name in ('op_rcl', 'op_rcr') and count % (width+1):
+            written |= FLAG_BITS['cf'] | (FLAG_BITS['of'] if count % (width+1) == 1 else 0)
+    return written
+
+
+def flag_contract_rows(body, lifted):
+    """Instruction groups: flags read before written, certain writes, guest transfers.
+
+    Writes describe emitted helper semantics. Only a group without intra-group
+    control flow writes, so a guarded helper or call never kills a demand.
     """
-    from collections import defaultdict, deque
-    pinned = set(pinned)
-    unsafe = {a for a,b in bodies.items() if re.search(
-        r'\b(?:fs|gs):|c->(?:fs|gs)\b|\b(?:seh|setjmp|longjmp)\b|RECOMP_TODO\(|ac1_unsupported_instruction\(', b, re.I)}
-    flows = {a: flag_flow(b) for a,b in bodies.items()}
-    parents = defaultdict(set)
-    for a,flow in flows.items():
-        for target in flow['calls'].values(): parents[target].add(a)
-    definitions = {a:0 for a in bodies}
-    queue, queued = deque(bodies), set(bodies)
-    updates = 0
-    while queue:
-        a = queue.popleft(); queued.remove(a)
-        value = 0 if a in unsafe else flag_abi_must_define(flows[a], definitions)
-        if value & definitions[a] != definitions[a]:
-            raise ValueError(f'non-monotone FLAGABI definition at 0x{a:08X}')
-        if value != definitions[a]:
-            definitions[a] = value; updates += 1
-            for caller in parents[a]:
-                if caller not in queued: queue.append(caller); queued.add(caller)
-    public, private, narrowed_sites = {}, {}, 0
-    worth_cloning = {}
-    demands = defaultdict(int)
-    pending = deque()
-    def transform(a, return_live, is_private):
-        nonlocal narrowed_sites
-        if a in unsafe: return bodies[a]
-        flow = flag_flow(bodies[a], return_live, definitions)
-        text = flag_flow_emit(flow)
-        for i,target in flow['calls'].items():
-            demands[target] |= flow['after'][i]
-            if (not private_variants or flow['after'][i] or
-                target not in bodies or target in pinned or target in unsafe): continue
-            # Only material copies: public helpers/masks are compared without
-            # changing function identity. Dispatch wrappers remain untouched.
-            if target not in private:
-                if target not in worth_cloning:
-                    ordinary = flag_flow_emit(flag_flow(bodies[target], FLAG_ALL, definitions))
-                    narrowed = flag_flow_emit(flag_flow(bodies[target], 0, definitions))
-                    worth_cloning[target] = ordinary != narrowed
-                if not worth_cloning[target]: continue
-                private[target] = None
-                pending.append(target)
-            original = f'AC1_CALL(c, L_{target:08X}, 0x{target:08X}u)'
-            # Match by instruction group, not global replacement: another call
-            # to this callee in the same caller may consume returned flags.
-            group = '\n'.join(flow['groups'][i])
-            replacement = group.replace(original, f'AC1_CALL(c, ac1_abi_{target:08X}, 0x{target:08X}u)')
-            if group == replacement: raise ValueError('FLAGABI lost direct callsite')
-            if text.count(group) != 1: raise ValueError('FLAGABI ambiguous instruction group')
-            text = text.replace(group, replacement, 1)
-            narrowed_sites += 1
-        if is_private:
-            text = text.replace(f'void L_{a:08X}(CPU *c)', f'void ac1_abi_{a:08X}(CPU *c)', 1)
-        return text
-    for a in bodies: public[a] = transform(a, FLAG_ALL, False)
-    while pending:
-        a = pending.popleft()
-        private[a] = transform(a, 0, True)
-    report = dict(public_entries_all_live=len(bodies), public_returns_narrowed=0,
-                  private_functions_narrowed=len(private), direct_sites_narrowed=narrowed_sites,
-                  private_returns_narrowed=sum(len(re.findall(r'\breturn;', b)) for b in private.values()),
-                  proven_defining_callees=sum(bool(v) for v in definitions.values()),
-                  definition_updates=updates, unsafe_functions=len(unsafe),
-                  pinned_functions=len(pinned), caller_return_demands={f'0x{a:08X}':v for a,v in sorted(demands.items())})
-    return public, private, report
+    prefix, pending, groups = codegen_instruction_groups(body)
+    texts = [re.sub(r'/\*.*?\*/', '', '\n'.join(g), flags=re.S) for g in groups]
+    labels = {label: i for i, text in enumerate(texts)
+              for label in re.findall(r'^(L_[0-9A-F]{8}):', text, re.M)}
+    known = (set(FLAG_HELPERS) | FLAG_TRANSPARENT_HELPERS | set(FLAG_HELPER_WRITES) |
+             set(FLAG_HELPER_READS) | set(FLAG_COUNTED_HELPERS))
+    rows, opaque = [], collections.Counter()
+    for i, text in enumerate(texts):
+        helpers = re.findall(r'\b(flags_\w+)\(c\s*,', text)
+        eligible = (len(helpers) == 1 and helpers[0] in FLAG_HELPERS and
+                    not re.search(r'\b(?:if|while|for|goto|return)\b|atomic_', text))
+        # A failing x87 check stops the guest, so its early return is dead and
+        # what follows it (fcomi's flags) is unconditional.
+        checked = FLAG_X87_CHECK.sub('', text)
+        guarded = bool(re.search(r'\b(?:if|while|for|switch)\b', checked))
+        read = sum(bit for flag, bit in FLAG_BITS.items() if re.search(r'\bc->'+flag+r'\b(?!\s*=(?!=))', text))
+        write = FLAG_HELPERS[helpers[0]] if eligible else 0
+        if any(helper in ('flags_adc', 'flags_sbb') for helper in helpers): read |= FLAG_BITS['cf']
+        rest = re.sub(r'\bc->\w+', 'member', FLAG_DISPATCH.sub('', FLAG_DIRECT_CALL.sub('', text)))
+        rest = re.sub(r'\bdispatch_jmp\(c, [^;]*;', '', rest)
+        names = re.findall(r'\b(\w+)\(c(?=\s*[,)])', rest)
+        for name in names:
+            read |= FLAG_HELPER_READS.get(name, 0)
+            if not guarded: write |= FLAG_HELPER_WRITES.get(name, 0)
+        if not guarded:
+            write |= flag_counted_writes(text)
+            write |= sum(bit for flag, bit in FLAG_BITS.items() if re.search(r'\bc->'+flag+r'\s*=(?!=)', text))
+        rest = re.sub(r'\b(\w+)\(c(?=\s*[,)])', lambda m: '(' if m[1] in known else m[0], rest)
+        transfers = ([('direct', int(t, 16)) for t in FLAG_DIRECT_CALL.findall(text)] +
+                     [('direct', int(t, 16)) if t and int(t, 16) in lifted else
+                      ('import', int(t, 16)) if t else ('indirect', None) for t in FLAG_DISPATCH.findall(text)])
+        # A diagnostic stop never returns to guest code (only its report shows flags).
+        stop = bool(re.search(r'\b(?:RECOMP_TODO|ac1_unsupported_instruction)\(', text))
+        if (len(transfers) > 1 or re.search(r'\bc\b', rest) or
+                re.search(r'/\*\s*[0-9A-Fa-f]{8}:\s*(?:lahf|pushfd|pushf)\b', '\n'.join(groups[i]))):
+            read = FLAG_ALL
+            opaque.update(n for n in names if n not in known)
+        call = transfers[0] if len(transfers) == 1 else None
+        tail = bool(call) and bool(FLAG_TAIL_CALL.search(text))
+        if call and not guarded and call[0] != 'import': write = FLAG_ALL
+        targets = re.findall(r'\bgoto (L_[0-9A-F]{8});', text)
+        edges = {labels[t] for t in targets if t in labels}
+        terminal = bool(re.search(r'^\s*(?:goto L_[0-9A-F]{8};|(?:dispatch_jmp|guest_ret)\()', text, re.M))
+        terminal |= ('return;' in checked or stop) and not guarded
+        if not terminal and i+1 < len(groups): edges.add(i+1)
+        # The return after a tail call or indirect jump returns the target's flags.
+        jump = bool(re.search(r'\bdispatch_jmp\(c,', text))
+        ret = checked.count('return;') > tail + jump or (i+1 == len(groups) and not terminal)
+        if any(t not in labels for t in targets): read = FLAG_ALL
+        rows.append(dict(read=read, write=write, eligible=eligible, call=call, tail=tail, ret=ret,
+                         jump=jump, successors=tuple(edges)))
+    entry = 0
+    guards = re.findall(r'\bgoto (L_[0-9A-F]{8});', '\n'.join(prefix[2:]))
+    if guards:
+        if len(guards) != 1 or guards[0] not in labels:
+            raise ValueError('FLAGABI cannot resolve sparse entry guard')
+        entry = labels[guards[0]]
+    return dict(prefix=prefix, pending=pending, groups=groups, rows=rows, entry=entry, opaque=opaque)
 
+
+def flag_contract_solve(flow, R, E, e_call, e_jump, native=frozenset()):
+    """Per-group live-in; a call reads its callee's entry demand, then defines all flags.
+
+    Imports and native bindings return with the incoming flags (host code does
+    not write them), so demand after them also reads through them.
+    """
+    reads, writes = [], []
+    for row in flow['rows']:
+        read, write = row['read'], row['write']
+        if row['call']:
+            kind, target = row['call']
+            read |= E[target] if kind == 'direct' else e_call
+            if kind == 'import' or target in native:
+                write = 0
+                if row['tail']: read |= R
+        if row['ret']: read |= R
+        if row['jump']: read |= e_jump
+        reads.append(read); writes.append(write)
+    live = [0]*len(reads)
+    changed = True
+    while changed:
+        changed = False
+        for i in reversed(range(len(reads))):
+            out = 0
+            for target in flow['rows'][i]['successors']: out |= live[target]
+            value = reads[i] | (out & ~writes[i])
+            if value != live[i]: live[i] = value; changed = True
+    after = [0]*len(reads)
+    for i, row in enumerate(flow['rows']):
+        for target in row['successors']: after[i] |= live[target]
+    return live, after, reads, writes
+
+
+def flag_contract_program(bodies, pinned=(), call_targets=None, jump_targets=None):
+    """Whole-program EFLAGS contracts, one emitted body per function.
+
+    E(F) is what F reads at entry before defining it; R(F) what callers read
+    after F returns. A direct call reads E(callee) and defines every flag; the
+    demand after it (our own R for a tail call) joins R(callee). Indirect calls
+    and imports (host code may call back) read the entry demand of any possible
+    target, and the demand after them joins R of every such target; indirect
+    jumps read and pass on demand likewise. Possible targets default to every
+    entry. Native bindings keep conservative per-function masks.
+    """
+    lifted = set(bodies)
+    native = frozenset(pinned) & lifted
+    call_targets = lifted if call_targets is None else set(call_targets) & lifted
+    jump_targets = lifted if jump_targets is None else set(jump_targets) & lifted
+    flows = {a: flag_contract_rows(b, lifted) for a, b in bodies.items()}
+    callers, indirect_users = collections.defaultdict(set), set()
+    for a, flow in flows.items():
+        for row in flow['rows']:
+            if row['call'] and row['call'][0] == 'direct': callers[row['call'][1]].add(a)
+            if row['call'] and row['call'][0] != 'direct' or row['jump']: indirect_users.add(a)
+    E, R = dict.fromkeys(bodies, 0), dict.fromkeys(bodies, 0)
+    e_call = e_jump = d_call = d_jump = 0
+    queue, queued, solves = collections.deque(bodies), set(bodies), 0
+    while queue:
+        a = queue.popleft(); queued.discard(a); solves += 1
+        flow = flows[a]
+        live, after, _, _ = flag_contract_solve(flow, R[a], E, e_call, e_jump, native)
+        wake = set()
+        entry = live[flow['entry']] if live else 0
+        if entry & E[a] != E[a]: raise ValueError(f'non-monotone FLAGABI entry demand at 0x{a:08X}')
+        if entry != E[a]:
+            E[a] = entry; wake |= callers[a]
+            if a in call_targets and entry & ~e_call: e_call |= entry; wake |= indirect_users
+            if a in jump_targets and entry & ~e_jump: e_jump |= entry; wake |= indirect_users
+        global_demand = d_call, d_jump
+        for i, row in enumerate(flow['rows']):
+            demand = R[a] if row['tail'] else after[i]
+            if row['call'] and row['call'][0] == 'direct':
+                target = row['call'][1]
+                if demand & ~R[target]: R[target] |= demand; wake.add(target)
+            elif row['call']:
+                d_call |= demand
+            if row['jump']: d_jump |= R[a]
+        if (d_call, d_jump) != global_demand:
+            for b in jump_targets:
+                want = d_jump | (d_call if b in call_targets else 0)
+                if want & ~R[b]: R[b] |= want; wake.add(b)
+        for b in wake:
+            if b not in queued: queue.append(b); queued.add(b)
+    contracted, opaque = {}, collections.Counter()
+    masked = live_bits = 0
+    for a, body in bodies.items():
+        flow = flows[a]
+        opaque.update(flow['opaque'])
+        if a in native:
+            contracted[a] = flag_liveness_function(body, 'cfg'); continue
+        _, after, reads, writes = flag_contract_solve(flow, R[a], E, e_call, e_jump, native)
+        masks = [w & (out | r) for w, out, r in zip(writes, after, reads)]
+        eligible = [row['eligible'] for row in flow['rows']]
+        masked += sum(eligible)
+        live_bits += sum(bin(m).count('1') for m, e in zip(masks, eligible) if e)
+        contracted[a] = flag_flow_emit(flow['prefix'], flow['pending'], flow['groups'], eligible, masks)
+    report = dict(
+        functions=len(bodies), native_entries=len(native), solves=solves,
+        indirect_call_targets=len(call_targets), indirect_jump_targets=len(jump_targets),
+        indirect_entry_demand=e_call, indirect_jump_entry_demand=e_jump,
+        indirect_return_demand=d_call, indirect_jump_return_demand=d_jump,
+        entry_demand_functions=sum(bool(v) for v in E.values()),
+        return_demand_functions=sum(bool(v) for v in R.values()),
+        indirect_targets_with_entry_demand=[f'0x{a:08X}' for a in sorted(jump_targets) if E[a]],
+        native_contracts={f'0x{a:08X}': [E[a], R[a]] for a in sorted(native)},
+        masked_helpers=masked, live_flag_lanes=live_bits,
+        opaque_helpers=dict(opaque.most_common()))
+    return contracted, report
+
+
+def flag_image_addresses(pe, entries):
+    """Entries stored in the image: any offset of a data section, aligned in code."""
+    import struct
+    found = set()
+    for section in getattr(pe, 'sections', ()):
+        data = section.get_data()
+        for offset in range(1 if section.Characteristics & 0x20000000 else 4):
+            count = (len(data)-offset) // 4
+            found |= entries.intersection(struct.unpack_from(f'<{count}I', data, offset))
+    return found
+
+
+def flag_indirect_targets(bodies, functions, stored=frozenset()):
+    """Entries an indirect call or jump can reach; calls never enter another function.
+
+    An entry is a possible target when the image stores its address (`stored`)
+    or lifted code uses it as a value: any constant except an AC1_SET_GUEST_EIP
+    marker, a direct transfer's own target or the return address a call pushes.
+    """
+    entries = set(bodies)
+    taken = entries & set(stored)
+    for body in bodies.values():
+        code = re.sub(r'/\*.*?\*/', '', body, flags=re.S)
+        code = re.sub(r'\bpush32\(c, 0x[0-9A-F]{8}u\); (?=AC1_CALL\(c, |dispatch\(c, )', '', code)
+        code = re.sub(r'\bAC1_SET_GUEST_EIP\(c, 0x[0-9A-F]{8}u\)|\bAC1_CALL\(c, L_[0-9A-F]{8}, 0x[0-9A-F]{8}u\)|'
+                      r'\bdispatch\(c, 0x[0-9A-F]{8}u\)|\bL_[0-9A-F]{8}\b', '', code)
+        taken |= entries.intersection(int(v, 16) for v in re.findall(r'\b0x([0-9A-Fa-f]{1,8})u?\b', code))
+    interior = {va for spec in functions for block in spec.get('blocks', ())
+                for va, _ in block['instructions'] if va != spec['address'] and va in entries}
+    return taken - interior, taken
 
 
 def flag_liveness_function(body: str, mode: str = 'cfg') -> str:
@@ -4396,6 +4490,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     bindings = validate_native_bindings(native_overrides or [], functions, set(lifted), read_va, lifter.md)
     regions = validate_region_bindings(native_overrides or [], functions, set(lifted), read_va, lifter.md)
     if set(bindings) & set(regions): raise ValueError('leaf and region entries overlap')
+    stored_entries = flag_image_addresses(pe, set(lifted)) if flag_liveness == 'abi' else set()
     pe.close()
     # Specialize after the complete success set is known. Cached bodies remain
     # independent of catalog membership; failed/removed callees cannot become
@@ -4406,19 +4501,22 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         for index, address in enumerate(lifted):
             bodies[index], direct_callees[address], sites = specialize_direct_calls(bodies[index], successful)
             direct_sites += sites
-    abi_private, abi_report = {}, None
+    abi_report = None
     # Region oracles are a closed call graph, and continuations split a body at
-    # a guest label. Keep their independent CFG form before private ABI symbols
-    # or function-local GPR declarations can enter those copied/split bodies.
+    # a guest label. Their copies keep the independent per-function CFG form,
+    # whose calls and returns keep every flag, before any contract or local
+    # GPR declaration can enter those copied/split bodies.
     region_mode = 'cfg' if flag_liveness == 'abi' else flag_liveness
     region_members = {int(member['address'], 0) for entry in regions.values()
                       for member in entry['members']}
     region_bodies = [flag_liveness_function(body, region_mode) if address in region_members else ''
                      for address, body in zip(lifted, bodies)] if regions else []
     if flag_liveness == 'abi':
-        public, abi_private, abi_report = flag_abi_program(
-            dict(zip(lifted, bodies)), pinned=set(bindings) | set(regions), private_variants=True)
-        bodies = [public[a] for a in lifted]
+        by_address = dict(zip(lifted, bodies))
+        call_targets, jump_targets = flag_indirect_targets(by_address, functions, stored_entries)
+        contracted, abi_report = flag_contract_program(
+            by_address, set(bindings) | set(regions), call_targets, jump_targets)
+        bodies = [contracted[a] for a in lifted]
     elif flag_liveness != 'off':
         bodies = [flag_liveness_function(body, flag_liveness) for body in bodies]
     if x87 not in ('exact', 'native'):
@@ -4429,8 +4527,6 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
             transformed = native_x87_function(bodies[index])
             x87_native_count += transformed != bodies[index]
             bodies[index] = transformed
-            if address in abi_private:
-                abi_private[address] = native_x87_function(abi_private[address])
     selected_locals = local_register_selection(local_regs, set(lifted))
     local_count, local_xmm_count, local_excluded = 0, 0, []
     for index, address in enumerate(lifted):
@@ -4443,11 +4539,6 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
             else:
                 local_excluded.append(f'0x{address:08X}')
             bodies[index] = transformed
-            if address in abi_private:
-                abi_private[address] = local_xmm_function(local_register_function(abi_private[address]))
-    for index, address in enumerate(lifted):
-        if address in abi_private:
-            bodies[index] += '\n\n' + abi_private[address]
     # Keep L_VA as the one public entry for direct transfers AND the dispatch
     # table. Retain a private, callable translated oracle behind that entry.
     region_bodies = [declare_local_memory_base(body) for body in region_bodies]
@@ -4481,18 +4572,14 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "",
     ])
     direct_prototypes = 0
-    body_by_address = dict(zip(lifted, bodies))
     def tu_header_for(addresses: list[int]) -> str:
         nonlocal direct_prototypes
         # Per-shard prototypes avoid parsing all 100k entries in every TU.
         callees = set().union(*(direct_callees.get(a, set()) for a in addresses))
         direct_prototypes += len(callees)
         native_header = '#include "ac1_native.h"\n' if any(a in bindings or a in regions for a in addresses) else ''
-        private_needed = set().union(*(set(int(v, 16) for v in re.findall(
-            r'AC1_CALL\(c, ac1_abi_([0-9A-F]{8}),', body_by_address[a])) for a in addresses)) if abi_private else set()
         return (tu_header + native_header +
-                "".join(f"void L_{a:08X}(CPU *);\n" for a in sorted(callees)) +
-                "".join(f"void ac1_abi_{a:08X}(CPU *);\n" for a in sorted(private_needed)) + "\n")
+                "".join(f"void L_{a:08X}(CPU *);\n" for a in sorted(callees)) + "\n")
 
     tu_names = emit_region_sources(regions,lifted,region_bodies,output_dir,tu_header) if regions else []
     if translation_unit_buckets:
@@ -4737,8 +4824,8 @@ def main() -> int:
                              'exact keeps the full x87 model')
     parser.add_argument('--local-regs', default='all', metavar='off|all|VA,...',
                         help='function-gated GPR and XMM locals; off restores CPU-struct registers')
-    parser.add_argument('--flag-liveness', choices=('off', 'straight', 'cfg', 'abi'), default='cfg',
-                        help='constant-mask flag liveness; abi adds proved direct-only return contracts')
+    parser.add_argument('--flag-liveness', choices=('off', 'straight', 'cfg', 'abi'), default='abi',
+                        help='constant-mask flag liveness; abi: whole-program entry/return contracts, cfg: per function')
     parser.add_argument("--no-direct-calls", action="store_true",
                         help="keep constant main-catalog transfers in dispatch for A/B comparisons")
     parser.add_argument('--profile-count-entries', default='',
@@ -5092,11 +5179,11 @@ def main() -> int:
           f"RECOMP_TODO={todo_count}; remaining call queue={queued}; out={output_dir}")
     if lift_result['flag_abi'] is not None:
         abi = lift_result['flag_abi']
-        print('FLAGABI: public entries all-live={public_entries_all_live}; '
-              'public narrowed={public_returns_narrowed}; '
-              'private functions/returns narrowed={private_functions_narrowed}/{private_returns_narrowed}; '
-              'direct sites narrowed={direct_sites_narrowed}; '
-              'proved defining callees={proven_defining_callees}'.format(**abi))
+        print('FLAGABI: functions with entry/return demand={entry_demand_functions}/{return_demand_functions}; '
+              'indirect call/jump targets={indirect_call_targets}/{indirect_jump_targets}; '
+              'indirect entry demand=0x{indirect_entry_demand:02X}/0x{indirect_jump_entry_demand:02X}; '
+              'indirect return demand=0x{indirect_return_demand:02X}/0x{indirect_jump_return_demand:02X}; '
+              'live lanes={live_flag_lanes} in {masked_helpers} helpers'.format(**abi))
     return 0 if lift_result["lifted"] else 2
 
 

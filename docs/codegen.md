@@ -73,7 +73,7 @@ overstate the remaining opportunity.
 
 ## Flag pass
 
-`tools/lift_ac1.py --flag-liveness off|straight|cfg` controls an emitted-C
+`tools/lift_ac1.py --flag-liveness off|straight|cfg|abi` controls an emitted-C
 instruction-group pass. It runs after raw-body caching and direct-call
 specialization, before native-oracle wrapping. `tools/build.ps1 -FlagLiveness`
 passes the selection and checks it in the generation report, so switching it
@@ -88,6 +88,24 @@ helper, dispatch, return, explicit full-flag observation and diagnostic escape
 requires all six arithmetic flags. FS/GS/SEH functions are excluded. Repeated
 string operations and instruction-internal control flow are not rewritten.
 Sparse entry guards stay outside the lowest-address instruction's CFG node.
+
+`abi` replaces those per-function barriers with whole-program contracts, one
+emitted body per function: `E(F)`, the flags F reads before defining them,
+and `R(F)`, the flags its callers read after it returns. A direct call reads
+`E(callee)` and defines every flag; the demand after it (the caller's own `R`
+for a tail call) joins `R(callee)`; a return reads `R(F)`. Indirect calls,
+imports and indirect jumps read the entry demand of every possible target and
+pass their demand on to it; possible targets are entries the image stores or
+lifted code uses as a value, and indirect calls never enter another
+function's interior. Imports and native bindings keep the incoming flags;
+native entries and region oracles keep the per-function masks. Exception-frame
+functions are included (the runtime never dispatches guest SEH), diagnostic
+stops observe nothing, constant-count shifts define their flags and logical
+operations clear AF (undefined on x86; the prepared helper clears it as QEMU
+and Bochs do). The lift report's `flag_abi` section gives the indirect
+contracts (all zero for AC1), the functions with entry or return demand and
+the native contracts. See
+[perf-architecture.md](perf-architecture.md#9-fourth-step-flags-across-calls).
 
 `tools/prepare_runtime.py` retains pinned donor hashes and generates masked
 clones of those helpers, preserving their algorithms. Each lane assignment is

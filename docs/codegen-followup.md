@@ -69,6 +69,10 @@ using those stage labels alone as a locals-only divergence signal.
 
 ## FLAGABI contracts
 
+*Superseded:* `abi` is now a single-body whole-program contract mode and the
+default; see [perf-architecture.md](perf-architecture.md#9-fourth-step-flags-across-calls).
+The private-copy experiment below is kept as history.
+
 The [NFSU2 precedent](https://github.com/th0mk/nfsu2-web/blob/main/tools/flagabi.py)
 computes entry flag needs and caller observations of returned flags. This
 implementation analyzes AC1's emitted-C instruction groups and actual helper
