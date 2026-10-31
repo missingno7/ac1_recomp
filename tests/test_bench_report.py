@@ -86,6 +86,20 @@ class FrameWindowTests(unittest.TestCase):
         self.assertIn('main CPU mean ms/frame: 2 (workload-equivalent pairs=1)', text)
         self.assertIn('draw calls in window: 20 (workload-equivalent pairs=1)', text)
 
+    def test_segment_deltas_pair_the_per_present_csvs(self):
+        root = ROOT / 'work/bench-report-tests/segment'
+        header = 'present_index,wall_ms,main_thread_cpu_ms,process_cpu_ms,cpu_sample_window_frames,main_thread_cycles'
+        for pair, (a, b) in enumerate(((100, 90), (200, 190), (100, 95)), 1):
+            for side, cost in (('A', a), ('B', b)):
+                path = root / side / f'pair-{pair:02d}' / 'run-01'
+                path.mkdir(parents=True, exist_ok=True)
+                rows = [f'{p},1,1,1,16,{cost if p < 1900 else 1}' for p in range(1800, 2000)]
+                (path / 'frame-stats.csv').write_text(header + '\n' + '\n'.join(rows) + '\n')
+        deltas, mean, ci = report.segment_deltas(root, 1800, 1900)
+        self.assertEqual([round(d, 1) for d in deltas], [-10.0, -5.0, -5.0])
+        self.assertAlmostEqual(mean, -6.667, places=3)
+        self.assertLess(ci[0], mean); self.assertGreater(ci[1], mean)
+
     def test_adaptive_decision_stops_for_a_clear_difference(self):
         result = report.adaptive_decision([9.5, 10.0, 10.5], [250, 252, 251], 3)
         self.assertTrue(result['stop'])

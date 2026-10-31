@@ -204,6 +204,29 @@ def adaptive_decision(deltas, baseline, executed_pairs, min_pairs=3, max_pairs=8
     }
 
 
+def segment_deltas(comparison, lo, hi):
+    """Paired B-A main-thread cycles/frame (% of A) over Presents [lo, hi) of
+    each pair's per-Present CSVs, e.g. the part of the window before a scene
+    change that a faster side reaches later."""
+    deltas = []
+    for a_path in sorted(Path(comparison, "A").glob("pair-*/run-*/frame-stats.csv")):
+        b_path = Path(comparison, "B", *a_path.parts[-3:])
+        means = []
+        for path in (a_path, b_path):
+            with open(path, newline="") as f:
+                cycles = [float(r["main_thread_cycles"]) for r in csv.DictReader(f)
+                          if r["present_index"].isdigit() and lo <= int(r["present_index"]) < hi
+                          and r["main_thread_cycles"]]
+            means.append(statistics.mean(cycles) if cycles else None)
+        if None not in means:
+            deltas.append((means[1] - means[0]) / means[0] * 100)
+    if len(deltas) < 2:
+        return deltas, None, None
+    mean = statistics.mean(deltas)
+    half = t975(len(deltas) - 1) * statistics.stdev(deltas) / len(deltas) ** 0.5
+    return deltas, mean, (mean - half, mean + half)
+
+
 def successful(data, key):
     return [r[key] for r in data.get("runs", []) if r.get("reached_workload", r.get("reached_gameplay")) and isinstance(r.get(key), (int, float))]
 
@@ -335,6 +358,14 @@ def main():
             report = "\n".join(lines) + "\n"
         (Path(sys.argv[2]) / "summary.md").write_text(report, encoding="utf-8")
         print(report, end="")
+        return
+    if len(sys.argv) >= 4 and sys.argv[1] == "--segment":
+        for span in sys.argv[3:]:
+            lo, hi = map(int, span.split("-"))
+            deltas, mean, ci = segment_deltas(sys.argv[2], lo, hi)
+            shown = ", ".join(f"{d:+.1f}%" for d in deltas)
+            print(f"Presents {lo}-{hi}: main-thread cycles/frame B-A per pair [{shown}]" +
+                  (f"; mean {mean:+.1f}%, 95% t CI [{ci[0]:+.1f}%, {ci[1]:+.1f}%]" if ci else ""))
         return
     if len(sys.argv) == 2 and Path(sys.argv[1], "result.json").exists():
         d = read(sys.argv[1])

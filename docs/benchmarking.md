@@ -33,10 +33,15 @@ Present index follows real time, not the fixed guest clock, so a faster binary
 reaches it later: `e634876` at Present 2038-2050 in five runs, the flag-contract
 build at 2148-2200+ (the stack step moved it from ~2010 to ~2075). The 1800-2200
 window then holds more heavy frames on the faster side and understates its gain:
--3.7% there against -10.7% in 2400-2800 for the flag contracts. When a change
-moves the scene change, also compare a window after it in both runs
-(`-StartPresent 2400 -EndPresent 2800`). The white frame at the boundary
-capture is that flash, not breakage.
+-3.7% there against -10.7% in 2400-2800 for the flag contracts. A window
+after the change is no cleaner: frame cost keeps falling for hundreds of
+Presents after it, so the side that changed scene later is in a heavier
+stage, and runs of one binary spread by +-10% there (flag locals: eight pairs
+from -10% to +13%, inconclusive). The most stable comparison is the part of
+the standard window before the change in both runs, from the per-Present CSVs
+(`python -B tools/bench_report.py --segment <comparison> 1800-2000`); report it
+next to the standard window. The white frame at the boundary capture is that flash, not
+breakage.
 
 Workload equivalence is judged from gameplay phase and identical replay command
 indices at both boundaries, plus a gross guest-time sanity bound (33%). Present

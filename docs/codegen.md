@@ -102,7 +102,11 @@ native entries and region oracles keep the per-function masks. Exception-frame
 functions are included (the runtime never dispatches guest SEH), diagnostic
 stops observe nothing, constant-count shifts define their flags and logical
 operations clear AF (undefined on x86; the prepared helper clears it as QEMU
-and Bochs do). The lift report's `flag_abi` section gives the indirect
+and Bochs do). Shifts get constant-mask clones too, and each function keeps
+the flags in an `ac1_flags` local (clones of the flag writers in
+`prepare_runtime.py` take it instead of the CPU), stored to the CPU struct only
+where a contract needs them and synced in full around the few helpers that
+still use it. The lift report's `flag_abi` section gives the indirect
 contracts (all zero for AC1), the functions with entry or return demand and
 the native contracts. See
 [perf-architecture.md](perf-architecture.md#9-fourth-step-flags-across-calls).

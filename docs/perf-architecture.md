@@ -377,6 +377,42 @@ the window (before the change, Presents 1800-2000: -19.9% [-24.2%, -15.5%]; see
 [benchmarking.md](benchmarking.md)). A run to Present 5010 and the intro
 videos show no stop or visual breakage.
 
+**Flags in locals and masked shifts.** The re-profile below found almost all
+remaining parity work inside the shift helpers, and the compiled code still
+stored each flag to the CPU struct (`sete` + store) for a branch that reloaded
+it after any intervening guest store. Now:
+
+* Constant-count and variable-count shifts get constant-mask clones
+  (`op_shl_m` ... `op_shrd_m`); a zero count still writes nothing.
+* Each function keeps the six flags in an `ac1_flags` local that GCC
+  scalarizes into registers. The CPU struct holds them only where a contract
+  needs it: E(callee) before a call, the demand after it (reloaded), R(F)
+  before a return, R(F) before an import tail call. Flag writers have clones on
+  the local (`flags_*_m_l`, `op_*_m_l`, `sse_compare_l`, `fcompare_eflags_l`,
+  `do_sahf_l`, `op_rol_l` ...). The 181 groups whose helpers still use the CPU
+  struct's flags (`lock cmpxchg`, `rep cmps`, `pushfd`/`popfd`, `rcl`/`rcr`,
+  native calls) sync all six around them, after their labels.
+* `lock xadd` (7,824 inline InterlockedIncrement/Decrement sites) is plain
+  code and now masked like any arithmetic; only `cmpxchg`'s trailing `if`
+  keeps it whole.
+
+In the kernel's main function the flag stores to the CPU struct fall 20 -> 0
+and `setcc` 8 -> 0; the cone runs 98-100 -> 94 ticks/bone (-5%, four of four
+interleaved pairs), x64 instructions 2,145 -> 2,091, AArch64 1,969 -> 1,903,
+byte-identical on all records and both fills. `.text` 105.2 -> 100.3 MB. The
+whole-program differential now also covers a jump into a fully synced group,
+an import tail call, a guarded tail call and an atomic add; dropping either the
+stores or the reloads fails it.
+
+Controlled comparison against the contract build (`8e59bb1`): standard window
+(4 pairs, B faster in every pair) main-thread cycles/frame **-4.7%** [-8.8%,
+-0.7%], mean frame time -5.5%, 37.1 -> 39.3 FPS; before the scene change in
+both runs (Presents 1800-2000) **-6.3%** [-10.6%, -1.9%]. The window after the
+scene change was inconclusive after eight pairs (+2.3% [-4.7%, +9.4%]; pairs
+from -10% to +13%): see [benchmarking.md](benchmarking.md) on why that phase is
+not a stable workload. A run to Present 5003 and the intro videos show no stop
+or visual breakage.
+
 ## 10. Recommendation
 
 Re-profile of the contract build (main thread, Presents 1800 + 15 s, the same
@@ -387,27 +423,24 @@ helpers 6.1% (`flags_sub_m` 3.7%), shift flags 3.8% (234 of the 255 `parity8`
 samples are inside `op_sar`/`op_shr`/`op_shl`), libwinpthread 5.0%, ntdll 4.3%,
 x87 integer stores 2.0%.
 
-1. **Masked shifts.** Constant-count shifts define flags but still compute all
-   four, parity included, almost always dead: ~3.8% of the main thread.
-   Constant-mask clones of the shift helpers fed by the contract masks.
-2. **Flag locals.** The remaining masked helpers mostly store ZF/CF to the CPU
-   struct for the branch that reloads them. Keeping flags in locals synced only
-   where a contract or observer needs them lets GCC emit `cmp; jcc`.
-3. **Call boundaries** (Pinyon Shift's ABI sync: -11-12% guest
+Masked shifts and flag locals (items 1-2 of the previous list) are done,
+above. Next, pending a re-profile of that build:
+
+1. **Call boundaries** (Pinyon Shift's ABI sync: -11-12% guest
    instructions; here ~20% of the main thread with dispatch, the checkpoint
    and syncs). A guest call is ~70 host instructions: accounting, an
    out-of-line scheduler checkpoint after every return, full GPR/XMM syncs.
    An inline countdown before the checkpoint is a small runtime change;
    skipping callee-saved reloads needs an exception list (CRT EH/SEH prologs,
    `_chkstk`, `longjmp`) or a preservation proof.
-4. **XMM and GPR locals in exception-frame functions** (12% of main-thread
+2. **XMM and GPR locals in exception-frame functions** (12% of main-thread
    CPU, 25% of SSE instructions). The argument used for flags applies: the
    runtime never dispatches guest SEH or C++ exceptions, so no handler reads a
    register at a fault.
-5. **x87 integer stores** (2.0%). Keep RC and the sticky status bits in locals
+3. **x87 integer stores** (2.0%). Keep RC and the sticky status bits in locals
    synced at the existing TOP sync points.
-6. **Frame-slot promotion proper** (store elimination, values across calls)
+4. **Frame-slot promotion proper** (store elimination, values across calls)
    for the 47% of main-thread CPU in private-frame functions, plus the 733
    8-byte loads after 4-byte stores.
-7. Keep native x87, the vector lowering, the stack changes and the flag
+5. Keep native x87, the vector lowering, the stack changes and the flag
    contracts under validation on AArch64 hardware, videos and long play.

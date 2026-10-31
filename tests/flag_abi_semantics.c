@@ -18,6 +18,9 @@ void guest_execution_read(uint32_t a, void *o, size_t n) {
 void guest_execution_write(uint32_t a, const void *v, size_t n) {
     assert((uint64_t)a+n <= sizeof memory);memcpy(memory+a,v,n);
 }
+uint32_t guest_atomic_xadd32(uint32_t a, uint32_t v) {
+    uint32_t old;guest_execution_read(a,&old,4);v+=old;guest_execution_write(a,&v,4);return old;
+}
 void ac1_dispatch_guard_failed(CPU *c,uint32_t t) {(void)c;(void)t;abort();}
 void ac1_scheduler_return_checkpoint(CPU *c) {(void)c;}
 void dispatch(CPU *c,uint32_t target) {variant_dispatch(version,c,target);}

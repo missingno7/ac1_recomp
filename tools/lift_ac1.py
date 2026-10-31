@@ -3364,22 +3364,16 @@ def codegen_instruction_groups(body: str):
     return prefix, pending, groups
 
 
-def flag_flow_emit(prefix, pending, groups, eligible, masks):
-    """Narrow each eligible flags_* helper to the lanes its successors observe."""
-    output = prefix + pending
-    for i, group in enumerate(groups):
-        if not eligible[i]: output.extend(group); continue
-        text = '\n'.join(group)
-        match = re.search(r'\b('+'|'.join(FLAG_HELPERS)+r')\(c\s*,', text)
-        depth, end = 1, match.end()
-        while depth and end < len(text):
-            depth += (text[end] == '(') - (text[end] == ')')
-            end += 1
-        if depth: raise ValueError('unbalanced generated flag helper')
-        text = text[:end-1] + f', 0x{masks[i]:02X}u' + text[end-1:]
-        text = text[:match.start()] + match.group(1)+'_m' + text[match.start()+len(match.group(1)):]
-        output.extend(text.splitlines())
-    return '\n'.join(output+['}'])
+def flag_mask_group(text, mask):
+    """Narrow the group's one maskable helper to its `_m` clone with constant lanes."""
+    match = re.search(r'\b('+'|'.join([*FLAG_HELPERS, *FLAG_MASKED_SHIFTS])+r')\(c\s*,', text)
+    depth, end = 1, match.end()
+    while depth and end < len(text):
+        depth += (text[end] == '(') - (text[end] == ')')
+        end += 1
+    if depth: raise ValueError('unbalanced generated flag helper')
+    text = text[:end-1] + f', 0x{mask:02X}u' + text[end-1:]
+    return text[:match.start()] + match.group(1)+'_m' + text[match.start()+len(match.group(1)):]
 
 
 # EFLAGS effects of the other helpers that lifted bodies pass the CPU. The
@@ -3403,6 +3397,10 @@ FLAG_HELPER_READS = {'eflags_pack': FLAG_ALL, 'op_rcl': FLAG_BITS['cf'], 'op_rcr
 # Shifts and rotates change no flag for a zero count. Value: count argument index.
 FLAG_COUNTED_HELPERS = {'op_shl': 1, 'op_shr': 1, 'op_sar': 1, 'op_rol': 1, 'op_ror': 1,
                         'op_rcl': 1, 'op_rcr': 1, 'op_shld': 2, 'op_shrd': 2}
+# Shifts with constant-mask `_m` clones (prepare_runtime.py): the lanes they may write.
+FLAG_MASKED_SHIFTS = {name: FLAG_ALL & ~(FLAG_BITS['af'] | FLAG_BITS['of'])
+                      for name in ('op_shl', 'op_shr', 'op_sar', 'op_shld', 'op_shrd')}
+FLAG_MASKED_SHIFT_CLONES = frozenset(name + '_m' for name in FLAG_MASKED_SHIFTS)
 FLAG_DIRECT_CALL = re.compile(r'\bAC1_CALL\(c, L_([0-9A-F]{8}), 0x\1u\)')
 FLAG_DISPATCH = re.compile(r'\bdispatch\(c, (?:0x([0-9A-F]{8})u|[^;]*)\)')
 FLAG_TAIL_CALL = re.compile(r'(?:\bAC1_CALL\(c, L_[0-9A-F]{8}, 0x[0-9A-F]{8}u\)|\bdispatch\(c, [^;]*\));\s*return;')
@@ -3456,14 +3454,19 @@ def flag_contract_rows(body, lifted):
     rows, opaque = [], collections.Counter()
     for i, text in enumerate(texts):
         helpers = re.findall(r'\b(flags_\w+)\(c\s*,', text)
-        eligible = (len(helpers) == 1 and helpers[0] in FLAG_HELPERS and
-                    not re.search(r'\b(?:if|while|for|goto|return)\b|atomic_', text))
+        shifts = re.findall(r'\b('+'|'.join(FLAG_MASKED_SHIFTS)+r')\(c\s*,', text)
+        # One maskable helper: a flags_* helper, or a shift (whose lanes may stay
+        # unwritten for a zero count, so it only narrows what it computes). An
+        # atomic op (lock xadd) is plain code; cmpxchg's `if` keeps it whole.
+        eligible = (len(helpers) + len(shifts) == 1 and all(h in FLAG_HELPERS for h in helpers) and
+                    not re.search(r'\b(?:if|while|for|goto|return)\b', text))
+        lanes = (FLAG_HELPERS[helpers[0]] if helpers else FLAG_MASKED_SHIFTS[shifts[0]]) if eligible else 0
         # A failing x87 check stops the guest, so its early return is dead and
         # what follows it (fcomi's flags) is unconditional.
         checked = FLAG_X87_CHECK.sub('', text)
         guarded = bool(re.search(r'\b(?:if|while|for|switch)\b', checked))
         read = sum(bit for flag, bit in FLAG_BITS.items() if re.search(r'\bc->'+flag+r'\b(?!\s*=(?!=))', text))
-        write = FLAG_HELPERS[helpers[0]] if eligible else 0
+        write = FLAG_HELPERS[helpers[0]] if eligible and helpers else 0
         if any(helper in ('flags_adc', 'flags_sbb') for helper in helpers): read |= FLAG_BITS['cf']
         rest = re.sub(r'\bc->\w+', 'member', FLAG_DISPATCH.sub('', FLAG_DIRECT_CALL.sub('', text)))
         rest = re.sub(r'\bdispatch_jmp\(c, [^;]*;', '', rest)
@@ -3496,7 +3499,7 @@ def flag_contract_rows(body, lifted):
         jump = bool(re.search(r'\bdispatch_jmp\(c,', text))
         ret = checked.count('return;') > tail + jump or (i+1 == len(groups) and not terminal)
         if any(t not in labels for t in targets): read = FLAG_ALL
-        rows.append(dict(read=read, write=write, eligible=eligible, call=call, tail=tail, ret=ret,
+        rows.append(dict(read=read, write=write, eligible=eligible, lanes=lanes, call=call, tail=tail, ret=ret,
                          jump=jump, successors=tuple(edges)))
     entry = 0
     guards = re.findall(r'\bgoto (L_[0-9A-F]{8});', '\n'.join(prefix[2:]))
@@ -3538,6 +3541,74 @@ def flag_contract_solve(flow, R, E, e_call, e_jump, native=frozenset()):
     for i, row in enumerate(flow['rows']):
         for target in row['successors']: after[i] |= live[target]
     return live, after, reads, writes
+
+
+# Flag writers with clones on the local `ac1_flags` (prepare_runtime.py), besides
+# the masked `_m` helpers.
+FLAG_LOCAL_CLONES = frozenset({'sse_compare', 'fcompare_eflags', 'do_sahf', 'op_rol', 'op_ror',
+                               'op_bsf', 'op_bsr'} | {name + '_m' for name in [*FLAG_HELPERS, *FLAG_MASKED_SHIFTS]})
+FLAG_FIELDS = ('cf', 'pf', 'af', 'zf', 'sf', 'of')
+
+
+def flag_sync(flags, store):
+    """Copy the given flags from the locals to the CPU struct, or back."""
+    return ''.join(f'c->{f} = _ac1_f.{f}; ' if store else f'_ac1_f.{f} = c->{f}; '
+                   for f in FLAG_FIELDS if flags & FLAG_BITS[f])
+
+
+def flag_contract_emit(flow, masks, after, own_return, entry, E, e_call, e_jump, native):
+    """Masked helpers on function-local flags; the CPU struct holds flags only
+    where a contract needs them: a callee's entry demand before a call, the
+    demand after it (reloaded), our return demand before a return. Groups
+    whose helpers use the CPU struct's flags sync all six around them."""
+    local_names = r'\b(' + '|'.join(sorted(FLAG_LOCAL_CLONES)) + r')\(c,'
+    texts = []
+    for i, group in enumerate(flow['groups']):
+        row = flow['rows'][i]
+        text = '\n'.join(group)
+        if row['eligible']: text = flag_mask_group(text, masks[i])
+        code = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+        rest = FLAG_DISPATCH.sub('', FLAG_DIRECT_CALL.sub('', re.sub(r'\bdispatch_jmp\(c, [^;]*;', '', code)))
+        names = set(re.findall(r'\b(\w+)\(c(?=\s*[,)])', rest))
+        kind, target = row['call'] or (None, None)
+        guarded = bool(re.search(r'\b(?:if|while|for|switch)\b', FLAG_X87_CHECK.sub('', code)))
+        local = (all(n in FLAG_TRANSPARENT_HELPERS or n in FLAG_LOCAL_CLONES for n in names)
+                 and not re.search(r'\bc\b', re.sub(r'\b\w+\(c(?=\s*[,)])|\bc->\w+', '', rest))
+                 and target not in native
+                 and not (kind in ('direct', 'indirect') and guarded and not row['tail']))
+        if not local:
+            reload = flag_sync(FLAG_ALL, False)
+            text = re.sub(r'\bgoto (L_[0-9A-F]{8});', lambda m: f'{{ {reload}goto {m[1]}; }}', text)
+            labels = re.match(r'(?:L_[0-9A-F]{8}:\n)*', text)[0]   # jumps here must sync too
+            texts.append(f'{labels}    {flag_sync(FLAG_ALL, True)}\n{text[len(labels):]}\n    {reload}')
+            continue
+        text = re.sub(local_names, r'\1_l(&_ac1_f,', text)
+        text = re.sub(r'\bc->(cf|pf|af|zf|sf|of)\b', r'_ac1_f.\1', text)
+        # A dead early return after a failing x87 check needs no flags.
+        checks = FLAG_X87_CHECK.findall(text)
+        text = FLAG_X87_CHECK.sub('\x00', text)
+        if kind == 'direct':
+            text = re.sub(r'\b(AC1_CALL|dispatch)\(', lambda m: flag_sync(E[target], True) + m[0], text, count=1)
+        elif kind == 'indirect':
+            text = re.sub(r'\bdispatch\(', lambda m: flag_sync(e_call, True) + m[0], text, count=1)
+        elif kind == 'import':
+            # Host code keeps the flags: the locals stay valid, but a tail call
+            # returns them to our caller through the CPU struct.
+            demand = e_call | (own_return if row['tail'] else 0)
+            text = re.sub(r'\bdispatch\(', lambda m: flag_sync(demand, True) + m[0], text, count=1)
+        if row['jump']:
+            text = re.sub(r'\bdispatch_jmp\(', lambda m: flag_sync(e_jump, True) + m[0], text, count=1)
+        if row['ret'] and not row['tail'] and not row['jump']:
+            text = re.sub(r'\breturn;', lambda m: flag_sync(own_return, True) + m[0], text)
+        for check in checks: text = text.replace('\x00', check, 1)
+        if kind in ('direct', 'indirect') and not row['tail']:
+            text += '\n    ' + flag_sync(after[i], False)
+        if row['ret'] and 'return;' not in FLAG_X87_CHECK.sub('', code):   # falls off the end
+            text += '\n    ' + flag_sync(own_return, True)
+        texts.append(text)
+    lines = flow['prefix'][:2] + ['    ac1_flags _ac1_f = {0}; ' + flag_sync(entry, False)] + flow['prefix'][2:]
+    return '\n'.join(lines + flow['pending'] + [line for text in texts for line in text.splitlines()
+                                                   if line.strip()] + ['}'])
 
 
 def flag_contract_program(bodies, pinned=(), call_targets=None, jump_targets=None):
@@ -3597,12 +3668,12 @@ def flag_contract_program(bodies, pinned=(), call_targets=None, jump_targets=Non
         opaque.update(flow['opaque'])
         if a in native:
             contracted[a] = flag_liveness_function(body, 'cfg'); continue
-        _, after, reads, writes = flag_contract_solve(flow, R[a], E, e_call, e_jump, native)
-        masks = [w & (out | r) for w, out, r in zip(writes, after, reads)]
+        _, after, reads, _ = flag_contract_solve(flow, R[a], E, e_call, e_jump, native)
+        masks = [row['lanes'] & (out | r) for row, out, r in zip(flow['rows'], after, reads)]
         eligible = [row['eligible'] for row in flow['rows']]
         masked += sum(eligible)
         live_bits += sum(bin(m).count('1') for m, e in zip(masks, eligible) if e)
-        contracted[a] = flag_flow_emit(flow['prefix'], flow['pending'], flow['groups'], eligible, masks)
+        contracted[a] = flag_contract_emit(flow, masks, after, R[a], E[a], E, e_call, e_jump, native)
     report = dict(
         functions=len(bodies), native_entries=len(native), solves=solves,
         indirect_call_targets=len(call_targets), indirect_jump_targets=len(jump_targets),
@@ -3821,6 +3892,7 @@ def wrap_native_binding(body: str, address: int, entry: dict) -> str:
 LOCAL_GPR_FREE_HELPERS = frozenset({
     'AC1_SET_GUEST_EIP', 'op_shl', 'op_shr', 'op_sar', 'op_rol', 'op_ror',
     'op_shld', 'op_shrd', 'op_bsf', 'op_bsr', 'shr32', 'shl32',
+    'op_shl_m', 'op_shr_m', 'op_sar_m', 'op_shld_m', 'op_shrd_m',
     'eflags_pack', 'eflags_unpack',
     # x87 helpers that read or write only flags, x87 control/status and init state.
     'fcompare', 'fcompare_eflags', 'do_sahf', 'ac1_x87_status', 'ac1_fp_init',
@@ -4157,9 +4229,10 @@ def xmm_free_helpers(cpu_header: str) -> frozenset:
     names|=set(re.findall(r'^#define\s+(\w+)\(',cpu_header,re.M))
     if re.search(r'\bxmm\s*\[',re.sub(r'^\s*XMM\s+xmm\[8\];','',cpu_header,flags=re.M)):
         raise ValueError('prepared CPU header accesses XMM state; audit the XMM-local sync points')
-    # ac1_x87_integer_native is emitted by native_x87_function; the header read at
-    # lift time can predate it (prepare_runtime.py runs after the lifter).
-    return frozenset((names|{'AC1_SET_GUEST_EIP','ac1_x87_integer_native'})-{'AC1_CALL','RECOMP_TODO'})
+    # ac1_x87_integer_native and the masked shift clones are emitted by lifter
+    # passes; the header read at lift time can predate them (prepare_runtime.py
+    # runs after the lifter).
+    return frozenset((names|{'AC1_SET_GUEST_EIP','ac1_x87_integer_native'}|FLAG_MASKED_SHIFT_CLONES)-{'AC1_CALL','RECOMP_TODO'})
 
 
 _XMM_FREE_HELPERS = None
@@ -4246,8 +4319,9 @@ def native_x87_function(body: str) -> str:
         header=(ROOT/'src/runtime/cpu.h').read_text(encoding='utf-8')
         names=set(re.findall(r'^(?:static inline|AC1_ACCESSOR_INLINE|AC1_X87_INTEGER_INLINE)\s+[^\n(]*?\b(\w+)\s*\(',header,re.M))
         names|=set(re.findall(r'^#define\s+(\w+)\(',header,re.M))|{'AC1_SET_GUEST_EIP'}
-        # The pass emits ac1_x87_integer_native itself; the header read here may predate it.
-        _X87_FREE_HELPERS=frozenset((names|{'ac1_x87_integer_native'})-{'AC1_CALL','RECOMP_TODO'}-X87_STACK_HELPERS)
+        # Lifter passes emit ac1_x87_integer_native and the masked shift clones;
+        # the header read here may predate them.
+        _X87_FREE_HELPERS=frozenset((names|{'ac1_x87_integer_native'}|FLAG_MASKED_SHIFT_CLONES)-{'AC1_CALL','RECOMP_TODO'}-X87_STACK_HELPERS)
     free=_X87_FREE_HELPERS
     lines=body.splitlines()
     if len(lines)<3 or lines[1]!='{' or lines[-1]!='}':raise ValueError('unexpected lifted function shape for native x87')

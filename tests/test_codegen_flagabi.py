@@ -19,7 +19,7 @@ def call(target, ret):
 
 
 def masks(body):
-    return re.findall(r'flags_\w+_m\(.*?, (0x[0-9A-F]+)u\)', body)
+    return re.findall(r'flags_\w+?_m(?:_l)?\(.*?, (0x[0-9A-F]+)u\)', body)
 
 
 def compile_and_run(source, name, *flags):
@@ -135,6 +135,18 @@ class FlagContractTests(unittest.TestCase):
                             'if (c->zf) c->ebx = 1u;', 'c->esp += 4; return;')
             out, _ = lift.flag_contract_program({0x401000: body})
             self.assertEqual(masks(out[0x401000]), [mask], shift)
+
+    def test_shifts_compute_only_demanded_lanes(self):
+        shifts = lambda body: re.findall(r'op_s\w+?_m(?:_l)?\(.*?, (0x[0-9A-F]+)u\)', body)
+        for shift, reader, expected in (
+                ('op_shl(c, c->eax, 0x3u, 4)', 'c->esp += 4; return;', (['0x00'], ['0x00'])),
+                ('op_shr(c, c->eax, 0x3u, 4)', 'if (c->zf) c->ebx = 1u;', (['0x00'], ['0x08'])),
+                ('op_sar(c, c->eax, c->ecx, 4)', 'if (c->sf) c->ebx = 1u;', (['0x10'], ['0x10'])),
+                ('op_shrd(c, c->eax, c->edx, 0x4u, 4)', 'SET8L(c->ebx, c->cf);', (['0x00'], ['0x01']))):
+            body = function(0x401000, 'flags_sub(c, c->eax, 1, 4);', f'c->eax = {shift};', reader,
+                            'c->esp += 4; return;')
+            out, _ = lift.flag_contract_program({0x401000: body})
+            self.assertEqual((masks(out[0x401000]), shifts(out[0x401000])), expected, shift)
 
     def test_unknown_helpers_and_unresolved_gotos_observe_every_flag(self):
         for observer in ('unknown(c);', 'goto L_00402000;'):
@@ -256,6 +268,32 @@ class FlagContractTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stdout)
 
     @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
+    def test_masked_shift_clones_write_exactly_their_lanes(self):
+        cases = []
+        for helper, position in lift.FLAG_MASKED_SHIFTS.items():
+            for size in (1, 2, 4):
+                for count in (0, 1, 7, 16, 31):
+                    for value in (0x1, 0x80, 0xC0000003):
+                        arguments = ([f'0x{value:X}u', '0x5A5Au'] if helper in ('op_shld', 'op_shrd') else
+                                     [f'0x{value:X}u']) + [f'0x{count:X}u', str(size)]
+                        for lanes in (0x00, 0x01, 0x02, 0x08, 0x10, 0x1B):
+                            cases.append(f'CHECK({helper}, ({", ".join(arguments)}), 0x{lanes:02X}u);')
+        source = '\n'.join([
+            '#include "cpu.h"', '#include <stdio.h>',
+            'static unsigned flags(const CPU *c) { return c->cf | c->pf << 1 | c->af << 2 | c->zf << 3 | c->sf << 4 | c->of << 5; }',
+            'static void set(CPU *c, unsigned f) { c->cf = f & 1; c->pf = f >> 1 & 1; c->af = f >> 2 & 1; c->zf = f >> 3 & 1; c->sf = f >> 4 & 1; c->of = f >> 5 & 1; }',
+            'static int failures, cases;',
+            '#define ARGS(...) __VA_ARGS__',
+            '#define CHECK(name, args, lanes) do { for (unsigned prior = 0; prior < 64; prior += 21) { '
+            'CPU full = {0}, masked = {0}; set(&full, prior); set(&masked, prior); '
+            '{ CPU *c = &full; uint32_t r1 = name(c, ARGS args); c = &masked; uint32_t r2 = name##_m(c, ARGS args, lanes); ++cases; '
+            'unsigned want = (flags(&full) & (lanes)) | (prior & ~(lanes)); '
+            'if (r1 != r2 || flags(&masked) != want) { printf("lane mismatch: %s %s lanes %u\\n", #name, #args, (unsigned)(lanes)); ++failures; } } } } while (0)',
+            'int main(void) {', *cases, 'printf("%d masked shift cases\\n", cases); return failures != 0; }'])
+        run = compile_and_run(source, 'masked_shifts')
+        self.assertEqual(run.returncode, 0, run.stdout)
+
+    @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
     def test_compiled_contracts_match_per_function_masks(self):
         bodies = {
             0x401000: function(0x401000,
@@ -275,6 +313,9 @@ class FlagContractTests(unittest.TestCase):
                 'if (c->cf) c->ebp ^= 1u;',
                 'c->ecx = flags_logicz(c, c->ecx & c->eax, 4);',
                 'push32(c, eflags_pack(c)); c->edi ^= pop32(c);',
+                'flags_sub(c, c->esi, c->edi, 4);',
+                'c->edx = op_shr(c, c->edx, c->ebp & 3u, 4);',   # a zero count keeps the sub's ZF
+                'if (c->zf) c->edi ^= 0x1234u;',
                 'c->esp += 4; return;'),
             0x401100: function(0x401100, 'c->eax = flags_sub(c, c->eax, c->edx, 4);', 'c->esp += 4; return;'),
             0x401200: function(0x401200, 'if (c->cf) c->edx ^= 9u;', 'c->edx = flags_add(c, c->edx, c->eax, 4);',
@@ -284,13 +325,26 @@ class FlagContractTests(unittest.TestCase):
                                'AC1_CALL(c, L_00401300, 0x00401300u); return;'),
             0x401500: function(0x401500, 'if (c->zf) c->esi ^= 0x77u;', 'c->ebx = flags_logicz(c, c->ebx | 1u, 4);',
                                'c->esp += 4; return;'),
+            # A full-sync group at a label reached by a jump; an import tail
+            # call whose caller reads ZF; a guarded tail call.
+            0x401600: function(0x401600, 'flags_sub(c, c->eax, c->ebx, 4);', 'if (c->zf) goto L_00401004;',
+                               'c->ecx = flags_logicz(c, c->ecx | 1u, 4);', 'goto L_00401004;',
+                               ('L_00401004', 'push32(c, eflags_pack(c)); c->edi ^= pop32(c);'),
+                               'flags_sub(c, c->esi, 3u, 4);', 'if (c->cf) { AC1_CALL(c, L_00401300, 0x00401300u); return; }',
+                               'flags_add(c, c->edx, c->eax, 4);', 'dispatch(c, 0x00500000u); return;'),
+            0x401700: function(0x401700, call(0x401600, 0x401001), 'if (c->zf) c->esi ^= 7u;',
+                               'if (c->sf) c->ebp ^= 2u;',
+                               '{ uint32_t _v = c->ecx; uint32_t _old = atomic_xadd32((c->esp - 0x10u), _v); '
+                               'c->ecx = (uint32_t)(_old); flags_add(c, _old, _v, 4); }',   # lock xadd
+                               'if (c->zf) c->eax ^= 0x77u;', 'c->esp += 4; return;'),
         }
         call_targets, jump_targets = lift.flag_indirect_targets(bodies, [])
         self.assertEqual(call_targets, {0x401200})
         contracted, report = lift.flag_contract_program(bodies, (), call_targets, jump_targets)
-        self.assertEqual(masks(contracted[0x401000]), ['0x08', '0x01', '0x09', '0x3F'])
+        self.assertEqual(masks(contracted[0x401000]), ['0x08', '0x01', '0x09', '0x3F', '0x08'])
+        self.assertEqual(re.findall(r'op_s\w+?_m(?:_l)?\(.*?, (0x[0-9A-F]+)u\)', contracted[0x401000]), ['0x01', '0x08'])
         self.assertEqual([masks(contracted[a]) for a in (0x401100, 0x401200, 0x401300, 0x401400, 0x401500)],
-                         [['0x01'], ['0x0A'], ['0x10'], ['0x00'], ['0x00']])
+                         [['0x01'], ['0x1A'], ['0x18'], ['0x00'], ['0x00']])
         variants = [('cfg', [lift.flag_liveness_function(b) for b in bodies.values()]),
                     ('abi', list(contracted.values())),
                     ('abi_local', [lift.local_register_function(b) for b in contracted.values()])]
@@ -323,7 +377,7 @@ class FlagContractTests(unittest.TestCase):
         self.assertIn('{ 0x00401100u, L_00401100 }', (work/'initial_dispatch.c').read_text())
         sources = '\n'.join((work/name).read_text() for name in result['translation_units'])
         self.assertNotIn('ac1_abi_', sources)
-        self.assertIn('flags_add_m(c, c->eax, 0x1u, 4, 0x00u)', sources)
+        self.assertIn('flags_add_m_l(&_ac1_f, c->eax, 0x1u, 4, 0x00u)', sources)
         for name in result['translation_units']:
             subprocess.run(['gcc', '-O2', '-std=c11', '-Werror=implicit-function-declaration',
                             '-I', str(lift.prepare_test_runtime()), '-I', str(work), '-c', str(work/name),
@@ -346,7 +400,7 @@ class FlagContractTests(unittest.TestCase):
         self.assertIn('ac1_region_00401000_m_00401100(c)', region_source)
         self.assertEqual(set(masks(region_source)), {'0x3F'})
         sources = '\n'.join((work/name).read_text() for name in result['translation_units'])
-        self.assertIn('flags_add_m(c, _ac1_regs.eax, 0x1u, 4, 0x00u)', sources)
+        self.assertIn('flags_add_m_l(&_ac1_f, _ac1_regs.eax, 0x1u, 4, 0x00u)', sources)
         self.assertEqual(result['flag_abi']['native_entries'], 1)
         runtime = lift.prepare_test_runtime()
         for direct in (False, True):

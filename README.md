@@ -58,7 +58,11 @@ pose kernel runs 118 -> 98.6 ticks/bone (byte-identical); in gameplay
 main-thread cycles/frame -3.7% [-5.3%, -2.2%] in the standard window and
 -10.7% [-18.4%, -2.9%] after the scene change that the faster build reaches
 later (see [docs/benchmarking.md](docs/benchmarking.md)). `-FlagLiveness cfg`
-restores the per-function masks.
+restores the per-function masks. Each function now also keeps the flags in a
+local (synced to the CPU struct only where a contract needs them) and shifts
+compute only demanded flags: the kernel runs 98.6 -> 94 ticks/bone, gameplay
+main-thread cycles/frame -4.7% [-8.8%, -0.7%] against the contract build
+(-6.3% before the scene change).
 
 ## Gamepad and Android touch controller (2026-10-30)
 
