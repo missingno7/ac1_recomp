@@ -38,6 +38,15 @@ The loader must be selected before the first DXVK instance. All instance,
 device and surface entry points use that loader; the provider has no dynamic
 dependency on the system `libvulkan.so`.
 
+Android returns `VK_SUBOPTIMAL_KHR` for every present while the swapchain's
+identity pre-transform differs from the rotated landscape surface, and upstream
+DXVK rebuilt the swapchain after each such frame (about once per present on
+the S24 Ultra). `prepare.py` patches the presenter to keep the swapchain while
+the surface's current extent still equals its images and let the compositor
+rotate; extent changes, `VK_ERROR_OUT_OF_DATE_KHR` and surface loss still
+rebuild it. The patched ARM64 provider builds (2026-10-31); its phone run is
+pending.
+
 JNI sets `DXVK_WSI_DRIVER=Android`. ARM64 defaults to
 `AC1_VULKAN_DRIVER=turnip`, loading the pinned `ports/turnip/` package in-process
 through libadrenotools. It verifies the actual driver is Mesa Turnip and rejects

@@ -89,6 +89,31 @@ def main():
             'std::cerr << adjusted;\n'
             '        if (level >= LogLevel::Warn)\n'
             '          __android_log_print(level >= LogLevel::Error ? ANDROID_LOG_ERROR : ANDROID_LOG_WARN, "DXVK", "%s", adjusted.c_str());')
+    # Android reports VK_SUBOPTIMAL_KHR on every present while the identity
+    # pre-transform differs from the rotated landscape surface, so the presenter
+    # rebuilt its swapchain once per frame. The compositor applies the rotation;
+    # keep the swapchain while the surface extent still matches its images.
+    keep = ("#ifdef DXVK_WSI_ANDROID\n"
+            "    {status} = keepTransformedSwapchain({status}, m_vki, m_device->adapter()->handle(), m_surface, m_images);\n"
+            "#endif\n")
+    replace("src/dxvk/dxvk_presenter.cpp", "  VkResult Presenter::checkSwapChainStatus() {",
+            "#ifdef DXVK_WSI_ANDROID\n"
+            "  static VkResult keepTransformedSwapchain(VkResult status, const Rc<vk::InstanceFn>& vki,\n"
+            "      VkPhysicalDevice adapter, VkSurfaceKHR surface, const std::vector<Rc<DxvkImage>>& images) {\n"
+            "    VkSurfaceCapabilitiesKHR caps = { };\n"
+            "    if (status != VK_SUBOPTIMAL_KHR || images.empty()\n"
+            "     || vki->vkGetPhysicalDeviceSurfaceCapabilitiesKHR(adapter, surface, &caps))\n"
+            "      return status;\n"
+            "    VkExtent3D extent = images.front()->info().extent;\n"
+            "    return caps.currentExtent.width == extent.width && caps.currentExtent.height == extent.height\n"
+            "      ? VK_SUCCESS : status;\n"
+            "  }\n"
+            "#endif\n\n\n"
+            "  VkResult Presenter::checkSwapChainStatus() {")
+    present = "    VkResult status = m_vkd->vkQueuePresentKHR(\n      m_device->queues().graphics.queueHandle, &info);\n"
+    replace("src/dxvk/dxvk_presenter.cpp", present, present + keep.format(status="status"))
+    acquired = "    // This is a normal occurence, but may be useful for\n"
+    replace("src/dxvk/dxvk_presenter.cpp", acquired, keep.format(status="m_acquireStatus") + acquired)
     (args.output / "version.h").write_text('#define DXVK_VERSION "v3.1-android"\n', encoding="ascii")
     (args.output / "buildenv.h").write_text('#define DXVK_COMPILER "clang"\n#define DXVK_COMPILER_VERSION "NDK"\n#define DXVK_TARGET "Android"\n', encoding="ascii")
     (args.output / "PINNED_REVISION").write_text(PIN + "\n", encoding="ascii")
