@@ -44,7 +44,7 @@ struct Buffer {
     std::array<Span, 128> spans{};
     unsigned span_head = 0, span_count = 0;
     uint64_t visit = 0;
-    bool render_registered = false, consume_registered = false;
+    bool render_registered = false, consume_registered = false, event_registered = false;
     bool stop_pending = false;
     std::vector<uint8_t> notify_pending;
     std::array<uint32_t, 16> spatial{}, pending{};
@@ -75,8 +75,9 @@ ac1_ds8_callbacks cb{};
 void *ctx;
 std::map<uint32_t, Proxy> objects;
 // Callback-owned iteration sets. The control path updates them under mutex;
-// aliases share one Buffer and therefore produce one voice.
-std::vector<Buffer *> playing_buffers, pending_buffers;
+// aliases share one Buffer and therefore produce one voice. Event buffers hold
+// notifications and stops the audio thread deferred to the next guest service.
+std::vector<Buffer *> playing_buffers, pending_buffers, event_buffers, clock_buffers;
 Buffer *primary_buffer = nullptr;
 std::recursive_mutex mutex;
 thread_local char error[256];
@@ -163,10 +164,24 @@ void signal(uint32_t e) {
     if (!cb.signal_event || !cb.signal_event(ctx, e))
         fail("notification event is invalid or closed");
 }
+void register_event(Buffer &b) {
+    if (!b.event_registered) {
+        event_buffers.push_back(&b);
+        b.event_registered = true;
+    }
+}
+void unregister_event(Buffer &b) {
+    if (b.event_registered) {
+        auto it = std::find(event_buffers.begin(), event_buffers.end(), &b);
+        if (it != event_buffers.end()) event_buffers.erase(it);
+        b.event_registered = false;
+    }
+}
 void stopped(Buffer &b, bool audio = false) {
     b.resources_acquired = false;
     if (audio) {
         b.stop_pending = true;
+        register_event(b);
         return;
     }
     for (auto n : b.notifications)
@@ -213,10 +228,12 @@ void advance(Buffer &b, uint64_t after, bool audio) {
             if (next <= before)
                 next += total;
             if (next <= after) {
-                if (audio)
+                if (audio) {
                     b.notify_pending[i] = 1;
-                else
+                    register_event(b);
+                } else {
                     signal(n.second);
+                }
             }
         }
     }
@@ -238,7 +255,7 @@ void clock_update(Buffer &b, bool defer_events, uint64_t t = now()) {
     advance(b, b.frames + count, defer_events);
     b.render_frame = double(b.frames);
 }
-void update(Buffer &b, uint64_t t = now()) {
+void deliver(Buffer &b) {
     for (size_t i = 0; i < b.notify_pending.size(); ++i)
         if (b.notify_pending[i]) {
             signal(b.notifications[i].second);
@@ -248,6 +265,9 @@ void update(Buffer &b, uint64_t t = now()) {
         stopped(b);
         b.stop_pending = false;
     }
+}
+void update(Buffer &b, uint64_t t = now()) {
+    deliver(b);
     clock_update(b, false, t);
 }
 void reset_render(Buffer &b) {
@@ -711,13 +731,22 @@ extern "C" int ac1_ds8_service(void) {
     error[0] = 0;
     if (mixer_fault)
         return fail(mixer_fault);
-    // Aliases share a Buffer; update's elapsed time is zero on subsequent aliases.
-    // One clock read per service: it runs on scheduler handoffs, and a read
-    // per buffer was most of the Android vDSO clock time.
-    uint64_t t = now();
-    for (auto &o : objects)
-        if (o.second.buffer)
-            update(*o.second.buffer, t);
+    // This runs on every scheduler handoff. Updating every buffer here took a
+    // third of the Android main thread, and the audio callback rendered silence
+    // whenever that held the mutex. Only deferred events and, without a
+    // consuming device, the clock of playing buffers need servicing.
+    for (Buffer *b : event_buffers) {
+        b->event_registered = false;
+        deliver(*b);
+    }
+    event_buffers.clear();
+    if (!output_active && !output_paused) {
+        // One clock read per service; advance() may unregister finished buffers.
+        uint64_t t = now();
+        clock_buffers = playing_buffers;
+        for (Buffer *b : clock_buffers)
+            clock_update(*b, false, t);
+    }
     return error[0] ? -1 : 1;
 }
 extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint32_t *hr) {
@@ -781,6 +810,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
                 if (!still_referenced) {
                     unregister_playing(*released);
                     unregister_pending(*released);
+                    unregister_event(*released);
                 }
             }
         }
@@ -861,7 +891,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
                 return fail("duplicate source invalid");
             auto b = std::make_shared<Buffer>(*src->second.buffer);
             b->playing = b->locked = false;
-            b->render_registered = b->consume_registered = false;
+            b->render_registered = b->consume_registered = b->event_registered = false;
             b->resources_acquired = false;
             b->frames = b->remainder = 0;
             b->notifications.clear();
@@ -1192,6 +1222,7 @@ extern "C" void ac1_ds8_shutdown(void) {
     objects.clear();
     playing_buffers.clear();
     pending_buffers.clear();
+    event_buffers.clear();
     primary_buffer = nullptr;
     movies.clear();
     output_active = false;

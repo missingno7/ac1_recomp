@@ -27,9 +27,12 @@ try {
     Check "$output/audio_portable_contract.exe" @()
     Check "$HostBin/gcc.exe" @('-std=c11','-DAC1_PORTABLE_TEST','-Isrc/runtime','-Isrc/platform',
         '-c','src/platform/ac1_window_android.c','-o',"$output/window.o")
+    Check "$HostBin/gcc.exe" @('-std=c11','-DAC1_PORTABLE_TEST','-Isrc/runtime','-Isrc/platform',
+        '-c','src/platform/ac1_gamepad.c','-o',"$output/gamepad.o")
     Check "$HostBin/g++.exe" ($hostFlags + @('tests/android_portable_contract.cpp',
         'src/platform/ac1_ds8_portable.cpp','src/platform/ac1_dinput8_portable.cpp',
-        'src/platform/ac1_input_script.cpp',"$output/window.o",'-o',"$output/android_portable_contract.exe"))
+        'src/platform/ac1_input_script.cpp',"$output/window.o","$output/gamepad.o",
+        '-o',"$output/android_portable_contract.exe"))
     Check "$output/android_portable_contract.exe" @()
     $ndk = "$AndroidSdk/ndk/28.2.13676358/toolchains/llvm/prebuilt/windows-x86_64/bin"
     $sources = @('src/platform/ac1_ds8_portable.cpp','src/platform/ac1_audio_aaudio.cpp',

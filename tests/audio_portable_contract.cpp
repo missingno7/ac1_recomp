@@ -138,6 +138,8 @@ void consumption() {
     assert(cursor(b) == 0 && events.empty()); // Generated is not presented; clock cannot move it.
     consume(head - 2);
     assert(events.empty());
+    // The guest service delivers the event the audio thread deferred, once.
+    assert(ac1_ds8_service() == 1 && events.size() == 1 && events.back() == 101);
     assert(cursor(b) == 4 && events.size() == 1 && events.back() == 101);
     render(4, 1000, head);
     consume(head);
