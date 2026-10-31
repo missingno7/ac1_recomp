@@ -49,10 +49,15 @@ existing prebuilt-library path was used for packaging. Build evidence is
 `native31-incremental.log`, `bridge-windows-compile.log` and
 `apk31-final-package.log`.
 
-Phone rendering verification is blocked by adb disconnection; the separate
-Turnip shell probe also found no connected device. World geometry, shadows,
-HUD video and gameplay FPS remain unverified with this provider. No successful
-rendering fix or FPS improvement is claimed. See the
+On 2026-10-31 builds `911a6c4` and `9856f52` both ran on the S24 Ultra with
+this provider and Turnip (Mesa 26.2.5). Captures show world geometry, NPCs and
+shadows; the HUD tutorial video panel appears partly drawn in captures from
+both builds. DXVK logs `VK_SUBOPTIMAL_KHR` and recreates the swapchain once per
+present, likely because it requests the identity pre-transform for the rotated
+landscape surface (unconfirmed). `VK_KHR_swapchain_maintenance1` is enabled, so
+each recreation waits for the old swapchain's present fences, not for device
+idle; its cost is unmeasured. Gameplay FPS is recorded in the
+[README](../README.md#android-arm64-hardware-run-2026-10-30). See the
 [renderer build and integration commands](../ports/dxvk_android/README.md).
 
 Opt-in `AC1_D3D9_TRACE_CAPS=1` bridge diagnostics log CheckDeviceFormat requests

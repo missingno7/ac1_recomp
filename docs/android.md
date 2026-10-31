@@ -4,7 +4,8 @@ The Android app packages real generated AC1 startup functions and the portable
 guest runtime for `arm64-v8a`. Its native layer connects an Android
 `SurfaceView` to DXVK Native WSI, provides the AC1 D3D9 COM bridge, and imports
 DXVK's `Direct3DCreate9` factory. The x86_64 emulator smoke test below supersedes
-the historical compile-only checkpoints. ARM64 phone execution remains unverified.
+the historical compile-only checkpoints. ARM64 phone runs are recorded in the
+[README](../README.md#android-arm64-hardware-run-2026-10-30).
 
 ## Optimized native APK (2026-10-30)
 
@@ -209,7 +210,8 @@ fault in `dispatch`'s prologue, 180 native frames in logcat). The default stack
 was about 1 MiB and x86_64 debug `dispatch` reserves about 4 KiB per call.
 POSIX guest workers now reserve 64 MiB with checked pthread attributes; the
 Java startup executor requests the same stack size. This allocation is separate
-from guest x86 stack sizing and retains the 4096-call depth diagnostic.
+from guest x86 stack sizing and kept the 4096-call depth diagnostic (since
+2026-10-31 the dispatcher instead stops 256 KiB short of the host stack's end).
 The rerun passes that loader boundary. `/proc` maps in
 `work/emu/stacks-maps.log` confirm approximately 64 MiB native guest-worker
 stacks and a 65 MiB Java startup stack (including platform overhead).

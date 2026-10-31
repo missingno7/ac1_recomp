@@ -77,6 +77,7 @@ probe under `ports/turnip/probe/`. Its device result and a real APK replay are
 required before claiming compatibility, rendering correctness or FPS.
 
 At this checkpoint the complete APK has packaged successfully, but the phone
-disconnected from adb before its Turnip run. World geometry, shadows, HUD
-video and FPS remain unverified with the new provider. Evidence and review
-patches are under ignored `work/render/`; see [docs/graphics.md](../../docs/graphics.md).
+disconnected from adb before its Turnip run. The 2026-10-31 phone runs later
+showed world geometry and shadows with this provider; see
+[docs/graphics.md](../../docs/graphics.md). Evidence and review patches are
+under ignored `work/render/`.

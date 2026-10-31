@@ -702,8 +702,9 @@ static int create_guest_thread(CPU *cpu, const import_record *import)
 #else
     /* Lifted C recursion uses a separate native stack. Android's default 1 MiB
      * overflowed in the original recursive loader at 0x0093C740; even dispatch
-     * alone needs about 4 KiB per frame in the x86_64 diagnostic build. Reserve
-     * room for the 4096-call guard, independently of the guest x86 stack. */
+     * alone needs about 4 KiB per frame in the x86_64 diagnostic build. Guest
+     * calls nest on this stack until the dispatcher stops 256 KiB short of its
+     * end, independently of the guest x86 stack. */
     pthread_attr_t native_attributes;
     int host_error = pthread_attr_init(&native_attributes);
     if (!host_error) {
