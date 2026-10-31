@@ -74,6 +74,16 @@ def main():
             '    m_getInstanceProcAddr = dxvkAndroidGetInstanceProcAddr();\n'
             '    if (!m_getInstanceProcAddr)\n'
             '      throw DxvkError("Android Vulkan loader was not initialized before DXVK");\n  }')
+    # Backport of upstream 0847af3: the allocation pool is an unlocked free list.
+    # Swapchain images are imported on the game thread while other DXVK threads
+    # allocate and free under the allocator lock; the 2026-10-31 phone crash came
+    # from that race handing out one pool slot twice.
+    lock = "    std::lock_guard lock(m_mutex);\n\n"
+    create = "    Rc<DxvkResourceAllocation> allocation = m_allocationPool.create(this, nullptr);\n"
+    for head in ("importInfo) {\n", "imageHandle) {\n"):
+        replace("src/dxvk/dxvk_memory.cpp", head + create, head + lock + create)
+    sparse = "sparsePageTable,\n    const DxvkAllocationInfo&   allocationInfo) {\n"
+    replace("src/dxvk/dxvk_memory.cpp", sparse + "    auto allocation", sparse + lock + "    auto allocation")
     replace("src/util/log/log.cpp", '#include "log.h"', '#include "log.h"\n#include <android/log.h>')
     replace("src/util/log/log.cpp", "std::cerr << adjusted;",
             'std::cerr << adjusted;\n'

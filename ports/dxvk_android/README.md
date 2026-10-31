@@ -58,6 +58,16 @@ userdata. DXVK 3.1 uses its own `.dxvk.bin`/`.dxvk.lut` cache; the 1.9.2b custom
 pipeline-cache implementation and supplemental Vulkan headers were removed.
 The game installation remains read-only.
 
+## Upstream fixes
+
+`prepare.py` backports upstream commit `0847af3` (2026-10-16), which takes the
+allocator lock when creating imported and sparse allocations. Without it,
+swapchain images imported on the game thread race other DXVK threads on the
+allocation pool. A 2026-10-31 phone run of the pinned release crashed in
+`DxvkMemoryAllocator::importImageResource` during a swapchain recreation; the
+fault address was the first word of a live imported allocation, so the pool
+had handed out one slot twice.
+
 ## Phone capability checkpoint
 
 The NDK probe ran on the Galaxy S24 Ultra / Adreno 750 / Android 16. The
