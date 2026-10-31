@@ -62,7 +62,11 @@ restores the per-function masks. Each function now also keeps the flags in a
 local (synced to the CPU struct only where a contract needs them) and shifts
 compute only demanded flags: the kernel runs 98.6 -> 94 ticks/bone, gameplay
 main-thread cycles/frame -4.7% [-8.8%, -0.7%] against the contract build
-(-6.3% before the scene change).
+(-6.3% before the scene change). Then: guest returns enter the scheduler
+checkpoint only every 64th time, the guest clock caches its frequency and the
+D3D9 bridge hashes its objects (-3.3% [-5.9%, -0.8%], 16 pairs); and register
+locals now also cover the 13,472 exception-frame functions (-4.0% [-6.4%,
+-1.6%]; 41.5 -> 43.3 FPS in the standard window).
 
 ## Gamepad and Android touch controller (2026-10-30)
 

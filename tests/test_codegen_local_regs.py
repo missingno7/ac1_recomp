@@ -73,7 +73,7 @@ class LocalRegisterTests(unittest.TestCase):
             '{ uint64_t _lane = c->xmm[2].u64[1]; c->xmm[0].u64[0] = _lane; }',
             'c->esp += 4; return;')
         optimized=lift.local_xmm_function(source)
-        self.assertIn('XMM _ac1_xmm0 = c->xmm[0], _ac1_xmm1 = c->xmm[1]',optimized)
+        self.assertIn('XMM _ac1_xmm0 __attribute__((unused)) = c->xmm[0], _ac1_xmm1 __attribute__((unused)) = c->xmm[1]',optimized)
         # Lane arithmetic uses the locals; the CPU copy is touched only at sync points.
         self.assertNotRegex(optimized,r'c->xmm\[\d\]\.')
         self.assertEqual(optimized.count('AC1_CALL('),1)
@@ -140,9 +140,23 @@ class LocalRegisterTests(unittest.TestCase):
         self.assertIn('wr32(_ac1_regs.ebx, pop32(c))', helper)
         self.assertIn('_ac1_regs.esp = c->esp; __asm__', helper)
         self.assertIn('c->esp = _ac1_regs.esp;\n    AC1_SET_GUEST_EIP(c, 0x00401002', body)
-        for text in ('/* fs:[0] */', 'setjmp(c->opaque);', 'longjmp(c->opaque);'):
+        for text in ('setjmp(c->opaque);', 'longjmp(c->opaque);'):
             unsafe = source.replace('    c->esp += 4; return;', '    ' + text + ' return;')
             self.assertEqual(lift.local_register_function(unsafe), unsafe)
+        # Exception frames (fs:[0]) keep locals: the runtime never resumes guest
+        # code from an exception context, and fs: accesses touch no GPR.
+        framed = '\n'.join(['void L_00401000(CPU *c)', '{',
+            '    AC1_SET_GUEST_EIP(c, 0x00401000u);',
+            '    c->eax = (uint32_t)(FS_RD32(c, (0x00000000u)));   /* 00401000: mov eax, dword ptr fs:[0] */',
+            '    AC1_SET_GUEST_EIP(c, 0x00401006u);',
+            '    push32(c, c->eax);',
+            '    AC1_SET_GUEST_EIP(c, 0x00401007u);',
+            '    FS_WR32(c, (0x00000000u), c->esp);                /* 00401007: mov dword ptr fs:[0], esp */',
+            '    AC1_SET_GUEST_EIP(c, 0x0040100Du);',
+            '    c->esp += 4; return;', '}'])
+        local = lift.local_register_function(framed)
+        self.assertIn('_ac1_regs.eax = (uint32_t)(FS_RD32(c, (0x00000000u)));', local)
+        self.assertIn('FS_WR32(c, (0x00000000u), _ac1_regs.esp);', local)
         escaped=source.replace('RECOMP_TODO(0x401002, "unknown");','opaque(&c->eax);')
         self.assertEqual(lift.local_register_function(escaped),escaped)
 
@@ -150,20 +164,25 @@ class LocalRegisterTests(unittest.TestCase):
         header=(lift.prepare_test_runtime()/'cpu.h').read_text()
         self.assertRegex(header,re.compile(r'^#define STACK_BASE\(c\) 0u$',re.M))
         for name in (lift.LOCAL_GPR_FREE_HELPERS-{'AC1_SET_GUEST_EIP'}) | lift.LOCAL_ESP_HELPERS:
-            match=re.search(r'\b'+name+r'\([^{};]*\)\s*\{',header)
-            self.assertIsNotNone(match,name)
-            depth,end=1,match.end()
-            while depth:
-                depth+=(header[end]=='{')-(header[end]=='}');end+=1
-            code=re.sub(r'/\*.*?\*/','',header[match.end():end-1],flags=re.S)
-            fields=set(re.findall(r'\bc->(\w+)',code))
-            permitted={'esp'} if name in lift.LOCAL_ESP_HELPERS else set(lift.FLAG_BITS)|{'df','eflags_misc',
-                'fpu_sw','fpu_top','fpu_cw','fpu_tw','mxcsr','fp_initialized'}
-            self.assertLessEqual(fields,permitted,name)
-            pointer=re.sub(r'\bc->\w+','member',code)
-            if name in lift.LOCAL_ESP_HELPERS:pointer=pointer.replace('STACK_BASE(c)','0u')
-            pointer=re.sub(r'\b(?:flags_\w+|'+'|'.join(lift.LOCAL_GPR_FREE_HELPERS)+r')\(c(?=[,)])','safe(',pointer)
-            self.assertNotRegex(pointer,r'\bc\b|unsupported_instruction|RECOMP_TODO',name)
+            bodies=[]
+            for match in re.finditer(r'\b'+name+r'\([^{};]*\)\s*\{',header):
+                depth,end=1,match.end()
+                while depth:
+                    depth+=(header[end]=='{')-(header[end]=='}');end+=1
+                bodies.append(header[match.end():end-1])
+            # Macro helpers (fs: accesses): every preprocessor variant.
+            bodies+=re.findall(r'^#define\s+'+name+r'\([^)]*\)(.*)$',header,re.M)
+            self.assertTrue(bodies,name)
+            for body in bodies:
+                code=re.sub(r'/\*.*?\*/','',body,flags=re.S).replace('(c)->','c->')
+                fields=set(re.findall(r'\bc->(\w+)',code))
+                permitted={'esp'} if name in lift.LOCAL_ESP_HELPERS else {'fs_base'} if name.startswith('FS_') else \
+                    set(lift.FLAG_BITS)|{'df','eflags_misc','fpu_sw','fpu_top','fpu_cw','fpu_tw','mxcsr','fp_initialized'}
+                self.assertLessEqual(fields,permitted,name)
+                pointer=re.sub(r'\bc->\w+','member',code)
+                if name in lift.LOCAL_ESP_HELPERS:pointer=pointer.replace('STACK_BASE(c)','0u')
+                pointer=re.sub(r'\b(?:flags_\w+|'+'|'.join(lift.LOCAL_GPR_FREE_HELPERS)+r')\(c(?=[,)])','safe(',pointer)
+                self.assertNotRegex(pointer,r'\bc\b|unsupported_instruction|RECOMP_TODO',name)
 
     @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
     def test_push_pop_esp_flags_and_shifts_match_full_cpu_and_stack(self):

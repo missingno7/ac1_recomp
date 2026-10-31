@@ -3893,6 +3893,8 @@ LOCAL_GPR_FREE_HELPERS = frozenset({
     'AC1_SET_GUEST_EIP', 'op_shl', 'op_shr', 'op_sar', 'op_rol', 'op_ror',
     'op_shld', 'op_shrd', 'op_bsf', 'op_bsr', 'shr32', 'shl32',
     'op_shl_m', 'op_shr_m', 'op_sar_m', 'op_shld_m', 'op_shrd_m',
+    # fs: accesses use only c->fs_base (exception-frame prologs and epilogs).
+    'FS_RD8', 'FS_RD16', 'FS_RD32', 'FS_WR8', 'FS_WR16', 'FS_WR32',
     'eflags_pack', 'eflags_unpack',
     # x87 helpers that read or write only flags, x87 control/status and init state.
     'fcompare', 'fcompare_eflags', 'do_sahf', 'ac1_x87_status', 'ac1_fp_init',
@@ -4134,9 +4136,15 @@ def declare_local_memory_base(body: str) -> str:
 
 
 def local_register_function(body: str) -> str:
-    """GPR locals with conservative CFG dirty sets and audited CPU boundaries."""
+    """GPR locals with conservative CFG dirty sets and audited CPU boundaries.
+
+    Exception-frame (fs:) functions are included: the runtime never resumes
+    guest code from an exception context (RaiseException accepts only the
+    thread-name protocol; faults stop the guest), so no handler observes the
+    CPU struct mid-function. Nonlocal returns (setjmp/longjmp) still opt out.
+    """
     from collections import deque
-    if re.search(r'\b(?:fs|gs):|c->(?:fs|gs)\b|\b(?:seh|setjmp|longjmp)\b',body,re.I):return body
+    if re.search(r'\b(?:seh|setjmp|longjmp)\b',body,re.I):return body
     registers='eax ecx edx ebx esp ebp esi edi'.split()
     clean=re.sub(r'/\*.*?\*/','',body,flags=re.S)
     names='|'.join(registers)
@@ -4249,7 +4257,7 @@ def local_xmm_function(body: str) -> str:
     if _XMM_FREE_HELPERS is None:
         _XMM_FREE_HELPERS=xmm_free_helpers((ROOT/'src/runtime/cpu.h').read_text(encoding='utf-8'))
     free=_XMM_FREE_HELPERS
-    if re.search(r'\b(?:fs|gs):|c->(?:fs|gs)\b|\b(?:seh|setjmp|longjmp)\b',body,re.I):return body
+    if re.search(r'\b(?:seh|setjmp|longjmp)\b',body,re.I):return body   # fs: frames: see GPR locals
     clean=re.sub(r'/\*.*?\*/','',body,flags=re.S)
     if re.search(r'c->xmm(?!\[\d\])',clean):return body
     idx=sorted({int(i) for i in re.findall(r'c->xmm\[(\d)\]',clean)})
@@ -4263,14 +4271,16 @@ def local_xmm_function(body: str) -> str:
     load=' '.join(f'_ac1_xmm{i} = c->xmm[{i}];' for i in idx)
     lines=body.splitlines()
     if len(lines)<3 or lines[1]!='{' or lines[-1]!='}':raise ValueError('unexpected lifted function shape for XMM locals')
-    output=lines[:2]+['    XMM '+', '.join(f'_ac1_xmm{i} = c->xmm[{i}]' for i in idx)+';']
+    # A body that ends in a stop can load a register it never reads back.
+    output=lines[:2]+['    XMM '+', '.join(f'_ac1_xmm{i} __attribute__((unused)) = c->xmm[{i}]' for i in idx)+';']
     for line in lines[2:-1]:
         code,separator,comment=line.partition('/*')
         code=re.sub(r'c->xmm\[(\d)\]',r'_ac1_xmm\1',code)
         code=statement.sub(lambda m:m[0] if m[2] in free else f'{m[1]}{{ {store} {m[0].strip()} {load} }}',code)
         code=re.sub(r'\breturn;',f'{{ {store} return; }}',code)
         output.append(code+separator+comment)
-    return '\n'.join(output+[lines[-1]])
+    # A body may also leave by falling off its end.
+    return '\n'.join(output+['    '+store,lines[-1]])
 
 
 # Header helpers that read or write the x87 register stack, tags or TOP.

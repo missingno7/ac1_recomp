@@ -449,6 +449,20 @@ comparisons (the second significant alone, -4.2%): main-thread cycles/frame
 better; before the scene change -4.3% [-8.3%, -0.3%] in the second set. A run
 to Present 5013 and the intro videos show no stop or breakage.
 
+**Locals in exception-frame functions.** The GPR and XMM locals passes skipped
+every body that mentions `fs:` (13,472 functions with MSVC exception frames,
+12% of main-thread CPU, a quarter of the SSE instructions), for fear of
+resumption from an exception context. The runtime never does that (the same
+argument as for flags), so only `setjmp`/`longjmp`/SEH-helper bodies opt out
+now, and the `fs:` accessors are audited GPR-free helpers. Locals: 86,993 ->
+100,465 functions, XMM locals 6,946 -> 9,030; `.text` +1.7%. Making the
+general MMX/state oracle run with locals again (the default build mode) exposed
+two latent XMM-locals defects, both fixed: no store when a body falls off its
+end, and loaded-only locals rejected by `-Werror`. Against `05d225c`:
+main-thread cycles/frame **-4.0%** [-6.4%, -1.6%], mean frame time -4.0%,
+41.5 -> 43.3 FPS, all four pairs; before the scene change -3.8% [-6.6%,
+-1.0%]. Present 5001 and the intro videos show no stop or breakage.
+
 Next:
 
 1. **Call boundaries** (Pinyon Shift's ABI sync: -11-12% guest
@@ -459,14 +473,10 @@ Next:
    GPR/XMM syncs. Skipping callee-saved reloads needs an exception list (CRT
    EH/SEH prologs, `_chkstk`, `longjmp`) or a whole-program preservation proof
    like the flag contracts.
-2. **XMM and GPR locals in exception-frame functions** (12% of main-thread
-   CPU, 25% of SSE instructions). The argument used for flags applies: the
-   runtime never dispatches guest SEH or C++ exceptions, so no handler reads a
-   register at a fault.
-3. **x87 integer stores** (2.0%). Keep RC and the sticky status bits in locals
+2. **x87 integer stores** (2.0%). Keep RC and the sticky status bits in locals
    synced at the existing TOP sync points.
-4. **Frame-slot promotion proper** (store elimination, values across calls)
+3. **Frame-slot promotion proper** (store elimination, values across calls)
    for the 47% of main-thread CPU in private-frame functions, plus the 733
    8-byte loads after 4-byte stores.
-5. Keep native x87, the vector lowering, the stack changes and the flag
+4. Keep native x87, the vector lowering, the stack changes and the flag
    contracts under validation on AArch64 hardware, videos and long play.

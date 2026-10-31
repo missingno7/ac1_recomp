@@ -302,8 +302,11 @@ TODOs. Flags stripped SHA-256:
 `-LocalRegs` select GPR promotion. The default is `off`; a comma-separated list
 uses eight-digit hexadecimal guest entries, optionally prefixed with `0x`.
 Malformed or unlifted selections fail with a diagnostic. The selected mode is
-part of preparation freshness checking. The `all` build admits **88,523**
-functions and excludes **13,472** segmented/SEH/nonlocal-resumption functions.
+part of preparation freshness checking. The `all` build admits **100,465**
+functions (9,030 with XMM locals). Exception-frame (`fs:`) functions are
+included: the runtime never resumes guest code from an exception context, and
+the `fs:` accessors touch no GPR. Only bodies naming `setjmp`/`longjmp`/SEH
+helpers and address-exposed registers keep the CPU-struct form.
 The original failing RNG entry `007BFD40` is admitted.
 
 An unescaped local aggregate contains EAX/ECX/EDX/EBX/ESP/EBP/ESI/EDI. Its
