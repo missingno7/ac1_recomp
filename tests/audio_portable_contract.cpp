@@ -178,6 +178,23 @@ void consumption() {
     assert(call(notify, 2) == 0);
     close_buffer(b);
 }
+void write_cursor() {
+    // The write cursor never falls inside frames the mixer has already read,
+    // and unlocking PCM there is counted as late.
+    uint32_t b = buffer(1000, 1, 16, 200);
+    start(b);
+    assert(!call(b, 4, {out, io}) && get(out) == 0 && get(io) == 10 * 2); // 10 ms.
+    render(50);
+    assert(!call(b, 4, {out, io}) && get(out) == 0 && get(io) == 51 * 2);
+    ac1_audio_stats before{}, after{};
+    ac1_audio_get_stats(&before);
+    upload(b, std::vector<int16_t>(8).data(), 16); // Frames 0..7: already mixed.
+    ac1_audio_get_stats(&after);
+    assert(after.late_unlocks == before.late_unlocks + 1);
+    consume(head);
+    assert(!call(b, 4, {out, io}) && get(out) == 50 * 2 && get(io) == 60 * 2);
+    close_buffer(b);
+}
 void mixing() {
     uint32_t b = buffer(1000, 1, 16, 4);
     int16_t pcm[] = {0, 16384, 0, -16384};
@@ -578,6 +595,7 @@ int main() {
     dev = get(out);
     ac1_audio_output_active(1);
     consumption();
+    write_cursor();
     mixing();
     voice_registry();
     spatial();

@@ -9,20 +9,22 @@ extern "C" {
 /* Device adapters (and fake outputs) start a new frame timeline here. This
  * discards unconsumed output on device replacement, preserving the play cursor.
  * All mixer entry points are synchronized; none of these invoke guest services.
- * render is nonblocking: contention produces silence without moving voices.
- * first_frame is the absolute output frame; consumed counts PRESENTED frames,
- * not frames generated. Calls must be ordered by a single output consumer. */
+ * render is nonblocking: on contention it returns 0 with silence, without
+ * moving voices; otherwise 1. first_frame is the absolute output frame;
+ * consumed counts PRESENTED frames, not frames generated. Calls must be ordered
+ * by a single output consumer. */
 void ac1_audio_output_active(int active);
 void ac1_audio_output_paused(int paused);
 void ac1_audio_consume(uint64_t consumed);
-void ac1_audio_render(float *stereo, uint32_t frames, uint32_t rate, uint64_t first_frame,
-                      uint64_t consumed);
+int ac1_audio_render(float *stereo, uint32_t frames, uint32_t rate, uint64_t first_frame,
+                     uint64_t consumed);
 /* Cumulative host-owned diagnostics. Voice frames count contributions before
- * summation, not distinct output frames. Snapshot on a control thread only. */
+ * summation, not distinct output frames. Late unlocks wrote PCM the mixer had
+ * already read for a playing buffer. Snapshot on a control thread only. */
 typedef struct ac1_audio_stats {
     uint64_t render_calls, requested_frames, lock_misses;
     uint64_t ds_frames, bink_frames, bink_underrun_frames, bink_submitted_frames;
-    uint64_t nonzero_frames;
+    uint64_t nonzero_frames, late_unlocks;
 } ac1_audio_stats;
 void ac1_audio_get_stats(ac1_audio_stats *stats);
 /* Copies the whole native-endian s16 chunk; PTS starts at zero and must be

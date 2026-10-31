@@ -318,6 +318,19 @@ bool valid3d(const std::array<uint32_t, 16> &v, bool listener) {
     return v[7] <= 360 && v[8] <= 360 && int32_t(v[12]) >= -10000 && int32_t(v[12]) <= 0 &&
            scalar(v, 13) > 0 && scalar(v, 14) >= scalar(v, 13) && v[15] <= 2;
 }
+// DirectSound commits the span from the play cursor to the write cursor. The
+// mixer has already read source frames up to render_frame (and its
+// interpolation partner), so the write cursor never falls inside them.
+uint64_t write_lead(const Buffer &b, uint64_t total) {
+    uint64_t lead = b.frequency / 100, mixed = uint64_t(b.render_frame) + 1;
+    if (b.playing && output_active && mixed > b.frames)
+        lead = std::max(lead, mixed - b.frames);
+    return std::min(lead, total - 1);
+}
+// Whether circular frame ranges [a, a+la) and [c, c+lc) of a buffer overlap.
+bool overlaps(uint64_t a, uint64_t la, uint64_t c, uint64_t lc, uint64_t total) {
+    return la && lc && ((c + total - a) % total < la || (a + total - c) % total < lc);
+}
 float db(int32_t hundredths) {
     return hundredths <= -10000 ? 0.f : std::pow(10.f, float(hundredths) / 2000.f);
 }
@@ -442,18 +455,18 @@ extern "C" void ac1_audio_consume(uint64_t presented) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     consume(presented);
 }
-extern "C" void ac1_audio_render(float *out, uint32_t count, uint32_t rate, uint64_t first,
-                                 uint64_t presented) {
+extern "C" int ac1_audio_render(float *out, uint32_t count, uint32_t rate, uint64_t first,
+                                uint64_t presented) {
     render_calls.fetch_add(1, std::memory_order_relaxed);
     requested_frames.fetch_add(count, std::memory_order_relaxed);
     std::fill_n(out, size_t(count) * 2, 0.f);
     std::unique_lock<std::recursive_mutex> lock(mutex, std::try_to_lock);
     if (!lock) {
         lock_misses.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return 0;
     }
     if (!output_active || output_paused || !rate)
-        return;
+        return 1;
     consume(presented);
     float master = 1;
     const std::array<uint32_t, 16> *listener = primary_buffer ? &primary_buffer->listener : nullptr;
@@ -465,7 +478,7 @@ extern "C" void ac1_audio_render(float *out, uint32_t count, uint32_t rate, uint
             continue;
         if (b.span_count == b.spans.size()) {
             mixer_fault = "consumption history exhausted (128 outstanding parameter changes)";
-            return;
+            return 1;
         }
         double start = b.render_frame, step = double(b.frequency) / rate;
         float left, right;
@@ -559,6 +572,7 @@ extern "C" void ac1_audio_render(float *out, uint32_t count, uint32_t rate, uint
     for (uint32_t i = 0; i < count; ++i)
         if (out[i * 2] != 0.f || out[i * 2 + 1] != 0.f)
             ++statistics.nonzero_frames;
+    return 1;
 }
 extern "C" void ac1_audio_get_stats(ac1_audio_stats *stats) {
     if (!stats) return;
@@ -1035,6 +1049,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
     if (k != 3 && k != 5)
         return fail("unsupported interface method");
     uint32_t bytes = b.samples->bytes, cursor = uint32_t(b.frames % (bytes / b.align)) * b.align;
+    uint32_t write_cursor = uint32_t((cursor + write_lead(b, bytes / b.align) * b.align) % bytes);
     if (s == 3) {
         uint32_t size;
         if (!read(a[1], &size, 4) || size != 20)
@@ -1047,7 +1062,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
     if (s == 4) {
         if (a[1] && !word(a[1], cursor))
             return fail("play cursor output unmapped");
-        if (a[2] && !word(a[2], (cursor + b.frequency / 100 * b.align) % bytes))
+        if (a[2] && !word(a[2], write_cursor))
             return fail("write cursor output unmapped");
         return 1;
     }
@@ -1082,7 +1097,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
             return fail("Lock flags: only FROMWRITECURSOR=1 and ENTIREBUFFER=2 supported");
         }
         if (a[7] & 1)
-            offset = (cursor + b.frequency / 100 * b.align) % bytes;
+            offset = write_cursor;
         if (a[7] & 2) {
             offset = 0;
             length = bytes;
@@ -1193,9 +1208,15 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
             *hr = invalid;
             return 1;
         }
+        const uint64_t total = bytes / b.align, mixed = uint64_t(b.render_frame) + 1;
+        const uint64_t ahead = b.playing && output_active && mixed > b.frames
+                                   ? std::min(mixed - b.frames, total) : 0;
+        bool late = false;
         for (unsigned i : {0u, 2u}) {
             if (!b.lock[i + 1]) continue;
             size_t offset = b.lock[i] - b.samples->address;
+            late = late || overlaps(b.frames % total, ahead, offset / b.align,
+                                    b.lock[i + 1] / b.align, total);
             if (!read(b.lock[i], b.samples->pcm.data() + offset, b.lock[i + 1]))
                 return fail("Unlock PCM range unmapped during snapshot");
             const unsigned sample_bytes = b.format[14] / 8;
@@ -1203,6 +1224,8 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
                 b.samples->decoded[byte / sample_bytes] =
                     decode_sample(b.samples->pcm.data() + byte, b.format[14]);
         }
+        if (late)
+            ++statistics.late_unlocks;
         b.locked = false;
         return 1;
     }

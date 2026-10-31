@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <mutex>
 #include <time.h>
+#include <vector>
 
 namespace {
 std::mutex control;
@@ -17,6 +18,12 @@ std::atomic<uint64_t> presented{0};
 std::atomic<uint64_t> rendered_public{0};
 std::atomic<bool> used_read_counter{false};
 uint64_t rendered; // Callback thread only, reset before requestStart.
+// Output mixed ahead, a ring owned by the callback thread once the stream
+// starts. The mixer only try-locks against guest DirectSound calls; a missed
+// 2 ms callback used to play silence, now it plays frames mixed earlier.
+std::vector<float> ahead;
+uint32_t ahead_head, ahead_count, ahead_target;
+std::atomic<uint64_t> gap_frames{0}; // Output frames with nothing mixed.
 uint32_t device_rate;
 bool paused, wanted;
 bool reported_read_counter;
@@ -45,8 +52,32 @@ aaudio_data_callback_result_t pull(AAudioStream *s, void *, void *data, int32_t 
         }
     }
     presented.store(consumed, std::memory_order_release);
-    ac1_audio_render(static_cast<float *>(data), uint32_t(frames), device_rate, rendered, consumed);
-    rendered += uint32_t(frames);
+    // Top up to the target lead with one mixer attempt into the ring's
+    // contiguous tail. Ring frame j is output frame rendered + j.
+    float *out = static_cast<float *>(data);
+    const uint32_t count = uint32_t(frames), capacity = uint32_t(ahead.size() / 2);
+    const uint32_t want = std::min(count + ahead_target, capacity);
+    if (ahead_count < want) {
+        uint32_t tail = (ahead_head + ahead_count) % capacity;
+        uint32_t room = std::min(want - ahead_count, capacity - tail);
+        if (ac1_audio_render(&ahead[size_t(tail) * 2], room, device_rate, rendered + ahead_count,
+                             consumed))
+            ahead_count += room;
+    }
+    uint32_t copied = 0;
+    while (copied < count && ahead_count) {
+        uint32_t piece = std::min(std::min(count - copied, ahead_count), capacity - ahead_head);
+        std::copy_n(&ahead[size_t(ahead_head) * 2], size_t(piece) * 2, out + size_t(copied) * 2);
+        ahead_head = (ahead_head + piece) % capacity;
+        ahead_count -= piece;
+        copied += piece;
+    }
+    if (copied < count) {
+        // Nothing was mixed for these output frames, so voices did not advance.
+        std::fill_n(out + size_t(copied) * 2, size_t(count - copied) * 2, 0.f);
+        gap_frames.fetch_add(count - copied, std::memory_order_relaxed);
+    }
+    rendered += count;
     rendered_public.store(rendered, std::memory_order_release);
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
@@ -60,14 +91,17 @@ void report(const char *reason) {
     uint64_t written = rendered_public.load(std::memory_order_acquire);
     std::fprintf(stderr,
         "AC1 AAudio stats: reason=%s stream=%llu callbacks=%llu requested=%llu "
-        "written=%llu consumed=%llu xruns=%d lock_misses=%llu ds_frames=%llu "
-        "bink_submitted=%llu bink_frames=%llu bink_underrun_frames=%llu nonzero_frames=%llu\n",
+        "written=%llu consumed=%llu xruns=%d lock_misses=%llu gap_frames=%llu ds_frames=%llu "
+        "bink_submitted=%llu bink_frames=%llu bink_underrun_frames=%llu nonzero_frames=%llu "
+        "late_unlocks=%llu\n",
         reason, (unsigned long long)generation, (unsigned long long)stats.render_calls,
         (unsigned long long)stats.requested_frames, (unsigned long long)written,
         (unsigned long long)consumed, stream ? AAudioStream_getXRunCount(stream) : 0,
-        (unsigned long long)stats.lock_misses, (unsigned long long)stats.ds_frames,
-        (unsigned long long)stats.bink_submitted_frames, (unsigned long long)stats.bink_frames,
-        (unsigned long long)stats.bink_underrun_frames, (unsigned long long)stats.nonzero_frames);
+        (unsigned long long)stats.lock_misses,
+        (unsigned long long)gap_frames.load(std::memory_order_relaxed),
+        (unsigned long long)stats.ds_frames, (unsigned long long)stats.bink_submitted_frames,
+        (unsigned long long)stats.bink_frames, (unsigned long long)stats.bink_underrun_frames,
+        (unsigned long long)stats.nonzero_frames, (unsigned long long)stats.late_unlocks);
     std::fflush(stderr); // Control thread only; never log from the data callback.
 }
 void close_stream() {
@@ -141,6 +175,13 @@ void service() {
                     "AC1 AAudio buffer size request failed: %s (%d); retaining device default\n",
                     AAudio_convertResultToText(size), size);
         }
+        // Mix up to 20 ms ahead: it covers guest DirectSound critical sections
+        // and costs that much output latency. A callback asks for at most the
+        // stream's buffer capacity.
+        ahead_target = device_rate / 50;
+        int32_t callback_limit = std::max(AAudioStream_getBufferCapacityInFrames(stream), burst);
+        ahead.assign(size_t(std::max(callback_limit, 1) + ahead_target) * 2, 0.f);
+        ahead_head = ahead_count = 0;
         ac1_audio_output_active(1);
         rc = AAudioStream_requestStart(stream);
     }
