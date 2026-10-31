@@ -52,11 +52,16 @@ existing prebuilt-library path was used for packaging. Build evidence is
 On 2026-10-31 builds `911a6c4` and `9856f52` both ran on the S24 Ultra with
 this provider and Turnip (Mesa 26.2.5). Captures show world geometry, NPCs and
 shadows; the HUD tutorial video panel appears partly drawn in captures from
-both builds. DXVK logs `VK_SUBOPTIMAL_KHR` and recreates the swapchain once per
-present, likely because it requests the identity pre-transform for the rotated
-landscape surface (unconfirmed). `VK_KHR_swapchain_maintenance1` is enabled, so
-each recreation waits for the old swapchain's present fences, not for device
-idle; its cost is unmeasured. Gameplay FPS is recorded in the
+both builds. DXVK logged `VK_SUBOPTIMAL_KHR` and recreated the swapchain once
+per present, likely because it requests the identity pre-transform for the
+rotated landscape surface (unconfirmed). `VK_KHR_swapchain_maintenance1` is
+enabled, so each recreation waited for the old swapchain's present fences, not
+for device idle. One recreation crashed in an upstream allocator race, now
+backported (see the README). The provider now keeps a swapchain whose surface
+extent still matches its images; a 30-minute free-play session created it once.
+Its frame-time effect is unmeasured. The Android WSI keeps one HWND for the game
+window, since D3D9 presents to the handle it was created with, and surface
+creation waits while Android has no surface. Gameplay FPS is recorded in the
 [README](../README.md#android-arm64-hardware-run-2026-10-30). See the
 [renderer build and integration commands](../ports/dxvk_android/README.md).
 

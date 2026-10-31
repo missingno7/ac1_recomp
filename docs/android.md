@@ -418,6 +418,14 @@ are inspected. These checks compile no translated game functions and run no game
 Actual audibility, callback underruns, A/V sync, device-route disconnect/restart,
 and background/resume require a Galaxy S24 Ultra run; none is claimed here.
 
+On the S24 Ultra (2026-10-31) the callback rendered silence for 38.7% of its
+2 ms callbacks because `ac1_ds8_service`, run at every scheduler handoff,
+updated every buffer under the mixer mutex (35% of the main guest thread). The
+service now visits only buffers whose events the audio thread deferred, plus
+playing buffers in clock fallback. The user then reported the crackle much
+reduced but not gone: any remaining try-lock miss still drops 2 ms of output.
+Back now moves the game task to the background (see the README).
+
 ### Portable D3DX (2026-10-30)
 
 `src/graphics/ac1_d3dx_portable.h` supplies the non-Windows implementation;

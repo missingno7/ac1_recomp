@@ -44,8 +44,15 @@ DXVK rebuilt the swapchain after each such frame (about once per present on
 the S24 Ultra). `prepare.py` patches the presenter to keep the swapchain while
 the surface's current extent still equals its images and let the compositor
 rotate; extent changes, `VK_ERROR_OUT_OF_DATE_KHR` and surface loss still
-rebuild it. The patched ARM64 provider builds (2026-10-31); its phone run is
-pending.
+rebuild it. In a 30-minute free-play phone session on 2026-10-31 the patched
+provider created the swapchain once and rendered normally; the frame-time
+effect is unmeasured.
+
+`android_wsi.cpp` publishes one HWND for the game window's lifetime: D3D9
+swapchains present to the handle they were created with, so a new handle per
+Android surface could never be presented to again after the app returned from
+the background. While Android has no surface, `createSurface` waits for the
+next one, which pauses the presenting game thread instead of failing each frame.
 
 JNI sets `DXVK_WSI_DRIVER=Android`. ARM64 defaults to
 `AC1_VULKAN_DRIVER=turnip`, loading the pinned `ports/turnip/` package in-process
