@@ -69,7 +69,10 @@ locals now also cover the 13,472 exception-frame functions (-4.0% [-6.4%,
 -1.6%]; 41.5 -> 43.3 FPS in the standard window); and a direct call checks the
 host stack against a per-thread floor and counts its return instead of the
 depth, budget and last-target bookkeeping (-2.1% [-3.5%, -0.6%], 22 pairs;
-`.text` -22%).
+`.text` -22%). The MinGW build resolves `_Thread_local` through its own
+`__emutls_get_address`, which reads a TEB slot instead of winpthreads' locked
+`pthread_getspecific` (~10% of the main thread under imports): -3.5% [-6.0%,
+-0.9%], 43.3 -> 45.0 FPS.
 
 ## Gamepad and Android touch controller (2026-10-30)
 

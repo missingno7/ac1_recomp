@@ -493,15 +493,37 @@ before the scene change -2.0% [-3.5%, -0.6%]; mean frame time -1.3% to -3.2%
 per set, FPS 42.2 -> 43.4. Present 5001 and the intro videos show no stop or
 breakage.
 
+**Fast emulated TLS.** The external modules in that profile were mostly one
+chain. MinGW GCC lowers `_Thread_local` to emulated TLS, and libgcc's
+`__emutls_get_address` reads each thread's array through winpthreads'
+`pthread_getspecific`, which takes a spin lock and saves and restores
+`GetLastError` around `TlsGetValue`: together ~10% of main-thread samples
+(`pthread_getspecific` 3.1%, `pthread_spin_lock` 1.8%, Get/SetLastError 1.6%,
+`__emutls_get_address` 1.5%, `pthread_tls_init` 1.0%, `TlsGetValue` 1.0%;
+the profiler's own counters add one access per dispatch). Attributed by guest
+EIP, most of it was under imports; the guest's critical-section wrapper alone
+(`EnterCriticalSection` at `0x7A2EF3`, `LeaveCriticalSection` at `0x7A2F03`)
+cost 3.8%, with about four thread-local reads per call. The executable now
+defines `__emutls_get_address` itself (`src/runtime/ac1_emutls.c`, MinGW GCC
+x64 only): libgcc's control objects and semantics, but the array pointer sits
+in a `TlsAlloc` slot read straight from the TEB (checked against
+`TlsGetValue` at first use), ~15 instructions and no call on the hot path.
+Control objects of other modules (libstdc++'s `std::call_once` state, used
+from inline code here) go to libgcc's resolver, and indices assigned here
+carry a tag bit, so a foreign index never takes the fast path. Thread exit
+leaves the storage allocated (at most 32 guest threads; C++ `thread_local`
+destructors keep valid objects). Profile: libwinpthread 6.1% -> 0.3%, libgcc
+1.6% -> 0, KERNEL32 2.2% -> 0.2%; the new resolver is 1.4%. Against
+`ee7d907`: main-thread cycles/frame **-3.5%** [-6.0%, -0.9%], all four
+pairs; before the scene change -3.7% [-6.5%, -1.0%]; mean frame time 23.07 ->
+22.21 ms, FPS 43.3 -> 45.0. Present 5003 and the intro videos show no stop.
+
 Next:
 
-1. **Runtime thread-locals.** MinGW lowers `_Thread_local` to emulated TLS:
-   `__emutls_get_address`, then winpthreads' `pthread_getspecific` (a spin
-   lock and Get/SetLastError around `TlsGetValue`). That chain is ~10% of
-   main-thread samples in the profiled run (the profiler's own counters add
-   one access per dispatch), mostly under imports: the guest's critical
-   section wrapper alone costs 3.8%, and the handlers' name compares
-   (`strcmp` 1.3%) come on top.
+1. **Import paths.** Name-compare chains in the handlers (`strcmp` 1.2%,
+   `equal_ascii_fold` 0.9%; the critical-section handler compares six names
+   per call after its route is cached), host clock reads
+   (`RtlQueryPerformanceCounter` 1.9%) and `guest_memory_try_ptr` (1.2%).
 2. **Call boundaries** (Pinyon Shift's ABI sync: -11-12% guest
    instructions). Left per call: the GPR reloads after each call and the
    stores before it (CPU-state syncs 6.9% of the main thread after the change

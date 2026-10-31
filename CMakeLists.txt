@@ -34,6 +34,7 @@ add_library(ac1_runtime STATIC
   src/runtime/ac1_network.c
   src/runtime/ac1_files.c
   src/runtime/ac1_crypto.c
+  src/runtime/ac1_emutls.c
   src/platform/ac1_gamepad.c
   src/runtime/guest_clock.c
   src/runtime/ac1_guest_time.c
