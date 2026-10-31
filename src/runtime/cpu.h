@@ -100,10 +100,16 @@ typedef union {
 
 typedef struct ac1_call_state {
     uint64_t count;
-    uint32_t depth, last_target;
+    /* Generated code calls directly while the host stack pointer is at or
+     * above `stack_floor` and enters the dispatcher below it. The runtime puts
+     * the floor near the end of the thread's host stack, or at UINTPTR_MAX so
+     * that tracing sees every call; the dispatcher stops below `stack_limit`. */
+    uintptr_t stack_floor, stack_limit;
+    /* Target of the innermost dispatched (not direct) call, for diagnostics. */
+    uint32_t last_target;
     /* Generated code counts returns and enters the runtime's checkpoint only
      * when `returns` reaches `return_threshold` (0: after every return). The
-     * runtime shares the count with its import checkpoints. */
+     * runtime adds them to `count`, the dispatch budget, when it resets them. */
     uint32_t returns, return_threshold;
 } ac1_call_state;
 typedef struct {
@@ -146,32 +152,32 @@ void dispatch(CPU *cpu, uint32_t target);
 void dispatch_jmp(CPU *cpu, uint32_t target);
 void ac1_unsupported_instruction(uint32_t guest_va, const char *reason);
 
-extern uint64_t ac1_dispatch_limit;
-extern int ac1_direct_slow_mode;
-void ac1_dispatch_guard_failed(CPU *c, uint32_t target);
 void ac1_scheduler_return_checkpoint(CPU *c);
 
-/* Tracing takes the original dispatcher, including its callsite-specific
- * diagnostics. Unbound test CPUs also retain that path. The runtime binds
- * calls on its first dispatch, without reading emulated TLS on later calls. */
+/* The host stack pointer, without forcing a frame pointer. */
+#if defined(__x86_64__)
+#define AC1_HOST_SP() __extension__({ uintptr_t _sp; __asm__("movq %%rsp, %0" : "=r"(_sp)); _sp; })
+#elif defined(__aarch64__)
+#define AC1_HOST_SP() __extension__({ uintptr_t _sp; __asm__("mov %0, sp" : "=r"(_sp)); _sp; })
+#else
+#define AC1_HOST_SP() ((uintptr_t)__builtin_frame_address(0))
+#endif
+
+/* Unbound CPUs (tests, a thread's first transfer), tracing and a nearly
+ * exhausted host stack take the dispatcher, which binds, traces or stops. A
+ * direct call otherwise costs the stack comparison and the return count; the
+ * runtime's checkpoints keep the dispatch budget. */
 #if defined(AC1_NO_DIRECT_CALLS)
 #define AC1_CALL(c, fn, target) dispatch((c), (target))
 #else
 #define AC1_CALL(c, fn, target) do { \
     CPU *_ac = (c); \
-    if (ac1_direct_slow_mode || !_ac->calls) { \
+    ac1_call_state *_as = _ac->calls; \
+    if (__builtin_expect(!_as || AC1_HOST_SP() < _as->stack_floor, 0)) { \
         dispatch(_ac, (target)); \
     } else { \
-        ac1_call_state *_as = _ac->calls; \
-        ++_as->count; \
-        if ((ac1_dispatch_limit && _as->count > ac1_dispatch_limit) || _as->depth >= 4096u) \
-            ac1_dispatch_guard_failed(_ac, (target)); \
-        uint32_t _ap = _as->last_target; \
-        _as->last_target = (target); \
-        ++_as->depth; \
         fn(_ac); \
-        --_as->depth; \
-        _as->last_target = _ap; \
+        _as = _ac->calls; \
         if (__builtin_expect(++_as->returns >= _as->return_threshold, 0)) \
             ac1_scheduler_return_checkpoint(_ac); \
     } \

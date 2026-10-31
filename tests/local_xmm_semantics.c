@@ -5,9 +5,6 @@
 #include <stdlib.h>
 static uint64_t digest;
 static unsigned calls;
-uint64_t ac1_dispatch_limit;
-int ac1_direct_slow_mode;
-void ac1_dispatch_guard_failed(CPU *c, uint32_t target) { (void)c; (void)target; abort(); }
 void ac1_scheduler_return_checkpoint(CPU *c) { (void)c; }
 void plain_L_00401000(CPU *);
 void local_L_00401000(CPU *);

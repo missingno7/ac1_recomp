@@ -59,9 +59,8 @@ class DirectCallsTests(unittest.TestCase):
                     capture_output=True, timeout=60)
                 result = subprocess.run([str(exe)], check=True, capture_output=True, text=True, timeout=15)
                 self.assertIn("2000 nested/tail cases", result.stdout)
-                for arg, code in (("budget", 81), ("depth", 82)):
-                    stopped = subprocess.run([str(exe), arg], capture_output=True, timeout=15)
-                    self.assertEqual(stopped.returncode, code, stopped.stderr)
+                stopped = subprocess.run([str(exe), "depth"], capture_output=True, timeout=15)
+                self.assertEqual(stopped.returncode, 82, stopped.stderr)
 
 
 if __name__ == "__main__":

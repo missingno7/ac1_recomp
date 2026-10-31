@@ -463,20 +463,56 @@ main-thread cycles/frame **-4.0%** [-6.4%, -1.6%], mean frame time -4.0%,
 41.5 -> 43.3 FPS, all four pairs; before the scene change -3.8% [-6.6%,
 -1.0%]. Present 5001 and the intro videos show no stop or breakage.
 
+**Lean direct calls.** Re-profile of that build: call lines 11.9% and returns
+2.9% of main-thread samples. At instruction level about two thirds of the
+call-line samples sat on per-call bookkeeping (call-state loads and stores,
+the budget and slow-mode reads through `.refptr`, depth and last-target
+updates and the shuffles packing them); the XMM syncs on the same lines were
+0.9%. A direct call now loads the call state, compares the host stack pointer
+with a per-thread floor, calls, and counts the return:
+
+* Depth. The host stack is the guard: the runtime reads the thread's stack
+  bounds (`VirtualQuery`, `pthread_getattr_np`) and stops with "guest call
+  depth exceeded" 256 KiB before the end, instead of after 4,096 nested calls
+  on a 2 MiB stack. The Windows executables now reserve 8 MiB per thread.
+* Tracing sets the floor to `UINTPTR_MAX`, so every call takes the dispatcher
+  and its diagnostics; generated code no longer reads a slow-mode global.
+* Budget. The checkpoints settle the counted returns into the per-thread
+  count and the dispatcher counts imports and COM methods. Import batching
+  has its own counter, so the clock is read once per 16 imports or 64 returns.
+* The last target is kept for dispatched calls; unimplemented-import stops now
+  name the exact call site.
+
+The kernel runs 94.8 -> 91.6 ticks/bone (byte-identical; a plain `fn(c)` call
+gives 91.2) and `.text` shrinks 22% (102.2 -> 79.5 MB). Call lines fall to
+7.4% and call plus return lines to 10.4% of main-thread samples. Against
+`e00da65`, pooled over three comparisons (22 pairs; the first two
+inconclusive alone, the third significant alone at -2.9% [-5.0%, -0.7%]):
+main-thread cycles/frame **-2.1%** [-3.5%, -0.6%], 15 of 22 pairs better;
+before the scene change -2.0% [-3.5%, -0.6%]; mean frame time -1.3% to -3.2%
+per set, FPS 42.2 -> 43.4. Present 5001 and the intro videos show no stop or
+breakage.
+
 Next:
 
-1. **Call boundaries** (Pinyon Shift's ABI sync: -11-12% guest
-   instructions; here call lines 10.8% + returns 2.6% + dispatch 3.8% +
-   CPU-state syncs ~3.7% of the main thread, with the checkpoint now inline).
-   Left per call: the dispatch count and the global budget and slow-mode reads
-   (each through a MinGW `.refptr`), depth and last-target bookkeeping, and the
-   GPR/XMM syncs. Skipping callee-saved reloads needs an exception list (CRT
-   EH/SEH prologs, `_chkstk`, `longjmp`) or a whole-program preservation proof
-   like the flag contracts.
-2. **x87 integer stores** (2.0%). Keep RC and the sticky status bits in locals
+1. **Runtime thread-locals.** MinGW lowers `_Thread_local` to emulated TLS:
+   `__emutls_get_address`, then winpthreads' `pthread_getspecific` (a spin
+   lock and Get/SetLastError around `TlsGetValue`). That chain is ~10% of
+   main-thread samples in the profiled run (the profiler's own counters add
+   one access per dispatch), mostly under imports: the guest's critical
+   section wrapper alone costs 3.8%, and the handlers' name compares
+   (`strcmp` 1.3%) come on top.
+2. **Call boundaries** (Pinyon Shift's ABI sync: -11-12% guest
+   instructions). Left per call: the GPR reloads after each call and the
+   stores before it (CPU-state syncs 6.9% of the main thread after the change
+   above), XMM syncs, prologues and epilogues (3.7%), and the dispatcher for
+   indirect calls (4.1%). Skipping callee-saved reloads needs an exception
+   list (CRT EH/SEH prologs, `_chkstk`, `longjmp`) or a whole-program
+   preservation proof like the flag contracts.
+3. **x87 integer stores** (2.0%). Keep RC and the sticky status bits in locals
    synced at the existing TOP sync points.
-3. **Frame-slot promotion proper** (store elimination, values across calls)
+4. **Frame-slot promotion proper** (store elimination, values across calls)
    for the 47% of main-thread CPU in private-frame functions, plus the 733
    8-byte loads after 4-byte stores.
-4. Keep native x87, the vector lowering, the stack changes and the flag
+5. Keep native x87, the vector lowering, the stack changes and the flag
    contracts under validation on AArch64 hardware, videos and long play.

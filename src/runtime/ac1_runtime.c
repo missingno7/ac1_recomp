@@ -65,7 +65,9 @@ extern uintptr_t ac1_android_d3d9_guest_hwnd(void *context, uint32_t guest_hwnd)
 #define AC1_IMPORT_BASE 0xF1000000u
 #define AC1_RETURN_SENTINEL 0xFFFFF000u
 #define AC1_DISPATCH_LIMIT_DEFAULT UINT64_C(200000000)
-#define AC1_DISPATCH_DEPTH 4096u
+/* Guest calls stop ("guest call depth exceeded") with this much host stack
+ * left for the dispatcher, imports and the host APIs they reach. */
+#define AC1_HOST_STACK_RESERVE (256u * 1024u)
 #define AC1_IMPORT_LIMIT 2048u
 #define AC1_PROCESS_HEAP_HANDLE 0xE0000001u
 #define AC1_PRIVATE_HEAP_BASE 0xE0000100u
@@ -130,6 +132,7 @@ struct ac1_guest_thread {
     uint32_t wait_count;
     uint64_t wait_deadline;
     uint64_t return_slice_deadline;
+    uint32_t import_batch;
     uint64_t checkpoints, wait_completions;
     ac1_handoff_cause checkpoint_cause;
     int checkpoint_force;
@@ -182,10 +185,49 @@ static inline ac1_call_state *current_calls(void)
 }
 #define last_guest_target (current_calls()->last_target)
 #define dispatch_count (current_calls()->count)
-#define dispatch_depth (current_calls()->depth)
-uint64_t ac1_dispatch_limit = AC1_DISPATCH_LIMIT_DEFAULT;
-#define dispatch_limit ac1_dispatch_limit
-int ac1_direct_slow_mode;
+static uint64_t dispatch_limit = AC1_DISPATCH_LIMIT_DEFAULT;
+
+/* Run on the host thread that executes the guest thread. */
+static void bind_host_stack(ac1_call_state *calls)
+{
+    uintptr_t low = 0u;
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION region;
+    if (VirtualQuery(&region, &region, sizeof(region)) == sizeof(region))
+        low = (uintptr_t)region.AllocationBase;
+#else
+    pthread_attr_t attributes;
+    void *address = NULL;
+    size_t size = 0u;
+    if (pthread_getattr_np(pthread_self(), &attributes) == 0) {
+        if (pthread_attr_getstack(&attributes, &address, &size) == 0) low = (uintptr_t)address;
+        pthread_attr_destroy(&attributes);
+    }
+#endif
+    if (!low)
+        fprintf(stderr, "AC1 host stack bounds unavailable: the guest call depth guard is off on this thread\n");
+    calls->stack_limit = low ? low + AC1_HOST_STACK_RESERVE : 0u;
+    calls->stack_floor = trace_imports || trace_object_types ? UINTPTR_MAX : calls->stack_limit;
+}
+
+/* Generated and dispatched calls count their returns into `returns`; the
+ * dispatch budget sees them once they are settled into `count`. Imports and
+ * COM methods are counted by the dispatcher itself. */
+static void settle_returns(ac1_call_state *calls)
+{
+    calls->count += calls->returns;
+    calls->returns = 0u;
+}
+
+static void stop_guest(const char *reason, uint32_t target);
+static void check_dispatch_budget(const ac1_call_state *calls, uint32_t target)
+{
+    if (!dispatch_limit || calls->count + calls->returns <= dispatch_limit) return;
+    char reason[128];
+    snprintf(reason, sizeof(reason), "guest dispatch budget exceeded (limit=%llu)",
+             (unsigned long long)dispatch_limit);
+    stop_guest(reason, target);
+}
 static uint64_t scheduler_return_slice_ns = UINT64_C(1000000);
 static uint64_t trace_wait_interval_ns;
 static int scheduler_batch_imports = 1;
@@ -481,7 +523,7 @@ static void run_guest_thread(ac1_guest_thread *thread)
         com_apartment_model = UINT32_MAX;
         g_image_delta = thread->image_delta;
         dispatch_count = 0u;
-        dispatch_depth = 0u;
+        bind_host_stack(&thread->calls);
         trace_import_count = 0u;
         last_guest_target = thread->start;
     }
@@ -945,8 +987,8 @@ static void scheduler_checkpoint_for_thread(ac1_guest_thread *thread)
         cause != AC1_HANDOFF_START) {
         /* Imports run millions of times per second; on Android the vDSO clock
          * read alone was ~8% of the main thread. Sample it like returns do. */
-        if (++thread->calls.returns < 16u) return;
-        thread->calls.returns = 0u;
+        if (++thread->import_batch < 16u) return;
+        thread->import_batch = 0u;
         if (guest_monotonic_ns() < thread->return_slice_deadline) return;
     }
     scheduler_lock(scheduler);
@@ -991,7 +1033,8 @@ static void scheduler_checkpoint_for_thread(ac1_guest_thread *thread)
     scheduler_unlock(scheduler);
     if (scheduler_return_slice_ns) {
         thread->return_slice_deadline = guest_monotonic_ns() + scheduler_return_slice_ns;
-        thread->calls.returns = 0u;
+        settle_returns(&thread->calls);
+        thread->import_batch = 0u;
     }
     if ((stopping || failed) && thread->slot != 0u)
         longjmp(thread->exit_env, 1);
@@ -1016,14 +1059,16 @@ void ac1_scheduler_return_checkpoint(CPU *cpu)
     calls->return_threshold = scheduler_return_slice_ns ? 64u : 0u;
     if (!scheduler || !thread || scheduler->count < 2u ||
         scheduler_return_slice_ns == 0u) {
-        calls->returns = 0u;
+        settle_returns(calls);
+        check_dispatch_budget(calls, cpu->eip);
         scheduler_checkpoint_for_thread(thread);
         return;
     }
     if (!thread->return_slice_deadline)
         thread->return_slice_deadline = guest_monotonic_ns() + scheduler_return_slice_ns;
     if (calls->returns < 64u) return;
-    calls->returns = 0u;
+    settle_returns(calls);
+    check_dispatch_budget(calls, cpu->eip);
     if (guest_monotonic_ns() < thread->return_slice_deadline) return;
     scheduler_checkpoint_for_thread(thread);
 }
@@ -6849,18 +6894,6 @@ static int run_import_handlers(CPU *cpu, const import_record *import)
     return 0;
 }
 
-/* Shared cold guard failure for inline, statically bound guest calls. */
-void ac1_dispatch_guard_failed(CPU *cpu, uint32_t target)
-{
-    if (dispatch_limit && cpu->calls->count > dispatch_limit) {
-        char reason[128];
-        snprintf(reason, sizeof(reason), "guest dispatch budget exceeded (limit=%llu)",
-                 (unsigned long long)dispatch_limit);
-        stop_guest(reason, target);
-    }
-    stop_guest("guest call depth exceeded", target);
-}
-
 /* Diagnose the original allocator's null result without changing its result. */
 static void dispatch_allocator_diagnostic(CPU *cpu, uint32_t target,
                                           ac1_lifted_fn function)
@@ -6887,23 +6920,16 @@ void dispatch(CPU *cpu, uint32_t target)
     if (!cpu) stop_guest("null CPU state", target);
     if (!cpu->calls) cpu->calls = &guest_thread_for_cpu(cpu)->calls;
     ac1_call_state *calls = cpu->calls;
-    ac1_direct_slow_mode = trace_imports || trace_object_types;
     const uint32_t guest_callsite = cpu->eip;
-    ++calls->count;
-    if (dispatch_limit && calls->count > dispatch_limit) {
-        char reason[128];
-        snprintf(reason, sizeof(reason), "guest dispatch budget exceeded (limit=%llu)",
-                 (unsigned long long)dispatch_limit);
-        stop_guest(reason, target);
-    }
-    if (calls->depth >= AC1_DISPATCH_DEPTH)
+    check_dispatch_budget(calls, target);
+    if (AC1_HOST_SP() < calls->stack_limit)
         stop_guest("guest call depth exceeded", target);
 
     /* Fast path for indirect transfers into the main catalog (virtual calls,
      * callbacks, jump tables): imports, COM tokens and Bink lie outside this
      * range, so their handling below is unchanged; tracing keeps the slow
      * path, as does the logged CRT handoff. */
-    if (dispatch_fast_enabled && !ac1_direct_slow_mode && lifted_line_first &&
+    if (dispatch_fast_enabled && !trace_imports && !trace_object_types && lifted_line_first &&
         target != 0x00401375u &&
         target - lifted_line_base < (lifted_line_count << 4)) {
         ac1_lifted_fn function = ac1_lifted_lookup_cached(
@@ -6912,11 +6938,9 @@ void dispatch(CPU *cpu, uint32_t target)
         if (function) {
             uint32_t previous_target = calls->last_target;
             calls->last_target = target;
-            ++calls->depth;
             if (guest_callsite == 0x007A4544u)
                 dispatch_allocator_diagnostic(cpu, target, function);
             else function(cpu);
-            --calls->depth;
             calls->last_target = previous_target;
             if (++calls->returns >= calls->return_threshold) ac1_scheduler_return_checkpoint(cpu);
             return;
@@ -7042,6 +7066,7 @@ void dispatch(CPU *cpu, uint32_t target)
 
     const import_record *import = find_import(target);
     if (import) {
+        ++calls->count;
         if (trace_imports && trace_import_count < 128u) {
             if (import->by_ordinal)
                 fprintf(stderr, "AC1 import[%u] eip=0x%08x target=0x%08x %s!#%u\n",
@@ -7061,7 +7086,7 @@ void dispatch(CPU *cpu, uint32_t target)
             import->ordinal == 115u && guest_memory_try_ptr(cpu->esp + 4u, 8u))
             snprintf(message, sizeof(message),
                      "unimplemented import WS2_32.dll!#115 (WSAStartup) version=0x%04x wsadata=0x%08x from 0x%08x",
-                     rd32(cpu->esp + 4u) & 0xffffu, rd32(cpu->esp + 8u), calls->last_target);
+                     rd32(cpu->esp + 4u) & 0xffffu, rd32(cpu->esp + 8u), guest_callsite);
         else if (!import->by_ordinal && !strcmp(import->name, "CreateFileA")) {
             uint32_t args[7] = {0};
             int args_mapped = guest_memory_try_ptr(cpu->esp + 4u, sizeof(args)) != NULL;
@@ -7076,7 +7101,7 @@ void dispatch(CPU *cpu, uint32_t target)
                      import->dll, path, args_mapped ? args[1] : 0u,
                      args_mapped ? args[2] : 0u,
                      args_mapped ? args[4] : 0u,
-                     args_mapped ? args[5] : 0u, calls->last_target);
+                     args_mapped ? args[5] : 0u, guest_callsite);
         }
         else if (!import->by_ordinal &&
                  equal_ascii_fold(import->dll, "DINPUT8.dll") &&
@@ -7093,7 +7118,7 @@ void dispatch(CPU *cpu, uint32_t target)
                      return_address,
                      args_mapped ? args[0] : 0u, args_mapped ? args[1] : 0u,
                      args_mapped ? args[2] : 0u, args_mapped ? args[3] : 0u,
-                     args_mapped ? args[4] : 0u, calls->last_target);
+                     args_mapped ? args[4] : 0u, guest_callsite);
         }
         else if (!import->by_ordinal && !strcmp(import->name, "SetCurrentDirectoryA")) {
             uint32_t path_address = guest_memory_try_ptr(cpu->esp + 4u, 4u)
@@ -7111,23 +7136,23 @@ void dispatch(CPU *cpu, uint32_t target)
             path[i < sizeof(path) ? i : sizeof(path) - 1u] = '\0';
             snprintf(message, sizeof(message),
                      "unimplemented import KERNEL32.dll!SetCurrentDirectoryA path=\"%s\" from 0x%08x",
-                     path, calls->last_target);
+                     path, guest_callsite);
         }
         else if (import->by_ordinal)
             snprintf(message, sizeof(message), "unimplemented import %s!#%u from 0x%08x",
-                     import->dll, import->ordinal, calls->last_target);
+                     import->dll, import->ordinal, guest_callsite);
         else
             snprintf(message, sizeof(message), "unimplemented import %s!%s from 0x%08x",
-                     import->dll, import->name, calls->last_target);
+                     import->dll, import->name, guest_callsite);
         stop_guest(message, target);
     }
 
 #if defined(AC1_HOST_D3D9)
-    if (dispatch_d3d9_method(cpu, target)) return;
+    if (dispatch_d3d9_method(cpu, target)) { ++calls->count; return; }
 #endif
 #if defined(_WIN32) || defined(__ANDROID__)
-    if (dispatch_dinput8_method(cpu, target)) return;
-    if (dispatch_ds8_method(cpu, target)) return;
+    if (dispatch_dinput8_method(cpu, target)) { ++calls->count; return; }
+    if (dispatch_ds8_method(cpu, target)) { ++calls->count; return; }
 #endif
 
     ac1_lifted_fn function = ac1_lifted_lookup_cached(
@@ -7153,11 +7178,9 @@ void dispatch(CPU *cpu, uint32_t target)
 
     uint32_t previous_target = calls->last_target;
     calls->last_target = target;
-    ++calls->depth;
     if (guest_callsite == 0x007A4544u)
         dispatch_allocator_diagnostic(cpu, target, function);
     else function(cpu);
-    --calls->depth;
     if (trace_object_types && guest_callsite == 0x0085B197u) {
         uint32_t descriptor = cpu->eax;
         unsigned descriptor_index = object_type_descriptor_count++;
@@ -7762,7 +7785,7 @@ int ac1_run(const char *exe_path)
     image_size_loaded = image.image_size;
     wr32(cpu->esp, AC1_RETURN_SENTINEL);
     dispatch_count = 0;
-    dispatch_depth = 0;
+    bind_host_stack(&primary->calls);
     last_guest_target = cpu->eip;
     g_image_delta = image.load_base - image.preferred_base;
 
@@ -7802,7 +7825,7 @@ int ac1_run(const char *exe_path)
         }
     } else {
         runtime_stop_ready = 0;
-        fprintf(stderr, "AC1 guest stop: %s; main-caller=0x%08x main-EIP=0x%08x main-ESP=0x%08x main-EAX=0x%08x main-dispatches=%llu\n",
+        fprintf(stderr, "AC1 guest stop: %s; main-dispatched=0x%08x main-EIP=0x%08x main-ESP=0x%08x main-EAX=0x%08x main-dispatches=%llu\n",
                 stop_reason, last_guest_target, cpu->eip, cpu->esp, cpu->eax,
                 (unsigned long long)dispatch_count);
         if (!(scheduler && scheduler->failed))
@@ -7810,7 +7833,7 @@ int ac1_run(const char *exe_path)
         if (scheduler && scheduler->failed) {
             const CPU *failed = &scheduler->failure_cpu;
             fprintf(stderr,
-                    "AC1 worker stop: thread=%u reason=%s caller=0x%08x target=0x%08x EIP=0x%08x ESP=0x%08x EAX=0x%08x ECX=0x%08x EDX=0x%08x EBX=0x%08x EBP=0x%08x ESI=0x%08x EDI=0x%08x stack=[%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x]\n",
+                    "AC1 worker stop: thread=%u reason=%s dispatched=0x%08x target=0x%08x EIP=0x%08x ESP=0x%08x EAX=0x%08x ECX=0x%08x EDX=0x%08x EBX=0x%08x EBP=0x%08x ESI=0x%08x EDI=0x%08x stack=[%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x]\n",
                     scheduler->failure_thread_id, scheduler->failure_reason,
                     scheduler->failure_caller, scheduler->failure_target,
                     failed->eip, failed->esp, failed->eax, failed->ecx,

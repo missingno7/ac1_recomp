@@ -156,6 +156,12 @@ if(NOT ANDROID)
   target_link_libraries(ac1_startup PRIVATE ac1_runtime)
   add_executable(ac1_repeat_run EXCLUDE_FROM_ALL tests/repeat_run.c)
   target_link_libraries(ac1_repeat_run PRIVATE ac1_runtime)
+  if(WIN32 AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    # Guest calls nest on the host stack of each thread (the default size of
+    # CreateThread); the dispatcher stops 256 KiB short of its end.
+    target_link_options(ac1_startup PRIVATE -Wl,--stack,8388608)
+    target_link_options(ac1_repeat_run PRIVATE -Wl,--stack,8388608)
+  endif()
   add_executable(ac1_network_contract EXCLUDE_FROM_ALL tests/network_contract.c)
   target_link_libraries(ac1_network_contract PRIVATE ac1_runtime)
   add_executable(ac1_crypto_contract EXCLUDE_FROM_ALL

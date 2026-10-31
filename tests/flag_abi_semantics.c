@@ -7,8 +7,6 @@
 #include <stdio.h>
 static unsigned char memory[0x10000];
 static int version;
-uint64_t ac1_dispatch_limit;
-int ac1_direct_slow_mode;
 void variant_dispatch(int version, CPU *c, uint32_t target);
 void variant_entry(int version, CPU *c, unsigned entry);
 extern const unsigned variant_entries;
@@ -21,7 +19,6 @@ void guest_execution_write(uint32_t a, const void *v, size_t n) {
 uint32_t guest_atomic_xadd32(uint32_t a, uint32_t v) {
     uint32_t old;guest_execution_read(a,&old,4);v+=old;guest_execution_write(a,&v,4);return old;
 }
-void ac1_dispatch_guard_failed(CPU *c,uint32_t t) {(void)c;(void)t;abort();}
 void ac1_scheduler_return_checkpoint(CPU *c) {(void)c;}
 void dispatch(CPU *c,uint32_t target) {variant_dispatch(version,c,target);}
 static uint32_t random_state=0x12345678u;
@@ -40,10 +37,10 @@ int main(void) {
         seed.cf=i&1;seed.pf=(i>>1)&1;seed.af=(i>>2)&1;
         seed.zf=(i>>3)&1;seed.sf=(i>>4)&1;seed.of=(i>>5)&1;
         seed.esp=0x8000;
-        ac1_direct_slow_mode=(i>>6)&1;
         for(version=0;version<3;++version) {
             CPU actual=seed;
             memset(&calls,0,sizeof calls);actual.calls=&calls;
+            calls.stack_floor=(i>>6)&1?UINTPTR_MAX:0u;   /* tracing: every call through dispatch */
             memset(memory+0x7fe0,0x55,64);
             variant_entry(version,&actual,(i>>7)%variant_entries);
             actual.cf=actual.pf=actual.af=actual.zf=actual.sf=actual.of=0;actual.calls=NULL;
