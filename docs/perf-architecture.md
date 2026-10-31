@@ -379,30 +379,35 @@ videos show no stop or visual breakage.
 
 ## 10. Recommendation
 
-Re-profile the contract build before choosing; the order below is from the
-`e634876` profile with the flag share removed.
+Re-profile of the contract build (main thread, Presents 1800 + 15 s, the same
+window as before): flags 21.5% -> 8.6% of samples. What remains, as shares of
+the smaller total: guest memory accessors 11.8%, calls 8.3% + returns 2.0% +
+dispatch 3.6% + return checkpoint 3.3% + CPU-state syncs 3.4%, masked flag
+helpers 6.1% (`flags_sub_m` 3.7%), shift flags 3.8% (234 of the 255 `parity8`
+samples are inside `op_sar`/`op_shr`/`op_shl`), libwinpthread 5.0%, ntdll 4.3%,
+x87 integer stores 2.0%.
 
-1. **Call boundaries** (Pinyon Shift's ABI sync: -11-12% guest
-   instructions; here call/ret 8.6%, return checkpoint 3.0%, dispatch 3.5%).
-   A guest call is ~70 host instructions: accounting, an out-of-line scheduler
-   checkpoint after every return, full GPR/XMM syncs. An inline countdown
-   before the checkpoint is a small runtime change; skipping callee-saved
-   reloads needs an exception list (CRT EH/SEH prologs, `_chkstk`, `longjmp`)
-   or a preservation proof.
-2. **XMM and GPR locals in exception-frame functions** (12% of main-thread
+1. **Masked shifts.** Constant-count shifts define flags but still compute all
+   four, parity included, almost always dead: ~3.8% of the main thread.
+   Constant-mask clones of the shift helpers fed by the contract masks.
+2. **Flag locals.** The remaining masked helpers mostly store ZF/CF to the CPU
+   struct for the branch that reloads them. Keeping flags in locals synced only
+   where a contract or observer needs them lets GCC emit `cmp; jcc`.
+3. **Call boundaries** (Pinyon Shift's ABI sync: -11-12% guest
+   instructions; here ~20% of the main thread with dispatch, the checkpoint
+   and syncs). A guest call is ~70 host instructions: accounting, an
+   out-of-line scheduler checkpoint after every return, full GPR/XMM syncs.
+   An inline countdown before the checkpoint is a small runtime change;
+   skipping callee-saved reloads needs an exception list (CRT EH/SEH prologs,
+   `_chkstk`, `longjmp`) or a preservation proof.
+4. **XMM and GPR locals in exception-frame functions** (12% of main-thread
    CPU, 25% of SSE instructions). The argument used for flags applies: the
    runtime never dispatches guest SEH or C++ exceptions, so no handler reads a
    register at a fault.
-3. **x87 integer stores.** Every `fist(p)` reloads the control word for the
-   rounding mode, range-checks, converts, re-converts to test exactness and
-   read-modify-writes `c->fpu_sw` for PE (~15% of the cone, 1.5% of the
-   game's main thread). Keep RC and the sticky status bits in locals synced at
-   the existing TOP sync points.
-4. **Frame-slot promotion proper** (store elimination, values across calls)
+5. **x87 integer stores** (2.0%). Keep RC and the sticky status bits in locals
+   synced at the existing TOP sync points.
+6. **Frame-slot promotion proper** (store elimination, values across calls)
    for the 47% of main-thread CPU in private-frame functions, plus the 733
-   8-byte loads after 4-byte stores. Forwarding already removed the stalls;
-   what remains is the stores themselves and reloads across calls.
-5. **Masked shifts.** Constant-count shifts now define flags, but the shift
-   helpers still compute all four (parity included) even when dead.
-6. Keep native x87, the vector lowering, the stack changes and the flag
+   8-byte loads after 4-byte stores.
+7. Keep native x87, the vector lowering, the stack changes and the flag
    contracts under validation on AArch64 hardware, videos and long play.
