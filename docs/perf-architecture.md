@@ -424,15 +424,41 @@ samples are inside `op_sar`/`op_shr`/`op_shl`), libwinpthread 5.0%, ntdll 4.3%,
 x87 integer stores 2.0%.
 
 Masked shifts and flag locals (items 1-2 of the previous list) are done,
-above. Next, pending a re-profile of that build:
+above. Their re-profile: flags 1.4% of main-thread samples; the return
+checkpoint 3.8% plus 2.1% of clock reads (`guest_monotonic_ns`, every 64th
+return) under it.
+
+**Runtime hot paths.** Three exact changes, measured together:
+
+* Return checkpoint. Generated code counts returns in the per-thread call
+  state and enters the runtime only at the threshold (64, or every return with
+  the legacy zero slice); the count is still shared with import checkpoints, so
+  scheduling is unchanged. Alone: -1.9% [-4.3%, +0.5%] over eight pairs, not
+  demonstrated, `.text` +5% (105.5 MB) from the counter at ~220k call sites.
+* Guest clock. `guest_monotonic_ns` queried the boot-fixed QPC frequency and
+  did three 64-bit divisions per read; it caches the frequency and converts the
+  usual 10 MHz counter with one multiply (identical values).
+* D3D9 bridge objects. `find_object` walked a `std::map` per object argument;
+  the maps are hashed, and shutdown releases in the old address order.
+
+Profile of the result: the checkpoint 3.82% -> 0.23% of main-thread samples,
+`guest_monotonic_ns` 0.91% -> 0.33%, `find_object` 2.14% -> below 0.1%; the
+call lines gain ~1.5 points. Against `9e00f6c`, pooled over two 8-pair
+comparisons (the second significant alone, -4.2%): main-thread cycles/frame
+**-3.3%** [-5.9%, -0.8%], mean frame time -3.2%, FPS +3.5%; 12 of 16 pairs
+better; before the scene change -4.3% [-8.3%, -0.3%] in the second set. A run
+to Present 5013 and the intro videos show no stop or breakage.
+
+Next:
 
 1. **Call boundaries** (Pinyon Shift's ABI sync: -11-12% guest
-   instructions; here ~20% of the main thread with dispatch, the checkpoint
-   and syncs). A guest call is ~70 host instructions: accounting, an
-   out-of-line scheduler checkpoint after every return, full GPR/XMM syncs.
-   An inline countdown before the checkpoint is a small runtime change;
-   skipping callee-saved reloads needs an exception list (CRT EH/SEH prologs,
-   `_chkstk`, `longjmp`) or a preservation proof.
+   instructions; here call lines 10.8% + returns 2.6% + dispatch 3.8% +
+   CPU-state syncs ~3.7% of the main thread, with the checkpoint now inline).
+   Left per call: the dispatch count and the global budget and slow-mode reads
+   (each through a MinGW `.refptr`), depth and last-target bookkeeping, and the
+   GPR/XMM syncs. Skipping callee-saved reloads needs an exception list (CRT
+   EH/SEH prologs, `_chkstk`, `longjmp`) or a whole-program preservation proof
+   like the flag contracts.
 2. **XMM and GPR locals in exception-frame functions** (12% of main-thread
    CPU, 25% of SSE instructions). The argument used for flags applies: the
    runtime never dispatches guest SEH or C++ exceptions, so no handler reads a

@@ -130,7 +130,6 @@ struct ac1_guest_thread {
     uint32_t wait_count;
     uint64_t wait_deadline;
     uint64_t return_slice_deadline;
-    unsigned return_slice_checks;
     uint64_t checkpoints, wait_completions;
     ac1_handoff_cause checkpoint_cause;
     int checkpoint_force;
@@ -471,7 +470,7 @@ static void run_guest_thread(ac1_guest_thread *thread)
         active_guest_thread = thread;
         thread->return_slice_deadline = scheduler_return_slice_ns
             ? guest_monotonic_ns() + scheduler_return_slice_ns : 0u;
-        thread->return_slice_checks = 0u;
+        thread->calls.returns = 0u;
         guest_address_space_select(scheduler->space);
         static_tls_data_base = thread->static_tls_data;
         static_tls_vector_base = thread->static_tls_vector;
@@ -946,8 +945,8 @@ static void scheduler_checkpoint_for_thread(ac1_guest_thread *thread)
         cause != AC1_HANDOFF_START) {
         /* Imports run millions of times per second; on Android the vDSO clock
          * read alone was ~8% of the main thread. Sample it like returns do. */
-        if (++thread->return_slice_checks < 16u) return;
-        thread->return_slice_checks = 0u;
+        if (++thread->calls.returns < 16u) return;
+        thread->calls.returns = 0u;
         if (guest_monotonic_ns() < thread->return_slice_deadline) return;
     }
     scheduler_lock(scheduler);
@@ -992,7 +991,7 @@ static void scheduler_checkpoint_for_thread(ac1_guest_thread *thread)
     scheduler_unlock(scheduler);
     if (scheduler_return_slice_ns) {
         thread->return_slice_deadline = guest_monotonic_ns() + scheduler_return_slice_ns;
-        thread->return_slice_checks = 0u;
+        thread->calls.returns = 0u;
     }
     if ((stopping || failed) && thread->slot != 0u)
         longjmp(thread->exit_env, 1);
@@ -1011,15 +1010,20 @@ void ac1_scheduler_return_checkpoint(CPU *cpu)
 {
     ac1_guest_thread *thread = guest_thread_for_cpu(cpu);
     ac1_scheduler *scheduler = thread->scheduler;
+    /* Callers count `returns` inline and enter here once it reaches the
+     * threshold: every 64th return, or every return with the legacy zero slice. */
+    ac1_call_state *calls = cpu->calls ? cpu->calls : &thread->calls;
+    calls->return_threshold = scheduler_return_slice_ns ? 64u : 0u;
     if (!scheduler || !thread || scheduler->count < 2u ||
         scheduler_return_slice_ns == 0u) {
+        calls->returns = 0u;
         scheduler_checkpoint_for_thread(thread);
         return;
     }
     if (!thread->return_slice_deadline)
         thread->return_slice_deadline = guest_monotonic_ns() + scheduler_return_slice_ns;
-    if (++thread->return_slice_checks < 64u) return;
-    thread->return_slice_checks = 0u;
+    if (calls->returns < 64u) return;
+    calls->returns = 0u;
     if (guest_monotonic_ns() < thread->return_slice_deadline) return;
     scheduler_checkpoint_for_thread(thread);
 }
@@ -6914,7 +6918,7 @@ void dispatch(CPU *cpu, uint32_t target)
             else function(cpu);
             --calls->depth;
             calls->last_target = previous_target;
-            ac1_scheduler_return_checkpoint(cpu);
+            if (++calls->returns >= calls->return_threshold) ac1_scheduler_return_checkpoint(cpu);
             return;
         }
     }
@@ -7192,7 +7196,7 @@ void dispatch(CPU *cpu, uint32_t target)
         }
     }
     calls->last_target = previous_target;
-    ac1_scheduler_return_checkpoint(cpu);
+    if (++calls->returns >= calls->return_threshold) ac1_scheduler_return_checkpoint(cpu);
 }
 
 void dispatch_jmp(CPU *cpu, uint32_t target)
@@ -7745,7 +7749,7 @@ int ac1_run(const char *exe_path)
     ac1_profile_guest(0, primary->id, &primary->cpu.eip, &scheduler->owner);
     primary->return_slice_deadline = scheduler_return_slice_ns
         ? guest_monotonic_ns() + scheduler_return_slice_ns : 0u;
-    primary->return_slice_checks = 0u;
+    primary->calls.returns = 0u;
     wr32(AC1_TIB_BASE + 0x20u, 1u);
     wr32(AC1_TIB_BASE + 0x24u, primary->id);
     CPU *cpu = &primary->cpu;

@@ -43,6 +43,7 @@ using D3DXMATRIX = ac1_d3dx::Matrix;
 #include <sstream>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 #include <chrono>
 #include <mutex>
@@ -509,8 +510,10 @@ static_assert(sizeof(D3DVERTEXELEMENT9) == 8,
 
 ac1_d3d9_callbacks g_callbacks{};
 void *g_context = nullptr;
-std::map<uint32_t, GuestObject> g_objects;
-std::map<IUnknown *, uint32_t> g_guest_by_native;
+// Hashed: every D3D9 call that names an object looks it up. Element pointers
+// stay valid across rehashing; only shutdown walks them, in address order.
+std::unordered_map<uint32_t, GuestObject> g_objects;
+std::unordered_map<IUnknown *, uint32_t> g_guest_by_native;
 struct GuestConstantHandle {
     uint32_t table = 0;
     const char *native = nullptr;
@@ -4412,21 +4415,25 @@ extern "C" AC1_D3D9_API int ac1_d3d9_argument_count(uint32_t token)
 extern "C" AC1_D3D9_API void ac1_d3d9_shutdown(void)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
-    for (auto &entry : g_objects) {
-        discard_staged_locks(entry.first,entry.second);
-        if (entry.second.kind == ObjectKind::VertexBuffer ||
-            entry.second.kind == ObjectKind::IndexBuffer)
-            abandon_buffer_lock(entry.second);
+    std::vector<uint32_t> addresses;   // release in guest-address order
+    addresses.reserve(g_objects.size());
+    for (const auto &entry : g_objects) addresses.push_back(entry.first);
+    std::sort(addresses.begin(), addresses.end());
+    for (uint32_t address : addresses) {
+        GuestObject &object = g_objects.at(address);
+        discard_staged_locks(address, object);
+        if (object.kind == ObjectKind::VertexBuffer || object.kind == ObjectKind::IndexBuffer)
+            abandon_buffer_lock(object);
     }
-    for (auto &entry : g_objects) {
-        if (entry.second.kind == ObjectKind::ConstantTable)
-            release_constant_table_allocations(entry.first);
+    for (uint32_t address : addresses) {
+        if (g_objects.at(address).kind == ObjectKind::ConstantTable)
+            release_constant_table_allocations(address);
     }
-    for (auto &entry : g_objects) {
-        GuestObject &object = entry.second;
+    for (uint32_t address : addresses) {
+        GuestObject &object = g_objects.at(address);
         for (uint32_t refs = object.guest_references; refs; --refs)
             object.native->Release();
-        free_guest_object(entry.first, object);
+        free_guest_object(address, object);
     }
     g_objects.clear();
     g_staged_locks.clear();

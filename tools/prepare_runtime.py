@@ -32,6 +32,10 @@ CALL_STATE_DECL = r'''
 typedef struct ac1_call_state {
     uint64_t count;
     uint32_t depth, last_target;
+    /* Generated code counts returns and enters the runtime's checkpoint only
+     * when `returns` reaches `return_threshold` (0: after every return). The
+     * runtime shares the count with its import checkpoints. */
+    uint32_t returns, return_threshold;
 } ac1_call_state;
 '''
 CALL_HELPERS = r'''
@@ -61,7 +65,8 @@ void ac1_scheduler_return_checkpoint(CPU *c);
         fn(_ac); \
         --_as->depth; \
         _as->last_target = _ap; \
-        ac1_scheduler_return_checkpoint(_ac); \
+        if (__builtin_expect(++_as->returns >= _as->return_threshold, 0)) \
+            ac1_scheduler_return_checkpoint(_ac); \
     } \
 } while (0)
 #endif
@@ -978,6 +983,30 @@ def main() -> None:
                 "void guest_execution_write(uint32_t address, const void *input, size_t width);",
             )
             content = text.replace("\r\n", "\n").encode("utf-8")
+        if destination == "src/runtime/guest_clock.c":
+            # The scheduler reads this clock every 64 guest returns: query the
+            # boot-fixed frequency once, and convert the usual 10 MHz counter
+            # with one multiply. Results are unchanged (floor(ticks*1e9/rate)).
+            text = content.decode("utf-8").replace("\r\n", "\n")
+            old = ("    LARGE_INTEGER ticks, frequency;\n"
+                   "    if (!QueryPerformanceFrequency(&frequency) || !QueryPerformanceCounter(&ticks) || frequency.QuadPart <= 0) abort();\n"
+                   "    uint64_t value = (uint64_t)ticks.QuadPart, rate = (uint64_t)frequency.QuadPart;\n"
+                   "    return value / rate * 1000000000ull + value % rate * 1000000000ull / rate;\n")
+            if text.count(old) != 1:
+                raise SystemExit(f"unexpected guest clock: {source}")
+            text = text.replace(old,
+                   "    static volatile uint64_t cached_rate;\n"
+                   "    LARGE_INTEGER ticks, frequency;\n"
+                   "    uint64_t rate = cached_rate;\n"
+                   "    if (!rate) {\n"
+                   "        if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0) abort();\n"
+                   "        cached_rate = rate = (uint64_t)frequency.QuadPart;\n"
+                   "    }\n"
+                   "    if (!QueryPerformanceCounter(&ticks)) abort();\n"
+                   "    uint64_t value = (uint64_t)ticks.QuadPart;\n"
+                   "    if (rate == 10000000ull) return value * 100ull;\n"
+                   "    return value / rate * 1000000000ull + value % rate * 1000000000ull / rate;\n")
+            content = text.encode("utf-8")
         if destination == "src/runtime/guest_memory.c":
             text = content.decode("utf-8").replace("\r\n", "\n")
             # Reserve the direct arena top-down: a bottom-up 4 GiB reservation

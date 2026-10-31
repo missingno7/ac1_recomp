@@ -101,6 +101,10 @@ typedef union {
 typedef struct ac1_call_state {
     uint64_t count;
     uint32_t depth, last_target;
+    /* Generated code counts returns and enters the runtime's checkpoint only
+     * when `returns` reaches `return_threshold` (0: after every return). The
+     * runtime shares the count with its import checkpoints. */
+    uint32_t returns, return_threshold;
 } ac1_call_state;
 typedef struct {
     uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
@@ -168,7 +172,8 @@ void ac1_scheduler_return_checkpoint(CPU *c);
         fn(_ac); \
         --_as->depth; \
         _as->last_target = _ap; \
-        ac1_scheduler_return_checkpoint(_ac); \
+        if (__builtin_expect(++_as->returns >= _as->return_threshold, 0)) \
+            ac1_scheduler_return_checkpoint(_ac); \
     } \
 } while (0)
 #endif
