@@ -518,23 +518,43 @@ destructors keep valid objects). Profile: libwinpthread 6.1% -> 0.3%, libgcc
 pairs; before the scene change -3.7% [-6.5%, -1.0%]; mean frame time 23.07 ->
 22.21 ms, FPS 43.3 -> 45.0. Present 5003 and the intro videos show no stop.
 
+**Import paths.** In the re-profile, attributed by guest EIP, the
+name-dispatched handlers still compared names on every call after the route
+cache had picked them: the critical-section handler one case-folded DLL
+compare and six `strcmp`s, the clock handler two folds and up to three, and
+guest `TlsGetValue` about fifteen in the heap handler's chain (`strcmp` 1.2%,
+`equal_ascii_fold` 0.9% of the main thread). These handlers now classify an
+import once into a per-import operation code, cleared with the import table
+on each run. The scheduler read its slice clock (`QueryPerformanceCounter`)
+every 64 returns or 16 imports, ~1.9%; it now reads it every 256 returns or
+64 imports, still far inside the 1 ms slice. Profile: name compares 2.25% ->
+0.24%, ntdll 2.95% -> 1.52%, the return checkpoint 0.49% -> 0.12%. Against
+`c5616cb`: main-thread cycles/frame **-8.5%** [-10.1%, -6.8%], all three
+pairs between -8% and -9%; before the scene change -8.4% [-11.4%, -5.4%];
+mean frame time 22.15 -> 20.24 ms, FPS 45.2 -> 49.4. Draw calls in the window
+match (444k-503k against 462k-502k); resource locks are ~18% fewer, partly
+because streaming follows real time and the faster build crosses the window
+sooner. The gain is about twice what the profile's shares suggested
+(QueryPerformanceCounter itself costs ~61 cycles here, all in user mode).
+Present 5003 and the intro videos show no stop.
+
 Next:
 
-1. **Import paths.** Name-compare chains in the handlers (`strcmp` 1.2%,
-   `equal_ascii_fold` 0.9%; the critical-section handler compares six names
-   per call after its route is cached), host clock reads
-   (`RtlQueryPerformanceCounter` 1.9%) and `guest_memory_try_ptr` (1.2%).
-2. **Call boundaries** (Pinyon Shift's ABI sync: -11-12% guest
+1. **Call boundaries** (Pinyon Shift's ABI sync: -11-12% guest
    instructions). Left per call: the GPR reloads after each call and the
    stores before it (CPU-state syncs 6.9% of the main thread after the change
    above), XMM syncs, prologues and epilogues (3.7%), and the dispatcher for
    indirect calls (4.1%). Skipping callee-saved reloads needs an exception
    list (CRT EH/SEH prologs, `_chkstk`, `longjmp`) or a whole-program
    preservation proof like the flag contracts.
-3. **x87 integer stores** (2.0%). Keep RC and the sticky status bits in locals
+2. **x87 integer stores** (2.0%). Keep RC and the sticky status bits in locals
    synced at the existing TOP sync points.
-4. **Frame-slot promotion proper** (store elimination, values across calls)
+3. **Frame-slot promotion proper** (store elimination, values across calls)
    for the 47% of main-thread CPU in private-frame functions, plus the 733
    8-byte loads after 4-byte stores.
+4. **Runtime leftovers** (each ~1%): `guest_memory_try_ptr` validations,
+   the remaining thread-local reads (the resolver is 1.6%), the D3D9
+   bridge's object hash (`unordered_map::find` with a prime modulo), and the
+   scheduler lock taken on every outermost `LeaveCriticalSection`.
 5. Keep native x87, the vector lowering, the stack changes and the flag
    contracts under validation on AArch64 hardware, videos and long play.

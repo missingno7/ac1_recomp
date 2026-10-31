@@ -68,6 +68,11 @@ extern uintptr_t ac1_android_d3d9_guest_hwnd(void *context, uint32_t guest_hwnd)
 /* Guest calls stop ("guest call depth exceeded") with this much host stack
  * left for the dispatcher, imports and the host APIs they reach. */
 #define AC1_HOST_STACK_RESERVE (256u * 1024u)
+/* Guest returns and imports between reads of the scheduler's slice clock: a
+ * read (QueryPerformanceCounter) every 64 returns was ~2% of the main thread,
+ * and 256 returns stay far below the 1 ms slice. */
+#define AC1_RETURN_CLOCK_INTERVAL 256u
+#define AC1_IMPORT_CLOCK_INTERVAL 64u
 #define AC1_IMPORT_LIMIT 2048u
 #define AC1_PROCESS_HEAP_HANDLE 0xE0000001u
 #define AC1_PRIVATE_HEAP_BASE 0xE0000100u
@@ -193,7 +198,7 @@ static void bind_host_stack(ac1_call_state *calls)
     uintptr_t low = 0u;
 #ifdef _WIN32
     MEMORY_BASIC_INFORMATION region;
-    if (VirtualQuery(&region, &region, sizeof(region)) == sizeof(region))
+    if (VirtualQuery(&low, &region, sizeof(region)) == sizeof(region))
         low = (uintptr_t)region.AllocationBase;
 #else
     pthread_attr_t attributes;
@@ -987,7 +992,7 @@ static void scheduler_checkpoint_for_thread(ac1_guest_thread *thread)
         cause != AC1_HANDOFF_START) {
         /* Imports run millions of times per second; on Android the vDSO clock
          * read alone was ~8% of the main thread. Sample it like returns do. */
-        if (++thread->import_batch < 16u) return;
+        if (++thread->import_batch < AC1_IMPORT_CLOCK_INTERVAL) return;
         thread->import_batch = 0u;
         if (guest_monotonic_ns() < thread->return_slice_deadline) return;
     }
@@ -1054,9 +1059,10 @@ void ac1_scheduler_return_checkpoint(CPU *cpu)
     ac1_guest_thread *thread = guest_thread_for_cpu(cpu);
     ac1_scheduler *scheduler = thread->scheduler;
     /* Callers count `returns` inline and enter here once it reaches the
-     * threshold: every 64th return, or every return with the legacy zero slice. */
+     * threshold: every AC1_RETURN_CLOCK_INTERVAL returns, or every return with
+     * the legacy zero slice. */
     ac1_call_state *calls = cpu->calls ? cpu->calls : &thread->calls;
-    calls->return_threshold = scheduler_return_slice_ns ? 64u : 0u;
+    calls->return_threshold = scheduler_return_slice_ns ? AC1_RETURN_CLOCK_INTERVAL : 0u;
     if (!scheduler || !thread || scheduler->count < 2u ||
         scheduler_return_slice_ns == 0u) {
         settle_returns(calls);
@@ -1066,7 +1072,7 @@ void ac1_scheduler_return_checkpoint(CPU *cpu)
     }
     if (!thread->return_slice_deadline)
         thread->return_slice_deadline = guest_monotonic_ns() + scheduler_return_slice_ns;
-    if (calls->returns < 64u) return;
+    if (calls->returns < AC1_RETURN_CLOCK_INTERVAL) return;
     settle_returns(calls);
     check_dispatch_budget(calls, cpu->eip);
     if (guest_monotonic_ns() < thread->return_slice_deadline) return;
@@ -2450,9 +2456,58 @@ static int handle_module_import(CPU *cpu, const import_record *import)
     return 0;
 }
 
+/* Name-dispatched handlers classify an import once. The hot ones (critical
+ * sections, clocks, guest TLS) run millions of times, and once the route
+ * cache in run_import_handlers had picked their handler, its case-folded DLL
+ * and strcmp chains were still ~2% of the main thread. 0: not classified. */
+static unsigned classify_import(uint8_t *ops, const import_record *import,
+                                unsigned (*classify)(const import_record *))
+{
+    const size_t index = (size_t)(import - imports);
+    if (index >= AC1_IMPORT_LIMIT) return classify(import);
+    if (!ops[index]) ops[index] = (uint8_t)classify(import);
+    return ops[index];
+}
+
+enum { HEAP_OTHER = 1, HEAP_TLS_GET, HEAP_TLS_SET };
+static uint8_t heap_ops[AC1_IMPORT_LIMIT];
+
+static unsigned heap_op(const import_record *import)
+{
+    if (import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll")) return HEAP_OTHER;
+    return !strcmp(import->name, "TlsGetValue") ? HEAP_TLS_GET :
+           !strcmp(import->name, "TlsSetValue") ? HEAP_TLS_SET : HEAP_OTHER;
+}
+
 static int handle_heap_import(CPU *cpu, const import_record *import)
 {
-    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
+    if (!import) return 0;
+    const unsigned op = classify_import(heap_ops, import, heap_op);
+    if (op == HEAP_TLS_GET) {
+        uint32_t index = rd32(cpu->esp + 4u);
+        if (index >= AC1_TLS_SLOTS || !tls_used[index]) {
+            cpu->eax = 0u;
+            last_error = 87u;
+        } else {
+            cpu->eax = tls_values[index];
+            last_error = 0u;
+        }
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (op == HEAP_TLS_SET) {
+        uint32_t index = rd32(cpu->esp + 4u);
+        if (index >= AC1_TLS_SLOTS || !tls_used[index]) {
+            cpu->eax = 0u;
+            last_error = 87u;
+        } else {
+            tls_values[index] = rd32(cpu->esp + 8u);
+            cpu->eax = 1u;
+        }
+        return_stdcall(cpu, 8u);
+        return 1;
+    }
+    if (import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
         return 0;
     const char *name = import->name;
     if (!strcmp(name, "GetProcessHeap")) {
@@ -2593,30 +2648,6 @@ static int handle_heap_import(CPU *cpu, const import_record *import)
         return_stdcall(cpu, 4u);
         return 1;
     }
-    if (!strcmp(name, "TlsGetValue")) {
-        uint32_t index = rd32(cpu->esp + 4u);
-        if (index >= AC1_TLS_SLOTS || !tls_used[index]) {
-            cpu->eax = 0u;
-            last_error = 87u;
-        } else {
-            cpu->eax = tls_values[index];
-            last_error = 0u;
-        }
-        return_stdcall(cpu, 4u);
-        return 1;
-    }
-    if (!strcmp(name, "TlsSetValue")) {
-        uint32_t index = rd32(cpu->esp + 4u);
-        if (index >= AC1_TLS_SLOTS || !tls_used[index]) {
-            cpu->eax = 0u;
-            last_error = 87u;
-        } else {
-            tls_values[index] = rd32(cpu->esp + 8u);
-            cpu->eax = 1u;
-        }
-        return_stdcall(cpu, 8u);
-        return 1;
-    }
     if (!strcmp(name, "GetCurrentThreadId")) {
         cpu->eax = current_host_thread_id();
         return_stdcall(cpu, 0);
@@ -2746,18 +2777,33 @@ static void trace_critical_section_span(const CPU *cpu, const char *name,
     }
 }
 
+enum { CS_NONE = 1, CS_INIT_SPIN, CS_INIT, CS_DELETE, CS_ENTER, CS_LEAVE, CS_TRY_ENTER };
+static uint8_t critical_section_ops[AC1_IMPORT_LIMIT];
+
+static unsigned critical_section_op(const import_record *import)
+{
+    static const char *const names[] = {
+        "InitializeCriticalSectionAndSpinCount", "InitializeCriticalSection",
+        "DeleteCriticalSection", "EnterCriticalSection", "LeaveCriticalSection",
+        "TryEnterCriticalSection",
+    };
+    if (import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll")) return CS_NONE;
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+        if (!strcmp(import->name, names[i])) return CS_INIT_SPIN + i;
+    return CS_NONE;
+}
+
 static int handle_critical_section_import(CPU *cpu, const import_record *import)
 {
-    if (!import || import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
-        return 0;
+    if (!import) return 0;
+    const unsigned op = classify_import(critical_section_ops, import, critical_section_op);
+    if (op == CS_NONE) return 0;
     const char *name = import->name;
-    int init_spin = !strcmp(name, "InitializeCriticalSectionAndSpinCount");
-    int init = !strcmp(name, "InitializeCriticalSection");
-    int destroy = !strcmp(name, "DeleteCriticalSection");
-    int enter = !strcmp(name, "EnterCriticalSection");
-    int leave = !strcmp(name, "LeaveCriticalSection");
-    int try_enter = !strcmp(name, "TryEnterCriticalSection");
-    if (!init_spin && !init && !destroy && !enter && !leave && !try_enter) return 0;
+    int init_spin = op == CS_INIT_SPIN;
+    int init = op == CS_INIT;
+    int destroy = op == CS_DELETE;
+    int enter = op == CS_ENTER;
+    int try_enter = op == CS_TRY_ENTER;
     if (active_guest_thread) active_guest_thread->checkpoint_cause = AC1_HANDOFF_CS;
 
     uint32_t address = rd32(cpu->esp + 4u);
@@ -4878,30 +4924,41 @@ static int handle_window_import(CPU *cpu, const import_record *import)
     return 0;
 }
 
+enum { CLOCK_NONE = 1, CLOCK_TIME_GET_TIME, CLOCK_TIME_PERIOD, CLOCK_QPF, CLOCK_QPC };
+static uint8_t clock_ops[AC1_IMPORT_LIMIT];
+
+static unsigned clock_op(const import_record *import)
+{
+    if (import->by_ordinal) return CLOCK_NONE;
+    if (equal_ascii_fold(import->dll, "WINMM.dll"))
+        return !strcmp(import->name, "timeGetTime") ? CLOCK_TIME_GET_TIME :
+               !strcmp(import->name, "timeBeginPeriod") ||
+               !strcmp(import->name, "timeEndPeriod") ? CLOCK_TIME_PERIOD : CLOCK_NONE;
+    if (!equal_ascii_fold(import->dll, "KERNEL32.dll")) return CLOCK_NONE;
+    return !strcmp(import->name, "QueryPerformanceFrequency") ? CLOCK_QPF :
+           !strcmp(import->name, "QueryPerformanceCounter") ? CLOCK_QPC : CLOCK_NONE;
+}
+
 static int handle_clock_import(CPU *cpu, const import_record *import)
 {
-    if (!import || import->by_ordinal) return 0;
-    if (equal_ascii_fold(import->dll, "WINMM.dll")) {
-        /* timeGetTime shares GetTickCount's guest clock. Timer-resolution
-         * requests are scheduling hints; valid periods report TIMERR_NOERROR
-         * and zero reports TIMERR_NOCANDO (97), as winmm does. */
-        if (!strcmp(import->name, "timeGetTime")) {
-            cpu->eax = (uint32_t)(ac1_guest_time_ns() / UINT64_C(1000000));
-            return_stdcall(cpu, 0u);
-            return 1;
-        }
-        if (!strcmp(import->name, "timeBeginPeriod") ||
-            !strcmp(import->name, "timeEndPeriod")) {
-            cpu->eax = rd32(cpu->esp + 4u) ? 0u : 97u;
-            return_stdcall(cpu, 4u);
-            return 1;
-        }
-        return 0;
+    if (!import) return 0;
+    const unsigned op = classify_import(clock_ops, import, clock_op);
+    if (op == CLOCK_NONE) return 0;
+    /* timeGetTime shares GetTickCount's guest clock. Timer-resolution
+     * requests are scheduling hints; valid periods report TIMERR_NOERROR
+     * and zero reports TIMERR_NOCANDO (97), as winmm does. */
+    if (op == CLOCK_TIME_GET_TIME) {
+        cpu->eax = (uint32_t)(ac1_guest_time_ns() / UINT64_C(1000000));
+        return_stdcall(cpu, 0u);
+        return 1;
     }
-    if (!equal_ascii_fold(import->dll, "KERNEL32.dll"))
-        return 0;
+    if (op == CLOCK_TIME_PERIOD) {
+        cpu->eax = rd32(cpu->esp + 4u) ? 0u : 97u;
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
     uint64_t value;
-    if (!strcmp(import->name, "QueryPerformanceFrequency")) {
+    if (op == CLOCK_QPF) {
 #ifdef _WIN32
         LARGE_INTEGER frequency;
         if (!QueryPerformanceFrequency(&frequency)) {
@@ -4914,7 +4971,7 @@ static int handle_clock_import(CPU *cpu, const import_record *import)
 #else
         value = UINT64_C(1000000000);
 #endif
-    } else if (!strcmp(import->name, "QueryPerformanceCounter") && ac1_guest_time_fixed()) {
+    } else if (ac1_guest_time_fixed()) {
         /* Fixed frame clock in the frequency QueryPerformanceFrequency reports. */
         const uint64_t ns = ac1_guest_time_ns();
 #ifdef _WIN32
@@ -4926,7 +4983,7 @@ static int handle_clock_import(CPU *cpu, const import_record *import)
         const uint64_t rate = UINT64_C(1000000000);
 #endif
         value = ns / UINT64_C(1000000000) * rate + ns % UINT64_C(1000000000) * rate / UINT64_C(1000000000);
-    } else if (!strcmp(import->name, "QueryPerformanceCounter")) {
+    } else {
 #ifdef _WIN32
         LARGE_INTEGER counter;
         if (!QueryPerformanceCounter(&counter)) {
@@ -4942,8 +4999,6 @@ static int handle_clock_import(CPU *cpu, const import_record *import)
             stop_guest("monotonic performance counter failed", import->token);
         value = (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
 #endif
-    } else {
-        return 0;
     }
     uint32_t output = rd32(cpu->esp + 4u);
     if (!guest_memory_try_ptr(output, 8))
@@ -7539,6 +7594,9 @@ int ac1_run(const char *exe_path)
     import_count = 0;
     memset(imports, 0, sizeof(imports));
     memset(import_routes, 0, sizeof(import_routes));
+    memset(heap_ops, 0, sizeof(heap_ops));
+    memset(critical_section_ops, 0, sizeof(critical_section_ops));
+    memset(clock_ops, 0, sizeof(clock_ops));
     memset(&bink_image, 0, sizeof(bink_image));
     bink_image_mapped = 0;
     bink_module_path[0] = '\0';

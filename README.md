@@ -72,7 +72,10 @@ depth, budget and last-target bookkeeping (-2.1% [-3.5%, -0.6%], 22 pairs;
 `.text` -22%). The MinGW build resolves `_Thread_local` through its own
 `__emutls_get_address`, which reads a TEB slot instead of winpthreads' locked
 `pthread_getspecific` (~10% of the main thread under imports): -3.5% [-6.0%,
--0.9%], 43.3 -> 45.0 FPS.
+-0.9%], 43.3 -> 45.0 FPS. The hot import handlers (critical sections, clocks,
+guest TLS) classify each import once instead of comparing names per call, and
+the scheduler reads its slice clock every 256 returns or 64 imports instead of
+64 or 16: -8.5% [-10.1%, -6.8%], 45.2 -> 49.4 FPS.
 
 ## Gamepad and Android touch controller (2026-10-30)
 
