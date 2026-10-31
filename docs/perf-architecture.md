@@ -534,9 +534,24 @@ pairs between -8% and -9%; before the scene change -8.4% [-11.4%, -5.4%];
 mean frame time 22.15 -> 20.24 ms, FPS 45.2 -> 49.4. Draw calls in the window
 match (444k-503k against 462k-502k); resource locks are ~18% fewer, partly
 because streaming follows real time and the faster build crosses the window
-sooner. The gain is about twice what the profile's shares suggested
-(QueryPerformanceCounter itself costs ~61 cycles here, all in user mode).
+sooner. Split by a second comparison, the operation codes alone give -2.5%
+[-5.0%, -0.1%] (six pairs), close to their share; the clock interval gives
+the other ~6%, three times its profile share (the clock samples and the
+checkpoint were ~2.4%). QueryPerformanceCounter costs ~61 cycles here, all
+in user mode, but it reads the TSC with RDTSCP, which waits for older
+instructions to complete: in code that returns every few nanoseconds the
+pipeline drain costs more than the samples on the instruction itself show,
+which is consistent with the gap. Handoffs per second are unchanged (~150).
 Present 5003 and the intro videos show no stop.
+
+Not integrated: moving the dispatcher's import, COM and trace paths out of
+line, so that indirect calls into lifted functions get a five-register frame
+instead of ~900 bytes (dispatcher samples 5.2% -> 3.6%), together with a
+1024-return clock interval: -0.5% [-3.6%, +2.7%] over eight pairs, mean
+frame time unchanged. Nor critical sections without host barriers (the lock
+count as a plain read-modify-write, and the scheduler lock on release only
+when a peer waits for the section, both sound because only the baton holder
+runs guest code): +0.5% [-0.8%, +1.9%] over eight pairs.
 
 Next:
 
@@ -546,15 +561,21 @@ Next:
    above), XMM syncs, prologues and epilogues (3.7%), and the dispatcher for
    indirect calls (4.1%). Skipping callee-saved reloads needs an exception
    list (CRT EH/SEH prologs, `_chkstk`, `longjmp`) or a whole-program
-   preservation proof like the flag contracts.
+   preservation proof like the flag contracts. Write sets alone are not
+   enough: 77% of the 245,010 direct call sites reach a callee that
+   (transitively) writes all of EBX, ESI, EDI and EBP, mostly through
+   push/pop saves, and only 14% could skip all four reloads; the proof has
+   to follow the saved stack slots.
 2. **x87 integer stores** (2.0%). Keep RC and the sticky status bits in locals
    synced at the existing TOP sync points.
 3. **Frame-slot promotion proper** (store elimination, values across calls)
    for the 47% of main-thread CPU in private-frame functions, plus the 733
    8-byte loads after 4-byte stores.
 4. **Runtime leftovers** (each ~1%): `guest_memory_try_ptr` validations,
-   the remaining thread-local reads (the resolver is 1.6%), the D3D9
-   bridge's object hash (`unordered_map::find` with a prime modulo), and the
-   scheduler lock taken on every outermost `LeaveCriticalSection`.
+   the remaining thread-local reads (the resolver is 1.6%) and the D3D9
+   bridge's object hash (`unordered_map::find` with a prime modulo). Two
+   such reductions of runtime samples (the dispatcher frame, critical
+   section barriers, above) did not show in gameplay; the clear wins came
+   from removing serializing work (locked TLS, RDTSCP) from hot paths.
 5. Keep native x87, the vector lowering, the stack changes and the flag
    contracts under validation on AArch64 hardware, videos and long play.
