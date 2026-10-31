@@ -49,9 +49,11 @@ def main():
     args = parser.parse_args()
     verify(args.source)
     args.output.mkdir(parents=True, exist_ok=True)
+    # Fresh timestamps: a file whose patch was removed must still look newer than
+    # objects built from the patched copy, so the next build recompiles it.
     for directory in ("src", "include", "subprojects"):
         shutil.copytree(args.source / directory, args.output / directory, dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns(".git"))
+                        ignore=shutil.ignore_patterns(".git"), copy_function=shutil.copy)
     shutil.copy2(args.source / "LICENSE", args.output / "LICENSE")
 
     def replace(path, old, new):
