@@ -27,7 +27,7 @@ android {
         if (!ac1PrebuiltNativeDir) externalNativeBuild {
             // Keep Java/debug signing debuggable, but optimize native game/runtime code.
             cmake { arguments '-DANDROID_STL=c++_static', '-DCMAKE_BUILD_TYPE=RelWithDebInfo', '-DAC1_NATIVE_BINK=ON',
-                    '-DAC1_DIRECT_MEMORY=ON', '-DAC1_FORCE_INLINE_ACCESSORS=ON' }
+                    '-DAC1_DIRECT_MEMORY=ON', '-DAC1_FORCE_INLINE_ACCESSORS=ON', '-DAC1_TRACE_EIP=OFF' }
         }
     }
 

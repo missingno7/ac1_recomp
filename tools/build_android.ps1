@@ -85,7 +85,7 @@ try {
             "-DCMAKE_TOOLCHAIN_FILE=$ndkToolchain" "-DANDROID_ABI=$Abi" `
             -DANDROID_PLATFORM=29 -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=RelWithDebInfo `
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=$jniAbi" `
-            -DAC1_NATIVE_BINK=ON -DAC1_DIRECT_MEMORY=ON -DAC1_FORCE_INLINE_ACCESSORS=ON
+            -DAC1_NATIVE_BINK=ON -DAC1_DIRECT_MEMORY=ON -DAC1_FORCE_INLINE_ACCESSORS=ON -DAC1_TRACE_EIP=OFF
         if ($LASTEXITCODE) { throw 'Android native CMake configuration failed' }
         & $cmake --build $nativeBuild --parallel $Jobs
         if ($LASTEXITCODE) { throw 'Android native Make build failed' }

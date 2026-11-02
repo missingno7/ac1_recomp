@@ -31,6 +31,14 @@ if(NOT EXISTS "${AC1_DXVK_ANDROID_LIBRARY}")
 endif()
 add_subdirectory("${AC1_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/ac1_core")
 target_compile_definitions(ac1_runtime PRIVATE RECOMP_FS_SIMULATED AC1_HOST_D3D9=1)
+# The archive stays inside libac1_android.so (--exclude-libs below), so hidden
+# symbols cost nothing and let every generated function load the guest arena
+# base directly instead of through a GOT entry.
+target_compile_options(ac1_runtime PRIVATE -fvisibility=hidden)
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    # Turnip's Adreno SoCs are ARMv8.2+: inline LSE atomics, not helper calls.
+    target_compile_options(ac1_runtime PRIVATE -march=armv8.2-a)
+endif()
 target_sources(ac1_runtime PRIVATE
     "${AC1_ROOT}/src/graphics/ac1_d3d9_bridge.cpp"
     "${AC1_ROOT}/src/platform/ac1_audio_win32.c"
@@ -58,6 +66,7 @@ target_compile_options(ac1_android PRIVATE -Wall -Wextra)
 target_compile_definitions(ac1_android PRIVATE _GNU_SOURCE AC1_DXVK31=1)
 target_include_directories(ac1_android PRIVATE "${AC1_ROOT}/work/dxvk/prepared-3.1/include/vulkan/include")
 if(ANDROID_ABI STREQUAL "arm64-v8a")
+    target_compile_options(ac1_android PRIVATE -march=armv8.2-a)
     target_compile_definitions(ac1_android PRIVATE AC1_HAS_TURNIP=1)
     target_include_directories(ac1_android PRIVATE "${AC1_ROOT}/work/deps/libadrenotools/include")
 endif()

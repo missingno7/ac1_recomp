@@ -123,9 +123,14 @@ DIRECT_ACCESS_HELPERS = r'''/* Guest memory accessors are force-inlined: in very
  * stores. A plain global (not _Thread_local, which MinGW lowers to emutls
  * calls) is safe because every AC1 guest thread shares one address space.
  * Unmapped arena pages fault instead of producing the checked diagnostic.
- * Without an arena the parenthesized calls reach the checked implementation. */
+ * Without an arena the parenthesized calls reach the checked implementation.
+ * On ELF the arena is hidden: it is defined in the same shared object, so
+ * every generated function loads it PC-relatively, not through a GOT entry. */
 #ifdef AC1_DIRECT_MEMORY
 #include <string.h>
+#ifdef __ELF__
+__attribute__((visibility("hidden")))
+#endif
 extern uint8_t *ac1_direct_arena;
 AC1_ACCESSOR_INLINE void ac1_direct_read(uint32_t a, void *o, size_t w)
 {
