@@ -70,9 +70,10 @@ extern uintptr_t ac1_android_d3d9_guest_hwnd(void *context, uint32_t guest_hwnd)
 #define AC1_HOST_STACK_RESERVE (256u * 1024u)
 /* Guest returns and imports between reads of the scheduler's slice clock: a
  * read (QueryPerformanceCounter) every 64 returns was ~2% of the main thread,
- * and 256 returns stay far below the 1 ms slice. */
-#define AC1_RETURN_CLOCK_INTERVAL 256u
-#define AC1_IMPORT_CLOCK_INTERVAL 64u
+ * and every 256 returns still ~1.4% on the phone (vDSO clock_gettime). 1024
+ * returns take tens of microseconds, far below the 1 ms slice. */
+#define AC1_RETURN_CLOCK_INTERVAL 1024u
+#define AC1_IMPORT_CLOCK_INTERVAL 256u
 #define AC1_IMPORT_LIMIT 2048u
 #define AC1_PROCESS_HEAP_HANDLE 0xE0000001u
 #define AC1_PRIVATE_HEAP_BASE 0xE0000100u
@@ -2540,15 +2541,24 @@ static unsigned classify_import(uint8_t *ops, const import_record *import,
     return ops[index];
 }
 
-enum { HEAP_OTHER = 1, HEAP_TLS_GET, HEAP_TLS_SET };
+/* Busy scenes call the heap imports and Get/SetLastError millions of times;
+ * the name chain below cost ~1.6% of the phone's main thread in strcmp. */
+enum { HEAP_OTHER = 1, HEAP_TLS_GET, HEAP_TLS_SET, HEAP_GET_LAST_ERROR,
+       HEAP_SET_LAST_ERROR, HEAP_ALLOC, HEAP_FREE, HEAP_REALLOC, HEAP_SIZE };
 static uint8_t heap_ops[AC1_IMPORT_LIMIT];
 
 static unsigned heap_op(const import_record *import)
 {
+    static const char *const names[] = {"TlsGetValue", "TlsSetValue", "GetLastError",
+                                        "SetLastError", "HeapAlloc", "HeapFree",
+                                        "HeapReAlloc", "HeapSize"};
     if (import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll")) return HEAP_OTHER;
-    return !strcmp(import->name, "TlsGetValue") ? HEAP_TLS_GET :
-           !strcmp(import->name, "TlsSetValue") ? HEAP_TLS_SET : HEAP_OTHER;
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+        if (!strcmp(import->name, names[i])) return HEAP_TLS_GET + i;
+    return HEAP_OTHER;
 }
+
+static int handle_heap_allocation(CPU *cpu, const import_record *import, unsigned op);
 
 static int handle_heap_import(CPU *cpu, const import_record *import)
 {
@@ -2578,6 +2588,17 @@ static int handle_heap_import(CPU *cpu, const import_record *import)
         return_stdcall(cpu, 8u);
         return 1;
     }
+    if (op == HEAP_GET_LAST_ERROR) {
+        cpu->eax = last_error;
+        return_stdcall(cpu, 0);
+        return 1;
+    }
+    if (op == HEAP_SET_LAST_ERROR) {
+        last_error = rd32(cpu->esp + 4u);
+        return_stdcall(cpu, 4u);
+        return 1;
+    }
+    if (op >= HEAP_ALLOC) return handle_heap_allocation(cpu, import, op);
     if (import->by_ordinal || !equal_ascii_fold(import->dll, "KERNEL32.dll"))
         return 0;
     const char *name = import->name;
@@ -2585,16 +2606,6 @@ static int handle_heap_import(CPU *cpu, const import_record *import)
         if (!process_heap) stop_guest("process heap is not initialized", import->token);
         cpu->eax = AC1_PROCESS_HEAP_HANDLE;
         return_stdcall(cpu, 0);
-        return 1;
-    }
-    if (!strcmp(name, "GetLastError")) {
-        cpu->eax = last_error;
-        return_stdcall(cpu, 0);
-        return 1;
-    }
-    if (!strcmp(name, "SetLastError")) {
-        last_error = rd32(cpu->esp + 4u);
-        return_stdcall(cpu, 4u);
         return 1;
     }
     if (!strcmp(name, "FreeEnvironmentStringsW")) {
@@ -2752,11 +2763,15 @@ static int handle_heap_import(CPU *cpu, const import_record *import)
         return_stdcall(cpu, 0);
         return 1;
     }
-    int allocate = !strcmp(name, "HeapAlloc");
-    int release = !strcmp(name, "HeapFree");
-    int resize = !strcmp(name, "HeapReAlloc");
-    int size = !strcmp(name, "HeapSize");
-    if (!allocate && !release && !resize && !size) return 0;
+    return 0;
+}
+
+static int handle_heap_allocation(CPU *cpu, const import_record *import, unsigned op)
+{
+    int allocate = op == HEAP_ALLOC;
+    int release = op == HEAP_FREE;
+    int resize = op == HEAP_REALLOC;
+    int size = op == HEAP_SIZE;
     pcrecomp_heap *heap = heap_by_handle(rd32(cpu->esp + 4u));
     if (!heap) {
         cpu->eax = size ? UINT32_MAX : 0;
