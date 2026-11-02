@@ -104,6 +104,8 @@ static void *wc_ptr(uint32_t address, uint64_t bytes, const import_record *i)
         char reason[256];
         snprintf(reason, sizeof(reason), "%s!%s invalid guest range 0x%08x + %llu", i->dll, i->name,
                  address, (unsigned long long)bytes);
+        /* The regions around the span show whether it hits a hole. */
+        ac1_guest_memory_dump_span(address, bytes <= SIZE_MAX ? (size_t)bytes : SIZE_MAX);
         stop_guest(reason, i->token);
     }
     return p;

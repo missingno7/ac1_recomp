@@ -56,6 +56,37 @@ static int mapping_capacity_contract(void)
     return 0;
 }
 
+/* The first phone autosave wrote a 64 KiB chunk at 0x26B7B020 from a game
+ * dlmalloc block across adjacent 64 KiB VirtualAlloc regions. In the direct
+ * arena they are one host range; a hole or a released neighbour still fails. */
+static int direct_adjacent_span_contract(void)
+{
+    guest_address_space *space = guest_address_space_create_direct();
+    CHECK(space);
+    guest_address_space_select(space);
+    uint8_t *a = guest_memory_allocate(0x26B70000u, 0x10000u);
+    uint8_t *b = guest_memory_allocate(0x26B80000u, 0x10000u);
+    uint8_t *c = guest_memory_allocate(0x26B90000u, 0x10000u);
+    CHECK(a && b == a + 0x10000 && c == b + 0x10000);
+    a[0xB020] = 0x11;
+    b[0xB01F] = 0x22;
+    uint8_t *span = guest_memory_try_ptr(0x26B7B020u, 0x10000u);
+    CHECK(span == a + 0xB020 && span[0] == 0x11 && span[0xFFFF] == 0x22);
+    CHECK(guest_ptr(0x26B7B020u, 0x10000u) == span);
+    CHECK(guest_memory_try_ptr(0x26B7FFF0u, 0x10020u) == a + 0xFFF0);
+    CHECK(guest_memory_try_ptr(0x26B80000u, 0x10u) == b);
+    CHECK(guest_memory_try_ptr(0x26B9FFF0u, 0x20u) == NULL);
+    guest_memory_release(0x26B90000u);
+    CHECK(guest_memory_try_ptr(0x26B8FFF0u, 0x20u) == NULL);
+    CHECK(guest_memory_try_ptr(0x26B8FFF0u, 0x10u) == b + 0xFFF0);
+    guest_memory_release(0x26B80000u);
+    CHECK(guest_memory_try_ptr(0x26B7B020u, 0x10000u) == NULL);
+    CHECK(guest_memory_try_ptr(0x26B80000u, 0x10u) == NULL);
+    CHECK(guest_memory_try_ptr(0x26B7B020u, 0x4FE0u) == a + 0xB020);
+    guest_address_space_destroy(space);
+    return 0;
+}
+
 int main(void)
 {
     /* VirtualQuery is bounded to tracked allocations. An interior address
@@ -194,6 +225,7 @@ int main(void)
 
     guest_address_space_destroy(space);
     CHECK(mapping_capacity_contract() == 0);
-    puts("PASS: VirtualQuery/scalar spans and 8192 simultaneous independent reservations with release/reuse");
+    CHECK(direct_adjacent_span_contract() == 0);
+    puts("PASS: VirtualQuery/scalar spans, direct adjacent spans and 8192 simultaneous independent reservations with release/reuse");
     return 0;
 }

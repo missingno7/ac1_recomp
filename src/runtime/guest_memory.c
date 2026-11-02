@@ -183,6 +183,24 @@ static size_t ac1_region_floor(uint32_t address)
     return low ? low - 1 : SIZE_MAX;
 }
 
+/* Direct-arena backing is arena+base, so a span that the floor region and
+ * its exactly adjacent successors cover is one host range. Checked memory
+ * has a separate host buffer per region and keeps the one-region rule.
+ * The lookup cache holds single regions, so these spans are not cached. */
+static void *ac1_direct_span(size_t floor, uint32_t address, uint64_t end)
+{
+    if (!current_memory.arena || floor == SIZE_MAX) return NULL;
+    uint64_t covered = (uint64_t)current_memory.regions[floor].base +
+                       current_memory.regions[floor].size;
+    if (covered <= address) return NULL;
+    for (size_t i = floor + 1; covered < end; ++i) {
+        if (i == current_memory.count || current_memory.regions[i].base != covered)
+            return NULL;
+        covered += current_memory.regions[i].size;
+    }
+    return current_memory.arena + address;
+}
+
 void ac1_guest_memory_dump_span(uint32_t address, size_t width)
 {
     int wraps = width > UINT64_C(0x100000000) - address;
@@ -316,7 +334,7 @@ void *guest_memory_try_ptr(uint32_t address, size_t width)
         }
     }
     AC1_PROFILE_SCAN(1);
-    return NULL;
+    return ac1_direct_span(i, address, end);
 }
 int guest_memory_read(uint32_t address, void *output, size_t width)
 {
@@ -327,7 +345,8 @@ int guest_memory_read(uint32_t address, void *output, size_t width)
 
 /* CPU scalar accesses can cross adjacent guest mappings whose host backing
  * allocations are unrelated. Validate the full guest span first, then copy
- * it in per-region chunks. Raw guest_ptr intentionally remains one-region. */
+ * it in per-region chunks. Raw pointers cross adjacent regions only in the
+ * direct arena, whose backing is contiguous (ac1_direct_span). */
 static guest_memory_region_t *scalar_region_at(uint64_t address)
 {
     if (!selected_memory || address >= UINT64_C(0x100000000)) return NULL;
@@ -462,6 +481,8 @@ void *guest_ptr(uint32_t address, size_t width)
                 return region->data + (size_t)(address - region->base);
             }
         }
+        void *span = ac1_direct_span(floor, address, end);
+        if (span) return span;
     }
     /* Zero width (adjacent-mapping preference) and misses keep the scan. */
     for (i = 0; i < current_memory.count; ++i) {

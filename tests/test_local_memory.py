@@ -91,7 +91,10 @@ class LocalMemoryTests(unittest.TestCase):
         subprocess.run(common+objects+[str(ROOT/'tests/local_memory_oracle.c'),str(runtime/'guest_memory.c'),'-lm','-o',str(exe)],check=True,capture_output=True,timeout=60)
         run=subprocess.run([str(exe)],check=True,capture_output=True,text=True,timeout=60)
         self.assertIn('4096 full CPU/memory cases passed',run.stdout)
-        for address,reason in [('0x8ff9','unaligned atomic'),('0x8fff','outside mapped range')]:
+        # The direct arena maps 0x8fff..0x9002 across the adjacent pages, so
+        # only alignment rejects it; 0x9ffe runs past the last mapping.
+        for address,reason in [('0x8ff9','unaligned atomic'),('0x8fff','unaligned atomic'),
+                               ('0x9ffe','outside mapped range')]:
             for operation in range(3):
                 failures=[subprocess.run([str(exe),str(local),str(operation),address],capture_output=True,text=True,timeout=30) for local in (0,1)]
                 self.assertTrue(all(result.returncode!=0 for result in failures))

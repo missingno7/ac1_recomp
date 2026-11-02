@@ -37,7 +37,9 @@ static void span_contract(int direct, int expect_rejection)
     /* Reverse insertion exercises the sorted-region transform. */
     CHECK(guest_memory_allocate(0x25750000u, 0x10000u));
     CHECK(guest_memory_allocate(0x25740000u, 0x10000u));
-    CHECK(!guest_memory_try_ptr(section_address, 24u));
+    /* Only the direct arena backs both regions with one host range. */
+    uint8_t *span = guest_memory_try_ptr(section_address, 24u);
+    CHECK(direct ? span == (uint8_t *)guest_memory_try_ptr(0x25740000u, 1u) + 0xfff0u : !span);
     for (unsigned i = 0; i < 24u; i += 4u) wr32(section_address + i, 0xa5a5a5a5u);
     int initialized = call_section("InitializeCriticalSectionAndSpinCount", section_address);
     if (expect_rejection) {

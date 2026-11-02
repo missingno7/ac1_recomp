@@ -75,6 +75,11 @@ static void *guest_memory_try_ptr(uint32_t p, size_t n)
 {
     return p && (uint64_t)p + n <= sizeof(memory) ? memory + p : NULL;
 }
+static void ac1_guest_memory_dump_span(uint32_t address, size_t width)
+{
+    (void)address;
+    (void)width;
+}
 static uint32_t rd32(uint32_t p)
 {
     uint32_t n;

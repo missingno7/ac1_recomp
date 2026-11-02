@@ -69,8 +69,10 @@ established for that experimental pointer corruption.
 ## Mapping and concurrency audit
 
 The sorted-region transform in `tools/prepare_runtime.py` maintains disjoint
-regions. Binary search selects the only region that can contain a whole raw
-pointer span; it intentionally rejects a span across adjacent regions. Lookup
+regions. Binary search selects the floor region for a raw pointer span. Since
+2026-11-02 the direct arena also accepts a span over exactly adjacent regions,
+whose backing is one host range (the first autosave's 64 KiB `WriteFile`
+chunk crossed one); checked memory still rejects such spans. Lookup
 cache entries copy region records, so sorted insertion does not invalidate
 their backing pointers. Removal invalidates the cache.
 
