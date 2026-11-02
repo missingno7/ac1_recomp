@@ -391,14 +391,15 @@ public final class LauncherActivity extends Activity {
     }
 
     /** While the guest runs, the surface owns the whole display: launcher views and system bars hide. */
-    /** Diagnostic runtime settings from `--es env "AC1_X=1,DXVK_Y=2"`; only AC1_ and DXVK_ keys. */
+    /** Diagnostic runtime settings from `--es env "AC1_X=1,DXVK_Y=2"`; only AC1_, DXVK_ and
+     * TU_ (in-app Turnip, e.g. TU_DEBUG=sysmem) keys. */
     private void applyEnvironment(String settings) throws Exception {
         if (settings == null || settings.isEmpty()) return;
         for (String setting : settings.split(",")) {
             int split = setting.indexOf('=');
             String key = split > 0 ? setting.substring(0, split) : "";
-            if (!key.matches("(AC1|DXVK)_[A-Z0-9_]+"))
-                throw new IllegalArgumentException("env accepts AC1_/DXVK_ KEY=VALUE pairs: " + setting);
+            if (!key.matches("(AC1|DXVK|TU)_[A-Z0-9_]+"))
+                throw new IllegalArgumentException("env accepts AC1_/DXVK_/TU_ KEY=VALUE pairs: " + setting);
             String value = setting.substring(split + 1);
             if (key.equals("AC1_FRAME_STATS") && value.startsWith("private:")) {
                 String name = value.substring("private:".length());
