@@ -178,11 +178,15 @@ static uint32_t wc_errno(void)
 #endif
 static int wc_resolve(const char *guest, char *host, int writing, int missing)
 {
-    char root[32768];
+    char root[32768], path[32768];
     if (!get_user_data_root(root, sizeof(root)))
         root[0] = 0;
+    if (!userdata_host_path(guest, path, sizeof(path))) {
+        last_error = 206;
+        return 0;
+    }
     uint32_t error;
-    int ok = ac1_files_resolve(guest_files, root, guest, writing, missing, host, 32768, &error);
+    int ok = ac1_files_resolve(guest_files, root, path, writing, missing, host, 32768, &error);
     if (!ok)
         last_error = error;
     return ok;
@@ -521,9 +525,10 @@ static int wc_file_import(CPU *cpu, const import_record *import, wc_state *s)
 #define IS(n) (!strcmp(import->name, n))
 #define RET(v, n) return wc_return(cpu, (uint32_t)(v), n)
     if (IS("CreateFileA")) {
-        char path[32768], root[32768];
+        char path[32768], root[32768], host[32768];
         wc_string(A(1), path, sizeof(path), import);
-        if (!get_user_data_root(root, sizeof(root)) || !profile_path_is_in_userdata(path))
+        if (!get_user_data_root(root, sizeof(root)) || !userdata_host_path(path, host, sizeof(host)) ||
+            !profile_path_is_in_userdata(host))
             return 0;
         uint32_t handle = UINT32_MAX;
         /* The CRT's _sopen passes SECURITY_ATTRIBUTES {12, NULL descriptor,
@@ -536,7 +541,7 @@ static int wc_file_import(CPU *cpu, const import_record *import, wc_state *s)
         if (A(7))
             stop_guest("userdata CreateFileA template unsupported", import->token);
         uint32_t error;
-        int ok = ac1_files_open_userdata(guest_files, root, path, A(2), A(3), A(5), A(6), &handle,
+        int ok = ac1_files_open_userdata(guest_files, root, host, A(2), A(3), A(5), A(6), &handle,
                                          &error);
         if (trace_imports) {
             fprintf(stderr,
@@ -828,8 +833,8 @@ static int wc_file_import(CPU *cpu, const import_record *import, wc_state *s)
     }
     if (IS("GetTempPathA")) {
         char root[32768], path[32768];
-        if (!get_user_data_root(root, sizeof(root)) ||
-            snprintf(path, sizeof(path), "%s/temp", root) >= (int)sizeof(path) - 1) {
+        if (!guest_user_data_root(root, sizeof(root)) ||
+            snprintf(path, sizeof(path), "%s%stemp", root, guest_separator) >= (int)sizeof(path) - 1) {
             last_error = 5;
             RET(0, 2);
         }
@@ -842,11 +847,7 @@ static int wc_file_import(CPU *cpu, const import_record *import, wc_state *s)
         }
         if (!wc_resolve(path, checked, 1, 0))
             RET(0, 2);
-#ifdef _WIN32
-        strcat(path, "\\");
-#else
-        strcat(path, "/");
-#endif
+        strcat(path, guest_separator);
         size_t n = strlen(path);
         if (A(1) <= n)
             RET(n + 1, 2);

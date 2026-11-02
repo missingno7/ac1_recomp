@@ -65,6 +65,8 @@ static char bink_module_path[32768], exe_path_copy[32768], guest_current_directo
 static unsigned char memory[4 * 1024 * 1024];
 static uint32_t next_heap = 0x200000, allocs[4096];
 static unsigned alloc_count;
+static int trace_imports;
+static _Thread_local unsigned trace_import_window;
 static jmp_buf trap;
 static char trap_reason[512];
 static unsigned callback_count;
@@ -156,6 +158,21 @@ static int profile_path_is_in_userdata(const char *p)
 {
     size_t n = strlen(userdata);
     return !_strnicmp(p, userdata, n) && (p[n] == '/' || p[n] == '\\');
+}
+/* As in the Windows runtime: the guest sees the host root with backslashes. */
+static const char guest_separator[] = "\\";
+static int guest_user_data_root(char *out, size_t cap)
+{
+    if (snprintf(out, cap, "%s", userdata) <= 0)
+        return 0;
+    for (char *p = out; *p; ++p)
+        if (*p == '/')
+            *p = '\\';
+    return 1;
+}
+static int userdata_host_path(const char *guest, char *out, size_t cap)
+{
+    return strlen(guest) < cap && snprintf(out, cap, "%s", guest) >= 0;
 }
 static int profile_path_is_absolute(const char *p)
 {
@@ -517,7 +534,9 @@ static void test_files(const char *root)
     CHECK(needed > 1);
     CHECK(K("GetTempPathA", 2, 1024u, 0x1800u) == needed - 1);
     strcpy(temp, (char *)memory + 0x1800);
-    CHECK(strstr(temp, userdata) == temp);
+    char guest_root[32768];
+    CHECK(guest_user_data_root(guest_root, sizeof(guest_root)));
+    CHECK(strstr(temp, guest_root) == temp && !strchr(temp, '/'));
     CHECK(GetFileAttributesA(temp) & FILE_ATTRIBUTE_DIRECTORY);
     CHECK(K("GetDriveTypeA", 1, 0u) == DRIVE_FIXED);
     /* Every install mutation fails, including destination of copy/move. */

@@ -1193,6 +1193,74 @@ static int get_user_data_root(char *output, size_t capacity)
 #endif
 }
 
+/* The game's own file system resolves a path through devices registered for
+ * its logical drives ("C:\") and UNC ("\\") prefixes, and silently skips a save
+ * whose folder no device matches (0x0098AEFC). So the guest sees userdata on a
+ * drive: Windows shows the host root with backslashes, Android shows
+ * C:\AC1Data on its only drive, beside the read-only C:\AC1. */
+#ifdef __ANDROID__
+static const char android_guest_user_data_root[] = "C:\\AC1Data";
+#endif
+#if defined(_WIN32) || defined(__ANDROID__)
+static const char guest_separator[] = "\\";
+#else
+static const char guest_separator[] = "/";
+#endif
+
+static int guest_user_data_root(char *output, size_t capacity)
+{
+#ifdef __ANDROID__
+    if (capacity < sizeof(android_guest_user_data_root)) return 0;
+    memcpy(output, android_guest_user_data_root, sizeof(android_guest_user_data_root));
+    return 1;
+#else
+    if (!get_user_data_root(output, capacity)) return 0;
+#ifdef _WIN32
+    for (char *cursor = output; *cursor; ++cursor)
+        if (*cursor == '/') *cursor = '\\';
+#endif
+    return 1;
+#endif
+}
+
+/* Case- and separator-insensitive: path is root itself or below it. */
+static int path_is_below_root(const char *path, const char *root)
+{
+    size_t n = strlen(root);
+    while (n > 1u && (root[n - 1u] == '/' || root[n - 1u] == '\\')) --n;
+    for (size_t i = 0u; i < n; ++i) {
+        unsigned char a = (unsigned char)path[i], b = (unsigned char)root[i];
+        if (!a) return 0;
+        if (a == '\\') a = '/';
+        if (b == '\\') b = '/';
+        if (a >= 'A' && a <= 'Z') a = (unsigned char)(a + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = (unsigned char)(b + ('a' - 'A'));
+        if (a != b) return 0;
+    }
+    return !path[n] || path[n] == '/' || path[n] == '\\';
+}
+
+/* Host path for a guest path below the Android guest userdata root; every
+ * other path is copied unchanged for the existing resolvers to check. */
+static int userdata_host_path(const char *guest_path, char *output, size_t capacity)
+{
+    size_t length = strlen(guest_path);
+#ifdef __ANDROID__
+    if (path_is_below_root(guest_path, android_guest_user_data_root)) {
+        char root[32768];
+        if (!get_user_data_root(root, sizeof(root))) return 0;
+        int written = snprintf(output, capacity, "%s%s", root,
+                               guest_path + sizeof(android_guest_user_data_root) - 1u);
+        if (written < 0 || (size_t)written >= capacity) return 0;
+        host_path_separators(output);
+        return 1;
+    }
+#endif
+    if (length >= capacity) return 0;
+    memcpy(output, guest_path, length + 1u);
+    return 1;
+}
+
 #ifdef _WIN32
 extern char **_environ;
 #else
@@ -3141,9 +3209,8 @@ static int android_guest_path_is_root(const char *path)
     return equal_ascii_fold(normalized, guest_current_directory);
 }
 
-/* Maps guest paths under C:\\AC1 to the imported host game folder. POSIX
- * absolute paths, notably the app-private userdata paths returned by the
- * special-folder shim, remain host-native. */
+/* Maps guest paths under C:\\AC1 to the imported host game folder. Userdata
+ * is C:\\AC1Data (userdata_host_path); POSIX absolute paths remain host-native. */
 static int android_guest_path_to_game_relative(const char *guest_path,
                                                char *relative_path,
                                                size_t capacity)
@@ -3183,6 +3250,8 @@ static int resolve_profile_path(const char *guest_path, char *host_path, size_t 
 {
     if (!guest_path || !*guest_path || !host_path || !capacity) return 0;
 #ifdef __ANDROID__
+    if (path_is_below_root(guest_path, android_guest_user_data_root))
+        return userdata_host_path(guest_path, host_path, capacity);
     if (guest_path[0] == '/') {
         int written = snprintf(host_path, capacity, "%s", guest_path);
         if (written < 0 || (size_t)written >= capacity) return 0;
@@ -4516,21 +4585,13 @@ static int handle_shell_import(CPU *cpu, const import_record *import)
         }
         if (length + 1u >= sizeof(path))
             stop_guest("SHCreateDirectoryExA path is too long", import->token);
-        char root[32768];
-        if (!get_user_data_root(root, sizeof(root))) {
+        char root[32768], host[32768];
+        if (!guest_user_data_root(root, sizeof(root))) {
             cpu->eax = 3u;
             return_stdcall(cpu, 12u);
             return 1;
         }
-        size_t root_length = strlen(root);
-        int in_root = length >= root_length;
-        for (size_t i = 0; in_root && i < root_length; ++i) {
-            unsigned char a = (unsigned char)path[i], b = (unsigned char)root[i];
-            if (a >= 'A' && a <= 'Z') a = (unsigned char)(a + ('a' - 'A'));
-            if (b >= 'A' && b <= 'Z') b = (unsigned char)(b + ('a' - 'A'));
-            if (a != b) in_root = 0;
-        }
-        in_root = in_root && (length == root_length || path[root_length] == '/' || path[root_length] == '\\');
+        int in_root = path_is_below_root(path, root);
         for (size_t i = 0; in_root && i + 1u < length; ++i) {
             if ((path[i] == '.' && path[i + 1u] == '.') &&
                 (i == 0u || path[i - 1u] == '/' || path[i - 1u] == '\\') &&
@@ -4538,8 +4599,9 @@ static int handle_shell_import(CPU *cpu, const import_record *import)
                 in_root = 0;
         }
         if (!in_root) cpu->eax = 5u; /* ERROR_ACCESS_DENIED: never create beside the game. */
-        else if (directory_exists(path)) cpu->eax = 183u; /* ERROR_ALREADY_EXISTS */
-        else if (ensure_directory_tree(path)) cpu->eax = 0u;
+        else if (!userdata_host_path(path, host, sizeof(host))) cpu->eax = 206u;
+        else if (directory_exists(host)) cpu->eax = 183u; /* ERROR_ALREADY_EXISTS */
+        else if (ensure_directory_tree(host)) cpu->eax = 0u;
         else cpu->eax = 5u;
         return_stdcall(cpu, 12u);
         return 1;
@@ -4562,7 +4624,8 @@ static int handle_shell_import(CPU *cpu, const import_record *import)
     }
     char root[32768];
     char path[32768];
-    if (!get_user_data_root(root, sizeof(root))) {
+    char host[32768];
+    if (!guest_user_data_root(root, sizeof(root))) {
         cpu->eax = 0u;
         last_error = 3u;
         return_stdcall(cpu, 16u);
@@ -4570,7 +4633,8 @@ static int handle_shell_import(CPU *cpu, const import_record *import)
     }
     size_t root_length = strlen(root);
     int separator = root_length && root[root_length - 1u] != '/' && root[root_length - 1u] != '\\';
-    int written = snprintf(path, sizeof(path), "%s%s%s", root, separator ? "/" : "", subdirectory);
+    int written = snprintf(path, sizeof(path), "%s%s%s", root, separator ? guest_separator : "",
+                           subdirectory);
     if (written < 0 || (size_t)written >= sizeof(path) || (size_t)written >= 260u) {
         cpu->eax = 0u;
         last_error = 206u; /* ERROR_FILENAME_EXCED_RANGE */
@@ -4579,7 +4643,7 @@ static int handle_shell_import(CPU *cpu, const import_record *import)
     }
     char *output = (char *)guest_memory_try_ptr(output_address, 260u);
     if (!output) stop_guest("SHGetSpecialFolderPathA output is unmapped", import->token);
-    if (create && !ensure_directory_tree(path)) {
+    if (create && (!userdata_host_path(path, host, sizeof(host)) || !ensure_directory_tree(host))) {
         cpu->eax = 0u;
         last_error = 5u;
     } else {
