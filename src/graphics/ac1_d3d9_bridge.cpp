@@ -48,6 +48,7 @@ using D3DXMATRIX = ac1_d3dx::Matrix;
 #include <chrono>
 #include <mutex>
 #include <array>
+#include <thread>
 
 #if defined(_WIN32)
 #include <processthreadsapi.h>
@@ -514,6 +515,44 @@ void *g_context = nullptr;
 // stay valid across rehashing; only shutdown walks them, in address order.
 std::unordered_map<uint32_t, GuestObject> g_objects;
 std::unordered_map<IUnknown *, uint32_t> g_guest_by_native;
+// Direct-mapped front for g_objects: a call looks its object and its object
+// arguments up several times (validation, then marshalling), thousands of
+// calls per frame. Element pointers stay valid until erase, which goes
+// through erase_object and drops the matching entry. An object's kind never
+// changes, so a hit checks it here without touching the map node.
+struct ObjectCacheEntry {
+    uint32_t address = 0;
+    ObjectKind kind{};
+    GuestObject *object = nullptr;
+};
+std::array<ObjectCacheEntry, 4096> g_object_cache{};
+
+ObjectCacheEntry &object_cache_entry(uint32_t address)
+{
+    return g_object_cache[(address * 2654435761u) >> 20];
+}
+
+void erase_object(uint32_t address)
+{
+    ObjectCacheEntry &entry = object_cache_entry(address);
+    if (entry.address == address) entry = {};
+    g_objects.erase(address);
+}
+// Entry points run on guest threads, which the scheduler baton serializes,
+// so this lock is uncontended; it only guards against misuse. An acquire
+// exchange and a release store are one atomic read-modify-write per call
+// where pthread_mutex_lock and unlock are two.
+class BridgeLock {
+public:
+    void lock()
+    {
+        while (held_.exchange(true, std::memory_order_acquire)) std::this_thread::yield();
+    }
+    void unlock() { held_.store(false, std::memory_order_release); }
+
+private:
+    std::atomic<bool> held_{false};
+};
 struct GuestConstantHandle {
     uint32_t table = 0;
     const char *native = nullptr;
@@ -521,7 +560,7 @@ struct GuestConstantHandle {
 std::map<uint32_t, std::vector<uint32_t>> g_constant_table_allocations;
 std::map<uint32_t, GuestConstantHandle> g_constant_handles;
 std::map<std::pair<uint32_t, uintptr_t>, uint32_t> g_guest_handle_by_native;
-std::mutex g_mutex;
+BridgeLock g_mutex;
 uint64_t g_successful_draw_calls = 0;
 std::atomic<uint64_t> g_successful_present_calls{0};
 std::atomic<uint64_t> g_state_epoch{1};
@@ -617,11 +656,14 @@ void capture_back_buffer(IDirect3DDevice9 *device)
 
 void trace_frame_success(bool is_present, const char *method)
 {
-    // Replay uses this clock on every platform, independently of frame tracing.
+    // Replay uses this clock on every platform, independently of frame tracing;
+    // frame statistics count draws on every platform too.
     if (is_present) {
         g_successful_present_calls.fetch_add(1, std::memory_order_relaxed);
         g_frame_stats.present();
         ac1_guest_time_present();
+    } else {
+        ++g_successful_draw_calls;
     }
 #ifdef AC1_PROFILE_HOOKS
     if (is_present && ac1_profile_frames_enabled) ac1_profile_present();
@@ -652,7 +694,6 @@ void trace_frame_success(bool is_present, const char *method)
             g_first_present_reported = true;
         }
     } else {
-        ++g_successful_draw_calls;
         if (!g_first_draw_reported) {
             std::fprintf(stderr,
                 "AC1 D3D9 trace: first successful draw via %s (draw_calls=%llu)\n",
@@ -1008,9 +1049,13 @@ uint32_t wrap_native(IUnknown *native, ObjectKind kind, bool acquired_reference)
 
 GuestObject *find_object(uint32_t address, ObjectKind expected)
 {
-    auto it = g_objects.find(address);
-    if (it == g_objects.end() || it->second.kind != expected) return nullptr;
-    return &it->second;
+    ObjectCacheEntry &entry = object_cache_entry(address);
+    if (entry.address != address || !entry.object) {
+        auto it = g_objects.find(address);
+        if (it == g_objects.end()) return nullptr;
+        entry = {address, it->second.kind, &it->second};
+    }
+    return entry.kind == expected ? entry.object : nullptr;
 }
 
 uint32_t hresult(HRESULT value)
@@ -1259,7 +1304,7 @@ HRESULT do_query_interface(GuestObject &object, const uint32_t *args,
                 else {
                     GuestObject retired = it->second;
                     g_guest_by_native.erase(retired.native);
-                    g_objects.erase(it);
+                    erase_object(guest_output);
                     free_guest_object(guest_output, retired);
                 }
             }
@@ -1407,7 +1452,7 @@ HRESULT create_device(IDirect3D9 *d3d, const uint32_t *args)
             wrapped->native->Release();
             GuestObject retired = *wrapped;
             g_guest_by_native.erase(retired.native);
-            g_objects.erase(guest_device);
+            erase_object(guest_device);
             free_guest_object(guest_device, retired);
         }
         set_error("CreateDevice output pointer became unmapped");
@@ -2097,7 +2142,7 @@ uint32_t invoke_constant_table(GuestObject &object, uint32_t method,
             release_constant_table_allocations(guest_address);
             GuestObject retired = object;
             g_guest_by_native.erase(native);
-            g_objects.erase(guest_address);
+            erase_object(guest_address);
             free_guest_object(guest_address, retired);
         }
         return guest_count;
@@ -2212,7 +2257,7 @@ uint32_t invoke_d3d9(GuestObject &object, uint32_t method,
             if (guest_count == 0) {
                 GuestObject retired = object;
                 g_guest_by_native.erase(native);
-                g_objects.erase(guest_address);
+                erase_object(guest_address);
                 free_guest_object(guest_address, retired);
             }
             return guest_count;
@@ -2762,7 +2807,7 @@ uint32_t invoke_device(GuestObject &object, uint32_t method,
         if (guest_count == 0) {
             GuestObject retired = object;
             g_guest_by_native.erase(native);
-            g_objects.erase(guest_address);
+            erase_object(guest_address);
             free_guest_object(guest_address, retired);
         }
         return guest_count;
@@ -3442,7 +3487,7 @@ uint32_t invoke_buffer(GuestObject &object, uint32_t method,
         if (!guest_count) {
             GuestObject retired = object;
             g_guest_by_native.erase(native);
-            g_objects.erase(guest_address);
+            erase_object(guest_address);
             free_guest_object(guest_address, retired);
         }
         return guest_count;
@@ -3484,7 +3529,7 @@ uint32_t invoke_query(GuestObject &object, uint32_t method,
         if (!guest_count) {
             GuestObject retired = object;
             g_guest_by_native.erase(native);
-            g_objects.erase(guest_address);
+            erase_object(guest_address);
             free_guest_object(guest_address, retired);
         }
         return guest_count;
@@ -3549,7 +3594,7 @@ uint32_t invoke_vertex_declaration(GuestObject &object, uint32_t method,
         if (!guest_count) {
             GuestObject retired = object;
             g_guest_by_native.erase(native);
-            g_objects.erase(guest_address);
+            erase_object(guest_address);
             free_guest_object(guest_address, retired);
         }
         return guest_count;
@@ -3995,7 +4040,7 @@ uint32_t invoke_unknown(GuestObject &object, uint32_t method, const uint32_t *a)
     if (!native_refs) g_private_interfaces.erase(native);
     if (!refs) {
         const GuestObject retired = object;
-        g_guest_by_native.erase(native); g_objects.erase(a[0]); free_guest_object(a[0],retired);
+        g_guest_by_native.erase(native); erase_object(a[0]); free_guest_object(a[0],retired);
     }
     return refs;
 }
@@ -4005,7 +4050,7 @@ uint32_t invoke_unknown(GuestObject &object, uint32_t method, const uint32_t *a)
 extern "C" AC1_D3D9_API int ac1_d3d9_configure(
     const ac1_d3d9_callbacks *callbacks, void *context)
 {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<BridgeLock> lock(g_mutex);
     clear_error();
     if (!callbacks || callbacks->struct_size < sizeof(ac1_d3d9_callbacks) ||
         !callbacks->guest_resolve || !callbacks->guest_alloc || !callbacks->guest_free) {
@@ -4023,7 +4068,7 @@ extern "C" AC1_D3D9_API int ac1_d3d9_configure(
 
 extern "C" AC1_D3D9_API uint32_t ac1_d3d9_create9(uint32_t sdk_version)
 {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<BridgeLock> lock(g_mutex);
     clear_error();
     if (!g_callbacks.guest_resolve || !g_callbacks.guest_alloc || !g_callbacks.guest_free) {
         set_error("configure guest memory callbacks before Direct3DCreate9");
@@ -4074,7 +4119,7 @@ extern "C" AC1_D3D9_API int ac1_d3d9_check_texture_requirements(
         return -1;
     }
     *native_hresult_out = 0;
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<BridgeLock> lock(g_mutex);
     clear_error();
     GuestObject *device_object = find_object(guest_device, ObjectKind::Device);
     if (!device_object) {
@@ -4154,7 +4199,7 @@ extern "C" AC1_D3D9_API int ac1_d3d9_get_shader_constant_table(
         return -1;
     }
     *native_hresult_out = 0;
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<BridgeLock> lock(g_mutex);
     clear_error();
     if (!guest_output ||
         !guest_memory(guest_output, sizeof(uint32_t), AC1_D3D9_GUEST_WRITE)) {
@@ -4205,7 +4250,7 @@ extern "C" AC1_D3D9_API int ac1_d3d9_get_shader_constant_table(
             wrapped->native->Release();
             GuestObject retired = *wrapped;
             g_guest_by_native.erase(retired.native);
-            g_objects.erase(guest_table);
+            erase_object(guest_table);
             free_guest_object(guest_table, retired);
         }
         *native_hresult_out = hresult(D3DERR_INVALIDCALL);
@@ -4224,14 +4269,14 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
     const int expected_arguments = token_argument_count(token);
     if (expected_arguments == 0) return 0;
     if (expected_arguments == -2) {
-        std::lock_guard<std::mutex> lock(g_mutex);
+        std::lock_guard<BridgeLock> lock(g_mutex);
         std::ostringstream message;
         message << "COM token 0x" << std::hex << token << " names an unsupported method";
         set_error(message.str());
         return -2;
     }
     if (expected_arguments < 0) {
-        std::lock_guard<std::mutex> lock(g_mutex);
+        std::lock_guard<BridgeLock> lock(g_mutex);
         set_error("malformed D3D9 method token or slot");
         return -1;
     }
@@ -4240,7 +4285,7 @@ extern "C" AC1_D3D9_API int ac1_d3d9_dispatch(uint32_t token,
         return -1;
     }
 
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<BridgeLock> lock(g_mutex);
     clear_error();
     const uint32_t offset = token - kTokenBase;
     const uint32_t kind = offset / kKindStride;
@@ -4414,7 +4459,7 @@ extern "C" AC1_D3D9_API int ac1_d3d9_argument_count(uint32_t token)
 
 extern "C" AC1_D3D9_API void ac1_d3d9_shutdown(void)
 {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<BridgeLock> lock(g_mutex);
     std::vector<uint32_t> addresses;   // release in guest-address order
     addresses.reserve(g_objects.size());
     for (const auto &entry : g_objects) addresses.push_back(entry.first);
@@ -4436,6 +4481,7 @@ extern "C" AC1_D3D9_API void ac1_d3d9_shutdown(void)
         free_guest_object(address, object);
     }
     g_objects.clear();
+    g_object_cache.fill({});
     g_staged_locks.clear();
     g_private_interfaces.clear();
     g_guest_by_native.clear();
