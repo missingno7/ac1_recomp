@@ -31,8 +31,12 @@ final class Ac1ControllerView extends View {
     private RectF camera;
     private boolean active, hidden, popup, rtLocked;
     private float moveX, moveY, originX, originY, cameraX, cameraY;
+    private final android.graphics.Typeface typeface = android.graphics.Typeface.create("sans-serif-medium",0);
+    // Touch events arrive at the panel's sampling rate; camera swipes change no pixels.
+    private long drawnKey = Long.MIN_VALUE;
     private static final class Control {
         String id, label; float x, y, r;
+        String sizedSymbol; float sizedUnit, textSize; // label size fitted to this unit
         Control(JSONObject j) throws Exception {
             id=j.getString("id"); label=j.getString("label");
             x=bounded(j.getDouble("x"),0,1); y=bounded(j.getDouble("y"),0,1);
@@ -120,7 +124,16 @@ final class Ac1ControllerView extends View {
     private void publish(){
         int buttons=0,lt=0,rt=rtLocked?255:0;
         if(!hidden)for(int i=0;i<fingers.size();i++){String r=fingers.valueAt(i).role;buttons|=bit(r);if(r.equals("LT"))lt=255;if(r.equals("RT"))rt=255;}
-        sink.state(active&&!hidden,buttons,lt,rt,raw(moveX),raw(-moveY),raw(cameraX),raw(-cameraY));invalidate();
+        sink.state(active&&!hidden,buttons,lt,rt,raw(moveX),raw(-moveY),raw(cameraX),raw(-cameraY));
+        long key=visualKey();if(key!=drawnKey){drawnKey=key;invalidate();}
+    }
+    /** Everything onDraw shows besides the layout; the stick knob to 1/256 of its radius. */
+    private long visualKey(){
+        long key=(active?1:0)|(hidden?2:0)|(popup?4:0)|(rtLocked?8:0);
+        for(int i=0;i<fingers.size();i++)key=key*31+fingers.valueAt(i).role.hashCode();
+        if(owned("move"))key=((key*31+Float.floatToIntBits(originX))*31+Float.floatToIntBits(originY))*31
+            +Math.round(moveX*256)*1024+Math.round(moveY*256);
+        return key;
     }
     private static int raw(float v){v=Math.max(-1,Math.min(1,v));return Math.round(v*(v<0?32768:32767));}
     private final Runnable cameraIdle=()->{cameraX=cameraY=0;publish();};
@@ -167,7 +180,7 @@ final class Ac1ControllerView extends View {
     private void toggleHidden(){clear();hidden=!hidden;getContext().getSharedPreferences("controller",0).edit().putBoolean("hidden",hidden).apply();publish();}
     @Override protected void onDraw(Canvas canvas){
         super.onDraw(canvas);if(!active||safe.isEmpty())return;
-        paint.setTextAlign(Paint.Align.CENTER);paint.setTypeface(android.graphics.Typeface.create("sans-serif-medium",0));
+        paint.setTextAlign(Paint.Align.CENTER);paint.setTypeface(typeface);
         for(Control c:controls)if(!hidden||c.id.equals("hide"))drawControl(canvas,c);
         if(!hidden&&popup)for(Control c:weapons)drawControl(canvas,c);
         if(!hidden){
@@ -183,9 +196,13 @@ final class Ac1ControllerView extends View {
         paint.setStyle(Paint.Style.STROKE);paint.setStrokeWidth(unit()*0.0015f);paint.setColor(Color.argb((int)(opacity*255),210,225,235));canvas.drawCircle(cx,cy,radius,paint);paint.setStyle(Paint.Style.FILL);
         if(c.id.equals("move")){canvas.drawCircle(cx+moveX*radius,cy+moveY*radius,radius*0.33f,paint);}
         else{
-            paint.setTextSize(unit()*(c.r<0.04?0.019f:0.025f));
             String symbol=c.id.equals("hide")?(hidden?"Show pad":"Hide pad"):c.label;
-            if(paint.measureText(symbol)>radius*1.75f)paint.setTextSize(paint.getTextSize()*radius*1.75f/paint.measureText(symbol));
+            if(!symbol.equals(c.sizedSymbol)||unit()!=c.sizedUnit){
+                paint.setTextSize(unit()*(c.r<0.04?0.019f:0.025f));
+                if(paint.measureText(symbol)>radius*1.75f)paint.setTextSize(paint.getTextSize()*radius*1.75f/paint.measureText(symbol));
+                c.sizedSymbol=symbol;c.sizedUnit=unit();c.textSize=paint.getTextSize();
+            }
+            paint.setTextSize(c.textSize);
             canvas.drawText(symbol,cx,cy+paint.getTextSize()*0.34f,paint);
             if("ABXY".contains(c.id)&&c.id.length()==1){
                 paint.setTextSize(unit()*0.025f);canvas.drawText(c.id,cx,cy-radius*0.42f,paint);
