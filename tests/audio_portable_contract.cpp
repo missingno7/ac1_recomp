@@ -370,6 +370,34 @@ void spatial() {
     assert(call(spatial, 2) == 0);
     close_buffer(b);
 }
+// DARE pools voice buffers by pointer: a voice queries IDirectSoundBuffer8 and
+// IDirectSound3DBuffer from a pooled buffer, then its creator releases the
+// pointer it started with. DirectSound answers with pointers it already handed
+// out, so every release lands on the live pooled object.
+void identity() {
+    const uint32_t kind5 = AC1_DS8_TOKEN_BASE + 5 * 0x1000, kind3 = AC1_DS8_TOKEN_BASE + 3 * 0x1000;
+    uint32_t pooled = buffer(1000, 1, 16, 4, 0x90);
+    assert(get(get(pooled)) == kind5);
+    assert(qi(pooled, {0x6825a449, 0x4d827524, 0xe3500f92, 0x1eabb36a}) == pooled);
+    assert(qi(pooled, {0x279afa85, 0x11ce4981, 0x200021a5, 0x60e50baf}) == pooled);
+    uint32_t spatial = qi(pooled, {0x279afa86, 0x11ce4981, 0x200021a5, 0x60e50baf});
+    assert(qi(pooled, {0x279afa86, 0x11ce4981, 0x200021a5, 0x60e50baf}) == spatial);
+    assert(qi(spatial, {0x279afa85, 0x11ce4981, 0x200021a5, 0x60e50baf}) == pooled);
+    assert(call(pooled, 2) == 3 && call(pooled, 2) == 2 && call(pooled, 2) == 1);
+    assert(call(spatial, 2) == 1 && call(spatial, 2) == 0);
+    assert(!call(pooled, 9, {out}));
+    uint32_t duplicate = (assert(!call(dev, 5, {pooled, out})), get(out));
+    assert(duplicate != pooled && get(get(duplicate)) == kind5);
+    close_buffer(duplicate);
+    close_buffer(pooled);
+    // Only secondary buffers are IDirectSoundBuffer8 objects.
+    assert(!call(dev, 3, {data({36, 0x11, 0, 0, 0, 0, 0, 0, 0}), out, 0}));
+    uint32_t primary = get(out);
+    assert(get(get(primary)) == kind3);
+    assert(call(primary, 0, {data({0x6825a449, 0x4d827524, 0xe3500f92, 0x1eabb36a}), out}) ==
+               0x80004002u && !get(out));
+    close_buffer(primary);
+}
 void bink() {
     int16_t pcm[] = {0, 16384, 0, -16384};
     assert(ac1_audio_bink_submit(1, 10, pcm, 4, 500, 1, 0));
@@ -599,6 +627,7 @@ int main() {
     mixing();
     voice_registry();
     spatial();
+    identity();
     bink();
     unsupported();
     concurrency_and_fallback();

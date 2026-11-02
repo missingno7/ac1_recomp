@@ -115,8 +115,9 @@ static void sound() {
     uint32_t effects_args[] = {deferred8, 0, 1, out}, effects_hr = 0;
     assert(ac1_ds8_dispatch(get(get(deferred8) + 22 * 4), effects_args, 4, &effects_hr) < 0);
     assert(std::strstr(ac1_ds8_last_error(), "zero effects"));
-    assert(call(true, deferred8, 2) == 0 && call(true, deferred, 2) == 0);
-    assert(call(true, buffer8, 2) == 0);
+    // A secondary buffer is its own IDirectSoundBuffer8: one object, two references.
+    assert(deferred8 == deferred && call(true, deferred8, 2) == 1 && call(true, deferred, 2) == 0);
+    assert(buffer8 == b && call(true, buffer8, 2) == 1);
     uint32_t io = alloc(nullptr, 32, 4);
     assert(!call(true, b, 11, {1996, 8, io, io + 4, io + 8, io + 12, 0}));
     assert(get(io + 4) == 4 && get(io + 12) == 4);

@@ -423,6 +423,26 @@ uint32_t wrap_native(IUnknown *native, ObjectKind kind)
     return address;
 }
 
+/* A proxy's vtable serves its own interface, IUnknown, and for
+ * IDirectSoundBuffer8 also the IDirectSoundBuffer prefix it extends. */
+bool kind_serves(ObjectKind have, ObjectKind want)
+{
+    return have == want || want == ObjectKind::Unknown ||
+           (have == ObjectKind::Buffer8 && want == ObjectKind::Buffer);
+}
+
+/* Secondary buffers are IDirectSoundBuffer8 objects from creation (the same
+ * native pointer); only the primary buffer lacks that interface. */
+uint32_t wrap_native_buffer(LPDIRECTSOUNDBUFFER native)
+{
+    IDirectSoundBuffer8 *native8 = nullptr;
+    if (FAILED(native->QueryInterface(kIidDirectSoundBuffer8,
+                                      reinterpret_cast<void **>(&native8))) || !native8)
+        return wrap_native(native, ObjectKind::Buffer);
+    native->Release();
+    return wrap_native(native8, ObjectKind::Buffer8);
+}
+
 bool iid_kind(const GUID &iid, ObjectKind *kind)
 {
     if (!kind) return false;
@@ -468,6 +488,20 @@ int invoke_query_interface(GuestObject &object, const uint32_t *args,
     if (!native_result) {
         set_error("DirectSound QueryInterface succeeded with a null COM interface");
         return AC1_DS8_ERROR;
+    }
+    /* DirectSound answers with an interface pointer it has already handed out
+     * (a secondary buffer is its own IDirectSoundBuffer8), and DARE pools
+     * buffers by that pointer. Return the live proxy for the same native
+     * pointer, carrying the reference this query added. */
+    for (auto &entry : g_objects) {
+        if (entry.second.native != native_result ||
+            !kind_serves(entry.second.kind, result_kind) ||
+            !entry.second.guest_references)
+            continue;
+        ++entry.second.guest_references;
+        *guest_output = entry.first;
+        *result_out = static_cast<uint32_t>(result);
+        return AC1_DS8_HANDLED;
     }
     const uint32_t guest_object = wrap_native(static_cast<IUnknown *>(native_result),
                                               result_kind);
@@ -585,7 +619,7 @@ int invoke_create_sound_buffer(GuestObject &object, const uint32_t *args,
         set_error("DirectSound CreateSoundBuffer succeeded with a null buffer");
         return AC1_DS8_ERROR;
     }
-    const uint32_t guest_buffer = wrap_native(native_buffer, ObjectKind::Buffer);
+    const uint32_t guest_buffer = wrap_native_buffer(native_buffer);
     if (!guest_buffer) return AC1_DS8_ERROR;
     *guest_output = guest_buffer;
     *result_out = static_cast<uint32_t>(result);
@@ -964,7 +998,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t token, const uint32_t *args,
         LPDIRECTSOUNDBUFFER duplicate = nullptr;
         HRESULT hr = reinterpret_cast<IDirectSound8 *>(object.native)->DuplicateSoundBuffer(
             native_buffer(source->second), &duplicate);
-        if (SUCCEEDED(hr) && duplicate) { uint32_t wrapped=wrap_native(duplicate,ObjectKind::Buffer); if (!wrapped) return AC1_DS8_ERROR; *output=wrapped; }
+        if (SUCCEEDED(hr) && duplicate) { uint32_t wrapped=wrap_native_buffer(duplicate); if (!wrapped) return AC1_DS8_ERROR; *output=wrapped; }
         else if (FAILED(hr)) *output=0;
         *result_out=static_cast<uint32_t>(hr); return AC1_DS8_HANDLED;
     }

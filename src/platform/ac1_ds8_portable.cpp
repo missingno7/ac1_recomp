@@ -793,11 +793,30 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
             *hr = nointerface;
             return 1;
         }
-        if (kind == k || kind == 1) {
+        // IDirectSoundBuffer8 (5) extends IDirectSoundBuffer (3).
+        if (kind == k || kind == 1 || (k == 5 && kind == 3)) {
             ++o.refs;
             word(a[2], a[0]);
             return 1;
         }
+        // A secondary buffer is its own IDirectSoundBuffer8; the primary has none.
+        bool primary = o.buffer && o.buffer.get() == primary_buffer;
+        if (kind == 3 || kind == 5) {
+            if (kind == 5 && primary) {
+                *hr = nointerface;
+                return 1;
+            }
+            kind = primary ? 3 : 5;
+        }
+        // DirectSound answers with the interface pointer it already handed
+        // out, and DARE pools buffers by that pointer: reuse the live proxy.
+        if (o.buffer)
+            for (auto &entry : objects)
+                if (entry.second.buffer == o.buffer && entry.second.kind == kind) {
+                    ++entry.second.refs;
+                    word(a[2], entry.first);
+                    return 1;
+                }
         uint32_t obj = wrap(kind, o.buffer);
         if (!obj)
             return -1;
@@ -880,7 +899,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
             for (size_t i = 0; i < b->samples->decoded.size(); ++i)
                 b->samples->decoded[i] = decode_sample(
                     b->samples->pcm.data() + i * (b->format[14] / 8), b->format[14]);
-            uint32_t obj = wrap(3, b);
+            uint32_t obj = wrap(b->flags & 1 ? 3 : 5, b);
             if (!obj)
                 return -1;
             if (b->flags & 1) primary_buffer = b.get();
@@ -912,7 +931,7 @@ extern "C" int ac1_ds8_dispatch(uint32_t t, const uint32_t *a, uint32_t n, uint3
             b->notify_pending.clear();
             b->stop_pending = false;
             reset_render(*b);
-            uint32_t duplicate = wrap(3, b);
+            uint32_t duplicate = wrap(5, b);
             if (!duplicate)
                 return fail("duplicate allocation failed");
             return put(a[2], duplicate);
