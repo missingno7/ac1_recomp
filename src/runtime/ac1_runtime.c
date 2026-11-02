@@ -2358,6 +2358,64 @@ static int handle_d3dx_shader_constant_table_import(
 }
 
 #if defined(AC1_HOST_D3D9)
+/* AC1_TRACE_QUERY_SITES=1: which game call sites issue the occlusion query
+ * ends that GetData later has to wait for (diagnostic, every ~2 s). */
+#define AC1_QUERY_SITE_SLOTS 64u
+#define AC1_QUERY_OBJECT_SLOTS 4096u
+typedef struct { uint32_t site, ends, waited, polls; } ac1_query_site;
+static ac1_query_site query_sites[AC1_QUERY_SITE_SLOTS];
+static struct { uint32_t query, site; uint8_t waited; } query_objects[AC1_QUERY_OBJECT_SLOTS];
+static int query_site_trace = -1;
+static uint64_t query_site_window;
+
+static ac1_query_site *query_site(uint32_t site)
+{
+    for (unsigned i = 0; i < AC1_QUERY_SITE_SLOTS; ++i) {
+        if (query_sites[i].site == site) return &query_sites[i];
+        if (!query_sites[i].site) { query_sites[i].site = site; return &query_sites[i]; }
+    }
+    return NULL;
+}
+
+static void trace_query_site(CPU *cpu, uint32_t target, const uint32_t *arguments, uint32_t result)
+{
+    const uint32_t issue = 0x7e000000u + 12u * 0x1000u + 6u * 0x10u;
+    if (target != issue && target != issue + 0x10u) return;
+    if (query_site_trace < 0) query_site_trace = getenv("AC1_TRACE_QUERY_SITES") != NULL;
+    if (!query_site_trace) return;
+    unsigned slot = (arguments[0] * 2654435761u) >> 20;
+    if (target == issue) {
+        if (arguments[1] != 1u /* D3DISSUE_END */) return;
+        /* 0x00AA40A0, the game's leaf end wrapper: name its caller instead. */
+        uint32_t at = rd32(cpu->esp);
+        if (at == 0x00AA40AFu) at = rd32(cpu->esp + 12u);
+        ac1_query_site *site = query_site(at);
+        if (site) site->ends++;
+        query_objects[slot].query = arguments[0];
+        query_objects[slot].site = at;
+        query_objects[slot].waited = 0;
+    } else if (result == 1u /* S_FALSE */ && query_objects[slot].query == arguments[0]) {
+        ac1_query_site *site = query_site(query_objects[slot].site);
+        if (site) {
+            site->polls++;
+            if (!query_objects[slot].waited) site->waited++;
+        }
+        query_objects[slot].waited = 1;
+    }
+    uint64_t now = guest_monotonic_ns();
+    if (!query_site_window) query_site_window = now;
+    if (now - query_site_window < 2000000000u) return;
+    query_site_window = now;
+    for (unsigned i = 0; i < AC1_QUERY_SITE_SLOTS && query_sites[i].site; ++i) {
+        fprintf(stderr, "AC1 query end returning to 0x%08x: ends %u waited %u pending-polls %u (2 s)\n",
+                query_sites[i].site, query_sites[i].ends, query_sites[i].waited,
+                query_sites[i].polls);
+        query_sites[i].ends = query_sites[i].waited = query_sites[i].polls = 0;
+    }
+}
+#endif
+
+#if defined(AC1_HOST_D3D9)
 static int dispatch_d3d9_method(CPU *cpu, uint32_t target)
 {
     int argument_count = ac1_d3d9_argument_count(target);
@@ -2382,6 +2440,7 @@ static int dispatch_d3d9_method(CPU *cpu, uint32_t target)
                    ? ac1_d3d9_last_error()
                    : "D3D9 COM dispatcher rejected the guest call", target);
     }
+    trace_query_site(cpu, target, arguments, result);
     cpu->eax = result;
     if (trace_imports && argument_count == 7 &&
         target == 0x7e000000u + 1u * 0x1000u + 16u * 0x10u) {
