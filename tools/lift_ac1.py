@@ -1784,6 +1784,48 @@ def run_terminal_external_direct_jump_selftest(binary: Path, pcrecomp: Path) -> 
     assert not dis.is_code_address(target)
     assert not validate_callback_code_entry(target, dis, info, iat, spans)
     print("AC1 external tail-jump self-test: startup adapter followed; local, indirect, conditional, interior, and non-code cases rejected")
+    run_code_immediate_join_selftest(dis, info, iat)
+
+
+def run_code_immediate_join_selftest(dis, info, iat) -> None:
+    """Pin both comparator arms at 0x00E37511 and keep real manual calls out."""
+    from types import SimpleNamespace
+
+    sorter = dis.disassemble_function(0x00E36BD0, iat)
+    if not sorter or not sorter.blocks:
+        raise AssertionError("AC1 0x00E36BD0 comparator selector did not disassemble")
+    edges = {edge["callsite"]: edge for edge in constant_code_immediate_edges(sorter)}
+    for callsite, target in ((0x00E37511, 0x00E33AF0), (0x00E37518, 0x00E33AA0)):
+        edge = edges.get(callsite)
+        if not edge or edge["target"] != target or edge["manual_call"]:
+            raise AssertionError(f"comparator push 0x{callsite:08X} must yield callback 0x{target:08X}: {edge!r}")
+        reason = code_immediate_rejection(target, dis, info, iat, InstructionSpanIndex(), {})
+        if reason is not None:
+            raise AssertionError(f"comparator 0x{target:08X} rejected: {reason}")
+
+    def synthetic(code: bytes, address: int, ranges: list[tuple[int, int]]):
+        decoded = list(dis.md.disasm(code, address))
+        return SimpleNamespace(blocks={
+            start: SimpleNamespace(start=start, end=end, instructions=[
+                ins for ins in decoded if start <= ins.address < end])
+            for start, end in ranges})
+
+    def manual(function) -> list[bool]:
+        return [edge["manual_call"] for edge in constant_code_immediate_edges(function)]
+
+    # push 0x500A; jmp 0x5010; 0x500A is only reached by the callee's RET, so
+    # the recovered blocks are the push/jmp and the absorbed callee.
+    returning = synthetic(b"\x68\x0A\x50\x00\x00\xE9\x06\x00\x00\x00" + b"\xCC" * 6 + b"\xC3",
+                          0x5000, [(0x5000, 0x500A), (0x5010, 0x5011)])
+    assert manual(returning) == [True]
+    # push 0x1000; jmp eax: an indirect transfer is never a local join.
+    indirect = synthetic(b"\x68\x00\x10\x00\x00\xFF\xE0", 0x6000, [(0x6000, 0x6007)])
+    assert manual(indirect) == [True]
+    # push 0x1000; jmp 0x7007; 0x7007: ret.
+    selected = synthetic(b"\x68\x00\x10\x00\x00\xEB\x00\xC3", 0x7000,
+                         [(0x7000, 0x7007), (0x7007, 0x7008)])
+    assert manual(selected) == [False]
+    print("AC1 code-immediate join self-test: both 0x00E37511 comparator arms accepted; return-address and indirect pushes stay manual calls")
 
 
 def run_ac1_sse_width_selftest(lifter, md, read_va) -> None:
@@ -2862,12 +2904,27 @@ def constant_code_immediate_edges(function) -> list[dict]:
 
     Use address adjacency across block boundaries too: PUSH return; JMP callee
     is a manual call, not evidence that the pushed continuation is a callback.
+    A return address lies in the pushing function. A code address outside its
+    recovered span, pushed before a JMP to one of its own blocks, is a stack
+    argument selected per arm of a join (cond ? f : g, as at 0x00E37511).
     No alignment is imposed; function-boundary evidence is checked separately.
     """
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
 
-    instructions = {ins.address: ins for block in function.blocks.values()
+    blocks = list(function.blocks.values())
+    instructions = {ins.address: ins for block in blocks
                     for ins in block.instructions}
+    local_starts = {block.start for block in blocks}
+    span_start = min((block.start for block in blocks), default=0)
+    span_end = max((block.end for block in blocks), default=0)
+
+    def joins_locally(push, jump) -> bool:
+        target = push.operands[0].imm & 0xFFFFFFFF
+        return (jump.mnemonic == "jmp" and len(jump.operands) == 1 and
+                jump.operands[0].type == X86_OP_IMM and
+                (jump.operands[0].imm & 0xFFFFFFFF) in local_starts and
+                not span_start <= target <= span_end)
+
     edges = []
     for ins in sorted(instructions.values(), key=lambda item: item.address):
         ops = ins.operands
@@ -2888,7 +2945,8 @@ def constant_code_immediate_edges(function) -> list[dict]:
             "target": operand.imm & 0xFFFFFFFF,
             "instruction": f"{ins.mnemonic} {ins.op_str}",
             "manual_call": (ins.mnemonic == "push" and following is not None and
-                            following.mnemonic in ("jmp", "ljmp")),
+                            following.mnemonic in ("jmp", "ljmp") and
+                            not joins_locally(ins, following)),
         })
     return edges
 

@@ -44,10 +44,31 @@ class CodeImmediateTests(unittest.TestCase):
         for jump in ("eb00", "ffe0"):
             fn = self.function(0x1000, "6820100000 " + jump)
             ins = fn.blocks[0x1000].instructions.pop()
-            fn.blocks[ins.address] = SimpleNamespace(instructions=[ins])
+            fn.blocks[0x1000].end = ins.address
+            fn.blocks[ins.address] = SimpleNamespace(start=ins.address, end=ins.address + ins.size,
+                                                     instructions=[ins])
             self.assertTrue(lift.constant_code_immediate_edges(fn)[0]["manual_call"])
         fn = self.function(0x1000, "6820100000 90 eb00")
         self.assertFalse(lift.constant_code_immediate_edges(fn)[0]["manual_call"])
+
+    def split(self, fn, *leaders):
+        instructions = [ins for block in fn.blocks.values() for ins in block.instructions]
+        bounds = sorted(fn.blocks) + list(leaders)
+        fn.blocks = {}
+        for start, end in zip(sorted(bounds), sorted(bounds)[1:] + [fn.end]):
+            fn.blocks[start] = SimpleNamespace(start=start, end=end, instructions=[
+                ins for ins in instructions if start <= ins.address < end])
+        return fn
+
+    def test_argument_selected_before_a_local_join(self):
+        # cond ? f : g as push f; jmp join; push g; join: (0x00E37511 in AC1).
+        fn = self.split(self.function(0x1000, "6800300000 eb05 6800310000 50 c3"), 0x1007, 0x100C)
+        self.assertEqual([(edge["target"], edge["manual_call"])
+                          for edge in lift.constant_code_immediate_edges(fn)],
+                         [(0x3000, False), (0x3100, False)])
+        # An address inside the pushing function is its return continuation.
+        fn = self.split(self.function(0x1000, "6807100000 eb00 c3"), 0x1007)
+        self.assertTrue(lift.constant_code_immediate_edges(fn)[0]["manual_call"])
 
     def test_function_boundary_suffixes(self):
         target = 0x1100
