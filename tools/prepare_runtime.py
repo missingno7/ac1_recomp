@@ -7,6 +7,7 @@ import json
 import re
 from pathlib import Path
 import shutil
+import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = json.loads((ROOT / "config/ac1_dx9.json").read_text(encoding="utf-8"))
@@ -745,6 +746,35 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def pinned_donor(relative: str, expected_hash: str) -> tuple[bytes, str]:
+    """Return the pinned donor bytes and where they were found.
+
+    The Duke checkout is a read-only reference, not a frozen one: its working
+    copy may carry newer uncommitted edits. Then take the pinned bytes from
+    its history, raw or in the CRLF form a Windows checkout writes. Only
+    content whose SHA-256 equals the pin is ever used.
+    """
+    source = DUKE_ROOT / relative
+    actual_hash = sha256(source) if source.is_file() else "missing"
+    if actual_hash == expected_hash:
+        return source.read_bytes(), str(source)
+    log = subprocess.run(["git", "-C", str(DUKE_ROOT), "log", "--format=%H", "--", relative],
+                         capture_output=True)
+    for revision in log.stdout.decode("ascii", "replace").split() if log.returncode == 0 else []:
+        blob = subprocess.run(["git", "-C", str(DUKE_ROOT), "show", f"{revision}:{relative}"],
+                              capture_output=True)
+        if blob.returncode:
+            continue
+        lf = blob.stdout.replace(b"\r\n", b"\n")
+        for candidate in (blob.stdout, lf.replace(b"\n", b"\r\n")):
+            if hashlib.sha256(candidate).hexdigest() == expected_hash:
+                return candidate, f"{DUKE_ROOT} git {revision}:{relative}"
+    raise SystemExit(
+        f"pinned runtime input changed: {source} sha256={actual_hash}; "
+        f"expected {expected_hash}, and no committed revision has it"
+    )
+
+
 X87_INTEGER_INLINE = r'''
 /* Independent A/B gate: keep the integer-conversion algorithm unchanged. */
 #if defined(AC1_FORCE_INLINE_X87)
@@ -950,15 +980,10 @@ def main() -> None:
     }
     for destination, (source_relative, expected_hash) in SOURCE_FILES.items():
         source = DUKE_ROOT / source_relative
-        actual_hash = sha256(source)
-        if actual_hash != expected_hash:
-            raise SystemExit(
-                f"pinned runtime input changed: {source} sha256={actual_hash}; "
-                f"expected {expected_hash}"
-            )
+        content, origin = pinned_donor(source_relative, expected_hash)
+        actual_hash = expected_hash
         output = ROOT / destination
         output.parent.mkdir(parents=True, exist_ok=True)
-        content = source.read_bytes()
         if destination == "src/runtime/guest_memory.h":
             text = content.decode("utf-8").replace("\r\n", "\n")
             capacity = (
@@ -1318,7 +1343,7 @@ void guest_execution_write(uint32_t address, const void *input, size_t width)
         if not output.exists() or output.read_bytes() != content:
             output.write_bytes(content)
         provenance["files"].append({
-            "source": str(source),
+            "source": origin,
             "destination": destination,
             "sha256": actual_hash,
             "prepared_sha256": hashlib.sha256(content).hexdigest(),
