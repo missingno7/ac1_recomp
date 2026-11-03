@@ -4364,13 +4364,14 @@ def xmm_contract_rows(body, lifted, free):
             for k in XMM_REF.findall(statement[full.start(2):] if target is not None else statement):
                 if not write >> int(k) & 1: read |= 1 << int(k)
             if target is not None and not guarded: write |= 1 << target
-        # A call defines every register (its callee's return contract); an
-        # import's host code keeps them.
-        if frow['call'] and not guarded and frow['call'][0] != 'import': write = XMM_ALL
+        # A direct call defines every register (its callee's return contract).
+        # An import's host code keeps them; an indirect callee writes back only
+        # what it modifies, so the caller's values must be valid before it.
+        if frow['call'] and not guarded and frow['call'][0] == 'direct': write = XMM_ALL
         site = None
-        if frow['call']:
+        if frow['call'] or frow['jump']:
             for line in group:
-                if FLAG_DIRECT_CALL.search(line) or FLAG_DISPATCH.search(line):
+                if FLAG_DIRECT_CALL.search(line) or FLAG_DISPATCH.search(line) or 'dispatch_jmp(c' in line:
                     match = re.search(r'/\*\s*([0-9A-F]{8}):', line)
                     site = int(match[1], 16) if match else None
                     break
@@ -4380,19 +4381,40 @@ def xmm_contract_rows(body, lifted, free):
             [('direct', int(t, 16)) for t in FLAG_DIRECT_CALL.findall(text)] +
             [('indirect', None)] * len(FLAG_DISPATCH.findall(text)))
         rows.append(dict(frow, read=read, write=write, site=site, opaque=opaque))
-    return dict(flow, rows=rows)
+    return dict(flow, rows=rows, modified=xmm_modified(body))
+
+
+XMM_ASSIGN = re.compile(r'c->xmm\[(\d)\](?:\.\w+)?(?:\[[^\]]*\])*\s*(?:[-+*/%|&^]|<<|>>)?=(?!=)')
+
+
+def xmm_modified(body):
+    '''Registers a body may write: an assignment to c->xmm[N] or a lane of it, or its address taken.'''
+    code = re.sub(r'/\*.*?\*/', '', body, flags=re.S)
+    if re.search(r'c->xmm(?!\[\d\])', code): return XMM_ALL
+    return functools.reduce(operator.or_, (1 << int(k) for k in
+                            XMM_ASSIGN.findall(code) + re.findall(r'&\s*c->xmm\[(\d)\]', code)), 0)
 
 
 def xmm_contract_program(bodies, pinned=(), call_targets=None, jump_targets=None):
     """Whole-program XMM contracts: what each function and call site must sync.
 
     The flag contracts' rules on eight registers: E(F) is read at entry before
-    being defined, R(F) is read by callers after F returns; indirect calls,
-    imports (host code may call back) and indirect jumps use the union over
-    their possible targets. Native bindings and regions read and write every
-    register; their translated bodies still pass the demand after their own
-    calls on to those callees. Returns, for each other function, E, R and for
-    each call instruction the registers to store before it and reload after it.
+    being defined, R(F) is read by direct callers after F returns. Indirect
+    calls, imports (host code may call back) and indirect jumps store the union
+    of their possible targets' entry demand.
+
+    Demand after indirect transfers is not pushed into every possible target
+    (two thirds of all functions), which made every contract all-register.
+    Instead the struct stays exact for the registers D read after any indirect
+    call or jump: every function writes back, besides R, the registers of D it
+    modifies itself, and an indirect caller stores what it reads afterwards
+    before the call, so registers the callee leaves alone survive there. By
+    induction over the call depth, at every return the struct holds each D
+    register's value. Each store is therefore a read of the local (a full sync
+    reads every register). Bound functions are analysed through their
+    translated bodies. Returns, for each other function, E, R and for each
+    call or indirect jump instruction the registers to store before it and
+    reload after it.
     """
     global _XMM_FREE_HELPERS
     if _XMM_FREE_HELPERS is None:
@@ -4417,15 +4439,18 @@ def xmm_contract_program(bodies, pinned=(), call_targets=None, jump_targets=None
     R = dict(E)
     e_call = e_jump = d_call = d_jump = 0
     d_sources = {}
+    shared = {a: {s for s, n in collections.Counter(row['site'] for row in flow['rows'] if row['call']).items()
+                  if n > 1 and s is not None} for a, flow in flows.items()}
 
     def solve(a):
-        # A group with several transfers has no call row: it reads what its
-        # callees read at entry, and passes demand after it through.
+        # A group with several transfers, or one instruction with two calls, is
+        # synced in full around each call, so it reads every register. An
+        # indirect jump stores what its targets read and this function's return
+        # demand (the target returns for it).
         flow = flows[a]
-        if any(row['opaque'] for row in flow['rows']):
-            rows = [dict(row, read=row['read'] | functools.reduce(operator.or_, (
-                        E.get(t, XMM_ALL) if k == 'direct' else e_call for k, t in row['opaque']), 0))
-                    if row['opaque'] else row for row in flow['rows']]
+        if any(row['opaque'] or row['jump'] or row['call'] and row['site'] in shared[a] for row in flow['rows']):
+            rows = [dict(row, read=XMM_ALL) if row['opaque'] or row['call'] and row['site'] in shared[a] else
+                    dict(row, read=row['read'] | R[a]) if row['jump'] else row for row in flow['rows']]
             flow = dict(flow, rows=rows)
         return flag_contract_solve(flow, R[a], E, e_call, e_jump)
 
@@ -4458,8 +4483,8 @@ def xmm_contract_program(bodies, pinned=(), call_targets=None, jump_targets=None
                     if after[i]: d_sources[(a, None)] = after[i]
             if row['jump']: d_jump |= R[a]
         if (d_call, d_jump) != global_demand:
-            for b in jump_targets | call_targets:
-                want = (d_jump if b in jump_targets else 0) | (d_call if b in call_targets else 0)
+            for b, flow_b in flows.items():
+                want = (d_call | d_jump) & flow_b['modified']
                 if want & ~R[b]: R[b] |= want; wake.add(b)
         for b in wake:
             if b in flows and b not in queued: queue.append(b); queued.add(b)
@@ -4469,12 +4494,16 @@ def xmm_contract_program(bodies, pinned=(), call_targets=None, jump_targets=None
         _, after, _, _ = solve(a)
         sites = {}
         for i, row in enumerate(flow['rows']):
-            if not row['call'] or row['site'] is None: continue
+            if row['site'] is None: continue
+            if row['jump'] and not row['call']:
+                sites[row['site']] = (e_jump | R[a], XMM_ALL, True)
+                continue
+            if not row['call']: continue
             kind, target = row['call']
-            store = E.get(target, XMM_ALL) if kind == 'direct' else e_call
             # Host code keeps the registers; a tail call's return stores R again.
             reload = 0 if kind == 'import' else R[a] if row['tail'] else after[i]
-            if row['site'] in sites: store, reload = XMM_ALL, XMM_ALL   # two calls, one instruction
+            store = E.get(target, XMM_ALL) if kind == 'direct' else e_call | (reload if kind == 'indirect' else 0)
+            if row['site'] in shared[a]: store, reload = XMM_ALL, XMM_ALL   # two calls, one instruction
             sites[row['site']] = (store, reload, row['tail'])
         contracts[a] = dict(entry=E[a], ret=R[a], sites=sites)
     report = dict(functions=len(bodies), native_entries=len(native),
@@ -4523,7 +4552,7 @@ def local_xmm_function(body: str, contract=None) -> str:
     entry,ret,sites=(contract['entry'],contract['ret'],contract['sites']) if contract else (XMM_ALL,XMM_ALL,{})
     def bracket(m,va):
         if m[2] in free:return m[0]
-        site=sites.get(va) if m[2] in ('AC1_CALL','dispatch') else None
+        site=sites.get(va) if m[2] in ('AC1_CALL','dispatch','dispatch_jmp') else None
         before,after=(site[0],site[1]) if site else (XMM_ALL,XMM_ALL)
         return f'{m[1]}{{ '+' '.join(filter(None,(store_mask(before),m[0].strip(),load_mask(after))))+' }'
     def leave(m):
