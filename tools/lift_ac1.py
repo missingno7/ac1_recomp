@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import argparse
 import collections
+import functools
 import hashlib
+import operator
 import importlib.metadata
 import json
 import re
@@ -4405,24 +4407,35 @@ def xmm_contract_program(bodies, pinned=(), call_targets=None, jump_targets=None
         for row in flow['rows']:
             if row['call'] and row['call'][0] == 'direct': callers[row['call'][1]].add(a)
             if row['call'] and row['call'][0] != 'direct' or row['jump']: indirect_users.add(a)
-    E = {a: XMM_ALL if a in native else 0 for a in bodies}
-    R = dict(E)
-    e_call = XMM_ALL if native & call_targets else 0
-    e_jump = XMM_ALL if native & jump_targets else 0
-    d_call = d_jump = 0
-    for flow in flows.values():
-        for row in flow['rows']:
             for kind, target in row['opaque']:
-                if kind == 'direct': R[target] = XMM_ALL
-                else: d_call = XMM_ALL
-    for b in call_targets: R[b] |= d_call
+                if kind == 'direct': callers[target].add(a)
+                else: indirect_users.add(a)
+    # Bound functions are analysed through their translated bodies: the native
+    # code is verified equal to them over the whole CPU state. Their own
+    # bodies keep the full sync (no contract below).
+    E = dict.fromkeys(bodies, 0)
+    R = dict(E)
+    e_call = e_jump = d_call = d_jump = 0
+    d_sources = {}
+
+    def solve(a):
+        # A group with several transfers has no call row: it reads what its
+        # callees read at entry, and passes demand after it through.
+        flow = flows[a]
+        if any(row['opaque'] for row in flow['rows']):
+            rows = [dict(row, read=row['read'] | functools.reduce(operator.or_, (
+                        E.get(t, XMM_ALL) if k == 'direct' else e_call for k, t in row['opaque']), 0))
+                    if row['opaque'] else row for row in flow['rows']]
+            flow = dict(flow, rows=rows)
+        return flag_contract_solve(flow, R[a], E, e_call, e_jump)
+
     queue = collections.deque(flows); queued = set(flows)
     while queue:
         a = queue.popleft(); queued.discard(a)
         flow = flows[a]
-        live, after, _, _ = flag_contract_solve(flow, R[a], E, e_call, e_jump)
+        live, after, _, _ = solve(a)
         wake = set()
-        entry = XMM_ALL if a in native else live[flow['entry']] if live else 0
+        entry = live[flow['entry']] if live else 0
         if entry & E[a] != E[a]: raise ValueError(f'non-monotone XMM entry demand at 0x{a:08X}')
         if entry != E[a]:
             E[a] = entry; wake |= callers[a]
@@ -4436,6 +4449,13 @@ def xmm_contract_program(bodies, pinned=(), call_targets=None, jump_targets=None
                 if demand & ~R[target]: R[target] |= demand; wake.add(target)
             elif row['call']:
                 d_call |= demand
+                if demand: d_sources[(a, row['site'])] = demand
+            for kind, target in row['opaque']:
+                if kind == 'direct':
+                    if after[i] & ~R.get(target, 0): R[target] = R.get(target, 0) | after[i]; wake.add(target)
+                else:
+                    d_call |= after[i]
+                    if after[i]: d_sources[(a, None)] = after[i]
             if row['jump']: d_jump |= R[a]
         if (d_call, d_jump) != global_demand:
             for b in jump_targets | call_targets:
@@ -4446,7 +4466,7 @@ def xmm_contract_program(bodies, pinned=(), call_targets=None, jump_targets=None
     contracts = {}
     for a, flow in flows.items():
         if a in native: continue
-        _, after, _, _ = flag_contract_solve(flow, R[a], E, e_call, e_jump)
+        _, after, _, _ = solve(a)
         sites = {}
         for i, row in enumerate(flow['rows']):
             if not row['call'] or row['site'] is None: continue
@@ -4462,7 +4482,13 @@ def xmm_contract_program(bodies, pinned=(), call_targets=None, jump_targets=None
                   entry_demand_functions=sum(bool(E[a]) for a in contracts),
                   return_demand_functions=sum(bool(R[a]) for a in contracts),
                   synced_call_sites=sum(len(c['sites']) for c in contracts.values()),
-                  empty_call_syncs=sum(not (st | rl) for c in contracts.values() for st, rl, _ in c['sites'].values()))
+                  empty_call_syncs=sum(not (st | rl) for c in contracts.values() for st, rl, _ in c['sites'].values()),
+                  # Who widens the indirect-call unions (entry: possible targets;
+                  # return: indirect call sites), widest first.
+                  indirect_entry_sources=[f'0x{t:08X}:{E[t]:02X}' for t in sorted(
+                      (t for t in call_targets if E.get(t)), key=lambda t: -bin(E[t]).count('1'))[:20]],
+                  indirect_return_sources=[f'0x{c:08X}@' + (f'{st:08X}' if st else 'group') + f':{d:02X}'
+                                           for (c, st), d in sorted(d_sources.items(), key=lambda kv: -bin(kv[1]).count('1'))[:20]])
     return contracts, report
 
 

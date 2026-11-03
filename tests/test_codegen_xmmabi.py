@@ -81,20 +81,39 @@ class XmmContractTests(unittest.TestCase):
         site = contracts[0x401000]['sites'][0x401001]
         self.assertEqual(site[:2], (0x21, 1))
 
-    def test_pinned_native_bindings_sync_everything(self):
+    def test_bound_functions_use_their_translated_body(self):
+        # The native code is verified equal to the translated body, whose
+        # analysis gives its contract; the bound body itself keeps a full sync.
         caller = function(0x401000, 'c->xmm[0] = rdxm(c->eax);', call(0x401100), 'wrxm(c->ecx, c->xmm[0]);',
                           'c->esp += 4; return;')
         native = function(0x401100, 'c->esp += 4; return;')
         body, contracts, _ = emitted({0x401000: caller, 0x401100: native}, 0x401000, pinned={0x401100})
         self.assertNotIn(0x401100, contracts)
-        self.assertEqual(around_call(body), (['0'], ['0']))
+        self.assertEqual(around_call(body), (['0'], ['0']))   # passed through the callee
+        caller2 = function(0x401000, 'c->xmm[0] = rdxm(c->eax);', 'wrxm(c->ecx, c->xmm[0]);', call(0x401100),
+                           'c->esp += 4; return;')
+        body, _, _ = emitted({0x401000: caller2, 0x401100: native}, 0x401000, pinned={0x401100})
+        self.assertEqual(around_call(body), ([], []))
+
+    def test_multi_transfer_groups_read_their_callees_entry_demand(self):
+        # Group of two calls: the second callee reads xmm2 at entry, which the
+        # first plain call (to A, which writes xmm2) must therefore reload.
+        caller = function(0x401000, call(0x401100),
+                          'AC1_CALL(c, L_00401200, 0x00401200u); AC1_CALL(c, L_00401300, 0x00401300u);',
+                          'c->esp += 4; return;')
+        a = function(0x401100, 'c->xmm[2] = rdxm(c->esp);', 'c->esp += 4; return;')
+        b = function(0x401200, 'wrxm(c->edx, c->xmm[2]);', 'c->esp += 4; return;')
+        leaf = function(0x401300, 'c->esp += 4; return;')
+        contracts, _ = lift.xmm_contract_program({0x401000: caller, 0x401100: a, 0x401200: b, 0x401300: leaf})
+        self.assertEqual(contracts[0x401100]['ret'] & 4, 4)
+        self.assertEqual(contracts[0x401000]['sites'][0x401000][1] & 4, 4)
 
     def test_pinned_translated_bodies_pass_demand_to_their_callees(self):
         # A region's translated fallback reads registers after its calls.
         region = function(0x401000, call(0x401100), 'wrxm(c->ecx, c->xmm[6]);', 'c->esp += 4; return;')
         callee = function(0x401100, 'c->xmm[6] = rdxm(c->esp);', 'c->esp += 4; return;')
         contracts, _ = lift.xmm_contract_program({0x401000: region, 0x401100: callee}, pinned={0x401000})
-        self.assertEqual(contracts[0x401100]['ret'], 0xFF)
+        self.assertEqual(contracts[0x401100]['ret'], 0x40)
 
     def test_tail_call_reloads_and_returns_the_return_demand(self):
         top = function(0x401000, call(0x401100), 'wrxm(c->ecx, c->xmm[4]);', 'c->esp += 4; return;')
