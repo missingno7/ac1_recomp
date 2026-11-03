@@ -395,7 +395,7 @@ def arm64_metrics(ins):
             if kind == 'struct' and b == cpu_root:
                 # CPU-struct field by offset (src/runtime/cpu.h layout on LP64).
                 field = ('gpr' if lo < 0x20 else 'eip' if lo < 0x24 else 'flags' if lo < 0x48 else 'x87 st' if 0x50 <= lo < 0x90
-                         else 'x87 top' if lo < 0x98 else 'xmm' if lo < 0x118 else 'other')
+                         else 'x87 top' if lo < 0x98 else 'xmm' if lo < 0x120 else 'other')
                 c[f'cpu {field} {"stores" if store else "loads"}'] += 1
             span = (lo, lo + width)
             if not store:

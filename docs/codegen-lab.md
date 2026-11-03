@@ -281,3 +281,6 @@ What this says for the lifter:
 Not yet measured: byte and word partial-register stores followed by a 32-bit
 reload (kernels `gpr_byte_chain`, `gpr_byte_merge_chain`, `pair_2x8_v16_chain`
 are in the source; the run was stopped when the phone was needed).
+
+Where CPU state is still materialized, measured on the phone, and the resulting
+priorities: [cpu-state-assessment.md](cpu-state-assessment.md).
