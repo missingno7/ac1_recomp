@@ -4330,7 +4330,141 @@ def xmm_free_helpers(cpu_header: str) -> frozenset:
 _XMM_FREE_HELPERS = None
 
 
-def local_xmm_function(body: str) -> str:
+XMM_ALL = 0xFF
+XMM_REF = re.compile(r'c->xmm\[(\d)\]')
+XMM_FULL_WRITE = re.compile(r'^\s*\{?\s*c->xmm\[(\d)\](?:\.v\w+)?\s*=(?!=)(.*)$', re.S)
+XMM_LOAD_WRITE = re.compile(r'^\s*\{?\s*sse_load_s[sd]\(&c->xmm\[(\d)\],(.*)$', re.S)
+
+
+def xmm_contract_rows(body, lifted, free):
+    """Per instruction group: XMM registers read before a certain write, and transfers.
+
+    The structure (successors, calls, returns, jumps, entry guard) is the flag
+    contract's. A register counts as written only by a whole-register store
+    (`c->xmm[N] = e`, `c->xmm[N].vT = e` or sse_load_ss/sd) whose operands do not
+    read it, in an unguarded group; every other mention reads it. A CPU-taking
+    helper other than a guest call is synced in full, so it reads every register.
+    """
+    flow = flag_contract_rows(body, lifted)
+    rows = []
+    for group, frow in zip(flow['groups'], flow['rows']):
+        text = re.sub(r'/\*.*?\*/', '', '\n'.join(group), flags=re.S)
+        guarded = bool(re.search(r'\b(?:if|while|for|switch)\b', FLAG_X87_CHECK.sub('', text)))
+        read = write = 0
+        if re.search(r'c->xmm(?!\[\d\])', text): read = XMM_ALL
+        rest = FLAG_DISPATCH.sub('', FLAG_DIRECT_CALL.sub('', re.sub(r'\bdispatch_jmp\(c, [^;]*;', '', text)))
+        if any(name not in free for name in re.findall(r'\b(\w+)\(c(?=\s*[,)])', rest)): read = XMM_ALL
+        for statement in text.split(';'):
+            full = XMM_FULL_WRITE.match(statement) or XMM_LOAD_WRITE.match(statement)
+            target = int(full[1]) if full and not re.search(rf'c->xmm\[{full[1]}\]', full[2]) else None
+            for k in XMM_REF.findall(statement[full.start(2):] if target is not None else statement):
+                if not write >> int(k) & 1: read |= 1 << int(k)
+            if target is not None and not guarded: write |= 1 << target
+        # A call defines every register (its callee's return contract); an
+        # import's host code keeps them.
+        if frow['call'] and not guarded and frow['call'][0] != 'import': write = XMM_ALL
+        site = None
+        if frow['call']:
+            for line in group:
+                if FLAG_DIRECT_CALL.search(line) or FLAG_DISPATCH.search(line):
+                    match = re.search(r'/\*\s*([0-9A-F]{8}):', line)
+                    site = int(match[1], 16) if match else None
+                    break
+        # A group with several transfers has no call row; its callees return
+        # every register (see xmm_contract_program).
+        opaque = [] if frow['call'] else (
+            [('direct', int(t, 16)) for t in FLAG_DIRECT_CALL.findall(text)] +
+            [('indirect', None)] * len(FLAG_DISPATCH.findall(text)))
+        rows.append(dict(frow, read=read, write=write, site=site, opaque=opaque))
+    return dict(flow, rows=rows)
+
+
+def xmm_contract_program(bodies, pinned=(), call_targets=None, jump_targets=None):
+    """Whole-program XMM contracts: what each function and call site must sync.
+
+    The flag contracts' rules on eight registers: E(F) is read at entry before
+    being defined, R(F) is read by callers after F returns; indirect calls,
+    imports (host code may call back) and indirect jumps use the union over
+    their possible targets. Native bindings and regions read and write every
+    register; their translated bodies still pass the demand after their own
+    calls on to those callees. Returns, for each other function, E, R and for
+    each call instruction the registers to store before it and reload after it.
+    """
+    global _XMM_FREE_HELPERS
+    if _XMM_FREE_HELPERS is None:
+        _XMM_FREE_HELPERS=xmm_free_helpers((ROOT/'src/runtime/cpu.h').read_text(encoding='utf-8'))
+    lifted = set(bodies)
+    native = frozenset(pinned) & lifted
+    call_targets = lifted if call_targets is None else set(call_targets) & lifted
+    jump_targets = lifted if jump_targets is None else set(jump_targets) & lifted
+    flows = {a: xmm_contract_rows(b, lifted, _XMM_FREE_HELPERS) for a, b in bodies.items()}
+    callers, indirect_users = collections.defaultdict(set), set()
+    for a, flow in flows.items():
+        for row in flow['rows']:
+            if row['call'] and row['call'][0] == 'direct': callers[row['call'][1]].add(a)
+            if row['call'] and row['call'][0] != 'direct' or row['jump']: indirect_users.add(a)
+    E = {a: XMM_ALL if a in native else 0 for a in bodies}
+    R = dict(E)
+    e_call = XMM_ALL if native & call_targets else 0
+    e_jump = XMM_ALL if native & jump_targets else 0
+    d_call = d_jump = 0
+    for flow in flows.values():
+        for row in flow['rows']:
+            for kind, target in row['opaque']:
+                if kind == 'direct': R[target] = XMM_ALL
+                else: d_call = XMM_ALL
+    for b in call_targets: R[b] |= d_call
+    queue = collections.deque(flows); queued = set(flows)
+    while queue:
+        a = queue.popleft(); queued.discard(a)
+        flow = flows[a]
+        live, after, _, _ = flag_contract_solve(flow, R[a], E, e_call, e_jump)
+        wake = set()
+        entry = XMM_ALL if a in native else live[flow['entry']] if live else 0
+        if entry & E[a] != E[a]: raise ValueError(f'non-monotone XMM entry demand at 0x{a:08X}')
+        if entry != E[a]:
+            E[a] = entry; wake |= callers[a]
+            if a in call_targets and entry & ~e_call: e_call |= entry; wake |= indirect_users
+            if a in jump_targets and entry & ~e_jump: e_jump |= entry; wake |= indirect_users
+        global_demand = d_call, d_jump
+        for i, row in enumerate(flow['rows']):
+            demand = R[a] if row['tail'] else after[i]
+            if row['call'] and row['call'][0] == 'direct':
+                target = row['call'][1]
+                if demand & ~R[target]: R[target] |= demand; wake.add(target)
+            elif row['call']:
+                d_call |= demand
+            if row['jump']: d_jump |= R[a]
+        if (d_call, d_jump) != global_demand:
+            for b in jump_targets | call_targets:
+                want = (d_jump if b in jump_targets else 0) | (d_call if b in call_targets else 0)
+                if want & ~R[b]: R[b] |= want; wake.add(b)
+        for b in wake:
+            if b in flows and b not in queued: queue.append(b); queued.add(b)
+    contracts = {}
+    for a, flow in flows.items():
+        if a in native: continue
+        _, after, _, _ = flag_contract_solve(flow, R[a], E, e_call, e_jump)
+        sites = {}
+        for i, row in enumerate(flow['rows']):
+            if not row['call'] or row['site'] is None: continue
+            kind, target = row['call']
+            store = E.get(target, XMM_ALL) if kind == 'direct' else e_call
+            # Host code keeps the registers; a tail call's return stores R again.
+            reload = 0 if kind == 'import' else R[a] if row['tail'] else after[i]
+            if row['site'] in sites: store, reload = XMM_ALL, XMM_ALL   # two calls, one instruction
+            sites[row['site']] = (store, reload, row['tail'])
+        contracts[a] = dict(entry=E[a], ret=R[a], sites=sites)
+    report = dict(functions=len(bodies), native_entries=len(native),
+                  indirect_entry_demand=e_call, indirect_return_demand=d_call,
+                  entry_demand_functions=sum(bool(E[a]) for a in contracts),
+                  return_demand_functions=sum(bool(R[a]) for a in contracts),
+                  synced_call_sites=sum(len(c['sites']) for c in contracts.values()),
+                  empty_call_syncs=sum(not (st | rl) for c in contracts.values() for st, rl, _ in c['sites'].values()))
+    return contracts, report
+
+
+def local_xmm_function(body: str, contract=None) -> str:
     """XMM locals: c->xmm[N] lives in a local, synced around guest calls and returns.
 
     Generated code reads and writes XMM state only through literal c->xmm[N]
@@ -4351,20 +4485,36 @@ def local_xmm_function(body: str) -> str:
     call=re.compile(r'\b(\w+)\s*\(\s*c\s*[,)]');statement=re.compile(r'(?:^|(?<=[;{}]))(\s*)(\w+)\(c\b[^;]*\);',re.M)
     if sum(m[1] not in free for m in call.finditer(clean))!=sum(m[2] not in free for m in statement.finditer(clean)):
         return body
-    store=' '.join(f'c->xmm[{i}] = _ac1_xmm{i};' for i in idx)
-    load=' '.join(f'_ac1_xmm{i} = c->xmm[{i}];' for i in idx)
+    store_mask=lambda mask:' '.join(f'c->xmm[{i}] = _ac1_xmm{i};' for i in idx if mask>>i&1)
+    load_mask=lambda mask:' '.join(f'_ac1_xmm{i} = c->xmm[{i}];' for i in idx if mask>>i&1)
+    # With a whole-program contract (xmm_contract_program) the struct holds a
+    # register only where a callee reads it at entry, a caller after return or
+    # code after a call: entry loads E, returns store R, and a guest call stores
+    # its callee's E and reloads what is live after it. Other CPU-taking
+    # helpers keep the full sync.
+    entry,ret,sites=(contract['entry'],contract['ret'],contract['sites']) if contract else (XMM_ALL,XMM_ALL,{})
+    def bracket(m,va):
+        if m[2] in free:return m[0]
+        site=sites.get(va) if m[2] in ('AC1_CALL','dispatch') else None
+        before,after=(site[0],site[1]) if site else (XMM_ALL,XMM_ALL)
+        return f'{m[1]}{{ '+' '.join(filter(None,(store_mask(before),m[0].strip(),load_mask(after))))+' }'
+    def leave(m):
+        return '{ '+' '.join(filter(None,(store_mask(ret),'return;')))+' }'
     lines=body.splitlines()
     if len(lines)<3 or lines[1]!='{' or lines[-1]!='}':raise ValueError('unexpected lifted function shape for XMM locals')
     # A body that ends in a stop can load a register it never reads back.
-    output=lines[:2]+['    XMM '+', '.join(f'_ac1_xmm{i} __attribute__((unused)) = c->xmm[{i}]' for i in idx)+';']
+    output=lines[:2]+['    XMM '+', '.join(f'_ac1_xmm{i} __attribute__((unused)) = '+(f'c->xmm[{i}]' if entry>>i&1 else '{{0}}')
+                                         for i in idx)+';']
     for line in lines[2:-1]:
         code,separator,comment=line.partition('/*')
+        va=re.match(r'\s*([0-9A-F]{8}):',comment)
+        va=int(va[1],16) if va else None
         code=re.sub(r'c->xmm\[(\d)\]',r'_ac1_xmm\1',code)
-        code=statement.sub(lambda m:m[0] if m[2] in free else f'{m[1]}{{ {store} {m[0].strip()} {load} }}',code)
-        code=re.sub(r'\breturn;',f'{{ {store} return; }}',code)
+        code=statement.sub(lambda m:bracket(m,va),code)
+        code=re.sub(r'\breturn;',leave,code)
         output.append(code+separator+comment)
     # A body may also leave by falling off its end.
-    return '\n'.join(output+['    '+store,lines[-1]])
+    return '\n'.join(output+['    '+store_mask(ret),lines[-1]])
 
 
 # Header helpers that read or write the x87 register stack, tags or TOP.
@@ -4518,7 +4668,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
               functions_per_tu: int, translation_unit_buckets: int = 0,
               emission_cache=None, direct_calls: bool = True, native_overrides=None,
               flag_liveness: str = 'off', local_regs: str = 'off', profile_counts=(),
-              x87: str = 'exact') -> dict:
+              x87: str = 'exact', xmm_abi: str = 'off') -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
@@ -4696,12 +4846,22 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
             transformed = native_x87_function(bodies[index])
             x87_native_count += transformed != bodies[index]
             bodies[index] = transformed
+    if xmm_abi not in ('off', 'on'):
+        raise ValueError('xmm_abi must be off or on')
+    xmm_contracts, xmm_report = {}, None
+    if xmm_abi == 'on':
+        by_address = dict(zip(lifted, bodies))
+        if flag_liveness != 'abi':
+            stored_entries = flag_image_addresses(pe, set(lifted))
+            call_targets, jump_targets = flag_indirect_targets(by_address, functions, stored_entries)
+        xmm_contracts, xmm_report = xmm_contract_program(
+            by_address, set(bindings) | set(regions), call_targets, jump_targets)
     selected_locals = local_register_selection(local_regs, set(lifted))
     local_count, local_xmm_count, local_excluded = 0, 0, []
     for index, address in enumerate(lifted):
         if address in selected_locals:
             gprs = local_register_function(bodies[index])
-            transformed = local_xmm_function(gprs)
+            transformed = local_xmm_function(gprs, xmm_contracts.get(address))
             local_xmm_count += transformed != gprs
             if transformed != bodies[index]:
                 local_count += 1
@@ -4849,6 +5009,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "direct_callee_declarations": direct_prototypes,
         "native_overrides": [f"0x{a:08X}" for a in sorted(bindings)],
         "flag_abi": abi_report,
+        "xmm_abi": xmm_report,
         'x87': {'mode': x87, 'native_count': x87_native_count},
         'local_regs': {'requested': local_regs, 'admitted_count': local_count,
                        'xmm_admitted_count': local_xmm_count,
@@ -4989,6 +5150,9 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=CONFIG_PATH,
                         help="discovery configuration (allows private seed-set A/B comparisons)")
     parser.add_argument("--selftest", action="store_true", help="run the focused block-entry ordering check")
+    parser.add_argument('--xmm-abi', choices=('off', 'on'), default='off',
+                        help='on: whole-program XMM entry/return contracts narrow the syncs of XMM locals '
+                             'at calls, entries and returns')
     parser.add_argument('--x87', choices=('exact', 'native'), default='native',
                         help='native keeps the x87 stack in block-local doubles without tag/env bookkeeping; '
                              'exact keeps the full x87 model')
@@ -5207,7 +5371,7 @@ def main() -> int:
                                 native_overrides=config.get('native_overrides', []),
                                 flag_liveness=args.flag_liveness, local_regs=args.local_regs,
                                 profile_counts=[int(s, 16) for s in args.profile_count_entries.split(',') if s],
-                                x87=args.x87)
+                                x87=args.x87, xmm_abi=args.xmm_abi)
     except Exception:
         if emission_cache is not None:
             emission_cache.close()
@@ -5225,6 +5389,8 @@ def main() -> int:
         "relocation_entries": lift_result["relocation_entries"],
         "flag_liveness": args.flag_liveness,
         "flag_abi": lift_result["flag_abi"],
+        "xmm_abi": args.xmm_abi,
+        "xmm_abi_report": lift_result["xmm_abi"],
         "local_regs": lift_result["local_regs"],
         "x87": lift_result["x87"],
         "direct_call_sites": lift_result["direct_call_sites"],
