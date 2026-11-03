@@ -949,7 +949,8 @@ def local_memory_helpers(text):
 
     With AC1_TRACE_EIP, an empty asm input observes EIP before each access, so
     the tracing store stays live for fault diagnostics after opaque fallback
-    calls disappear. It emits no instruction, but LLVM treats it as reading
+    calls disappear (AC1_EIP_OBSERVER alone selects it for code-generation
+    measurements, tools/codegen_lab.py). It emits no instruction, but LLVM treats it as reading
     and writing memory: no store-to-load forwarding, load reuse or dead-store
     elimination across any guest access. Without tracing EIP is never written,
     so the observer is omitted; memory ordering never depended on it (guest
@@ -983,7 +984,7 @@ def local_memory_helpers(text):
         declaration=prefix+'ac1_base_'+name+'('+args+')'
         prototypes.append(declaration+';')
         body=text[f['body']:f['end']-1]
-        if name in overrides:body=('\n#if defined(AC1_TRACE_EIP)\n    __asm__ __volatile__("" : : "m"(_ac1_observer->eip));\n'
+        if name in overrides:body=('\n#if defined(AC1_TRACE_EIP) || defined(AC1_EIP_OBSERVER)\n    __asm__ __volatile__("" : : "m"(_ac1_observer->eip));\n'
                                    '#else\n    (void)_ac1_observer;\n#endif\n    '+overrides[name]+'\n')
         else:
             edits=[]

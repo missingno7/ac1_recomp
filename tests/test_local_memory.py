@@ -63,7 +63,7 @@ class LocalMemoryTests(unittest.TestCase):
         # EIP-tracing builds keep it.
         observers=section.count('"m"(_ac1_observer->eip)')
         self.assertEqual(observers,3)
-        self.assertEqual(section.count('#if defined(AC1_TRACE_EIP)\n    __asm__ __volatile__("" : : "m"(_ac1_observer->eip));'),observers)
+        self.assertEqual(section.count('#if defined(AC1_TRACE_EIP) || defined(AC1_EIP_OBSERVER)\n    __asm__ __volatile__("" : : "m"(_ac1_observer->eip));'),observers)
 
     @unittest.skipUnless(os.name=='nt' and shutil.which('gcc'), 'Windows native fault oracle required')
     def test_precise_read_and_write_fault_eip_and_full_cpu_observers(self):

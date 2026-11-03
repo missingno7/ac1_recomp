@@ -1,0 +1,17 @@
+{
+  "description": "Code-generation lab corpus and variants (tools/codegen_lab.py, docs/codegen-lab.md).",
+  "leaves": ["0x00428540", "0x00653400", "0x01176DE0"],
+  "hot_top": 40,
+  "variants": {
+    "base": {"defines": [], "note": "as shipped: no EIP observer without EIP tracing"},
+    "eip_observer": {"defines": ["-DAC1_EIP_OBSERVER"], "note": "accessor barrier as before 5c0308c"}
+  },
+  "bench": {
+    "calls_per_rep": 1000000,
+    "reps": 7,
+    "check_calls": 20000,
+    "cpu_mask": "80",
+    "events": ["instructions:u", "cpu-cycles:u", "raw-stall-backend:u", "raw-stall-backend-mem:u"]
+  },
+  "compare": {"min_relative_change": 0.02, "noise_multiple": 3}
+}
