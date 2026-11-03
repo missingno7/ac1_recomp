@@ -1,6 +1,8 @@
-"""usage: python tools/codegen_lab/microbench_run.py   (phone connected, game not in the foreground)
+"""usage: python tools/codegen_lab/microbench_run.py [KERNEL,...]   (phone connected, game not in the foreground)
 
-Build the cost-model microbenchmarks, run each kernel on the phone under simpleperf stat, per core."""
+Build the cost-model microbenchmarks, run each kernel (or the named ones) on the phone under
+simpleperf stat, per core. The kernels `reload_plain` and `reload_speculative` run
+microbench_reload.c (callee-saved reloads after a guest call, plain or by value speculation)."""
 import json, os, re, statistics, subprocess, sys, pathlib
 ROOT = pathlib.Path(__file__).resolve().parents[2]; OUT = ROOT/'work/codegen_lab/experiments/microbench'
 OUT.mkdir(parents=True, exist_ok=True)
@@ -14,19 +16,26 @@ CORES = {'X4 cpu7': '80', 'A720 cpu2': '04'}
 sh = lambda c: subprocess.run([ADB, '-s', DEV, 'shell', c], capture_output=True, text=True)
 src = ROOT/'tools/codegen_lab/microbench_arm64.c'
 subprocess.run([str(NDK/'bin/clang.exe'), *FLAGS, str(src), '-o', str(OUT/'microbench')], check=True)
-subprocess.run([str(NDK/'bin/llvm-objdump.exe'), '-d', '--no-show-raw-insn', str(OUT/'microbench')], stdout=open(OUT/'microbench.s', 'w'), check=True)
+subprocess.run([str(NDK/'bin/clang.exe'), *FLAGS, str(ROOT/'tools/codegen_lab/microbench_reload.c'), '-o', str(OUT/'microbench_reload')], check=True)
+with open(OUT/'microbench.s', 'w') as f:
+    for b in ('microbench', 'microbench_reload'):
+        subprocess.run([str(NDK/'bin/llvm-objdump.exe'), '-d', '--no-show-raw-insn', str(OUT/b)], stdout=f, check=True)
 if 'org.ac1.recomp' in sh('dumpsys window | grep mCurrentFocus').stdout: sys.exit('game in foreground; not running')
-subprocess.run([ADB, '-s', DEV, 'push', str(OUT/'microbench'), '/data/local/tmp/microbench'], check=True, capture_output=True)
-sh('chmod 755 /data/local/tmp/microbench')
-kernels = sh('/data/local/tmp/microbench list').stdout.split()
+for b in ('microbench', 'microbench_reload'):
+    subprocess.run([ADB, '-s', DEV, 'push', str(OUT/b), f'/data/local/tmp/{b}'], check=True, capture_output=True)
+    sh(f'chmod 755 /data/local/tmp/{b}')
+kernels = sh('/data/local/tmp/microbench list').stdout.split() + ['reload_plain', 'reload_speculative']
+if len(sys.argv) > 1: kernels = ['empty'] + [k for k in sys.argv[1].split(',') if k != 'empty']
+command = lambda k: (f'/data/local/tmp/microbench_reload {k[7:]} {N}' if k.startswith('reload_')
+                     else f'/data/local/tmp/microbench {k} {N}')
 raw = {}
 for core, mask in CORES.items():
     for k in kernels:
         for r in range(REPS):
-            t = sh(f'taskset {mask} simpleperf stat -e {EVENTS} /data/local/tmp/microbench {k} {N}')
+            t = sh(f'taskset {mask} simpleperf stat -e {EVENTS} {command(k)}')
             for m in re.finditer(r'^\s*([\d,]+)\s+(\S+)', t.stdout + t.stderr, re.M):
                 raw.setdefault(core, {}).setdefault(k, {}).setdefault(m[2], []).append(int(m[1].replace(',', '')) / N)
-(OUT/'raw.json').write_text(json.dumps(dict(n=N, reps=REPS, temp=sh('cat /sys/class/thermal/thermal_zone0/temp').stdout.strip(), raw=raw), indent=1))
+(OUT/('raw.json' if len(sys.argv) == 1 else 'raw_selected.json')).write_text(json.dumps(dict(n=N, reps=REPS, temp=sh('cat /sys/class/thermal/thermal_zone0/temp').stdout.strip(), raw=raw), indent=1))
 for core, ks in raw.items():
     e0 = {e: statistics.median(v) for e, v in ks['empty'].items()}
     print(f'\n{core}: per iteration, loop overhead (empty) subtracted; median of {REPS}, spread = (max-min)/median')

@@ -19,6 +19,8 @@ param(
     [ValidateSet('off', 'on')][string]$XmmAbi = 'off',
     # Native x87 TOP kept across blocks where tools/function_facts.py proves the stack depth (experimental).
     [ValidateSet('off', 'on')][string]$X87Regions = 'off',
+    # Value-speculative reloads of live callee-saved GPRs after guest calls (experimental).
+    [ValidateSet('off', 'on')][string]$GprSpeculation = 'off',
     # Compiler fences on every goto of GPR-local functions, or only on backward branches.
     [ValidateSet('all', 'backward')][string]$BranchFences = 'all',
     # Dedicated count build only; default generated code has zero count hooks.
@@ -55,7 +57,8 @@ try {
                 $(if ($Report.xmm_abi) { $Report.xmm_abi } else { 'off' }) -ne $XmmAbi -or
                 $(if ($Report.branch_fences) { $Report.branch_fences } else { 'all' }) -ne $BranchFences -or
                 $(if ($Report.x87_regions) { $Report.x87_regions } else { 'off' }) -ne $X87Regions -or
-                ($X87Regions -eq 'on' -and $Report.function_facts_sha256 -ne $FactsHash)
+                $(if ($Report.gpr_speculation) { $Report.gpr_speculation } else { 'off' }) -ne $GprSpeculation -or
+                (($X87Regions -eq 'on' -or $GprSpeculation -eq 'on') -and $Report.function_facts_sha256 -ne $FactsHash)
             $CountEntries = @($ProfileCountEntries.Split(',') | Where-Object { $_ } | ForEach-Object { ([Convert]::ToUInt32($_,16)).ToString('X8') } | Sort-Object -Unique)
             if ((@($Report.profile_count_entries) -join ',') -ne ($CountEntries -join ',')) { $NeedGenerate = $true }
         }
@@ -63,7 +66,7 @@ try {
     if ($NeedGenerate) {
         & $Python -B tools/analyze_pe.py
         if ($LASTEXITCODE -ne 0) { throw 'PE analysis failed' }
-        & $Python -B tools/lift_ac1.py --flag-liveness $FlagLiveness --local-regs $LocalRegs --x87 $X87 --xmm-abi $XmmAbi --branch-fences $BranchFences --x87-regions $X87Regions "--profile-count-entries=$ProfileCountEntries"
+        & $Python -B tools/lift_ac1.py --flag-liveness $FlagLiveness --local-regs $LocalRegs --x87 $X87 --xmm-abi $XmmAbi --branch-fences $BranchFences --x87-regions $X87Regions --gpr-speculation $GprSpeculation "--profile-count-entries=$ProfileCountEntries"
         if ($LASTEXITCODE -ne 0) { throw 'AC1 generation failed' }
     }
     & $Python -B tools/prepare_runtime.py

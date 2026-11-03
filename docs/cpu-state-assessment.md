@@ -314,3 +314,81 @@ transfer kinds, an effects table, worklist summaries over the call graph)
 replaced what would have been another regex pass over generated C. GPR
 contracts need the same pieces, with Capstone's per-instruction register
 reads and writes in place of the x87 table.
+
+## Follow-up: GPR call boundaries, measured (item 2)
+
+**Exact footprint contracts do not pay.** `tools/codegen_lab/gpr_census.py`
+gives each function its transitive register footprint from the decoded x86
+(`function_facts.gpr_effect`, Capstone's implicit and explicit operands; an
+indirect call, import or unknown target counts as all eight registers). A
+register can stay in the caller's local across a call only if it is outside
+the callee's footprint. 72,995 of the 102,014 functions reach an indirect call
+or import and have all eight registers in their footprint. In the hot corpus,
+190 of 343 direct call sites have a register outside it: 31% of the live
+reloads and 13% of the dirty spills at call sites, weighted by function
+cycles. Against the phone city profile that is about 6% of all GPR-state
+cycles, or **0.5% of game-code cycles**, because most traffic is at calls into
+callees that use the register or call through vtables. That gain does not
+carry the whole-program invariants that contracts need.
+
+**Where the GPR cost is.** Splitting the profile's GPR-state loads and stores
+by the lifted statement they belong to (hot corpus):
+
+| sync site | share of GPR-state cycles | stall share |
+|---|---|---|
+| reloads after a call | 59% | 0.55 |
+| spills before a call | ~16% | |
+| entry loads | 9% | |
+| return stores | 9% | |
+
+About three quarters of the reload cycles are esi and edi, mostly one `ldp` of
+the pair, with stall share 0.62. These are callee-saved registers. The callee
+pushes them, pops them back and stores them to the struct at return; the caller
+reloads them and uses them at once (esi is usually `this`). That makes a memory
+chain through two struct hops and a guest-stack round trip on every call. The
+cost is the calling protocol, not missing analysis. esp is about 1.6%.
+
+**Value speculation (opt-in, exact).** With `--gpr-speculation on`
+(`build.ps1 -GprSpeculation on`), each live callee-saved local (ebx, ebp, esi,
+edi) is reloaded after a guest call as:
+
+```c
+v = c->esi;
+if (v != local) local = v;   /* behind __builtin_expect and a volatile asm */
+```
+
+On the predicted path the code after the call uses the caller's own register,
+so it no longer waits for the callee's stores. The result is always the
+struct's value, so the state is exact whatever the callee does. Liveness comes
+from `function_facts.gpr_live_after_calls`. Dead registers are left to Clang,
+which would otherwise have to keep the load for the compare.
+
+Checks:
+- The branch form survives in real lifted functions; no `csel` puts the load
+  back on the chain.
+- `tests/test_codegen_reload_speculation.py` runs plain and speculative code on
+  callees that keep or change esi and compares the full state and memory.
+- A mutant that ignores a mismatch fails that test.
+
+On the hot corpus (snapshot `gs1`, everything else default) the static price is:
+
+| metric | change |
+|---|---|
+| instructions | +8.2% |
+| branches | +40% |
+| CPU-struct GPR loads | +25% (one `ldp` of a pair becomes two compared loads) |
+| host stack spills | +15-17% (the old values stay live across the call) |
+
+`microbench_reload.c` reproduces the protocol. On the PC it shows no
+difference (1.56 vs 1.54 ns per call), as expected: x86 cores rename memory and
+forward stores nearly for free. The ARM64 cost model measured a 4-5 cycle hop
+per struct round trip. The phone run (`microbench_run.py
+reload_plain,reload_speculative`, then a lab benchmark of hot non-leaf
+functions) decides whether the removed chain outweighs the extra
+instructions. Until then it stays off.
+
+**If speculation wins on the phone**, the same chain is the case for a private
+register calling convention: callee-saved values and `this` passed in host
+registers instead of through the struct. That is the larger structural change,
+since every signature, the dispatch table and native bindings would change, so
+the speculation result is the cheap way to learn how much it could gain first.

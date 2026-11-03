@@ -4198,8 +4198,15 @@ def declare_local_memory_base(body: str) -> str:
     return re.sub(pattern, lambda m: m[0] + '\n    AC1_DECLARE_LOCAL_ARENA;', body)
 
 
-def local_register_function(body: str, branch_fences: str = 'all') -> str:
+def local_register_function(body: str, branch_fences: str = 'all', speculate=None) -> str:
     """GPR locals with conservative CFG dirty sets and audited CPU boundaries.
+
+    `speculate` ({guest call va: GPR mask live after it}, from
+    function_facts.gpr_live_after_calls) reloads the live callee-saved
+    registers after that call by value speculation: the struct is still read,
+    but the function keeps its own value unless the two differ (a branch the
+    core predicts), so code after the call does not wait for the callee's
+    stores. The result is always the struct's value, so the state stays exact.
 
     Exception-frame (fs:) functions are included: the runtime never resumes
     guest code from an exception context (RaiseException accepts only the
@@ -4224,6 +4231,12 @@ def local_register_function(body: str, branch_fences: str = 'all') -> str:
     gpr=re.compile(r'\bc->('+'|'.join(registers)+r')\b')
     def spill(dirty):return ' '.join(f'c->{r} = _ac1_regs.{r};' for r in registers if r in dirty)
     reload=' '.join(f'_ac1_regs.{r} = c->{r};' for r in registers)
+    def speculative_reload(live):
+        return ' '.join((f'{{ uint32_t _ac1_v = c->{r}; if (__builtin_expect(_ac1_v != _ac1_regs.{r}, 0)) '
+                         f'{{ __asm__ __volatile__("" : "+r"(_ac1_v)); _ac1_regs.{r} = _ac1_v; }} '
+                         f'else __asm__("" : "+r"(_ac1_regs.{r})); }}')
+                        if r in SPECULATED_GPRS and live>>GPR_INDEX[r]&1 else f'_ac1_regs.{r} = c->{r};'
+                        for r in registers)
     esp_spill,esp_reload='c->esp = _ac1_regs.esp;','_ac1_regs.esp = c->esp;'
     pure=r'flags_\w+|'+'|'.join(sorted(LOCAL_GPR_FREE_HELPERS))
     lines=body.splitlines()
@@ -4286,6 +4299,9 @@ def local_register_function(body: str, branch_fences: str = 'all') -> str:
             at_return=(esp_reload+' ' if partial[i] else '')+spill(after)
             text=re.sub(r'\breturn;','{ '+at_return+' return; }',text)
         edge_reload=reload if full[i] else esp_reload if partial[i] else ''
+        site=re.search(r'AC1_SET_GUEST_EIP\(c,\s*0x([0-9A-F]{8})u\)',text)
+        if full[i] and speculate and site and int(site[1],16) in speculate and re.search(r'\b(?:AC1_CALL|dispatch)\(c',text):
+            edge_reload=speculative_reload(speculate[int(site[1],16)])
         # 'backward': forward edges carry only their reload; fence_backward_branches
         # fences every backward edge afterwards, which keeps loops polling.
         fence=edge_reload+(' __asm__ __volatile__("" ::: "memory"); ' if branch_fences=='all' else ' ')
@@ -4297,6 +4313,10 @@ def local_register_function(body: str, branch_fences: str = 'all') -> str:
 
 
 LOOP_FENCE = '__asm__ __volatile__("" ::: "memory"); '
+# Callee-saved under the MSVC convention: callees push and restore them, so
+# after a call they almost always still hold the caller's values.
+SPECULATED_GPRS = frozenset({'ebx', 'ebp', 'esi', 'edi'})
+GPR_INDEX = {r: i for i, r in enumerate('eax ecx edx ebx esp ebp esi edi'.split())}
 
 
 def fence_backward_branches(body: str) -> str:
@@ -4772,7 +4792,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
               emission_cache=None, direct_calls: bool = True, native_overrides=None,
               flag_liveness: str = 'off', local_regs: str = 'off', profile_counts=(),
               x87: str = 'exact', xmm_abi: str = 'off', branch_fences: str = 'all',
-              x87_regions: str = 'off') -> dict:
+              x87_regions: str = 'off', gpr_speculation: str = 'off') -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
@@ -4950,10 +4970,19 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     if x87_regions == 'on' and x87 != 'native':
         raise ValueError('x87 regions need --x87 native')
     region_facts = None
+    if gpr_speculation not in ('off', 'on'):
+        raise ValueError('gpr_speculation must be off or on')
+    facts_program = None
+    def program_facts():
+        nonlocal facts_program
+        if facts_program is None:
+            import function_facts
+            facts_program = function_facts.Program(catalog=output_dir / 'functions.json')
+        return facts_program
     if x87_regions == 'on':
         # TOP proofs from the recovered CFG and decoded x86 (function_facts.py).
         import function_facts
-        program = function_facts.Program(catalog=output_dir / 'functions.json')
+        program = program_facts()
         all_facts = {a: program.facts(a) for a in program.functions}
         deltas = function_facts.x87_deltas(program, all_facts)
         region_facts = lambda a: (function_facts.x87_region(a, all_facts[a], deltas.get).lowering()
@@ -4983,9 +5012,15 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
             by_address, set(bindings) | set(regions), call_targets, jump_targets)
     selected_locals = local_register_selection(local_regs, set(lifted))
     local_count, local_xmm_count, local_excluded = 0, 0, []
+    speculated_sites = 0
     for index, address in enumerate(lifted):
         if address in selected_locals:
-            gprs = local_register_function(bodies[index], branch_fences)
+            speculate = None
+            if gpr_speculation == 'on' and address in program_facts().functions:
+                import function_facts
+                speculate = function_facts.gpr_live_after_calls(program_facts().gpr_facts(address))
+                speculated_sites += sum(bool(m & function_facts.GPR_CALLEE_SAVED) for m in speculate.values())
+            gprs = local_register_function(bodies[index], branch_fences, speculate)
             transformed = local_xmm_function(gprs, xmm_contracts.get(address))
             local_xmm_count += transformed != gprs
             if transformed != bodies[index]:
@@ -5137,6 +5172,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "xmm_abi": xmm_report,
         'x87': {'mode': x87, 'native_count': x87_native_count, 'regions': x87_regions,
                 'region_count': x87_region_count},
+        'gpr_speculation': {'mode': gpr_speculation, 'call_sites': speculated_sites},
         'local_regs': {'requested': local_regs, 'admitted_count': local_count,
                        'xmm_admitted_count': local_xmm_count,
                        'excluded_functions': local_excluded},
@@ -5282,6 +5318,9 @@ def main() -> int:
     parser.add_argument('--xmm-abi', choices=('off', 'on'), default='off',
                         help='on: whole-program XMM entry/return contracts narrow the syncs of XMM locals '
                              'at calls, entries and returns')
+    parser.add_argument('--gpr-speculation', choices=('off', 'on'), default='off',
+                        help='on: after guest calls, live callee-saved GPR locals are reloaded by value '
+                             'speculation (the struct is still read and wins on a mismatch; experimental)')
     parser.add_argument('--x87-regions', choices=('off', 'on'), default='off',
                         help='on: native x87 keeps TOP in its local across blocks where function_facts proves '
                              'the stack depth (experimental)')
@@ -5504,7 +5543,7 @@ def main() -> int:
                                 flag_liveness=args.flag_liveness, local_regs=args.local_regs,
                                 profile_counts=[int(s, 16) for s in args.profile_count_entries.split(',') if s],
                                 x87=args.x87, xmm_abi=args.xmm_abi, branch_fences=args.branch_fences,
-                                x87_regions=args.x87_regions)
+                                x87_regions=args.x87_regions, gpr_speculation=args.gpr_speculation)
     except Exception:
         if emission_cache is not None:
             emission_cache.close()
@@ -5525,6 +5564,7 @@ def main() -> int:
         "xmm_abi": args.xmm_abi,
         "branch_fences": args.branch_fences,
         "x87_regions": args.x87_regions,
+        "gpr_speculation": args.gpr_speculation,
         "function_facts_sha256": sha256(Path(__file__).with_name('function_facts.py')),
         "xmm_abi_report": lift_result["xmm_abi"],
         "local_regs": lift_result["local_regs"],

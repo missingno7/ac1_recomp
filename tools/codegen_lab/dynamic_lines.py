@@ -113,7 +113,7 @@ def asm_class(t, cpu):
                 else 'cpu x87 top' if 0x90 <= off < 0x98 else 'cpu xmm' if 0x98 <= off < 0x120 else 'cpu other')
     return f'{kind} {"store" if m[1].startswith("st") else "load"}'
 
-by_c, by_asm, by_fn, by_all, by_joint, by_fn_class = (collections.defaultdict(collections.Counter) for _ in range(6))
+by_c, by_asm, by_fn, by_all, by_joint, by_fn_class, by_gpr = (collections.defaultdict(collections.Counter) for _ in range(7))
 for a in game:
     v = counts[a]; s_ = sym_of(v); t = insn.get(a, '')
     ac = ('native ' if s_.startswith('ac1_translated_') else '') + (asm_class(t, cpu_regs.get(s_, {'x0'})) if t else 'unknown')
@@ -130,6 +130,18 @@ for a in picked:
     if ac.startswith('guest') and text:
         jc = ac + (' (stack)' if cc == 'guest stack access' else ' (other)' if cc == 'guest other access' else ' (in ' + cc + ')')
     elif cc == 'native leaf': jc = 'native leaf'
+    if ac.startswith('cpu gpr') and text:
+        prev = statement(w[0], w[1] - 1) or ''
+        gk = ('entry load' if 'STACK_BASE' in prev else 'call line (spill)' if re.search(r'AC1_CALL\(|dispatch\(', text)
+              else 'return store' if 'return;' in text else 'reload after call' if re.search(r'_ac1_regs\.\w+ = c->', text)
+              else 'other')
+        for e in EVENTS: by_gpr[gk + ' ' + ac[8:]][e] += v[e]
+        if gk == 'reload after call':
+            o = re.search(r'\[x\d+(?:, #(0x[0-9a-f]+|\d+))?\]', t)
+            off = int(o[1], 0) if o and o[1] else 0
+            pair = t.startswith('ldp')
+            name = ('eax ecx edx ebx esp ebp esi edi'.split()[off // 4] if off < 32 else '?') + ('+next' if pair else '')
+            for e in EVENTS: by_gpr['  reload ' + name][e] += v[e]
     for e in EVENTS:
         by_c[cc][e] += v[e]; by_asm[ac][e] += v[e]; by_fn[s][e] += v[e]; by_joint[jc][e] += v[e]
 corpus_cycles = sum(v['cpu-cycles:u'] for v in by_fn.values())
@@ -144,6 +156,7 @@ def table(title, d):
 game_cycles = sum(v['cpu-cycles:u'] for v in by_all.values())
 print(f'all translated game code: {100*game_cycles/total["cpu-cycles:u"]:.1f}% of main-thread cycles, {len(syms)} functions')
 table('all game code by ARM64 instruction', by_all)
+table('corpus GPR-state loads/stores by sync site', by_gpr)
 table('corpus by lifted C statement', by_c)
 table('corpus by ARM64 instruction, guest accesses split by their C statement', by_joint)
 json.dump(dict(total=total, by_c=by_c, by_asm=by_asm, by_fn=by_fn, by_all=by_all, by_joint=by_joint, by_fn_class=by_fn_class), open(out_dir/'summary.json', 'w'), indent=1)

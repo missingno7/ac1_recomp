@@ -63,6 +63,34 @@ def x87_effect(insn):
     return None
 
 
+# ---------------------------------------------------------------- GPR effects
+GPRS = ('eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi')
+GPR_ALL = 0xFF
+_GPR_OF = {**{r: i for i, r in enumerate(GPRS)},
+           **{n: i for i, r in enumerate(GPRS) for n in (r[1:], )},                       # ax, cx, ... sp, bp, si, di
+           'al': 0, 'ah': 0, 'cl': 1, 'ch': 1, 'dl': 2, 'dh': 2, 'bl': 3, 'bh': 3}
+_GPR_PARTIAL = {n for n in _GPR_OF if n not in GPRS}
+
+
+def gpr_effect(insn):
+    """(read mask, write mask) over the eight GPRs, implicit operands included.
+
+    A write of a partial register (al, ax) keeps the rest, so it also reads the
+    whole register.
+    """
+    reads, writes = insn.regs_access()
+    r = w = 0
+    for reg in reads:
+        name = insn.reg_name(reg)
+        if name in _GPR_OF: r |= 1 << _GPR_OF[name]
+    for reg in writes:
+        name = insn.reg_name(reg)
+        if name in _GPR_OF:
+            w |= 1 << _GPR_OF[name]
+            if name in _GPR_PARTIAL: r |= 1 << _GPR_OF[name]
+    return r, w
+
+
 # ---------------------------------------------------------------- facts
 @dataclasses.dataclass
 class Transfer:
@@ -106,6 +134,14 @@ class Program:
         decoded = self.decode(address)
         return [(b['start'], tuple(b['successors']),
                  [(va, decoded[va].mnemonic, x87_effect(decoded[va]), self.transfer(decoded[va], fn))
+                  for va, _ in b['instructions']]) for b in fn['blocks']]
+
+    def gpr_facts(self, address):
+        """[(start, successors, [(va, mnemonic, (reads, writes), transfer)])] for one function."""
+        fn = self.functions[address]
+        decoded = self.decode(address)
+        return [(b['start'], tuple(b['successors']),
+                 [(va, decoded[va].mnemonic, gpr_effect(decoded[va]), self.transfer(decoded[va], fn))
                   for va, _ in b['instructions']]) for b in fn['blocks']]
 
     def transfer(self, insn, function):
@@ -291,6 +327,47 @@ def x87_deltas(program, facts):
                 if c not in queued:
                     queue.append(c); queued.add(c)
     return delta
+
+
+# ---------------------------------------------------------------- GPR liveness
+GPR_CALLEE_SAVED = 0b11101000            # ebx, ebp, esi, edi (the MSVC callee-saved set)
+
+
+def gpr_live_after_calls(facts):
+    """{call va: GPRs whose reloaded value the function's own code reads before redefining it}.
+
+    Backward liveness over the CFG (gpr_facts), for GPR locals: after a call
+    every register is reloaded from the struct, so a later call or a return
+    does not read a reloaded value from the local (the struct already holds
+    it; only registers written since are synced, and those were redefined).
+    The register state itself stays exact either way: this only says where a
+    reload's value is used.
+    """
+    blocks = {s: (succ, insns) for s, succ, insns in facts}
+
+    def step(live, insn):
+        va, m, (r, w), t = insn
+        if t and t.kind in ('ret', 'tail', 'tail-indirect', 'direct', 'import', 'indirect'):
+            return 0
+        return r | (live & ~w)
+
+    live_in = dict.fromkeys(blocks, 0)
+    changed = True
+    while changed:
+        changed = False
+        for s, (succ, insns) in blocks.items():
+            live = 0
+            for t in succ: live |= live_in.get(t, GPR_ALL)
+            for insn in reversed(insns): live = step(live, insn)
+            if live != live_in[s]: live_in[s] = live; changed = True
+    after = {}
+    for s, (succ, insns) in blocks.items():
+        live = 0
+        for t in succ: live |= live_in.get(t, GPR_ALL)
+        for insn in reversed(insns):
+            if insn[3] and insn[3].kind in ('direct', 'import', 'indirect'): after[insn[0]] = live
+            live = step(live, insn)
+    return after
 
 
 # ---------------------------------------------------------------- census
