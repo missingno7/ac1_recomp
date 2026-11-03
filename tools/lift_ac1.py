@@ -4292,6 +4292,29 @@ def local_register_function(body: str) -> str:
     return '\n'.join(output)
 
 
+LOOP_FENCE = '__asm__ __volatile__("" ::: "memory"); '
+
+
+def fence_backward_branches(body: str) -> str:
+    """Fence every branch to an equal or lower guest address.
+
+    Every cycle in a function's CFG contains such a branch, so a guest load in
+    a loop is not hoisted out of it: a polling loop sees a value another thread
+    stores. GPR-local bodies already fence each goto; this covers the rest,
+    which before relied on the EIP observer in every memory accessor (kept only
+    for AC1_TRACE_EIP builds, see prepare_runtime.py).
+    """
+    out = []
+    for line in body.splitlines():
+        if 'goto L_' in line and LOOP_FENCE not in line:
+            va = re.search(r'/\*\s*([0-9A-F]{8}):', line)
+            if va:
+                line = re.sub(r'\bgoto (L_([0-9A-F]{8}));',
+                              lambda m: m[0] if int(m[2], 16) > int(va[1], 16) else '{ ' + LOOP_FENCE + m[0] + ' }', line)
+        out.append(line)
+    return '\n'.join(out)
+
+
 def xmm_free_helpers(cpu_header: str) -> frozenset:
     """Prepared CPU-header helpers never touch c->xmm; only guest calls can."""
     names=set(re.findall(r'^(?:static inline|AC1_ACCESSOR_INLINE|AC1_X87_INTEGER_INLINE)\s+[^\n(]*?\b(\w+)\s*\(',cpu_header,re.M))
@@ -4352,7 +4375,8 @@ X87_STACK_HELPERS = frozenset({
 X87_BOOKKEEPING = (
     re.compile(r'if \(!ac1_x87_check\(c, 0x[0-9A-F]+u\)\) return;'),
     re.compile(r'c->fpu_ip=GVA\(0x[0-9A-F]+\); c->fpu_cs=c->cs; c->fpu_opcode=0x[0-9A-F]+u;'),
-    re.compile(r'c->fpu_dp=[^;]*; c->fpu_ds=c->ss;'),
+    # Every operand's segment: memory operands not based on ESP/EBP record DS.
+    re.compile(r'c->fpu_dp=[^;]*; c->fpu_ds=c->[a-z]s;'),
     re.compile(r'ac1_x87_set_tag\(c,[^;]*\);'))
 
 
@@ -4684,6 +4708,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
             else:
                 local_excluded.append(f'0x{address:08X}')
             bodies[index] = transformed
+    bodies = [fence_backward_branches(body) for body in bodies]
     # Keep L_VA as the one public entry for direct transfers AND the dispatch
     # table. Retain a private, callable translated oracle behind that entry.
     region_bodies = [declare_local_memory_base(body) for body in region_bodies]

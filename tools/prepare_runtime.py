@@ -947,9 +947,14 @@ def local_memory_helpers(text):
     is required on Windows or Android. Unaligned atomics keep the original
     checked fallback, including its precise rejection diagnostics.
 
-    The empty asm input observes only EIP before an access. It keeps the
-    existing tracing store live for fault diagnostics after opaque fallback
-    calls disappear, emits no instruction, and needs no GPR synchronization.
+    With AC1_TRACE_EIP, an empty asm input observes EIP before each access, so
+    the tracing store stays live for fault diagnostics after opaque fallback
+    calls disappear. It emits no instruction, but LLVM treats it as reading
+    and writing memory: no store-to-load forwarding, load reuse or dead-store
+    elimination across any guest access. Without tracing EIP is never written,
+    so the observer is omitted; memory ordering never depended on it (guest
+    threads hand over under the scheduler mutex, atomics order themselves and
+    the branch fences keep polling loops).
     """
     functions,masked=helper_functions(text)
     aliases={'guest_execution_read':'ac1_direct_read','guest_execution_write':'ac1_direct_write',
@@ -978,7 +983,8 @@ def local_memory_helpers(text):
         declaration=prefix+'ac1_base_'+name+'('+args+')'
         prototypes.append(declaration+';')
         body=text[f['body']:f['end']-1]
-        if name in overrides:body='\n    __asm__ __volatile__("" : : "m"(_ac1_observer->eip));\n    '+overrides[name]+'\n'
+        if name in overrides:body=('\n#if defined(AC1_TRACE_EIP)\n    __asm__ __volatile__("" : : "m"(_ac1_observer->eip));\n'
+                                   '#else\n    (void)_ac1_observer;\n#endif\n    '+overrides[name]+'\n')
         else:
             edits=[]
             for m in re.finditer(r'\b(\w+)\s*\(',f['code']):

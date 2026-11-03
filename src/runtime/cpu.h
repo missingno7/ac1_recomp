@@ -1349,17 +1349,29 @@ static inline void ac1_base_ac1_x87_save(uint8_t * const _ac1_base, const CPU * 
 static inline void ac1_base_ac1_x87_restore(uint8_t * const _ac1_base, const CPU * const _ac1_observer, CPU *c, uint32_t a);
 AC1_ACCESSOR_INLINE void ac1_base_ac1_direct_read(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, void *o, size_t w) {
 
+#if defined(AC1_TRACE_EIP)
     __asm__ __volatile__("" : : "m"(_ac1_observer->eip));
+#else
+    (void)_ac1_observer;
+#endif
     memcpy(o, _ac1_base + a, w);
 }
 AC1_ACCESSOR_INLINE void ac1_base_ac1_direct_write(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, const void *i, size_t w) {
 
+#if defined(AC1_TRACE_EIP)
     __asm__ __volatile__("" : : "m"(_ac1_observer->eip));
+#else
+    (void)_ac1_observer;
+#endif
     memcpy(_ac1_base + a, i, w);
 }
 AC1_ACCESSOR_INLINE uint32_t *ac1_base_ac1_direct_atomic_cell(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a) {
 
+#if defined(AC1_TRACE_EIP)
     __asm__ __volatile__("" : : "m"(_ac1_observer->eip));
+#else
+    (void)_ac1_observer;
+#endif
     return !(a & 3u) ? (uint32_t *)(_ac1_base + a) : NULL;
 }
 AC1_ACCESSOR_INLINE uint32_t ac1_base_ac1_direct_xadd32(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, uint32_t v) {

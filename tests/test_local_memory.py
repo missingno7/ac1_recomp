@@ -59,6 +59,11 @@ class LocalMemoryTests(unittest.TestCase):
         self.assertIn('(guest_atomic_xadd32)',section)  # exact checked fallback
         for name in ('push32','pop32','rdf80','wrf80','ac1_x87_save','ac1_x87_restore','bit_string_op'):
             self.assertIn('ac1_base_'+name+'(',section)
+        # The EIP observer is an optimization barrier at every access; only
+        # EIP-tracing builds keep it.
+        observers=section.count('"m"(_ac1_observer->eip)')
+        self.assertEqual(observers,3)
+        self.assertEqual(section.count('#if defined(AC1_TRACE_EIP)\n    __asm__ __volatile__("" : : "m"(_ac1_observer->eip));'),observers)
 
     @unittest.skipUnless(os.name=='nt' and shutil.which('gcc'), 'Windows native fault oracle required')
     def test_precise_read_and_write_fault_eip_and_full_cpu_observers(self):
