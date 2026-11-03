@@ -462,3 +462,88 @@ code. The lab measures that on the hot corpus (static spills, then ARM64
 benchmarks of hot non-leaf functions) before any gameplay A/B. Of the earlier
 candidates, this one targets the largest measured cost: the 9.3% GPR-state
 traffic, plus the esp chain behind the guest-stack lines.
+
+### Guest-register calling protocols: semantics, cost, real code
+
+**ABI semantics.** `-ffixed-xN` only keeps Clang-compiled code in that unit
+from allocating xN. It creates no guest ABI. Any ordinary AAPCS64 function
+between guest frames saves x20-x28 on entry and restores them on return,
+silently reverting a callee's new values. `tools/codegen_lab/abi_chain.c`
+(+ `abi_host.c`, `abi_main.c`, run by `abi_run.py` on the phone) builds one
+guest call chain under each protocol: a direct chain, an indirect dispatcher
+call, a host import calling guest code back, push/pop, `ret n`. It checks every
+variant against the struct protocol on 4,000 random states (registers and
+guest memory). Results:
+
+- An AAPCS intermediary that restores x20-x27 breaks pinning in 3,688 of 4,000
+  cases. As a tail call it hides the bug, because the epilogue runs before the
+  jump.
+- Pinning is exact only with hand-written adapters wherever host code enters
+  guest code.
+- `preserve_none` is not available for AArch64 in NDK 28's Clang 19.0.1.
+- `swiftcall` returns four registers in x0-x3, where AAPCS64 returns the same
+  aggregate through memory.
+
+**Isolated cost** (cycles per inner call, chain benchmark, X4 / A720):
+
+| protocol | X4 | A720 |
+|---|---|---|
+| struct (today) | 38.8 | 65.8 |
+| pinned esp / esp+esi | 55.8 / 51.3 (slower) | 72.1 / 56.5 |
+| pinned all 8 | 25.3 | 41.4 |
+| swiftcall esp / esp+esi | 31.7 / 29.6 | 53.4 / 47.3 |
+| swiftcall eax, ecx, esp, esi | 23.8 | 24.6 |
+| swiftcall ebx, esp, esi, edi | 29.8 | 45.2 |
+
+**Reservation cost in real code** (`reserve_cost.py`): reserving x20-x27 in
+the hot corpus, code unchanged, costs +3.4% instructions, +50% spill loads and
++23% spill stores. One or two reserved registers cost nothing, but partial
+pinning was slower in the chain. **Global reservation is rejected.**
+
+**Which registers cross hot calls** (`abi_registers.py`, weighted by phone
+cycles): esp dominates in both directions. esi follows. ebx, ebp and edi come
+next, read by callees mostly to push them. ecx (`this`) matters on entry, eax
+only after the call.
+
+**Selective private ABI (opt-in, exact).** `--private-abi REGS`
+(`build.ps1 -PrivateAbi`, esp plus up to three more):
+
+- Every GPR-local function gets a `P_<VA>` body that takes those registers as
+  `swiftcall` arguments and returns them in x0-x3.
+- Its `L_<VA>` stays the struct entry for the dispatch table, natives and the
+  runtime.
+- Only direct calls between such functions use `AC1_PCALLn`, which writes the
+  registers to the struct around the dispatcher fallback and the scheduler
+  checkpoint. AAPCS64 and the struct are unchanged elsewhere.
+- `tests/test_codegen_private_abi.py` requires the struct protocol's hash of
+  full state, memory and every runtime observation (dispatcher entries,
+  checkpoints after every return, the no-call-state fallback) for four
+  register sets. A mutant that treats passed registers as synced fails it.
+- 189,283 call sites become private calls in a full generation.
+
+**Real code, statically.** `hot_static.py` compiles both builds with
+`hot_path.h`, which removes the cold fallback and checkpoint code from both
+call protocols alike. Weighted over the hot corpus:
+
+| | esp, esi | ecx, esp, esi, edi |
+|---|---|---|
+| instructions | +0.0% | +0.3% |
+| CPU-struct GPR loads / stores | -4% / +2% | -10% / -7% |
+| XMM state loads / stores | -15% / -10% | -15% / -10% |
+| spill loads / stores | +6.5% / +13% | +7% / +14% |
+
+Functions with chains of private calls gain (0xB43410: GPR-state operations
+133 → 68). Small hot leaves lose (0x4F2A30: 186 → 211 instructions), because a
+uniform signature keeps every passed register live through every body and
+returns it even when untouched.
+
+**Status.** Correctness is established. On real code the static picture is
+neutral, and the dynamic effect (the esp chain at each call against the added
+spills) is unmeasured. The decision needs a phone city A/B of game-code cycles
+per frame: today against `-PrivateAbi ecx,esp,esi,edi`, with
+`build_android.ps1` now forwarding the switch. If that shows a gain, the next
+step is per-function signatures: pass only the registers a callee reads and
+return only those it can change (its own writes, struct reloads after its
+ordinary calls, its private callees' returns). That removes the leaf penalty
+without transitive footprints. If it shows none, the private ABI is rejected
+as well.

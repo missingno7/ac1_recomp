@@ -7,8 +7,11 @@ param(
     [ValidateSet('arm64-v8a', 'x86_64')][string]$Abi = 'arm64-v8a',
     [ValidateSet('Gradle', 'Make')][string]$NativeBuilder = 'Gradle',
     [string]$Make = '',
-    # Passed to build.ps1, which regenerates when it differs from the last generation.
-    [ValidateSet('off', 'on')][string]$XmmAbi = 'off'
+    # Passed to build.ps1, which regenerates when they differ from the last generation.
+    [ValidateSet('off', 'on')][string]$XmmAbi = 'off',
+    [ValidateSet('off', 'on')][string]$X87Regions = 'off',
+    [ValidateSet('off', 'on')][string]$GprSpeculation = 'off',
+    [string]$PrivateAbi = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,7 +33,8 @@ if ([string]::IsNullOrWhiteSpace($AndroidSdk)) {
 if (-not (Test-Path -LiteralPath (Join-Path $AndroidSdk 'platforms\android-35\android.jar'))) {
     throw "Android SDK platform 35 was not found under '$AndroidSdk'. Pass -AndroidSdk or set ANDROID_HOME."
 }
-& (Join-Path $PSScriptRoot 'build.ps1') -PrepareOnly -Python $Python -XmmAbi $XmmAbi
+& (Join-Path $PSScriptRoot 'build.ps1') -PrepareOnly -Python $Python -XmmAbi $XmmAbi -X87Regions $X87Regions `
+    -GprSpeculation $GprSpeculation -PrivateAbi $PrivateAbi
 if ($LASTEXITCODE -ne 0) { throw 'Native input preparation failed' }
 
 function Get-JavaMajor([string]$JavaInstallRoot) {

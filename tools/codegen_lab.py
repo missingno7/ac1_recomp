@@ -456,11 +456,13 @@ def cmd_static(a):
     result = {}
     for f in snap['corpus']:
         name = f'{int(f["va"], 16):08X}'; unit = pathlib.Path(f['unit']).stem
-        wanted = {f'ac1_translated_{name}', f'L_{name}'}
+        # A private-ABI build (lift_ac1.py --private-abi) keeps the body in P_<VA>
+        # and only a struct adapter in L_<VA>.
+        wanted = {f'ac1_translated_{name}', f'P_{name}', f'L_{name}'}
         row = dict(weight=f['weight'], leaf=f['leaf'])
         for arch, metrics in (('arm64', arm64_metrics), ('x86', x86_metrics)):
             fns = function_insns(build/arch/(unit + '.o'), wanted)
-            body = fns.get(f'ac1_translated_{name}') or fns.get(f'L_{name}') or []
+            body = fns.get(f'ac1_translated_{name}') or fns.get(f'P_{name}') or fns.get(f'L_{name}') or []
             row[arch] = dict(metrics(body))
         result[f['va']] = row
     if (build/'remarks').exists(): result['_remarks'] = remark_blockers(build/'remarks', {f'L_{int(f["va"], 16):08X}' for f in snap['corpus']} |
