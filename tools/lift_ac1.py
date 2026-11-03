@@ -4198,8 +4198,17 @@ def declare_local_memory_base(body: str) -> str:
     return re.sub(pattern, lambda m: m[0] + '\n    AC1_DECLARE_LOCAL_ARENA;', body)
 
 
-def local_register_function(body: str, branch_fences: str = 'all', speculate=None) -> str:
+def local_register_function(body: str, branch_fences: str = 'all', speculate=None, private=None) -> str:
     """GPR locals with conservative CFG dirty sets and audited CPU boundaries.
+
+    `private` (mask: guest registers in GPR order, esp among them; callees:
+    entries with a private body; self: whether this one gets one) selects the
+    private call ABI. A direct call to a private callee pushes on the local esp,
+    spills only the other dirty registers, passes the mask registers as
+    arguments (AC1_PCALLn) and reloads only the others. A private body starts
+    with the mask registers from its arguments, counts them dirty (the struct
+    copy is stale) and returns them in _ac1_ret; private_abi_finish turns it
+    into P_<VA> with an L_<VA> struct adapter once the later passes are done.
 
     `speculate` ({guest call va: GPR mask live after it}, from
     function_facts.gpr_live_after_calls) reloads the live callee-saved
@@ -4225,10 +4234,18 @@ def local_register_function(body: str, branch_fences: str = 'all', speculate=Non
     referenced=set(re.findall(r'\bc->('+names+r')\b',clean))
     stack='|'.join(sorted(LOCAL_ESP_HELPERS))
     if re.search(r'\b(?:'+stack+r')\(c(?=[,)])',clean):referenced.add('esp')
+    if private:referenced|=set(private['mask'])
     registers=[r for r in registers if r in referenced]
     if not registers:return original
     all_regs=set(registers)
     gpr=re.compile(r'\bc->('+'|'.join(registers)+r')\b')
+    mask=[r for r in registers if private and r in private['mask']]
+    self_private=bool(private and private.get('self'))
+    if private and 'esp' not in mask:raise ValueError('the private call ABI needs esp among its registers')
+    def ret_value(source):
+        return '_ac1_ret = (ac1_pregs){ '+', '.join(f'.r{k} = {source}{r}' for k,r in enumerate(mask))+' };'
+    direct_call=re.compile(r'\bAC1_CALL\(c, L_([0-9A-F]{8}), 0x\1u\);')
+    push_block=re.compile(r'\{ uint32_t _ac1_push = 0x[0-9A-F]+u; c->esp -= 4u; wr32\(c->esp, _ac1_push\); \}')
     def spill(dirty):return ' '.join(f'c->{r} = _ac1_regs.{r};' for r in registers if r in dirty)
     reload=' '.join(f'_ac1_regs.{r} = c->{r};' for r in registers)
     def speculative_reload(live):
@@ -4250,12 +4267,19 @@ def local_register_function(body: str, branch_fences: str = 'all', speculate=Non
     if group:groups.append(group)
     texts=[re.sub(r'/\*.*?\*/','', '\n'.join(g),flags=re.S) for g in groups]
     labels={label:i for i,text in enumerate(texts) for label in re.findall(r'^(L_[0-9A-F]{8}):',text,re.M)}
-    full=[];partial=[];writes=[];edges=[];unknown_edges=False
+    full=[];partial=[];writes=[];edges=[];unknown_edges=False;private_call=[]
     for i,text in enumerate(texts):
         pointer=re.sub(r'\bc->\w+','member',text)
         pointer=re.sub(r'\b(?:'+pure+'|'+stack+r')\(c(?=[,)])','safe(',pointer)
         full.append(bool(re.search(r'\bc\b|RECOMP_TODO\(|ac1_unsupported_instruction\(',pointer)))
         partial.append(not full[-1] and bool(re.search(r'\b(?:'+stack+r')\(c(?=[,)])',text)))
+        # A group that is only the return-address push and a direct call to a
+        # private callee (perhaps with the tail return) calls it privately.
+        call=direct_call.search(text) if private else None
+        rest=push_block.sub('',direct_call.sub('',text)) if call and int(call[1],16) in private['callees'] else None
+        if rest is not None:rest=re.sub(r'AC1_SET_GUEST_EIP\(c,\s*0x[0-9A-F]+u\);|^L_[0-9A-F]{8}:|\breturn;','',rest,flags=re.M)
+        private_call.append(rest is not None and not rest.strip() and text.count('AC1_CALL(')==1)
+        if private_call[-1]:full[-1]=partial[-1]=False
         changed=set(re.findall(r'\bc->('+'|'.join(registers)+r')\s*\)*\s*(?:(?:<<|>>|[+*/%&|^\-])?=(?!=)|\+\+|--)',text))
         changed.update(re.findall(r'(?:\+\+|--)\s*\(*\s*c->('+'|'.join(registers)+r')\b',text))
         changed.update(re.findall(r'\bSET(?:8[HL]|16)\(\s*\(*\s*c->('+'|'.join(registers)+r')\b',text))
@@ -4273,9 +4297,10 @@ def local_register_function(body: str, branch_fences: str = 'all', speculate=Non
         if not terminal and i+1<len(groups):successors.add(i+1)
         edges.append(successors)
     def outgoing(i,before):
+        if private_call[i]:return set(mask)
         if full[i]:return set()
         return (before|writes[i])-({'esp'} if partial[i] else set())
-    incoming={0:set()};queue=deque([0])
+    incoming={0:set(mask) if self_private else set()};queue=deque([0])
     while queue:
         i=queue.popleft();after=outgoing(i,incoming[i])
         for target in edges[i]:
@@ -4284,8 +4309,10 @@ def local_register_function(body: str, branch_fences: str = 'all', speculate=Non
     output=lines[:2]+[
         '    struct { uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi; } _ac1_regs;',
         '    _Static_assert(STACK_BASE((CPU *)0) == 0u, "local GPR stack helpers require flat zero stack base");',
-        '    '+reload,
+        '    '+(' '.join(f'_ac1_regs.{r} = _ac1_p_{r};' if r in mask else f'_ac1_regs.{r} = c->{r};'
+                         for r in registers) if self_private else reload),
     ]
+    reload_others=' '.join(f'_ac1_regs.{r} = c->{r};' for r in registers if r not in mask)
     for i,group in enumerate(groups):
         before=all_regs if unknown_edges else incoming.get(i,all_regs)
         after=outgoing(i,before)
@@ -4293,12 +4320,22 @@ def local_register_function(body: str, branch_fences: str = 'all', speculate=Non
         if full[i]:
             sync=spill(before)
             if sync:output.append('    '+sync)
+            # The struct is current here: a private body returns from it.
+            if self_private:text=re.sub(r'\breturn;','{ '+ret_value('c->')+' return; }',text)
+        elif private_call[i]:
+            sync=spill(before-set(mask))
+            if sync:output.append('    '+sync)
+            text=gpr.sub(lambda m:'_ac1_regs.'+m[1],text)
+            text=direct_call.sub(lambda m:f'AC1_PCALL{len(mask)}(c, P_{m[1]}, 0x{m[1]}u, {", ".join(mask)});',text)
+            at_return=(spill(after-set(mask))+' '+ret_value('_ac1_regs.')) if self_private else spill(after)
+            text=re.sub(r'\breturn;','{ '+at_return+' return; }',text)
         else:
             if partial[i] and 'esp' in before:output.append('    '+esp_spill)
             text=gpr.sub(lambda m:m[0] if partial[i] and m[1]=='esp' else '_ac1_regs.'+m[1],text)
-            at_return=(esp_reload+' ' if partial[i] else '')+spill(after)
+            at_return=(esp_reload+' ' if partial[i] else '')+(
+                spill(after-set(mask))+' '+ret_value('_ac1_regs.') if self_private else spill(after))
             text=re.sub(r'\breturn;','{ '+at_return+' return; }',text)
-        edge_reload=reload if full[i] else esp_reload if partial[i] else ''
+        edge_reload=reload if full[i] else reload_others if private_call[i] else esp_reload if partial[i] else ''
         site=re.search(r'AC1_SET_GUEST_EIP\(c,\s*0x([0-9A-F]{8})u\)',text)
         if full[i] and speculate and site and int(site[1],16) in speculate and re.search(r'\b(?:AC1_CALL|dispatch)\(c',text):
             edge_reload=speculative_reload(speculate[int(site[1],16)])
@@ -4308,8 +4345,28 @@ def local_register_function(body: str, branch_fences: str = 'all', speculate=Non
         text=re.sub(r'\bgoto (L_[0-9A-F]{8});',lambda m:'{ '+fence+'goto '+m[1]+'; }',text)
         output.extend(text.splitlines())
         if edge_reload:output.append('    '+edge_reload)
-    output.extend(('    '+spill(all_regs),'}'))
+    output.extend(('    '+(spill(all_regs-set(mask))+' '+ret_value('_ac1_regs.') if self_private else spill(all_regs)),'}'))
     return '\n'.join(output)
+
+
+def private_abi_finish(body: str, address: int, mask) -> str:
+    """Turn a private body (local_register_function with private self) into P_<VA> plus its L_<VA> adapter.
+
+    Runs after every pass that rewrites `return;` (XMM locals) and after the
+    arena declaration, which only recognises `void name(CPU *c)` entries.
+    """
+    head=f'void L_{address:08X}(CPU *c)'
+    lines=body.splitlines()
+    if lines[0]!=head or lines[1]!='{':raise ValueError(f'unexpected private body shape at 0x{address:08X}')
+    lines[0]=f'AC1_PRIVATE ac1_pregs P_{address:08X}(CPU *c, '+', '.join(f'uint32_t _ac1_p_{r}' for r in mask)+')'
+    lines.insert(2,'    ac1_pregs _ac1_ret = {0};')
+    text='\n'.join(lines)
+    text=re.sub(r'\breturn;','return _ac1_ret;',text)
+    text=text[:text.rstrip().rfind('}')]+'    return _ac1_ret;\n}'
+    adapter=[head,'{',
+             f'    ac1_pregs _ac1_o = P_{address:08X}(c, '+', '.join(f'c->{r}' for r in mask)+');',
+             '    '+' '.join(f'c->{r} = (uint32_t)_ac1_o.r{k};' for k,r in enumerate(mask)),'}']
+    return text+'\n\n'+'\n'.join(adapter)
 
 
 LOOP_FENCE = '__asm__ __volatile__("" ::: "memory"); '
@@ -4792,7 +4849,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
               emission_cache=None, direct_calls: bool = True, native_overrides=None,
               flag_liveness: str = 'off', local_regs: str = 'off', profile_counts=(),
               x87: str = 'exact', xmm_abi: str = 'off', branch_fences: str = 'all',
-              x87_regions: str = 'off', gpr_speculation: str = 'off') -> dict:
+              x87_regions: str = 'off', gpr_speculation: str = 'off', private_abi: str = '') -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
@@ -5013,6 +5070,19 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     selected_locals = local_register_selection(local_regs, set(lifted))
     local_count, local_xmm_count, local_excluded = 0, 0, []
     speculated_sites = 0
+    private_mask = [r for r in ('eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi') if r in private_abi.split(',')]
+    if set(filter(None, private_abi.split(','))) - set(private_mask) or (private_mask and 'esp' not in private_mask) \
+            or len(private_mask) > 4:
+        raise ValueError('private_abi is up to four GPR names including esp, comma-separated')
+    private_set = set()
+    if private_mask:
+        # Entries whose body takes GPR locals get a private body; bound
+        # functions, regions and counted entries keep the ordinary one.
+        for index, address in enumerate(lifted):
+            if (address in selected_locals and address not in bindings and address not in regions
+                    and address not in profile_counts and bodies[index].startswith(f'void L_{address:08X}(CPU *c)\n{{')
+                    and local_register_function(bodies[index], branch_fences) != bodies[index]):
+                private_set.add(address)
     for index, address in enumerate(lifted):
         if address in selected_locals:
             speculate = None
@@ -5020,7 +5090,9 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
                 import function_facts
                 speculate = function_facts.gpr_live_after_calls(program_facts().gpr_facts(address))
                 speculated_sites += sum(bool(m & function_facts.GPR_CALLEE_SAVED) for m in speculate.values())
-            gprs = local_register_function(bodies[index], branch_fences, speculate)
+            private = (dict(mask=private_mask, callees=private_set, self=address in private_set)
+                       if private_mask else None)
+            gprs = local_register_function(bodies[index], branch_fences, speculate, private)
             transformed = local_xmm_function(gprs, xmm_contracts.get(address))
             local_xmm_count += transformed != gprs
             if transformed != bodies[index]:
@@ -5045,6 +5117,9 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         if address in count_entries:
             bodies[index] = profile_count_entry(bodies[index], address)
     bodies = [drop_unrecorded_eip_markers(declare_local_memory_base(body)) for body in bodies]
+    for index, address in enumerate(lifted):
+        if address in private_set:
+            bodies[index] = private_abi_finish(bodies[index], address, private_mask)
     if translation_unit_buckets < 0:
         raise ValueError("translation_unit_buckets must be zero or positive")
     if not translation_unit_buckets and functions_per_tu < 1:
@@ -5068,8 +5143,11 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         callees = set().union(*(direct_callees.get(a, set()) for a in addresses))
         direct_prototypes += len(callees)
         native_header = '#include "ac1_native.h"\n' if any(a in bindings or a in regions for a in addresses) else ''
+        private_protos = "".join(
+            f"AC1_PRIVATE ac1_pregs P_{a:08X}(CPU *, " + ", ".join("uint32_t" for _ in private_mask) + ");\n"
+            for a in sorted(callees & private_set))
         return (tu_header + native_header +
-                "".join(f"void L_{a:08X}(CPU *);\n" for a in sorted(callees)) + "\n")
+                "".join(f"void L_{a:08X}(CPU *);\n" for a in sorted(callees)) + private_protos + "\n")
 
     tu_names = emit_region_sources(regions,lifted,region_bodies,output_dir,tu_header) if regions else []
     if translation_unit_buckets:
@@ -5173,6 +5251,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         'x87': {'mode': x87, 'native_count': x87_native_count, 'regions': x87_regions,
                 'region_count': x87_region_count},
         'gpr_speculation': {'mode': gpr_speculation, 'call_sites': speculated_sites},
+        'private_abi': {'registers': private_mask, 'functions': len(private_set)},
         'local_regs': {'requested': local_regs, 'admitted_count': local_count,
                        'xmm_admitted_count': local_xmm_count,
                        'excluded_functions': local_excluded},
@@ -5318,6 +5397,9 @@ def main() -> int:
     parser.add_argument('--xmm-abi', choices=('off', 'on'), default='off',
                         help='on: whole-program XMM entry/return contracts narrow the syncs of XMM locals '
                              'at calls, entries and returns')
+    parser.add_argument('--private-abi', default='',
+                        help='comma-separated GPRs (esp and up to three more) that direct calls between GPR-local '
+                             'functions pass in host registers through P_ bodies (experimental; empty: off)')
     parser.add_argument('--gpr-speculation', choices=('off', 'on'), default='off',
                         help='on: after guest calls, live callee-saved GPR locals are reloaded by value '
                              'speculation (the struct is still read and wins on a mismatch; experimental)')
@@ -5543,7 +5625,8 @@ def main() -> int:
                                 flag_liveness=args.flag_liveness, local_regs=args.local_regs,
                                 profile_counts=[int(s, 16) for s in args.profile_count_entries.split(',') if s],
                                 x87=args.x87, xmm_abi=args.xmm_abi, branch_fences=args.branch_fences,
-                                x87_regions=args.x87_regions, gpr_speculation=args.gpr_speculation)
+                                x87_regions=args.x87_regions, gpr_speculation=args.gpr_speculation,
+                                private_abi=args.private_abi)
     except Exception:
         if emission_cache is not None:
             emission_cache.close()
@@ -5565,6 +5648,7 @@ def main() -> int:
         "branch_fences": args.branch_fences,
         "x87_regions": args.x87_regions,
         "gpr_speculation": args.gpr_speculation,
+        "private_abi": args.private_abi,
         "function_facts_sha256": sha256(Path(__file__).with_name('function_facts.py')),
         "xmm_abi_report": lift_result["xmm_abi"],
         "local_regs": lift_result["local_regs"],
