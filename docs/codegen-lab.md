@@ -192,11 +192,25 @@ leaf on each architecture):
 Recompilation efficiency on x86 (original/lifted cycles) as shipped:
 0x428540 1.00, 0x653400 0.50, 0x1176DE0 1.09.
 
-On ARM64 (one run, provisional: the game may have reached the foreground
-before it ended, which the end-of-run check now records) 0x428540 executes
-230 instructions in 110 cycles per call (59 of them backend stalls); its exact
-native leaf executes 177 in 27 (3 stalls): the gap is stalls, not
-instructions. The ARM64 A/A and observer runs are still to be made.
+ARM64, Cortex-X4 prime core, per call net of the harness (runs q1 with A/A
+q2, 7 repetitions; gates passed):
+
+| | instructions | cycles | backend stalls |
+|---|---|---|---|
+| 0x428540 with / without observer | 232 / 230 (-0.9%) | 155 / 110 (-29%) | 102 / 60 (-42%) |
+| 0x653400 | 125 / 116 (-7%) | 33 / 30 (within noise) | 18 / 16 (within noise) |
+| 0x1176DE0 | 133 / 130 (-3%) | 77 / 35 (-55%) | 60 / 18 (-70%) |
+| native leaves (controls) | unchanged | within 1.5% | within noise |
+
+Executed instructions barely move while cycles drop by up to 55%, nearly all
+of it backend stalls; 0x1176DE0 moves in opposite directions on the two
+architectures (-55% ARM64, +94% x86). The exact native 0x428540 executes 177
+instructions in 27 cycles (3 stalls) against the lifted 230 in 110: the
+remaining gap is stalls, not instruction count. The A/A pair also shows why
+calibration is mandatory: wall-clock time of identical builds differed by
+4-21% from clock changes while cycles and instructions agreed within a few
+percent, so on the phone cycles and instructions decide and nanoseconds are
+context.
 
 What the hot corpus says to do next (weighted static mix of the shipped
 build, and LLVM's reasons for loads it kept):
