@@ -455,20 +455,23 @@ static int prepare_guest_thread(ac1_guest_thread *thread)
  * CPU-bound main guest thread averaged 1.77 GHz while its prime core runs at
  * 3.4 GHz. Restrict guest threads to high-capacity CPUs. AC1_CPU_AFFINITY:
  * big (default, >= 80% of the largest cpu_capacity), prime, all, or hex mask. */
+static cpu_set_t android_guest_cpus;
+static int android_guest_cpus_state; /* 0 unresolved, 1 pin, -1 leave unchanged */
+static pid_t android_guest_tids[64]; /* every thread pinned so far */
+static unsigned android_guest_tid_count;
 static void android_pin_guest_thread(void)
 {
-    static cpu_set_t chosen;
-    static int state; /* 0 unresolved, 1 pin, -1 leave unchanged */
-    if (!state) {
+    cpu_set_t *chosen = &android_guest_cpus;
+    if (!android_guest_cpus_state) {
         const char *setting = getenv("AC1_CPU_AFFINITY");
         if (!setting || !*setting) setting = "big";
-        CPU_ZERO(&chosen);
+        CPU_ZERO(chosen);
         if (!strcmp(setting, "all")) {
-            state = -1;
+            android_guest_cpus_state = -1;
         } else if (strcmp(setting, "big") && strcmp(setting, "prime")) {
             unsigned long long mask = strtoull(setting, NULL, 16);
             for (int cpu = 0; cpu < 64 && cpu < CPU_SETSIZE; ++cpu)
-                if (mask >> cpu & 1ull) CPU_SET(cpu, &chosen);
+                if (mask >> cpu & 1ull) CPU_SET(cpu, chosen);
         } else {
             unsigned capacity[64] = {0}, best = 0;
             for (int cpu = 0; cpu < 64; ++cpu) {
@@ -484,17 +487,62 @@ static void android_pin_guest_thread(void)
             for (int cpu = 0; cpu < 64 && cpu < CPU_SETSIZE; ++cpu)
                 if (best && capacity[cpu] &&
                     (prime ? capacity[cpu] == best : capacity[cpu] * 5u >= best * 4u))
-                    CPU_SET(cpu, &chosen);
+                    CPU_SET(cpu, chosen);
         }
-        if (!state) state = CPU_COUNT(&chosen) ? 1 : -1;
+        if (!android_guest_cpus_state) android_guest_cpus_state = CPU_COUNT(chosen) ? 1 : -1;
         unsigned long long shown = 0;
         for (int cpu = 0; cpu < 64 && cpu < CPU_SETSIZE; ++cpu)
-            if (CPU_ISSET(cpu, &chosen)) shown |= 1ull << cpu;
+            if (CPU_ISSET(cpu, chosen)) shown |= 1ull << cpu;
         fprintf(stderr, "AC1 guest CPU affinity: %s mask=0x%llx%s\n", setting, shown,
-                state > 0 ? "" : " (unchanged)");
+                android_guest_cpus_state > 0 ? "" : " (unchanged)");
     }
-    if (state > 0 && sched_setaffinity(0, sizeof(chosen), &chosen) != 0)
+    if (android_guest_cpus_state <= 0) return;
+    static __thread int recorded;
+    if (!recorded) {
+        recorded = 1;
+        unsigned slot = __atomic_fetch_add(&android_guest_tid_count, 1u, __ATOMIC_RELAXED);
+        if (slot < sizeof(android_guest_tids) / sizeof(android_guest_tids[0]))
+            __atomic_store_n(&android_guest_tids[slot], (pid_t)syscall(SYS_gettid), __ATOMIC_RELEASE);
+    }
+    if (sched_setaffinity(0, sizeof(*chosen), chosen) != 0)
         fprintf(stderr, "AC1 guest CPU affinity failed: %s\n", strerror(errno));
+}
+
+/* The 6.1 kernel resets a thread's affinity to its cpuset's CPUs whenever
+ * Android moves the app between cpusets (background and back to top-app), so a
+ * guest thread found every core allowed after the screen had been off. Check
+ * about once a second, when a thread leaves a scheduler checkpoint's slow path
+ * (handoff or timed wait), and pin every guest thread again: a thread that
+ * rarely runs guest code would otherwise stay on all cores. Exited threads
+ * fail with ESRCH, which is ignored. */
+static void android_repin_guest_thread(void)
+{
+    static __thread uint64_t next_check_ns;
+    static unsigned restored;
+    if (android_guest_cpus_state <= 0) return;
+    uint64_t now = guest_monotonic_ns();
+    if (now < next_check_ns) return;
+    next_check_ns = now + UINT64_C(1000000000);
+    cpu_set_t current;
+    if (sched_getaffinity(0, sizeof(current), &current) != 0 ||
+        CPU_EQUAL(&current, &android_guest_cpus))
+        return;
+    if (restored++ < 8u) {
+        unsigned long long shown = 0;
+        for (int cpu = 0; cpu < 64 && cpu < CPU_SETSIZE; ++cpu)
+            if (CPU_ISSET(cpu, &current)) shown |= 1ull << cpu;
+        fprintf(stderr, "AC1 guest CPU affinity reset to 0x%llx; pinning again\n", shown);
+    }
+    unsigned count = __atomic_load_n(&android_guest_tid_count, __ATOMIC_RELAXED);
+    if (count > sizeof(android_guest_tids) / sizeof(android_guest_tids[0]))
+        count = sizeof(android_guest_tids) / sizeof(android_guest_tids[0]);
+    for (unsigned i = 0; i < count; ++i) {
+        pid_t tid = __atomic_load_n(&android_guest_tids[i], __ATOMIC_ACQUIRE);
+        if (tid && sched_setaffinity(tid, sizeof(android_guest_cpus), &android_guest_cpus) != 0 &&
+            errno != ESRCH)
+            fprintf(stderr, "AC1 guest CPU affinity failed for thread %d: %s\n", (int)tid,
+                    strerror(errno));
+    }
 }
 #endif
 
@@ -1040,6 +1088,9 @@ static void scheduler_checkpoint_for_thread(ac1_guest_thread *thread)
     char failure_reason[sizeof(scheduler->failure_reason)];
     snprintf(failure_reason, sizeof(failure_reason), "%s", scheduler->failure_reason);
     scheduler_unlock(scheduler);
+#ifdef __ANDROID__
+    android_repin_guest_thread();
+#endif
     if (scheduler_return_slice_ns) {
         thread->return_slice_deadline = guest_monotonic_ns() + scheduler_return_slice_ns;
         settle_returns(&thread->calls);
