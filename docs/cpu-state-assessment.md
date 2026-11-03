@@ -205,3 +205,112 @@ migrate one at a time behind their current tests.
    enumerated first.
 4. A measurement of call-free guest-stack forwarding, then a decision on item 4.
 5. One gameplay A/B after 1-3, as the integration milestone.
+
+## Follow-up: whole-function x87 TOP, measured (item 1)
+
+**Proof.** `tools/function_facts.py` builds per-function facts from the
+recovered CFG (`functions.json`) and the decoded x86, not from generated C:
+
+- blocks and successors;
+- call and tail-transfer kinds (direct, import, indirect);
+- an explicit x87 effects table: pops, pushes, and status, control, rotate,
+  tag, reset, environment and MMX classes.
+
+`x87_region` propagates (anchor, depth) over the CFG, including loops. An
+anchor is the function entry, a call of unknown stack effect, or a join whose
+predecessors disagree. Within one anchor, st(i) is the fixed physical slot
+(i - depth) mod 8, so value identity across blocks follows from consistent
+depth, and FXCH is a swap of two slots. Direct calls use whole-program
+net-depth summaries (`x87_deltas`, a worklist over the call graph).
+Environment, reset, tag, rotate and MMX instructions keep today's lowering.
+Census over the current generation:
+
+- 5,935 of the 6,563 native-x87 functions are provable: 31% of profiled
+  cycles, out of 34% in native-x87 functions.
+- Only 1,664 of them need a single anchor. 4,280 call something of unknown
+  stack effect, mostly virtual calls and imports.
+- 3,165 have a join whose predecessors disagree.
+- No native-lowered function contains fincstp, fdecstp, ffree or finit. The
+  block-local lowering does not model their direct writes to `c->fpu_top`, so
+  this was worth confirming.
+
+**Lowering.** `native_x87_function(body, regions)` keeps TOP in its local
+across blocks. It stores TOP only where it can be observed: calls, returns,
+fnstsw, and edges into a disagreeing join. It reloads TOP only after a call of
+unknown effect or at such a join, and adds a call's proven net depth to the
+local instead of reloading. Dirty slots are still written back at every block
+boundary. Where the generated C disagrees with the proof, the block-anchored
+lowering is used for that function. It is opt-in: `lift_ac1.py --x87-regions
+on`, `build.ps1 -X87Regions on`.
+
+**Correctness.** `tests/test_x87_native.py` compares region mode with the
+exact lowering over 4,096 random states each, on the full CPU struct (minus
+the fields native mode drops by design) and 512 bytes of guest memory. The
+fixtures cover:
+
+- a loop;
+- consistent joins;
+- FXCH;
+- fnstsw at depth 1;
+- a direct call with a proven +1 effect;
+- an indirect call of unknown effect;
+- a join whose predecessors disagree;
+- the unbalanced-join fixture, where region mode must equal today's code.
+
+A mutant that ignores a call's net depth fails the test.
+
+**Small-scale result** (`tools/codegen_lab/x87_regions_experiment.py`). Both
+lowerings are built from the same lifter input. The block-anchored rebuild
+must equal the snapshot's code exactly, and the two are compiled with the
+game's ARM64 flags. 27 of the 39 native-x87 hot-corpus functions change
+(14.8% of profiled cycles). Weighted ARM64 changes:
+
+| metric | change |
+|---|---|
+| instructions | -3.5% |
+| x87 TOP loads | -48% |
+| x87 TOP stores | -29% |
+| CPU-struct loads | -13% |
+| CPU-struct stores | -16% |
+| missed store-to-load forwards | -30% |
+
+One function grows: 0x762980, +12 instructions.
+
+A full generation with `-X87Regions on` (lab snapshot `x87r`) puts 5,101
+functions in region mode. On the whole 74-function hot corpus (47% of
+profiled cycles), against the current default:
+
+| metric | change |
+|---|---|
+| instructions | -3.1% |
+| x87 TOP loads | -48% |
+| x87 TOP stores | -29% |
+| missed forwards | -25% |
+| dead stores | -19% |
+| GPR and XMM state traffic | -3% to -6% |
+
+The three leaf controls are unchanged. 17 of the 18 flagged functions
+execute fewer instructions but save one more register pair, because TOP now
+stays live across calls in a callee-saved register.
+
+Against the phone's city profile (same x87 lowering), the TOP loads and
+stores of these 27 functions take 1.56% of game-code cycles, and region mode
+removes about a third of them: **about 0.5% of game-code cycles**, plus part
+of the 3.5% fewer instructions. TOP traffic in all game code is 3.5% of
+game-code cycles. The rest stays because calls must store TOP for the callee.
+Only 84 of the 277 call sites in those functions reach callees that never
+touch x87, even transitively, so an x87-transparency summary would remove
+roughly another third of what remains.
+
+**Verdict.** The proof requirements turned out modest and the implementation
+is small, but the removable cost is too. Realistically 0.5-1% of game-code
+cycles, with a hard ceiling of 3.5%. It stays opt-in, to be measured with an
+isolated phone benchmark and then enabled at the next integration milestone
+if confirmed. It does not justify further x87 work ahead of GPR contracts
+(9.3% of cycles) or guest addressing (11%).
+
+**The shared facts layer was worth it.** `function_facts.py` (decode, CFG,
+transfer kinds, an effects table, worklist summaries over the call graph)
+replaced what would have been another regex pass over generated C. GPR
+contracts need the same pieces, with Capstone's per-instruction register
+reads and writes in place of the x87 table.

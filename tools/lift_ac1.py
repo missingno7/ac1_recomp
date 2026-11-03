@@ -4600,12 +4600,21 @@ def c_statements(code: str) -> list[str]:
     return [s for s in out if s.strip()]
 
 
-def native_x87_function(body: str) -> str:
+def native_x87_function(body: str, regions=None) -> str:
     """Experimental x87 lowering: the register stack in double locals.
 
     Within a basic block the stack depth is static, so st(i) is a fixed local.
     Each block anchors on c->fpu_top; slots load lazily from c->st[] and dirty
     slots plus TOP are written back before branches, labels, calls and returns.
+
+    With `regions` (function_facts.X87Region.lowering(): each label's static
+    depth and whether its predecessors disagree, each call's proven net depth)
+    TOP stays in its local across blocks: it is stored only where it can be
+    observed (calls, returns, fnstsw, edges into a disagreeing join) and
+    reloaded only after a call of unknown stack effect or at such a join. A
+    call of known effect adds its depth to the local instead. Dirty slots are
+    still written back at every block boundary. Where the code disagrees with
+    the proof, the block-anchored lowering is returned.
     Arithmetic is unchanged (binary64, as before). Dropped: per-instruction
     MMX/init checks, FPU IP/DP/opcode stores, tag-word and dirty bookkeeping,
     which only fnstenv/fnsave/fxsave, MMX entry and stack-fault semantics
@@ -4640,6 +4649,16 @@ def native_x87_function(body: str) -> str:
     def anchor():
         state.update(d=0,loaded=set(),dirty=set())
         return ['_ac1_x87_top = (uint32_t)c->fpu_top;']
+    def sync_slots():
+        code=[f'c->st[(_ac1_x87_top + {r}u) & 7u] = _ac1_st{r};' for r in sorted(state['dirty'])]
+        state['dirty']=set()
+        return code
+    if regions is not None:
+        block_anchored=native_x87_function(body)
+        if block_anchored==body:return body
+    labels=regions['labels'] if regions else {}
+    joins=lambda targets:any(labels.get(int(t,16),(True,0))[0] for t in targets)
+    terminal=False
     def rewrite(text):
         pre,out,pos=[],[],0
         while True:
@@ -4668,8 +4687,19 @@ def native_x87_function(body: str) -> str:
         indent=code[:len(code)-len(code.lstrip())]
         for pattern in X87_BOOKKEEPING:code=pattern.sub('',code)
         code=re.sub(r'ac1_x87_integer\(c,(.*?),0x[0-9A-F]+u\)',lambda m:'ac1_x87_integer_native(c,'+m[1]+')',code)
-        if re.fullmatch(r'\s*L_[0-9A-F]{8}:\s*',code):
-            output+=['    '+' '.join(sync()),code.rstrip(),'    '+' '.join(anchor())];continue
+        label=re.fullmatch(r'\s*L_([0-9A-F]{8}):\s*',code)
+        if label:
+            info=labels.get(int(label[1],16)) if regions else None
+            if info is None or info[0]:
+                output+=['    '+' '.join(sync()),code.rstrip(),'    '+' '.join(anchor())]
+            else:
+                # Every predecessor reaches this label with the same TOP local.
+                if not terminal and state['d']!=info[1]:return block_anchored
+                output+=['    '+' '.join(sync_slots()),code.rstrip()]
+                state.update(d=info[1],loaded=set(),dirty=set())
+            terminal=False;continue
+        va=re.match(r'\s*([0-9A-F]{8}):',comment)
+        va=int(va[1],16) if va else None
         pieces=[]
         for statement in c_statements(code):
             s=statement.strip()
@@ -4677,11 +4707,27 @@ def native_x87_function(body: str) -> str:
             escapes=any(n not in free for n in names) or 'RECOMP_TODO(' in s
             if escapes and re.search(r'\b(?:fpush|fpop)\(c|\*fst\(c,',s):return body
             pre,s2=rewrite(s)
-            if escapes or re.search(r'\bgoto\b|\breturn\b|\bswitch\b',s):
+            branch=re.search(r'\bgoto\b|\breturn\b|\bswitch\b',s)
+            guest_call=escapes and any(n in ('AC1_CALL','dispatch','dispatch_jmp') for n in names)
+            if regions and not escapes and branch and not re.search(r'\breturn\b|\bswitch\b',s) \
+                    and not joins(re.findall(r'\bgoto L_([0-9A-F]{8});',s)):
+                pieces+=pre+sync_slots()+[s2]
+            elif regions and guest_call and not branch:
+                if va not in regions['calls']:return block_anchored
+                delta=regions['calls'][va]
+                pieces+=pre+sync()+[s2]
+                if delta is None:pieces+=anchor()
+                else:state.update(d=state['d']+delta,loaded=set(),dirty=set())
+            elif regions and escapes and not branch:
+                # Host helpers that run no guest code leave TOP alone.
+                pieces+=pre+sync()+[s2];state.update(loaded=set(),dirty=set())
+            elif escapes or branch:
                 pieces+=pre+sync()+[s2]+(anchor() if escapes else [])
             elif 'ac1_x87_status(c)' in s:
                 pieces+=pre+[f'c->fpu_top = (int)((_ac1_x87_top - {state["d"]}u) & 7u);',s2]
             else:pieces+=pre+[s2]
+            terminal=not re.search(r'\b(?:if|switch|while|for)\b',s) and \
+                bool(re.search(r'\b(?:goto L_[0-9A-F]{8}|return)\s*;\s*\}?\s*$',s))
         text=' '.join(p.strip() for p in pieces if p.strip())
         if text or comment:output.append(indent+text+(' ' if text and separator else '')+separator+comment)
     output.append('    '+' '.join(sync()))
@@ -4725,7 +4771,8 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
               functions_per_tu: int, translation_unit_buckets: int = 0,
               emission_cache=None, direct_calls: bool = True, native_overrides=None,
               flag_liveness: str = 'off', local_regs: str = 'off', profile_counts=(),
-              x87: str = 'exact', xmm_abi: str = 'off', branch_fences: str = 'all') -> dict:
+              x87: str = 'exact', xmm_abi: str = 'off', branch_fences: str = 'all',
+              x87_regions: str = 'off') -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
@@ -4897,11 +4944,30 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         bodies = [flag_liveness_function(body, flag_liveness) for body in bodies]
     if x87 not in ('exact', 'native'):
         raise ValueError('x87 must be exact or native')
-    x87_native_count = 0
+    x87_native_count = x87_region_count = 0
+    if x87_regions not in ('off', 'on'):
+        raise ValueError('x87_regions must be off or on')
+    if x87_regions == 'on' and x87 != 'native':
+        raise ValueError('x87 regions need --x87 native')
+    region_facts = None
+    if x87_regions == 'on':
+        # TOP proofs from the recovered CFG and decoded x86 (function_facts.py).
+        import function_facts
+        program = function_facts.Program(catalog=output_dir / 'functions.json')
+        all_facts = {a: program.facts(a) for a in program.functions}
+        deltas = function_facts.x87_deltas(program, all_facts)
+        region_facts = lambda a: (function_facts.x87_region(a, all_facts[a], deltas.get).lowering()
+                                  if a in all_facts else None)
     if x87 == 'native':
         for index, address in enumerate(lifted):
             transformed = native_x87_function(bodies[index])
             x87_native_count += transformed != bodies[index]
+            if region_facts and transformed != bodies[index]:
+                lowering = region_facts(address)
+                if lowering is not None:
+                    regional = native_x87_function(bodies[index], lowering)
+                    x87_region_count += regional != transformed
+                    transformed = regional
             bodies[index] = transformed
     if xmm_abi not in ('off', 'on'):
         raise ValueError('xmm_abi must be off or on')
@@ -5069,7 +5135,8 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "native_overrides": [f"0x{a:08X}" for a in sorted(bindings)],
         "flag_abi": abi_report,
         "xmm_abi": xmm_report,
-        'x87': {'mode': x87, 'native_count': x87_native_count},
+        'x87': {'mode': x87, 'native_count': x87_native_count, 'regions': x87_regions,
+                'region_count': x87_region_count},
         'local_regs': {'requested': local_regs, 'admitted_count': local_count,
                        'xmm_admitted_count': local_xmm_count,
                        'excluded_functions': local_excluded},
@@ -5215,6 +5282,9 @@ def main() -> int:
     parser.add_argument('--xmm-abi', choices=('off', 'on'), default='off',
                         help='on: whole-program XMM entry/return contracts narrow the syncs of XMM locals '
                              'at calls, entries and returns')
+    parser.add_argument('--x87-regions', choices=('off', 'on'), default='off',
+                        help='on: native x87 keeps TOP in its local across blocks where function_facts proves '
+                             'the stack depth (experimental)')
     parser.add_argument('--x87', choices=('exact', 'native'), default='native',
                         help='native keeps the x87 stack in block-local doubles without tag/env bookkeeping; '
                              'exact keeps the full x87 model')
@@ -5433,7 +5503,8 @@ def main() -> int:
                                 native_overrides=config.get('native_overrides', []),
                                 flag_liveness=args.flag_liveness, local_regs=args.local_regs,
                                 profile_counts=[int(s, 16) for s in args.profile_count_entries.split(',') if s],
-                                x87=args.x87, xmm_abi=args.xmm_abi, branch_fences=args.branch_fences)
+                                x87=args.x87, xmm_abi=args.xmm_abi, branch_fences=args.branch_fences,
+                                x87_regions=args.x87_regions)
     except Exception:
         if emission_cache is not None:
             emission_cache.close()
@@ -5453,6 +5524,8 @@ def main() -> int:
         "flag_abi": lift_result["flag_abi"],
         "xmm_abi": args.xmm_abi,
         "branch_fences": args.branch_fences,
+        "x87_regions": args.x87_regions,
+        "function_facts_sha256": sha256(Path(__file__).with_name('function_facts.py')),
         "xmm_abi_report": lift_result["xmm_abi"],
         "local_regs": lift_result["local_regs"],
         "x87": lift_result["x87"],

@@ -113,11 +113,11 @@ def asm_class(t, cpu):
                 else 'cpu x87 top' if 0x90 <= off < 0x98 else 'cpu xmm' if 0x98 <= off < 0x120 else 'cpu other')
     return f'{kind} {"store" if m[1].startswith("st") else "load"}'
 
-by_c, by_asm, by_fn, by_all, by_joint = (collections.defaultdict(collections.Counter) for _ in range(5))
+by_c, by_asm, by_fn, by_all, by_joint, by_fn_class = (collections.defaultdict(collections.Counter) for _ in range(6))
 for a in game:
     v = counts[a]; s_ = sym_of(v); t = insn.get(a, '')
     ac = ('native ' if s_.startswith('ac1_translated_') else '') + (asm_class(t, cpu_regs.get(s_, {'x0'})) if t else 'unknown')
-    for e in EVENTS: by_all[ac][e] += v[e]
+    for e in EVENTS: by_all[ac][e] += v[e]; by_fn_class[s_ + ' ' + ac][e] += v[e]
 unmapped = collections.Counter()
 for a in picked:
     v = counts[a]; s = sym_of(v); w = where.get(a)
@@ -146,7 +146,7 @@ print(f'all translated game code: {100*game_cycles/total["cpu-cycles:u"]:.1f}% o
 table('all game code by ARM64 instruction', by_all)
 table('corpus by lifted C statement', by_c)
 table('corpus by ARM64 instruction, guest accesses split by their C statement', by_joint)
-json.dump(dict(total=total, by_c=by_c, by_asm=by_asm, by_fn=by_fn, by_all=by_all, by_joint=by_joint), open(out_dir/'summary.json', 'w'), indent=1)
+json.dump(dict(total=total, by_c=by_c, by_asm=by_asm, by_fn=by_fn, by_all=by_all, by_joint=by_joint, by_fn_class=by_fn_class), open(out_dir/'summary.json', 'w'), indent=1)
 # Hottest lines for inspection.
 hot = sorted(picked, key=lambda a: -counts[a]['cpu-cycles:u'])[:60]
 with open(out_dir/'hot_lines.txt', 'w', encoding='utf-8') as f:
