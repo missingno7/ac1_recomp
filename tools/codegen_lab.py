@@ -150,12 +150,78 @@ def extract_image(out):
     return dict(exe_sha256=sha256(GAME_EXE), image_base=f'0x{base:08X}', patched_operands=len(offsets))
 
 
+FN_RE = re.compile(r'^(?:static )?void (?:L|ac1_translated)_([0-9A-F]{8})\(CPU \*c\)\n\{(.*?)\n\}', re.M | re.S)
+
+
+def function_features(body):
+    """What the XMM contracts and branch-fence switch act on, in generated C."""
+    code = re.sub(r'/\*.*?\*/', '', body, flags=re.S)
+    xmm_call = sum(len(re.findall(r'c->xmm\[\d\] = _ac1_xmm\d;|_ac1_xmm\d = c->xmm\[\d\];', m[0]))
+                   for m in re.finditer(r'\{ [^{}]*(?:AC1_CALL|dispatch)\(c[^{}]*\}', code))
+    entry = len(re.findall(r'_ac1_xmm\d __attribute__\(\(unused\)\) = c->xmm', code))
+    backward = forward = 0
+    for line in body.splitlines():
+        va = re.search(r'/\*\s*([0-9A-F]{8}):', line)
+        for t in re.findall(r'\bgoto L_([0-9A-F]{8});', line):
+            if va and int(t, 16) <= int(va[1], 16): backward += 1
+            elif va: forward += 1
+    return dict(xmm_call_syncs=xmm_call, xmm_entry_loads=entry,
+                direct_calls=code.count('AC1_CALL(c'), indirect_calls=len(re.findall(r'\bdispatch\(c', code)),
+                backward_branches=backward, forward_branches=forward,
+                fences=code.count('::: "memory"'), guest_accesses=len(re.findall(r'\b(?:rd|wr)\w*\(', code)),
+                callees=sorted(set(re.findall(r'AC1_CALL\(c, L_([0-9A-F]{8})', code))))
+
+
+def cmd_corpus(a):
+    """Rank functions for one optimisation by profile weight times the work it targets."""
+    out = LAB/'corpora'/f'{a.name}.json'
+    if out.exists(): raise SystemExit(f'{out.relative_to(ROOT)} exists')
+    profile = json.loads((LAB/'profiles'/a.profile/'profile.json').read_text())
+    weights = {int(k, 16): v / profile['total'] for k, v in profile['functions'].items()}
+    feats = {}
+    for path in sorted((ROOT/'work/lift_initial').glob('initial_[0-9][0-9][0-9][0-9].c')):
+        for m in FN_RE.finditer(path.read_text(encoding='utf-8')):
+            va = int(m[1], 16)
+            if weights.get(va, 0) >= a.min_weight and va not in feats: feats[va] = function_features(m[2])
+    catalog = json.loads((ROOT/'work/lift_initial/functions.json').read_text())
+    catalog = {f['address']: f for f in (catalog['functions'] if isinstance(catalog, dict) else catalog)}
+    if a.kind == 'xmm':
+        score = lambda va: weights[va] * (feats[va]['xmm_call_syncs'] + feats[va]['xmm_entry_loads'])
+    else:
+        score = lambda va: weights[va] * (feats[va]['forward_branches'] + 4 * feats[va]['backward_branches'])
+    ranked = [va for va in sorted(feats, key=score, reverse=True) if score(va) > 0][:a.top]
+    chosen = list(ranked)
+    if a.kind == 'xmm':
+        # Complete chains: hot direct callees of the chosen callers.
+        for va in ranked:
+            for callee in feats[va]['callees']:
+                cv = int(callee, 16)
+                if cv in feats and weights.get(cv, 0) >= a.min_weight and cv not in chosen: chosen.append(cv)
+    rows = []
+    for va in chosen:
+        f = catalog.get(va, {})
+        rows.append(dict(va=f'0x{va:08X}', weight=weights.get(va, 0), score=score(va), chain_callee=va not in ranked,
+                         leaf_with_loop=not f.get('calls_to') and feats[va]['backward_branches'] > 0 and not feats[va]['indirect_calls'],
+                         **{k: v for k, v in feats[va].items() if k != 'callees'}))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(dict(kind=a.kind, profile=a.profile, generated_from=str(ROOT/'work/lift_initial'),
+                                   functions=rows), indent=1), encoding='utf-8')
+    w = sum(r['weight'] for r in rows)
+    print(f'{a.name}: {len(rows)} functions ({sum(r["chain_callee"] for r in rows)} chain callees), {100*w:.1f}% of main-thread cycles')
+    for r in rows[:12]:
+        print(f'  {r["va"]} {100*r["weight"]:5.2f}%  xmm calls/entry {r["xmm_call_syncs"]:4d}/{r["xmm_entry_loads"]}  '
+              f'direct/indirect {r["direct_calls"]}/{r["indirect_calls"]}  loops {r["backward_branches"]} fwd {r["forward_branches"]}'
+              f'{"  leaf+loop" if r["leaf_with_loop"] else ""}')
+
+
 def cmd_snapshot(a):
     out = new_dir(LAB/'snapshots'/a.name)
     profile = json.loads((LAB/'profiles'/a.profile/'profile.json').read_text())
     leaves = [int(v, 16) for v in CONFIG['leaves']]
     hot = [int(v, 16) for v in profile['functions']][:a.top or CONFIG['hot_top']]
-    corpus = list(dict.fromkeys(leaves + hot))
+    extra = [int(r['va'], 16) for name in (a.corpus or '').split(',') if name
+             for r in json.loads((LAB/'corpora'/f'{name}.json').read_text())['functions']]
+    corpus = list(dict.fromkeys(leaves + hot + extra))
     units = {}
     for path in sorted((ROOT/'work/lift_initial').glob('initial_[0-9][0-9][0-9][0-9].c')):
         text = path.read_text(encoding='utf-8')
@@ -291,7 +357,7 @@ def arm64_metrics(ins):
     """Counts plus block-local redundancy, tracking address registers as root+offset."""
     c = collections.Counter(instructions=len(ins))
     targets = {int(t, 16) for _, t in ins for t in re.findall(r'^(?:b|b\.\w+|cbn?z|tbn?z)\s+(?:[^,]*,\s*)*0x([0-9a-f]+)', t)}
-    ids = [0]; val = {}; log = []; arena = set()
+    ids = [0]; val = {'0': (-1, 0)}; log = []; arena = set(); cpu_root = -1   # x0 holds the CPU pointer at entry
     reg = lambda r: (None if not re.fullmatch(r'[wx](\d+|zr)|w?sp', r) else 'sp' if 'sp' in r else re.fullmatch(r'[wx](\d+|zr)', r)[1])
     imm = lambda t: int(m[1], 0) if (m := re.search(r'#(-?0x[0-9a-f]+|-?\d+)', t)) else 0
     def get(r):
@@ -299,8 +365,13 @@ def arm64_metrics(ins):
         if n in (None, 'zr'): return (0, 0)
         if n not in val: ids[0] += 1; val[n] = (ids[0], 0)
         return val[n]
+    holders = None   # callee-saved registers holding the CPU pointer (or into it) after the entry block
+    def reset():
+        nonlocal holders
+        if holders is None: holders = {r: v for r, v in val.items() if v[0] == cpu_root and r.isdigit() and 19 <= int(r) <= 28}
+        return dict(holders), []
     for addr, t in ins:
-        if addr in targets: val, log = {}, []
+        if addr in targets: val, log = reset()
         op = t.split()[0] if t else ''
         m = MEM.match(t)
         if m:
@@ -321,6 +392,11 @@ def arm64_metrics(ins):
             kind = 'stack' if reg(inner[0]) == 'sp' else 'guest' if idx or b in arena else 'struct'
             store = mnem.startswith('st')
             c[f'{kind} {"stores" if store else "loads"}'] += 1
+            if kind == 'struct' and b == cpu_root:
+                # CPU-struct field by offset (src/runtime/cpu.h layout on LP64).
+                field = ('gpr' if lo < 0x20 else 'eip' if lo < 0x24 else 'flags' if lo < 0x48 else 'x87 st' if 0x50 <= lo < 0x90
+                         else 'x87 top' if lo < 0x98 else 'xmm' if lo < 0x118 else 'other')
+                c[f'cpu {field} {"stores" if store else "loads"}'] += 1
             span = (lo, lo + width)
             if not store:
                 for k2, r2, st2 in reversed(log):
@@ -343,7 +419,7 @@ def arm64_metrics(ins):
             log.append(('call', (0, 0), True)); continue
         if op in ('b', 'br', 'ret') or op.startswith('b.') or op in ('cbz', 'cbnz', 'tbz', 'tbnz'):
             c['branches'] += 1
-            if op in ('b', 'br', 'ret'): val, log = {}, []
+            if op in ('b', 'br', 'ret'): val, log = reset()
             continue
         parts = [x.strip() for x in t[len(op):].split(',')]
         d = reg(parts[0]) if parts and parts[0] else None
@@ -437,6 +513,8 @@ def cmd_bench(a):
     build = LAB/'builds'/a.build
     bm = json.loads((build/'manifest.json').read_text())
     game = ''
+    if not a.no_arm64 and run([ADB, '-s', DEVICE, 'get-state']).stdout.strip() != 'device':
+        raise SystemExit(f'phone {DEVICE} is not connected (use --no-arm64 for x86 only)')
     if not a.no_arm64:
         # Someone playing owns the phone; a game left in the background is
         # paused (presents wait for a surface) and is recorded, not touched.
@@ -548,6 +626,49 @@ def print_run(r):
 
 # ---------------------------------------------------------------- compare
 
+STATIC_KEYS = ['instructions', 'cpu xmm loads', 'cpu xmm stores', 'cpu gpr loads', 'cpu gpr stores', 'cpu x87 top loads',
+               'cpu x87 top stores', 'stack loads', 'stack stores', 'guest loads', 'guest stores', 'missed forwards',
+               'repeated loads', 'dead stores', 'branches', 'calls']
+
+
+def cmd_static_compare(a):
+    """Two builds' machine code over one corpus: weighted totals and per-function changes."""
+    ja, jb = (json.loads((LAB/'builds'/b/'static.json').read_text()) for b in (a.a, a.b))
+    if a.corpus:
+        subset = {r['va'] for r in json.loads((LAB/'corpora'/f'{a.corpus}.json').read_text())['functions']}
+    else:
+        subset = {va for va in ja if not va.startswith('_')}
+    common = sorted(va for va in subset if va in ja and va in jb)
+    lines = [f'# static: {a.b} vs {a.a} ({a.corpus or "whole snapshot corpus"}, {len(common)} functions, {a.arch})', '',
+             '| metric | A weighted | B weighted | change | A total | B total |', '|---|---|---|---|---|---|']
+    for k in STATIC_KEYS:
+        wa = sum(ja[va]['weight'] * ja[va][a.arch].get(k, 0) for va in common)
+        wb = sum(jb[va]['weight'] * jb[va][a.arch].get(k, 0) for va in common)
+        ta = sum(ja[va][a.arch].get(k, 0) for va in common); tb = sum(jb[va][a.arch].get(k, 0) for va in common)
+        if ta or tb:
+            lines.append(f'| {k} | {wa:.3f} | {wb:.3f} | {100*(wb-wa)/wa if wa else 0:+.1f}% | {ta} | {tb} |')
+    watched = ('instructions', 'stack loads', 'stack stores', 'cpu xmm loads', 'cpu xmm stores', 'cpu gpr loads', 'cpu gpr stores')
+    rows = []
+    for va in common:
+        da, db = ja[va][a.arch], jb[va][a.arch]
+        d = {k: db.get(k, 0) - da.get(k, 0) for k in watched}
+        rows.append((va, ja[va]['weight'], da.get('instructions', 0), d))
+    regress = [r for r in rows if r[3]['instructions'] > max(2, 0.02 * r[2]) or r[3]['stack loads'] + r[3]['stack stores'] > 0
+               or any(r[3][k] > 0 for k in watched if k.startswith('cpu'))]
+    improve = sorted(rows, key=lambda r: r[1] * r[3]['instructions'])[:10]
+    fmt = lambda r: (f'| {r[0]} | {100*r[1]:.2f}% | {r[2]} | {r[3]["instructions"]:+d} | '
+                     f'{r[3]["stack loads"] + r[3]["stack stores"]:+d} | {r[3]["cpu xmm loads"] + r[3]["cpu xmm stores"]:+d} | '
+                     f'{r[3]["cpu gpr loads"] + r[3]["cpu gpr stores"]:+d} |')
+    head = ['| function | weight | A insns | insns | spills | XMM state | GPR state |', '|---|---|---|---|---|---|---|']
+    lines += ['', '## largest weighted improvements', '', *head, *map(fmt, improve)]
+    lines += ['', f'## regressions ({len(regress)}): more instructions (>2%), spills or CPU-state traffic', '', *head,
+              *map(fmt, sorted(regress, key=lambda r: -r[1]))]
+    report = '\n'.join(lines) + '\n'
+    path = LAB/'reports'/f'static__{a.b.replace("/", "_")}__vs__{a.a.replace("/", "_")}__{a.corpus or "all"}__{a.arch}.md'
+    path.parent.mkdir(parents=True, exist_ok=True); path.write_text(report, encoding='utf-8')
+    print(report); print(f'report: {path.relative_to(ROOT)}')
+
+
 def cmd_compare(a):
     cfg = CONFIG['compare']
     ra, rb = (json.loads((LAB/'runs'/x/'results.json').read_text()) for x in (a.a, a.b))
@@ -615,15 +736,21 @@ def main():
     sub = p.add_subparsers(dest='cmd', required=True)
     s = sub.add_parser('profile'); s.add_argument('name'); s.add_argument('--perf', required=True)
     s.add_argument('--symbols', required=True); s.add_argument('--tid')
+    s = sub.add_parser('corpus'); s.add_argument('name'); s.add_argument('--kind', choices=('xmm', 'fences'), required=True)
+    s.add_argument('--profile', required=True); s.add_argument('--top', type=int, default=16)
+    s.add_argument('--min-weight', type=float, default=0.0005)
     s = sub.add_parser('snapshot'); s.add_argument('name'); s.add_argument('--profile', required=True); s.add_argument('--top', type=int)
+    s.add_argument('--corpus', help='comma-separated corpora (work/codegen_lab/corpora) added to the leaves and hot set')
     s = sub.add_parser('build'); s.add_argument('snapshot'); s.add_argument('variant'); s.add_argument('--remarks', action='store_true')
     s = sub.add_parser('static'); s.add_argument('build')
     s = sub.add_parser('bench'); s.add_argument('build'); s.add_argument('run')
     s.add_argument('--reps', type=int); s.add_argument('--calls', type=int)
     s.add_argument('--no-arm64', action='store_true'); s.add_argument('--no-x86', action='store_true')
     s = sub.add_parser('compare'); s.add_argument('a'); s.add_argument('b'); s.add_argument('--aa')
+    s = sub.add_parser('static-compare'); s.add_argument('a'); s.add_argument('b'); s.add_argument('--corpus')
+    s.add_argument('--arch', choices=('arm64', 'x86'), default='arm64')
     a = p.parse_args()
-    globals()['cmd_' + a.cmd](a)
+    globals()['cmd_' + a.cmd.replace('-', '_')](a)
 
 
 if __name__ == '__main__':

@@ -231,3 +231,53 @@ Lifter variants need one generation each (a new snapshot); header and
 runtime switches reuse a snapshot. Still to come: recorded real-game inputs,
 a full-state x86 thunk (all registers, flags, XMM and scratch), benchmarks
 for non-leaf hot functions, and a corpus-only fast path for lifter variants.
+
+## Cost model of lifted code shapes (phone)
+
+`tools/codegen_lab/microbench_run.py` builds `microbench_arm64.c` with the
+game's ARM64 flags, runs every kernel under `simpleperf stat` on the X4
+(cpu7) and an A720 (cpu2), and keeps raw counts in
+`work/codegen_lab/experiments/microbench/raw.json`. Each kernel repeats one
+shape the lifter emits; compiler barriers stand in for the calls and escapes
+that keep values in the CPU struct, and the machine code of every kernel was
+checked to contain the intended loads and stores. Cycles per iteration with
+the empty loop subtracted, median of 5, 20M iterations (spread under 2%
+unless noted):
+
+| shape | insns | X4 cycles | A720 cycles |
+|---|---|---|---|
+| XMM add in a register (reference) | 3 | 10 | 10 |
+| XMM 16B store, 16B reload | 2 | 7 | 7 |
+| XMM 16B store, 4B lane store, 16B reload | 5 | 23 | 18 |
+| four 4B stores, 16B reload | 10 | 14 | 17 |
+| 16B store, 4B lane reload | 3 | 9 | 9 |
+| call, value in argument registers | 3 | 1 | 1 |
+| call, one value through the struct each way | 5 | 5 | 5 |
+| call, 4 live values through the struct | 11 | 6 | 6 |
+| call, same 4 values in callee-saved registers | 5 | 1 | 1 |
+| call, all 8 GPRs synced, callee reads/writes all | 18 | 29 | 37 |
+| call, 8 GPR stores only (dead afterwards) | 12 | 3.7 | 2 |
+| indirect call through a table (predicted) | 4 | 1 | 1.2 |
+| x87 op with TOP and st(i) in the struct | 8 | 10 | 10 |
+| x87 op in a register | 1 | 4 | 4 |
+| flags stored, reloaded, branched on | 6 | 1.3 | 1.8 |
+| flags kept in a register | 3 | 1.3 | 1.3 |
+
+What this says for the lifter:
+
+- A value that crosses a call through the CPU struct costs a store-to-load
+  forwarding hop (about 4-5 cycles) on whatever depends on it; in registers
+  the call is nearly free. Dead syncs cost only issue slots. GPR
+  call-boundary contracts therefore pay where synced registers are live and
+  on the critical path, not in proportion to the instructions removed.
+- Mixed-width traffic to one slot is the expensive case: a 16B reload after a
+  narrower store fails forwarding and costs 7-16 extra cycles (the same shape
+  made 0x1176DE0 slower on x86). Lane writes into memory-resident XMM state
+  and Clang merging scalar CPU-field reloads into `ldp q` both produce it.
+- Materialized flags and predicted indirect calls are cheap; they are not
+  worth lifter work for cycles.
+- x87 through TOP in memory adds about 6 cycles per dependent operation.
+
+Not yet measured: byte and word partial-register stores followed by a 32-bit
+reload (kernels `gpr_byte_chain`, `gpr_byte_merge_chain`, `pair_2x8_v16_chain`
+are in the source; the run was stopped when the phone was needed).
