@@ -392,3 +392,73 @@ register calling convention: callee-saved values and `this` passed in host
 registers instead of through the struct. That is the larger structural change,
 since every signature, the dispatch table and native bindings would change, so
 the speculation result is the cheap way to learn how much it could gain first.
+
+### Phone results: the call protocol, and what Rosetta 2 does instead
+
+`microbench_reload.c` reproduces a lifted call in a loop. The caller spills
+esi, pushes the return address through `c->esp` and calls. The callee loads
+esi and esp, pushes and pops esi in guest memory, and stores both back at
+`ret`. The caller reloads them and chases a pointer through esi. Cycles per
+call on the phone (median of 9, loop overhead subtracted; raw per-run values in
+`work/codegen_lab/experiments/microbench/raw_selected.json`):
+
+| variant | X4 | A720 |
+|---|---|---|
+| plain (today's protocol) | 11.0 | 11.1 |
+| esi speculated | 11.2 | 11.3 |
+| esi pinned in x26 | 11.0 | 11.1 |
+| **esi and esp pinned (x26, x27)** | **6.3-6.6** | **6.7** |
+| esi and esp speculated | 7.4 or 12.4-12.9 (bimodal) | 5.9 |
+| esi alone, esp chain cut | 10.3 → 10.5 speculated, 9.1 pinned (noisy) | 9.3 → 6.0 speculated, 7.3 pinned |
+
+The binding chain is **esp**. Every call writes the return address through
+`c->esp`, the callee loads esp from the struct and stores it back at `ret`, and
+the next call depends on it. Fixing esi alone changes nothing while that chain
+exists.
+
+Speculating both registers is the fastest variant on the A720. On the X4,
+which runs the game's main thread, identical runs land at either 7.4 or about
+12.6 cycles. That is slower than plain in the bad case, so speculation is not
+dependable there. Keeping the registers in host registers is steady on both
+cores at -40% for the protocol: X4 12.2 → 7.8, A720 12.3 → 7.9 including loop
+overhead. `--gpr-speculation` therefore stays off.
+
+The same run measured the remaining cost-model kernels:
+- A byte store reloaded as a dword costs the same as a dword store (5 cycles
+  on both cores).
+- Two 8-byte stores reloaded as 16 bytes cost 5.2-5.7 cycles.
+- So mixed widths hurt only the XMM lane case (4B into 16B: 7-16 extra cycles).
+- A byte merge done in a register costs 10 cycles on the X4 (5 on the A720).
+
+**Rosetta 2** keeps x86 registers in fixed ARM registers, so calls cost no state
+traffic. It also translates CALL/RET to BL/RET with a side stack for return
+prediction, skips unused flags, and relies on Apple-specific hardware (a TSO
+mode, x86 parity and adjust flags). Translation is otherwise one-to-one.
+Comparing:
+
+- **Flags:** we already skip unused flags (FLAGABI), and flags are now 0.1% of
+  game cycles.
+- **Calls:** direct calls are already host calls with host return prediction.
+- **Hardware:** the Apple extensions do not exist on Snapdragon.
+- **Register mapping:** this is what we lack, and the microbenchmark puts a
+  number on it.
+
+**Proposed next step: Rosetta-style register pinning through Clang.** Reserve
+host x20-x27 for guest eax..edi in translated code and in the runtime between
+guest calls (`-ffixed-x20` ... `-ffixed-x27`, which the NDK accepts):
+
+- Locals stay as today. At entry, calls and returns they move to and from the
+  pinned registers with register moves instead of struct stores and loads.
+- x20-x27 are callee-saved in AAPCS64, so libc, DXVK and other host code
+  preserve them automatically.
+- Only runtime boundaries sync with the struct: imports, helpers that read the
+  struct, native bindings, and entries from host code into guest code (a
+  trampoline that saves host x20-x27).
+- The struct stays the canonical state at those boundaries. x86 hosts keep
+  today's protocol, selected by macro.
+
+The price is eight fewer allocatable registers for Clang inside translated
+code. The lab measures that on the hot corpus (static spills, then ARM64
+benchmarks of hot non-leaf functions) before any gameplay A/B. Of the earlier
+candidates, this one targets the largest measured cost: the 9.3% GPR-state
+traffic, plus the esp chain behind the guest-stack lines.
