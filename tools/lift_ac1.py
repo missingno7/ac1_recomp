@@ -4196,7 +4196,7 @@ def declare_local_memory_base(body: str) -> str:
     return re.sub(pattern, lambda m: m[0] + '\n    AC1_DECLARE_LOCAL_ARENA;', body)
 
 
-def local_register_function(body: str) -> str:
+def local_register_function(body: str, branch_fences: str = 'all') -> str:
     """GPR locals with conservative CFG dirty sets and audited CPU boundaries.
 
     Exception-frame (fs:) functions are included: the runtime never resumes
@@ -4284,7 +4284,9 @@ def local_register_function(body: str) -> str:
             at_return=(esp_reload+' ' if partial[i] else '')+spill(after)
             text=re.sub(r'\breturn;','{ '+at_return+' return; }',text)
         edge_reload=reload if full[i] else esp_reload if partial[i] else ''
-        fence=edge_reload+' __asm__ __volatile__("" ::: "memory"); '
+        # 'backward': forward edges carry only their reload; fence_backward_branches
+        # fences every backward edge afterwards, which keeps loops polling.
+        fence=edge_reload+(' __asm__ __volatile__("" ::: "memory"); ' if branch_fences=='all' else ' ')
         text=re.sub(r'\bgoto (L_[0-9A-F]{8});',lambda m:'{ '+fence+'goto '+m[1]+'; }',text)
         output.extend(text.splitlines())
         if edge_reload:output.append('    '+edge_reload)
@@ -4668,7 +4670,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
               functions_per_tu: int, translation_unit_buckets: int = 0,
               emission_cache=None, direct_calls: bool = True, native_overrides=None,
               flag_liveness: str = 'off', local_regs: str = 'off', profile_counts=(),
-              x87: str = 'exact', xmm_abi: str = 'off') -> dict:
+              x87: str = 'exact', xmm_abi: str = 'off', branch_fences: str = 'all') -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
@@ -4848,6 +4850,8 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
             bodies[index] = transformed
     if xmm_abi not in ('off', 'on'):
         raise ValueError('xmm_abi must be off or on')
+    if branch_fences not in ('all', 'backward'):
+        raise ValueError('branch_fences must be all or backward')
     xmm_contracts, xmm_report = {}, None
     if xmm_abi == 'on':
         by_address = dict(zip(lifted, bodies))
@@ -4860,7 +4864,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     local_count, local_xmm_count, local_excluded = 0, 0, []
     for index, address in enumerate(lifted):
         if address in selected_locals:
-            gprs = local_register_function(bodies[index])
+            gprs = local_register_function(bodies[index], branch_fences)
             transformed = local_xmm_function(gprs, xmm_contracts.get(address))
             local_xmm_count += transformed != gprs
             if transformed != bodies[index]:
@@ -5150,6 +5154,9 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=CONFIG_PATH,
                         help="discovery configuration (allows private seed-set A/B comparisons)")
     parser.add_argument("--selftest", action="store_true", help="run the focused block-entry ordering check")
+    parser.add_argument('--branch-fences', choices=('all', 'backward'), default='all',
+                        help='backward: compiler fences only on branches to an equal or lower address (every loop '
+                             'has one); all: on every goto of a GPR-local function')
     parser.add_argument('--xmm-abi', choices=('off', 'on'), default='off',
                         help='on: whole-program XMM entry/return contracts narrow the syncs of XMM locals '
                              'at calls, entries and returns')
@@ -5371,7 +5378,7 @@ def main() -> int:
                                 native_overrides=config.get('native_overrides', []),
                                 flag_liveness=args.flag_liveness, local_regs=args.local_regs,
                                 profile_counts=[int(s, 16) for s in args.profile_count_entries.split(',') if s],
-                                x87=args.x87, xmm_abi=args.xmm_abi)
+                                x87=args.x87, xmm_abi=args.xmm_abi, branch_fences=args.branch_fences)
     except Exception:
         if emission_cache is not None:
             emission_cache.close()
@@ -5390,6 +5397,7 @@ def main() -> int:
         "flag_liveness": args.flag_liveness,
         "flag_abi": lift_result["flag_abi"],
         "xmm_abi": args.xmm_abi,
+        "branch_fences": args.branch_fences,
         "xmm_abi_report": lift_result["xmm_abi"],
         "local_regs": lift_result["local_regs"],
         "x87": lift_result["x87"],
