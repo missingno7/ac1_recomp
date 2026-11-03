@@ -3,6 +3,8 @@
         android:allowBackup="false"
         android:label="AC1 Recomp"
         android:theme="@android:style/Theme.Material.NoActionBar">
+        <!-- Lets simpleperf attach to the release build the user plays (no debugger, no run-as). -->
+        <profileable android:shell="true" />
         <activity
             android:name=".LauncherActivity"
             android:screenOrientation="sensorLandscape"
