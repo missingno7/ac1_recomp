@@ -18,15 +18,22 @@ def main():
     parser.add_argument('--partial-alias', action='store_true', help='stress overlapping late-read quaternion vectors')
     parser.add_argument('--cases', type=int, default=10000)
     parser.add_argument('--compiler', default='C:/msys64/mingw64/bin/gcc.exe')
+    parser.add_argument('--no-trace-eip', action='store_true',
+                        help='compile without AC1_TRACE_EIP, as Android builds are (no EIP observer in accessors)')
     args = parser.parse_args()
     if args.cases < 1: parser.error('cases must be positive')
-    addresses = [0x01176DE0, 0x00653400, 0x0042EE70]
+    addresses = [0x01176DE0, 0x00653400, 0x0042EE70, 0x00428540]
     bodies = {}
+    preamble = None
+    eip_end = '#define AC1_SET_GUEST_EIP(cpu, va) ((void)0)\n#endif\n'
     for path in (ROOT/'work/lift_initial').glob('initial_[0-9][0-9][0-9][0-9].c'):
         text = path.read_text(encoding='utf-8')
+        # The generated bodies need their translation unit's helpers and
+        # local-memory macros, not only cpu.h.
+        if preamble is None: preamble = text[:text.index(eip_end) + len(eip_end)]
         for va in addresses:
             match = re.search(rf'(?:static )?void (?:L|ac1_translated)_{va:08X}\(CPU \*c\)\n\{{(.*?)\n\}}', text, re.S)
-            if match: bodies[va] = f'static void oracle_{va:08X}(CPU *c)\n{{{match[1]}\n}}'
+            if match: bodies[va] = f'void oracle_{va:08X}(CPU *c)\n{{{match[1]}\n}}'
         if len(bodies) == len(addresses): break
     if set(bodies) != set(addresses): raise SystemExit('missing translated oracle; generate the catalog first')
     out = ROOT/'work/native_oracle'; out.mkdir(parents=True, exist_ok=True)
@@ -40,9 +47,11 @@ uint8_t *ac1_direct_arena = memory;
 void guest_execution_read(uint32_t a,void *o,size_t n){memcpy(o,memory+a,n);}
 void guest_execution_write(uint32_t a,const void *v,size_t n){memcpy(memory+a,v,n);}
 void ac1_unsupported_instruction(uint32_t a,const char*s){fprintf(stderr,"%08x %s\n",a,s);exit(2);}
-#define AC1_SET_GUEST_EIP(c,va) ((c)->eip=(va))
 '''
-    source += '\n'.join(bodies.values())
+    # Their local-memory macros redefine wr32 and friends, so the bodies get
+    # a translation unit of their own, as in the generated build.
+    (out/'bodies.c').write_text(preamble + '\n'.join(bodies.values()) + '\n', encoding='utf-8')
+    source += ''.join(f'void oracle_{va:08X}(CPU *c);\n' for va in addresses)
     for va in addresses:
         source += f'\nvoid ac1_native_{va:08X}(CPU*);\nint ac1_native_{va:08X}_plan(const CPU*,ac1_native_plan*);\n'
         source += (f'static ac1_native_binding binding_{va:08X}={{.va=0x{va:08X},.name="{va:08X}",'
@@ -58,6 +67,7 @@ int main(void){
                f'_putenv_s("AC1_NATIVE_VERIFY","{args.cases}"); ac1_native_init();\n')
     source += f'const uint64_t expected_checked = {args.cases}u;\n'
     source += 'wr32(0x1680f90,0x3f800000);\n'
+    source += 'wr32(0x1680f98,0);wr32(0x1680f9c,0x3ff00000);wr32(0x1682fa0,0);wr32(0x1682fa4,0x40000000);\n'
     # One additional call exercises the NULL eligibility plan after the budget.
     source += f'for(unsigned i=0;i<{args.cases+1};++i){{\n'
     source += r'''
@@ -92,6 +102,15 @@ int main(void){
   memset(memory+0x28000,0,64);
 #endif
   ac1_native_invoke(&c,&binding_0042EE70,oracle_0042EE70);
+  c.esp=0x10000+(rng()&15);
+  c.ecx=0x2A000;
+  unsigned m=0x2B000;
+  if(i%4==0)m=c.ecx; else if(i%4==1)m=c.ecx-8; /* out aliases the quaternion */
+  wr32(c.esp+4,m);
+  for(unsigned j=0;j<4;++j){
+    float f=((int)(rng()%20001)-10000)/(i%3 ? 10000.0f : 16.0f);wrss(c.ecx+4*j,f);
+  }
+  ac1_native_invoke(&c,&binding_00428540,oracle_00428540);
  }
  for(size_t k=0;k<ac1_native_binding_count;++k){
    ac1_native_binding *b=ac1_native_bindings[k];
@@ -106,9 +125,9 @@ int main(void){
     exe = out/('portable.exe' if args.portable else 'sse2.exe')
     flags = ['-DAC1_NATIVE_PORTABLE'] if args.portable else []
     if args.partial_alias: flags.append('-DORACLE_PARTIAL_ALIAS')
-    subprocess.run([args.compiler, '-O2', '-g', '-DAC1_TRACE_EIP', '-DAC1_DIRECT_MEMORY',
+    subprocess.run([args.compiler, '-O2', '-g', *([] if args.no_trace_eip else ['-DAC1_TRACE_EIP']), '-DAC1_DIRECT_MEMORY',
                     '-ffp-contract=off', '-fno-strict-aliasing', '-I'+str(ROOT/'src/runtime'),
-                    *flags, str(fixture), str(ROOT/'src/runtime/ac1_native.c'),
+                    *flags, str(fixture), str(out/'bodies.c'), str(ROOT/'src/runtime/ac1_native.c'),
                     str(ROOT/'src/runtime/ac1_native_registry_empty.c'),
                     str(ROOT/'src/runtime/ac1_native_leaf.c'), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)

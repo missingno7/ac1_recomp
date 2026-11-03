@@ -48842,6 +48842,12 @@
       "instruction_sha256": "6db8ebd07af41eb5eff20c2c586af68e7873989a96ba3a6caa8c7029a5ee2adf"
     },
     {
+      "address": "0x00428540",
+      "implementation": "ac1_native_00428540",
+      "plan": "ac1_native_00428540_plan",
+      "instruction_sha256": "be3dcdfe63dbba1c38c16ada393be35187cb9c408bbc83dcbf8be90a90041ece"
+    },
+    {
       "kind": "region",
       "address": "0x00AE11A0",
       "boundary": "0x00AE1707",

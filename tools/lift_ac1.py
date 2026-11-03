@@ -4111,8 +4111,11 @@ def emit_journal_region_source(address,entry,originals,output_dir,tu_header):
     source=journal_header+'#define AC1_REGION_JOURNAL_ADAPTERS\n#include "ac1_region_journal.h"\n'
     # This project-owned SIMD implementation is compiled in the journal TU so
     # its stack/output writes use exactly the same transactional adapters.
+    # Rename every external leaf the file defines, or each one would be
+    # defined twice (here and in ac1_native_leaf.c's own object).
     math_names=[]
-    for va in (0x653400,0x42ee70,0x1176de0):
+    leaf_source=(ROOT/'src/runtime/ac1_native_leaf.c').read_text(encoding='utf-8')
+    for va in sorted({int(v,16) for v in re.findall(r'^(?:int|void) ac1_native_([0-9A-F]{8})(?:_plan)?\(',leaf_source,re.M)}):
         for suffix in ('','_plan'):
             old=f'ac1_native_{va:08X}{suffix}';new=f'ac1_r_{address:08X}_math_{va:08X}{suffix}'
             math_names.append(old);source+=f'#define {old} {new}\n'

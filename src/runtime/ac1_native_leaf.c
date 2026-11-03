@@ -219,3 +219,111 @@ void ac1_native_0042EE70(CPU *c) {
     c->eip=0x0042EF09u;
 #endif
 }
+
+static int ordinary_double(uint64_t bits) {
+    uint64_t magnitude = bits & UINT64_C(0x7fffffffffffffff);
+    return magnitude <= UINT64_C(0x4130000000000000) &&
+           (!magnitude || magnitude >= UINT64_C(0x0010000000000000));
+}
+
+int ac1_native_00428540_plan(const CPU *c, ac1_native_plan *plan) {
+    if (c->esp < 80 || c->esp > UINT32_MAX-16u) return decline(plan,c->esp,"ESP cannot hold the native stack contract");
+    uint32_t base = ((c->esp-4u)&~15u)-48u, out = rd32(c->esp+4);
+    if (c->ecx > UINT32_MAX-16u) return decline(plan,c->ecx,"quaternion wraps the guest address space");
+    if (overlaps(c->ecx,16,c->esp-4,4)) return decline(plan,c->ecx,"quaternion aliases the saved EBP");
+    if (!check_vector(plan,c->ecx)) return 0;
+    if (out > UINT32_MAX-64u) return decline(plan,out,"64-byte matrix wraps the guest address space");
+    /* Scratch, saved EBP, return address and argument are read after the
+     * first matrix store, as is the homogeneous 1.0f. */
+    if (overlaps(out,64,base,c->esp+8u-base)) return decline(plan,out,"matrix aliases stack scratch/saved EBP/return address");
+    if (overlaps(out,64,0x01680F90u,4)) return decline(plan,out,"matrix aliases the homogeneous constant");
+    uint64_t two, one;
+    two = (uint64_t)rd32(0x01682FA0u) | (uint64_t)rd32(0x01682FA4u) << 32;
+    one = (uint64_t)rd32(0x01680F98u) | (uint64_t)rd32(0x01680F9Cu) << 32;
+    if (!ordinary_double(two) || !ordinary_double(one)) return decline(plan,0x01680F98u,"double constant outside native contract");
+    if (plan) {
+        ac1_native_add_range(plan, base, 48);
+        ac1_native_add_range(plan, c->esp-4, 4);
+        ac1_native_add_range(plan, out, 64);
+    }
+    return 1;
+}
+
+static XMM single_lane(float f) { XMM x={{0}}; x.f32[0]=f; return x; }
+static XMM double_lane(double d) { XMM x={{0}}; x.f64[0]=d; return x; }
+static XMM widen_low_pair(XMM s) { XMM d; d.f64[0]=s.f32[0]; d.f64[1]=s.f32[1]; return d; }
+static XMM narrow_pair(XMM s) { XMM d={{0}}; d.f32[0]=(float)s.f64[0]; d.f32[1]=(float)s.f64[1]; return d; }
+
+/* thiscall (ecx quaternion; out matrix), ret 4. The guest copies the
+ * quaternion to two stack slots before every scalar load (18 16-byte stores);
+ * here the lanes come from registers and each slot is stored once, with the
+ * same final contents. Register lanes, binary64 products, binary32 rounding
+ * points and operand order follow the guest instruction by instruction. */
+void ac1_native_00428540(CPU *c) {
+    uint32_t sp=c->esp, aligned=(sp-4u)&~15u, base=aligned-48u, out=rd32(sp+4);
+    XMM q=rdxm(c->ecx), x0=q, x1, x2, x3, x4, x5, x6, x7;
+    float s0, s1, s2, s3, m[16];
+    x1=double_lane(rdsd(0x01682FA0u));                                         /* 428568 */
+    x2=widen_low_pair(single_lane(q.f32[0])); x3=widen_low_pair(single_lane(q.f32[0]));
+    x2.f64[0]*=x1.f64[0]; x2.f64[0]*=x3.f64[0]; x2.f32[0]=(float)x2.f64[0];    /* xx */
+    s2=x2.f32[0];
+    x3=widen_low_pair(single_lane(q.f32[1])); x2=widen_low_pair(single_lane(q.f32[0]));
+    x2.f64[0]*=x1.f64[0]; x2.f64[0]*=x3.f64[0];                                /* xy */
+    x4=widen_low_pair(single_lane(q.f32[2])); x3=widen_low_pair(single_lane(q.f32[0]));
+    x3.f64[0]*=x1.f64[0]; x3.f64[0]*=x4.f64[0];                                /* xz */
+    x5=widen_low_pair(single_lane(q.f32[3])); x4=widen_low_pair(single_lane(q.f32[0]));
+    x4.f64[0]*=x1.f64[0]; x4.f64[0]*=x5.f64[0];                                /* xw */
+    x6=widen_low_pair(single_lane(q.f32[1])); x5=widen_low_pair(single_lane(q.f32[1]));
+    x5.f64[0]*=x1.f64[0]; x5.f64[0]*=x6.f64[0];                                /* yy */
+    x6=widen_low_pair(single_lane(q.f32[1])); x6.f64[0]*=x1.f64[0];
+    x7=widen_low_pair(single_lane(q.f32[2])); x6.f64[0]*=x7.f64[0];
+    x6=narrow_pair(x6); s3=x6.f32[0];                                          /* yz */
+    x6=widen_low_pair(single_lane(q.f32[1])); x6.f64[0]*=x1.f64[0];
+    x7=widen_low_pair(single_lane(q.f32[3])); x6.f64[0]*=x7.f64[0];
+    x6=narrow_pair(x6); s1=x6.f32[0];                                          /* yw */
+    x6=widen_low_pair(single_lane(q.f32[2])); x6.f64[0]*=x1.f64[0];
+    x7=single_lane(q.f32[2]); x0=single_lane(q.f32[2]);                        /* 428695 */
+    x7=widen_low_pair(x7); x6.f64[0]*=x7.f64[0];                               /* zz */
+    x2=narrow_pair(x2); x3=narrow_pair(x3); x4=narrow_pair(x4);
+    x5=narrow_pair(x5); x6=narrow_pair(x6);
+    x0=widen_low_pair(x0); x0.f64[0]*=x1.f64[0];
+    x1=widen_low_pair(single_lane(q.f32[3])); x0.f64[0]*=x1.f64[0];            /* zw */
+    x1=double_lane(rdsd(0x01680F98u));
+    x0=narrow_pair(x0); s0=x0.f32[0];
+    x7=x1;
+    x0.f64[0]=x5.f32[0]; x7.f64[0]-=x0.f64[0];
+    x0.f64[0]=x6.f32[0]; x7.f64[0]-=x0.f64[0];
+    x0=narrow_pair(x7); x7.f64[0]=s0; m[0]=x0.f32[0];                          /* 1-yy-zz */
+    x0.f64[0]=x2.f32[0]; x0.f64[0]-=x7.f64[0]; x0=narrow_pair(x0);
+    x2.f64[0]=x2.f32[0]; m[4]=x0.f32[0];                                       /* xy-zw */
+    x0.f64[0]=s1; x7.f64[0]=x3.f32[0]; x0.f64[0]+=x7.f64[0];                   /* yw+xz */
+    x7.f64[0]=s0; x7.f64[0]+=x2.f64[0]; x2=narrow_pair(x7); m[1]=x2.f32[0];    /* zw+xy */
+    x2.f64[0]=s2; x1.f64[0]-=x2.f64[0];
+    x2.f64[0]=x6.f32[0]; x6=x1; x6.f64[0]-=x2.f64[0];
+    x2=narrow_pair(x6); m[5]=x2.f32[0];                                        /* 1-xx-zz */
+    x2=single_lane(s3); x6=widen_low_pair(x2);
+    x7.f64[0]=x4.f32[0]; x6.f64[0]-=x7.f64[0]; x6=narrow_pair(x6);
+    x3.f64[0]=x3.f32[0]; m[9]=x6.f32[0];                                       /* yz-xw */
+    x6.f64[0]=s1; x3.f64[0]-=x6.f64[0]; x3=narrow_pair(x3);
+    x2=widen_low_pair(x2); m[2]=x3.f32[0];                                     /* xz-yw */
+    x0=narrow_pair(x0);
+    x3.f64[0]=x4.f32[0]; x2.f64[0]+=x3.f64[0]; x2=narrow_pair(x2);
+    m[8]=x0.f32[0]; m[6]=x2.f32[0];                                            /* yw+xz, yz+xw */
+    x0=single_lane(0.0f); x0.u32[0]=0;
+    x2.f64[0]=x5.f32[0]; x1.f64[0]-=x2.f64[0];
+    m[3]=m[7]=m[11]=m[12]=m[13]=m[14]=0.0f;
+    x0.u32[0]=rd32(0x01680F90u);
+    x1=narrow_pair(x1); m[10]=x1.f32[0];                                       /* 1-xx-yy */
+    memcpy(&m[15],&x0.u32[0],4);
+    wr32(sp-4,c->ebp);
+    wrss(base,s0); wrss(base+4,s1); wrss(base+8,s2); wrss(base+12,s3);
+    wrxm(base+16,q); wrxm(base+32,q);
+    for (unsigned i=0;i<4;++i) { XMM row; memcpy(&row,&m[4*i],16); wrxm(out+16*i,row); }
+    c->xmm[0]=x0; c->xmm[1]=x1; c->xmm[2]=x2; c->xmm[3]=x3;
+    c->xmm[4]=x4; c->xmm[5]=x5; c->xmm[6]=x6; c->xmm[7]=x7;
+    c->eax=out; c->esp=sp+8;
+    flags_sub(c,aligned,48,4);
+#ifdef AC1_TRACE_EIP
+    c->eip=0x004287E3u;
+#endif
+}
