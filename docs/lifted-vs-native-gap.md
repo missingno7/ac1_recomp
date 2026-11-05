@@ -20,9 +20,27 @@ game code, so they live in `work/codegen_lab/audit/examples.md`.
 | `tools/codegen_lab/idioms.py` | Whole-program census of stack idioms (all 102,014 functions) |
 | `function_facts.stack_accesses` | Frame slots and frame escapes from decoded x86 |
 
-`llvm-mca`, `opt`, `llc` and Alive2 are not in the NDK or MSYS, so there is no
-scheduling simulation or formal IR equivalence here. Correctness below means
-full-state differential testing.
+Correctness below means full-state differential testing; there is no formal IR
+equivalence, because Alive2 has no Windows release.
+
+`llvm-mca`, `opt` and `llc` are not in the NDK. LLVM 19.1.7's official Windows
+archive provides them (signature verified, extracted to the ignored
+`work/tools/llvm-19.1.7/bin`). `tools/codegen_lab/mca.py` calibrates `llvm-mca`
+against the cycles measured on the phone, and it fails that check:
+
+| Function | Phone | cortex-x4 | cortex-a720 | neoverse-v2 | cortex-x4, loads may alias stores |
+|---|---|---|---|---|---|
+| 0x428540 lifted | 110 | 52.2 | 52.2 | 29.9 | 245.0 |
+| 0x428540 native | 27 | 107.3 | 107.3 | 55.6 | 121.2 |
+| 0x653400 lifted | 29 | 23.2 | 23.2 | 14.5 | 100.0 |
+| 0x653400 native | 70 | 113.2 | 113.2 | 58.3 | 201.0 |
+| 0x1176DE0 lifted | 35 | 27.3 | 27.3 | 18.1 | 131.0 |
+| 0x1176DE0 native | 39 | 106.2 | 106.2 | 54.4 | 126.1 |
+
+`cortex-x4` and `cortex-a720` match in every row, so there is no distinct X4
+model. The default mode reverses the 0x428540 ordering. `llvm-mca` does not model
+store-to-load forwarding, which is where this gap sits, so its cycle numbers are
+not used to explain anything here.
 
 ## Main results
 
