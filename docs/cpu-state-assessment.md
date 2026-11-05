@@ -617,3 +617,9 @@ All big cores were capped at 2.38 GHz during these samples (`scaling_max_freq`,
 against 3.40 GHz for the X4 and 3.15 GHz for the A720), while Android reported
 thermal status 0. The phone was connected over USB and earlier runs saw 2.35-2.65
 GHz on cpu7. What sets the cap is not established.
+
+The battery may explain the cap. It was at 9-11% during the gameplay samples and
+the A/B around them, with Battery Saver off, and it discharged at about 600 mA
+during play despite USB power. Later phone measurements should record battery
+level and `scaling_max_freq`, start from a well-charged phone, and compare
+clocks before drawing conclusions. The cause is not yet tested.
