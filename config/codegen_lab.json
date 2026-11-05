@@ -4,8 +4,7 @@
   "hot_top": 40,
   "variants": {
     "base": {"defines": [], "note": "as shipped: no EIP observer without EIP tracing"},
-    "eip_observer": {"defines": ["-DAC1_EIP_OBSERVER"], "note": "accessor barrier as before 5c0308c"},
-    "vector_access": {"defines": ["-DAC1_VECTOR_ACCESS"], "note": "16-byte guest accesses as one vector access"}
+    "eip_observer": {"defines": ["-DAC1_EIP_OBSERVER"], "note": "accessor barrier as before 5c0308c"}
   },
   "bench": {
     "calls_per_rep": 1000000,

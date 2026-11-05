@@ -6,20 +6,12 @@ param(
     # x86_64 is for the emulator (native speed under WHPX); arm64-v8a for phones.
     [ValidateSet('arm64-v8a', 'x86_64')][string]$Abi = 'arm64-v8a',
     [ValidateSet('Gradle', 'Make')][string]$NativeBuilder = 'Gradle',
-    [string]$Make = '',
-    # Passed to build.ps1, which regenerates when they differ from the last generation.
-    [ValidateSet('off', 'on')][string]$XmmAbi = 'off',
-    [ValidateSet('off', 'on')][string]$X87Regions = 'off',
-    [ValidateSet('off', 'on')][string]$GprSpeculation = 'off',
-    [string]$PrivateAbi = '',
-    # 16-byte guest accesses as one vector access instead of memcpy (experimental).
-    [switch]$VectorAccess
+    [string]$Make = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $abiTag = if ($Abi -eq 'arm64-v8a') { 'arm64' } else { 'x86_64' }
-$vectorAccessCMake = if ($VectorAccess) { 'ON' } else { 'OFF' }
 # Check the two external native providers before generating any game code.
 foreach ($component in @('avformat', 'avcodec', 'swscale', 'avutil')) {
     $archive = Join-Path $repoRoot "work\bink_native\ffmpeg-android-$abiTag\install\lib\lib$component.a"
@@ -36,8 +28,7 @@ if ([string]::IsNullOrWhiteSpace($AndroidSdk)) {
 if (-not (Test-Path -LiteralPath (Join-Path $AndroidSdk 'platforms\android-35\android.jar'))) {
     throw "Android SDK platform 35 was not found under '$AndroidSdk'. Pass -AndroidSdk or set ANDROID_HOME."
 }
-& (Join-Path $PSScriptRoot 'build.ps1') -PrepareOnly -Python $Python -XmmAbi $XmmAbi -X87Regions $X87Regions `
-    -GprSpeculation $GprSpeculation -PrivateAbi $PrivateAbi
+& (Join-Path $PSScriptRoot 'build.ps1') -PrepareOnly -Python $Python
 if ($LASTEXITCODE -ne 0) { throw 'Native input preparation failed' }
 
 function Get-JavaMajor([string]$JavaInstallRoot) {
@@ -94,8 +85,7 @@ try {
             "-DCMAKE_TOOLCHAIN_FILE=$ndkToolchain" "-DANDROID_ABI=$Abi" `
             -DANDROID_PLATFORM=29 -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=RelWithDebInfo `
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=$jniAbi" `
-            -DAC1_NATIVE_BINK=ON -DAC1_DIRECT_MEMORY=ON -DAC1_FORCE_INLINE_ACCESSORS=ON -DAC1_TRACE_EIP=OFF `
-            "-DAC1_VECTOR_ACCESS=$vectorAccessCMake"
+            -DAC1_NATIVE_BINK=ON -DAC1_DIRECT_MEMORY=ON -DAC1_FORCE_INLINE_ACCESSORS=ON -DAC1_TRACE_EIP=OFF
         if ($LASTEXITCODE) { throw 'Android native CMake configuration failed' }
         & $cmake --build $nativeBuild --parallel $Jobs
         if ($LASTEXITCODE) { throw 'Android native Make build failed' }
@@ -105,7 +95,7 @@ try {
     }
     # Recreate the ZIP: incremental packaging can retain large gaps after a .so shrinks.
     if (Test-Path -LiteralPath $apkPath) { Remove-Item -LiteralPath $apkPath -Force }
-    & .\gradlew.bat --no-daemon "--max-workers=$Jobs" "-Pac1Abi=$Abi" "-Pac1VectorAccess=$vectorAccessCMake" @prebuiltArgument assembleDebug
+    & .\gradlew.bat --no-daemon "--max-workers=$Jobs" "-Pac1Abi=$Abi" @prebuiltArgument assembleDebug
     $buildExit = $LASTEXITCODE
 } finally {
     Pop-Location

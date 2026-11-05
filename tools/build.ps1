@@ -8,29 +8,11 @@ param(
     [switch]$PrepareOnly,
     [switch]$CheckRepeat,
     [switch]$Run,
-    # Whole-program flag contracts; 'cfg' restores per-function masks (all flags at calls/returns).
-    [ValidateSet('off', 'straight', 'cfg', 'abi')][string]$FlagLiveness = 'abi',
-    # Register locals (GPR+XMM) for every admitted function; 'off' restores CPU-struct registers.
-    [string]$LocalRegs = 'all',
     [switch]$X87Inline,
-    # x87 stack in block-local doubles without tag/env bookkeeping; 'exact' restores the full model.
-    [ValidateSet('exact', 'native')][string]$X87 = 'native',
-    # Whole-program XMM contracts at calls (experimental; 'off' syncs every local XMM register).
-    [ValidateSet('off', 'on')][string]$XmmAbi = 'off',
-    # Native x87 TOP kept across blocks where tools/function_facts.py proves the stack depth (experimental).
-    [ValidateSet('off', 'on')][string]$X87Regions = 'off',
-    # Value-speculative reloads of live callee-saved GPRs after guest calls (experimental).
-    [ValidateSet('off', 'on')][string]$GprSpeculation = 'off',
-    # GPRs passed in host registers between translated functions (experimental), e.g. 'esp,esi'; '' is off.
-    [string]$PrivateAbi = '',
-    # Compiler fences on every goto of GPR-local functions, or only on backward branches.
-    [ValidateSet('all', 'backward')][string]$BranchFences = 'all',
     # Dedicated count build only; default generated code has zero count hooks.
     [string]$ProfileCountEntries = '',
     # Checked per-access guest memory (diagnosable bad pointers) instead of the direct arena.
     [switch]$CheckedMemory,
-    # 16-byte guest accesses as one vector access instead of memcpy (experimental).
-    [switch]$VectorAccess,
     [string]$GameExe = 'C:\Program Files (x86)\GOG.com\Assassins Creed\AssassinsCreed_Dx9.exe',
     # Reuse an existing build's generator; Ninja is the default for a new one.
     [ValidateSet('Ninja', 'MinGW Makefiles')][string]$Generator
@@ -49,21 +31,11 @@ try {
             $Report = Get-Content -LiteralPath $ReportPath -Raw | ConvertFrom-Json
             $ConfigHash = (Get-FileHash -LiteralPath 'config/ac1_dx9.json' -Algorithm SHA256).Hash.ToLowerInvariant()
             $DriverHash = (Get-FileHash -LiteralPath 'tools/lift_ac1.py' -Algorithm SHA256).Hash.ToLowerInvariant()
-            $FactsHash = (Get-FileHash -LiteralPath 'tools/function_facts.py' -Algorithm SHA256).Hash.ToLowerInvariant()
             $EmissionCacheHash = (Get-FileHash -LiteralPath 'tools/emission_cache.py' -Algorithm SHA256).Hash.ToLowerInvariant()
             $TablesHash = (Get-FileHash -LiteralPath 'config/startup_initializers.json' -Algorithm SHA256).Hash.ToLowerInvariant()
             $NeedGenerate = $Report.config_sha256 -ne $ConfigHash -or
                 $Report.lift_driver_sha256 -ne $DriverHash -or $Report.initializer_tables_sha256 -ne $TablesHash -or
-                $Report.generation_input_sha256.emission_cache -ne $EmissionCacheHash -or
-                $Report.flag_liveness -ne $FlagLiveness -or
-                $Report.local_regs.requested -ne $LocalRegs -or
-                $(if ($Report.x87) { $Report.x87.mode } else { 'exact' }) -ne $X87 -or
-                $(if ($Report.xmm_abi) { $Report.xmm_abi } else { 'off' }) -ne $XmmAbi -or
-                $(if ($Report.branch_fences) { $Report.branch_fences } else { 'all' }) -ne $BranchFences -or
-                $(if ($Report.x87_regions) { $Report.x87_regions } else { 'off' }) -ne $X87Regions -or
-                $(if ($Report.gpr_speculation) { $Report.gpr_speculation } else { 'off' }) -ne $GprSpeculation -or
-                $(if ($Report.private_abi) { $Report.private_abi } else { '' }) -ne $PrivateAbi -or
-                (($X87Regions -eq 'on' -or $GprSpeculation -eq 'on') -and $Report.function_facts_sha256 -ne $FactsHash)
+                $Report.generation_input_sha256.emission_cache -ne $EmissionCacheHash
             $CountEntries = @($ProfileCountEntries.Split(',') | Where-Object { $_ } | ForEach-Object { ([Convert]::ToUInt32($_,16)).ToString('X8') } | Sort-Object -Unique)
             if ((@($Report.profile_count_entries) -join ',') -ne ($CountEntries -join ',')) { $NeedGenerate = $true }
         }
@@ -71,7 +43,7 @@ try {
     if ($NeedGenerate) {
         & $Python -B tools/analyze_pe.py
         if ($LASTEXITCODE -ne 0) { throw 'PE analysis failed' }
-        & $Python -B tools/lift_ac1.py --flag-liveness $FlagLiveness --local-regs $LocalRegs --x87 $X87 --xmm-abi $XmmAbi --branch-fences $BranchFences --x87-regions $X87Regions --gpr-speculation $GprSpeculation "--private-abi=$PrivateAbi" "--profile-count-entries=$ProfileCountEntries"
+        & $Python -B tools/lift_ac1.py "--profile-count-entries=$ProfileCountEntries"
         if ($LASTEXITCODE -ne 0) { throw 'AC1 generation failed' }
     }
     & $Python -B tools/prepare_runtime.py
@@ -102,7 +74,6 @@ try {
     # Explicit, because an option default never overrides an existing CMake cache entry.
     $ConfigureArgs += "-DAC1_FORCE_INLINE_X87=$(if ($X87Inline) { 'ON' } else { 'OFF' })"
     $ConfigureArgs += "-DAC1_DIRECT_MEMORY=$(if ($CheckedMemory) { 'OFF' } else { 'ON' })"
-    $ConfigureArgs += "-DAC1_VECTOR_ACCESS=$(if ($VectorAccess) { 'ON' } else { 'OFF' })"
     if ($Target -eq 'Host') {
         $ConfigureArgs += '-DCMAKE_C_COMPILER=C:/msys64/mingw64/bin/gcc.exe'
         $ConfigureArgs += '-DCMAKE_CXX_COMPILER=C:/msys64/mingw64/bin/g++.exe'

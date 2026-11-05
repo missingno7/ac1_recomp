@@ -114,15 +114,6 @@ class LocalRegisterTests(unittest.TestCase):
             count += 1
         self.assertGreaterEqual(count, 20)
 
-    def test_per_function_selection_fails_closed(self):
-        entries = {0x401000, 0x401100}
-        self.assertEqual(lift.local_register_selection('off', entries), set())
-        self.assertEqual(lift.local_register_selection('all', entries), entries)
-        self.assertEqual(lift.local_register_selection('00401000,0x00401100', entries), entries)
-        for value in ('401000', 'all,00401000', '00401001', '00401000,', '0040100g'):
-            with self.assertRaises(ValueError):
-                lift.local_register_selection(value, entries)
-
     def test_helpers_stops_and_taken_edges_are_synchronized(self):
         source = '\n'.join(['void L_00401000(CPU *c)', '{',
             '    AC1_SET_GUEST_EIP(c, 0x00401000u);',

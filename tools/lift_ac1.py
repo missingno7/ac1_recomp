@@ -8,9 +8,7 @@ from __future__ import annotations
 
 import argparse
 import collections
-import functools
 import hashlib
-import operator
 import importlib.metadata
 import json
 import re
@@ -4198,24 +4196,8 @@ def declare_local_memory_base(body: str) -> str:
     return re.sub(pattern, lambda m: m[0] + '\n    AC1_DECLARE_LOCAL_ARENA;', body)
 
 
-def local_register_function(body: str, branch_fences: str = 'all', speculate=None, private=None) -> str:
+def local_register_function(body: str) -> str:
     """GPR locals with conservative CFG dirty sets and audited CPU boundaries.
-
-    `private` (mask: guest registers in GPR order, esp among them; callees:
-    entries with a private body; self: whether this one gets one) selects the
-    private call ABI. A direct call to a private callee pushes on the local esp,
-    spills only the other dirty registers, passes the mask registers as
-    arguments (AC1_PCALLn) and reloads only the others. A private body starts
-    with the mask registers from its arguments, counts them dirty (the struct
-    copy is stale) and returns them in _ac1_ret; private_abi_finish turns it
-    into P_<VA> with an L_<VA> struct adapter once the later passes are done.
-
-    `speculate` ({guest call va: GPR mask live after it}, from
-    function_facts.gpr_live_after_calls) reloads the live callee-saved
-    registers after that call by value speculation: the struct is still read,
-    but the function keeps its own value unless the two differ (a branch the
-    core predicts), so code after the call does not wait for the callee's
-    stores. The result is always the struct's value, so the state stays exact.
 
     Exception-frame (fs:) functions are included: the runtime never resumes
     guest code from an exception context (RaiseException accepts only the
@@ -4234,26 +4216,12 @@ def local_register_function(body: str, branch_fences: str = 'all', speculate=Non
     referenced=set(re.findall(r'\bc->('+names+r')\b',clean))
     stack='|'.join(sorted(LOCAL_ESP_HELPERS))
     if re.search(r'\b(?:'+stack+r')\(c(?=[,)])',clean):referenced.add('esp')
-    if private:referenced|=set(private['mask'])
     registers=[r for r in registers if r in referenced]
     if not registers:return original
     all_regs=set(registers)
     gpr=re.compile(r'\bc->('+'|'.join(registers)+r')\b')
-    mask=[r for r in registers if private and r in private['mask']]
-    self_private=bool(private and private.get('self'))
-    if private and 'esp' not in mask:raise ValueError('the private call ABI needs esp among its registers')
-    def ret_value(source):
-        return '_ac1_ret = (ac1_pregs){ '+', '.join(f'.r{k} = {source}{r}' for k,r in enumerate(mask))+' };'
-    direct_call=re.compile(r'\bAC1_CALL\(c, L_([0-9A-F]{8}), 0x\1u\);')
-    push_block=re.compile(r'\{ uint32_t _ac1_push = 0x[0-9A-F]+u; c->esp -= 4u; wr32\(c->esp, _ac1_push\); \}')
     def spill(dirty):return ' '.join(f'c->{r} = _ac1_regs.{r};' for r in registers if r in dirty)
     reload=' '.join(f'_ac1_regs.{r} = c->{r};' for r in registers)
-    def speculative_reload(live):
-        return ' '.join((f'{{ uint32_t _ac1_v = c->{r}; if (__builtin_expect(_ac1_v != _ac1_regs.{r}, 0)) '
-                         f'{{ __asm__ __volatile__("" : "+r"(_ac1_v)); _ac1_regs.{r} = _ac1_v; }} '
-                         f'else __asm__("" : "+r"(_ac1_regs.{r})); }}')
-                        if r in SPECULATED_GPRS and live>>GPR_INDEX[r]&1 else f'_ac1_regs.{r} = c->{r};'
-                        for r in registers)
     esp_spill,esp_reload='c->esp = _ac1_regs.esp;','_ac1_regs.esp = c->esp;'
     pure=r'flags_\w+|'+'|'.join(sorted(LOCAL_GPR_FREE_HELPERS))
     lines=body.splitlines()
@@ -4267,19 +4235,12 @@ def local_register_function(body: str, branch_fences: str = 'all', speculate=Non
     if group:groups.append(group)
     texts=[re.sub(r'/\*.*?\*/','', '\n'.join(g),flags=re.S) for g in groups]
     labels={label:i for i,text in enumerate(texts) for label in re.findall(r'^(L_[0-9A-F]{8}):',text,re.M)}
-    full=[];partial=[];writes=[];edges=[];unknown_edges=False;private_call=[]
+    full=[];partial=[];writes=[];edges=[];unknown_edges=False
     for i,text in enumerate(texts):
         pointer=re.sub(r'\bc->\w+','member',text)
         pointer=re.sub(r'\b(?:'+pure+'|'+stack+r')\(c(?=[,)])','safe(',pointer)
         full.append(bool(re.search(r'\bc\b|RECOMP_TODO\(|ac1_unsupported_instruction\(',pointer)))
         partial.append(not full[-1] and bool(re.search(r'\b(?:'+stack+r')\(c(?=[,)])',text)))
-        # A group that is only the return-address push and a direct call to a
-        # private callee (perhaps with the tail return) calls it privately.
-        call=direct_call.search(text) if private else None
-        rest=push_block.sub('',direct_call.sub('',text)) if call and int(call[1],16) in private['callees'] else None
-        if rest is not None:rest=re.sub(r'AC1_SET_GUEST_EIP\(c,\s*0x[0-9A-F]+u\);|^L_[0-9A-F]{8}:|\breturn;','',rest,flags=re.M)
-        private_call.append(rest is not None and not rest.strip() and text.count('AC1_CALL(')==1)
-        if private_call[-1]:full[-1]=partial[-1]=False
         changed=set(re.findall(r'\bc->('+'|'.join(registers)+r')\s*\)*\s*(?:(?:<<|>>|[+*/%&|^\-])?=(?!=)|\+\+|--)',text))
         changed.update(re.findall(r'(?:\+\+|--)\s*\(*\s*c->('+'|'.join(registers)+r')\b',text))
         changed.update(re.findall(r'\bSET(?:8[HL]|16)\(\s*\(*\s*c->('+'|'.join(registers)+r')\b',text))
@@ -4297,10 +4258,9 @@ def local_register_function(body: str, branch_fences: str = 'all', speculate=Non
         if not terminal and i+1<len(groups):successors.add(i+1)
         edges.append(successors)
     def outgoing(i,before):
-        if private_call[i]:return set(mask)
         if full[i]:return set()
         return (before|writes[i])-({'esp'} if partial[i] else set())
-    incoming={0:set(mask) if self_private else set()};queue=deque([0])
+    incoming={0:set()};queue=deque([0])
     while queue:
         i=queue.popleft();after=outgoing(i,incoming[i])
         for target in edges[i]:
@@ -4309,10 +4269,8 @@ def local_register_function(body: str, branch_fences: str = 'all', speculate=Non
     output=lines[:2]+[
         '    struct { uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi; } _ac1_regs;',
         '    _Static_assert(STACK_BASE((CPU *)0) == 0u, "local GPR stack helpers require flat zero stack base");',
-        '    '+(' '.join(f'_ac1_regs.{r} = _ac1_p_{r};' if r in mask else f'_ac1_regs.{r} = c->{r};'
-                         for r in registers) if self_private else reload),
+        '    '+reload,
     ]
-    reload_others=' '.join(f'_ac1_regs.{r} = c->{r};' for r in registers if r not in mask)
     for i,group in enumerate(groups):
         before=all_regs if unknown_edges else incoming.get(i,all_regs)
         after=outgoing(i,before)
@@ -4320,60 +4278,21 @@ def local_register_function(body: str, branch_fences: str = 'all', speculate=Non
         if full[i]:
             sync=spill(before)
             if sync:output.append('    '+sync)
-            # The struct is current here: a private body returns from it.
-            if self_private:text=re.sub(r'\breturn;','{ '+ret_value('c->')+' return; }',text)
-        elif private_call[i]:
-            sync=spill(before-set(mask))
-            if sync:output.append('    '+sync)
-            text=gpr.sub(lambda m:'_ac1_regs.'+m[1],text)
-            text=direct_call.sub(lambda m:f'AC1_PCALL{len(mask)}(c, P_{m[1]}, 0x{m[1]}u, {", ".join(mask)});',text)
-            at_return=(spill(after-set(mask))+' '+ret_value('_ac1_regs.')) if self_private else spill(after)
-            text=re.sub(r'\breturn;','{ '+at_return+' return; }',text)
         else:
             if partial[i] and 'esp' in before:output.append('    '+esp_spill)
             text=gpr.sub(lambda m:m[0] if partial[i] and m[1]=='esp' else '_ac1_regs.'+m[1],text)
-            at_return=(esp_reload+' ' if partial[i] else '')+(
-                spill(after-set(mask))+' '+ret_value('_ac1_regs.') if self_private else spill(after))
+            at_return=(esp_reload+' ' if partial[i] else '')+spill(after)
             text=re.sub(r'\breturn;','{ '+at_return+' return; }',text)
-        edge_reload=reload if full[i] else reload_others if private_call[i] else esp_reload if partial[i] else ''
-        site=re.search(r'AC1_SET_GUEST_EIP\(c,\s*0x([0-9A-F]{8})u\)',text)
-        if full[i] and speculate and site and int(site[1],16) in speculate and re.search(r'\b(?:AC1_CALL|dispatch)\(c',text):
-            edge_reload=speculative_reload(speculate[int(site[1],16)])
-        # 'backward': forward edges carry only their reload; fence_backward_branches
-        # fences every backward edge afterwards, which keeps loops polling.
-        fence=edge_reload+(' __asm__ __volatile__("" ::: "memory"); ' if branch_fences=='all' else ' ')
+        edge_reload=reload if full[i] else esp_reload if partial[i] else ''
+        fence=edge_reload+' __asm__ __volatile__("" ::: "memory"); '
         text=re.sub(r'\bgoto (L_[0-9A-F]{8});',lambda m:'{ '+fence+'goto '+m[1]+'; }',text)
         output.extend(text.splitlines())
         if edge_reload:output.append('    '+edge_reload)
-    output.extend(('    '+(spill(all_regs-set(mask))+' '+ret_value('_ac1_regs.') if self_private else spill(all_regs)),'}'))
+    output.extend(('    '+spill(all_regs),'}'))
     return '\n'.join(output)
 
 
-def private_abi_finish(body: str, address: int, mask) -> str:
-    """Turn a private body (local_register_function with private self) into P_<VA> plus its L_<VA> adapter.
-
-    Runs after every pass that rewrites `return;` (XMM locals) and after the
-    arena declaration, which only recognises `void name(CPU *c)` entries.
-    """
-    head=f'void L_{address:08X}(CPU *c)'
-    lines=body.splitlines()
-    if lines[0]!=head or lines[1]!='{':raise ValueError(f'unexpected private body shape at 0x{address:08X}')
-    lines[0]=f'AC1_PRIVATE ac1_pregs P_{address:08X}(CPU *c, '+', '.join(f'uint32_t _ac1_p_{r}' for r in mask)+')'
-    lines.insert(2,'    ac1_pregs _ac1_ret = {0};')
-    text='\n'.join(lines)
-    text=re.sub(r'\breturn;','return _ac1_ret;',text)
-    text=text[:text.rstrip().rfind('}')]+'    return _ac1_ret;\n}'
-    adapter=[head,'{',
-             f'    ac1_pregs _ac1_o = P_{address:08X}(c, '+', '.join(f'c->{r}' for r in mask)+');',
-             '    '+' '.join(f'c->{r} = (uint32_t)_ac1_o.r{k};' for k,r in enumerate(mask)),'}']
-    return text+'\n\n'+'\n'.join(adapter)
-
-
 LOOP_FENCE = '__asm__ __volatile__("" ::: "memory"); '
-# Callee-saved under the MSVC convention: callees push and restore them, so
-# after a call they almost always still hold the caller's values.
-SPECULATED_GPRS = frozenset({'ebx', 'ebp', 'esi', 'edi'})
-GPR_INDEX = {r: i for i, r in enumerate('eax ecx edx ebx esp ebp esi edi'.split())}
 
 
 def fence_backward_branches(body: str) -> str:
@@ -4411,194 +4330,7 @@ def xmm_free_helpers(cpu_header: str) -> frozenset:
 _XMM_FREE_HELPERS = None
 
 
-XMM_ALL = 0xFF
-XMM_REF = re.compile(r'c->xmm\[(\d)\]')
-XMM_FULL_WRITE = re.compile(r'^\s*\{?\s*c->xmm\[(\d)\](?:\.v\w+)?\s*=(?!=)(.*)$', re.S)
-XMM_LOAD_WRITE = re.compile(r'^\s*\{?\s*sse_load_s[sd]\(&c->xmm\[(\d)\],(.*)$', re.S)
-
-
-def xmm_contract_rows(body, lifted, free):
-    """Per instruction group: XMM registers read before a certain write, and transfers.
-
-    The structure (successors, calls, returns, jumps, entry guard) is the flag
-    contract's. A register counts as written only by a whole-register store
-    (`c->xmm[N] = e`, `c->xmm[N].vT = e` or sse_load_ss/sd) whose operands do not
-    read it, in an unguarded group; every other mention reads it. A CPU-taking
-    helper other than a guest call is synced in full, so it reads every register.
-    """
-    flow = flag_contract_rows(body, lifted)
-    rows = []
-    for group, frow in zip(flow['groups'], flow['rows']):
-        text = re.sub(r'/\*.*?\*/', '', '\n'.join(group), flags=re.S)
-        guarded = bool(re.search(r'\b(?:if|while|for|switch)\b', FLAG_X87_CHECK.sub('', text)))
-        read = write = 0
-        if re.search(r'c->xmm(?!\[\d\])', text): read = XMM_ALL
-        rest = FLAG_DISPATCH.sub('', FLAG_DIRECT_CALL.sub('', re.sub(r'\bdispatch_jmp\(c, [^;]*;', '', text)))
-        if any(name not in free for name in re.findall(r'\b(\w+)\(c(?=\s*[,)])', rest)): read = XMM_ALL
-        for statement in text.split(';'):
-            full = XMM_FULL_WRITE.match(statement) or XMM_LOAD_WRITE.match(statement)
-            target = int(full[1]) if full and not re.search(rf'c->xmm\[{full[1]}\]', full[2]) else None
-            for k in XMM_REF.findall(statement[full.start(2):] if target is not None else statement):
-                if not write >> int(k) & 1: read |= 1 << int(k)
-            if target is not None and not guarded: write |= 1 << target
-        # A direct call defines every register (its callee's return contract).
-        # An import's host code keeps them; an indirect callee writes back only
-        # what it modifies, so the caller's values must be valid before it.
-        if frow['call'] and not guarded and frow['call'][0] == 'direct': write = XMM_ALL
-        site = None
-        if frow['call'] or frow['jump']:
-            for line in group:
-                if FLAG_DIRECT_CALL.search(line) or FLAG_DISPATCH.search(line) or 'dispatch_jmp(c' in line:
-                    match = re.search(r'/\*\s*([0-9A-F]{8}):', line)
-                    site = int(match[1], 16) if match else None
-                    break
-        # A group with several transfers has no call row; its callees return
-        # every register (see xmm_contract_program).
-        opaque = [] if frow['call'] else (
-            [('direct', int(t, 16)) for t in FLAG_DIRECT_CALL.findall(text)] +
-            [('indirect', None)] * len(FLAG_DISPATCH.findall(text)))
-        rows.append(dict(frow, read=read, write=write, site=site, opaque=opaque))
-    return dict(flow, rows=rows, modified=xmm_modified(body))
-
-
-XMM_ASSIGN = re.compile(r'c->xmm\[(\d)\](?:\.\w+)?(?:\[[^\]]*\])*\s*(?:[-+*/%|&^]|<<|>>)?=(?!=)')
-
-
-def xmm_modified(body):
-    '''Registers a body may write: an assignment to c->xmm[N] or a lane of it, or its address taken.'''
-    code = re.sub(r'/\*.*?\*/', '', body, flags=re.S)
-    if re.search(r'c->xmm(?!\[\d\])', code): return XMM_ALL
-    return functools.reduce(operator.or_, (1 << int(k) for k in
-                            XMM_ASSIGN.findall(code) + re.findall(r'&\s*c->xmm\[(\d)\]', code)), 0)
-
-
-def xmm_contract_program(bodies, pinned=(), call_targets=None, jump_targets=None):
-    """Whole-program XMM contracts: what each function and call site must sync.
-
-    The flag contracts' rules on eight registers: E(F) is read at entry before
-    being defined, R(F) is read by direct callers after F returns. Indirect
-    calls, imports (host code may call back) and indirect jumps store the union
-    of their possible targets' entry demand.
-
-    Demand after indirect transfers is not pushed into every possible target
-    (two thirds of all functions), which made every contract all-register.
-    Instead the struct stays exact for the registers D read after any indirect
-    call or jump: every function writes back, besides R, the registers of D it
-    modifies itself, and an indirect caller stores what it reads afterwards
-    before the call, so registers the callee leaves alone survive there. By
-    induction over the call depth, at every return the struct holds each D
-    register's value. Each store is therefore a read of the local (a full sync
-    reads every register). Bound functions are analysed through their
-    translated bodies. Returns, for each other function, E, R and for each
-    call or indirect jump instruction the registers to store before it and
-    reload after it.
-    """
-    global _XMM_FREE_HELPERS
-    if _XMM_FREE_HELPERS is None:
-        _XMM_FREE_HELPERS=xmm_free_helpers((ROOT/'src/runtime/cpu.h').read_text(encoding='utf-8'))
-    lifted = set(bodies)
-    native = frozenset(pinned) & lifted
-    call_targets = lifted if call_targets is None else set(call_targets) & lifted
-    jump_targets = lifted if jump_targets is None else set(jump_targets) & lifted
-    flows = {a: xmm_contract_rows(b, lifted, _XMM_FREE_HELPERS) for a, b in bodies.items()}
-    callers, indirect_users = collections.defaultdict(set), set()
-    for a, flow in flows.items():
-        for row in flow['rows']:
-            if row['call'] and row['call'][0] == 'direct': callers[row['call'][1]].add(a)
-            if row['call'] and row['call'][0] != 'direct' or row['jump']: indirect_users.add(a)
-            for kind, target in row['opaque']:
-                if kind == 'direct': callers[target].add(a)
-                else: indirect_users.add(a)
-    # Bound functions are analysed through their translated bodies: the native
-    # code is verified equal to them over the whole CPU state. Their own
-    # bodies keep the full sync (no contract below).
-    E = dict.fromkeys(bodies, 0)
-    R = dict(E)
-    e_call = e_jump = d_call = d_jump = 0
-    d_sources = {}
-    shared = {a: {s for s, n in collections.Counter(row['site'] for row in flow['rows'] if row['call']).items()
-                  if n > 1 and s is not None} for a, flow in flows.items()}
-
-    def solve(a):
-        # A group with several transfers, or one instruction with two calls, is
-        # synced in full around each call, so it reads every register. An
-        # indirect jump stores what its targets read and this function's return
-        # demand (the target returns for it).
-        flow = flows[a]
-        if any(row['opaque'] or row['jump'] or row['call'] and row['site'] in shared[a] for row in flow['rows']):
-            rows = [dict(row, read=XMM_ALL) if row['opaque'] or row['call'] and row['site'] in shared[a] else
-                    dict(row, read=row['read'] | R[a]) if row['jump'] else row for row in flow['rows']]
-            flow = dict(flow, rows=rows)
-        return flag_contract_solve(flow, R[a], E, e_call, e_jump)
-
-    queue = collections.deque(flows); queued = set(flows)
-    while queue:
-        a = queue.popleft(); queued.discard(a)
-        flow = flows[a]
-        live, after, _, _ = solve(a)
-        wake = set()
-        entry = live[flow['entry']] if live else 0
-        if entry & E[a] != E[a]: raise ValueError(f'non-monotone XMM entry demand at 0x{a:08X}')
-        if entry != E[a]:
-            E[a] = entry; wake |= callers[a]
-            if a in call_targets and entry & ~e_call: e_call |= entry; wake |= indirect_users
-            if a in jump_targets and entry & ~e_jump: e_jump |= entry; wake |= indirect_users
-        global_demand = d_call, d_jump
-        for i, row in enumerate(flow['rows']):
-            demand = R[a] if row['tail'] else after[i]
-            if row['call'] and row['call'][0] == 'direct':
-                target = row['call'][1]
-                if demand & ~R[target]: R[target] |= demand; wake.add(target)
-            elif row['call']:
-                d_call |= demand
-                if demand: d_sources[(a, row['site'])] = demand
-            for kind, target in row['opaque']:
-                if kind == 'direct':
-                    if after[i] & ~R.get(target, 0): R[target] = R.get(target, 0) | after[i]; wake.add(target)
-                else:
-                    d_call |= after[i]
-                    if after[i]: d_sources[(a, None)] = after[i]
-            if row['jump']: d_jump |= R[a]
-        if (d_call, d_jump) != global_demand:
-            for b, flow_b in flows.items():
-                want = (d_call | d_jump) & flow_b['modified']
-                if want & ~R[b]: R[b] |= want; wake.add(b)
-        for b in wake:
-            if b in flows and b not in queued: queue.append(b); queued.add(b)
-    contracts = {}
-    for a, flow in flows.items():
-        if a in native: continue
-        _, after, _, _ = solve(a)
-        sites = {}
-        for i, row in enumerate(flow['rows']):
-            if row['site'] is None: continue
-            if row['jump'] and not row['call']:
-                sites[row['site']] = (e_jump | R[a], XMM_ALL, True)
-                continue
-            if not row['call']: continue
-            kind, target = row['call']
-            # Host code keeps the registers; a tail call's return stores R again.
-            reload = 0 if kind == 'import' else R[a] if row['tail'] else after[i]
-            store = E.get(target, XMM_ALL) if kind == 'direct' else e_call | (reload if kind == 'indirect' else 0)
-            if row['site'] in shared[a]: store, reload = XMM_ALL, XMM_ALL   # two calls, one instruction
-            sites[row['site']] = (store, reload, row['tail'])
-        contracts[a] = dict(entry=E[a], ret=R[a], sites=sites)
-    report = dict(functions=len(bodies), native_entries=len(native),
-                  indirect_entry_demand=e_call, indirect_return_demand=d_call,
-                  entry_demand_functions=sum(bool(E[a]) for a in contracts),
-                  return_demand_functions=sum(bool(R[a]) for a in contracts),
-                  synced_call_sites=sum(len(c['sites']) for c in contracts.values()),
-                  empty_call_syncs=sum(not (st | rl) for c in contracts.values() for st, rl, _ in c['sites'].values()),
-                  # Who widens the indirect-call unions (entry: possible targets;
-                  # return: indirect call sites), widest first.
-                  indirect_entry_sources=[f'0x{t:08X}:{E[t]:02X}' for t in sorted(
-                      (t for t in call_targets if E.get(t)), key=lambda t: -bin(E[t]).count('1'))[:20]],
-                  indirect_return_sources=[f'0x{c:08X}@' + (f'{st:08X}' if st else 'group') + f':{d:02X}'
-                                           for (c, st), d in sorted(d_sources.items(), key=lambda kv: -bin(kv[1]).count('1'))[:20]])
-    return contracts, report
-
-
-def local_xmm_function(body: str, contract=None) -> str:
+def local_xmm_function(body: str) -> str:
     """XMM locals: c->xmm[N] lives in a local, synced around guest calls and returns.
 
     Generated code reads and writes XMM state only through literal c->xmm[N]
@@ -4619,36 +4351,23 @@ def local_xmm_function(body: str, contract=None) -> str:
     call=re.compile(r'\b(\w+)\s*\(\s*c\s*[,)]');statement=re.compile(r'(?:^|(?<=[;{}]))(\s*)(\w+)\(c\b[^;]*\);',re.M)
     if sum(m[1] not in free for m in call.finditer(clean))!=sum(m[2] not in free for m in statement.finditer(clean)):
         return body
-    store_mask=lambda mask:' '.join(f'c->xmm[{i}] = _ac1_xmm{i};' for i in idx if mask>>i&1)
-    load_mask=lambda mask:' '.join(f'_ac1_xmm{i} = c->xmm[{i}];' for i in idx if mask>>i&1)
-    # With a whole-program contract (xmm_contract_program) the struct holds a
-    # register only where a callee reads it at entry, a caller after return or
-    # code after a call: entry loads E, returns store R, and a guest call stores
-    # its callee's E and reloads what is live after it. Other CPU-taking
-    # helpers keep the full sync.
-    entry,ret,sites=(contract['entry'],contract['ret'],contract['sites']) if contract else (XMM_ALL,XMM_ALL,{})
-    def bracket(m,va):
+    store=' '.join(f'c->xmm[{i}] = _ac1_xmm{i};' for i in idx)
+    load=' '.join(f'_ac1_xmm{i} = c->xmm[{i}];' for i in idx)
+    def bracket(m):
         if m[2] in free:return m[0]
-        site=sites.get(va) if m[2] in ('AC1_CALL','dispatch','dispatch_jmp') else None
-        before,after=(site[0],site[1]) if site else (XMM_ALL,XMM_ALL)
-        return f'{m[1]}{{ '+' '.join(filter(None,(store_mask(before),m[0].strip(),load_mask(after))))+' }'
-    def leave(m):
-        return '{ '+' '.join(filter(None,(store_mask(ret),'return;')))+' }'
+        return f'{m[1]}{{ {store} {m[0].strip()} {load} }}'
     lines=body.splitlines()
     if len(lines)<3 or lines[1]!='{' or lines[-1]!='}':raise ValueError('unexpected lifted function shape for XMM locals')
     # A body that ends in a stop can load a register it never reads back.
-    output=lines[:2]+['    XMM '+', '.join(f'_ac1_xmm{i} __attribute__((unused)) = '+(f'c->xmm[{i}]' if entry>>i&1 else '{{0}}')
-                                         for i in idx)+';']
+    output=lines[:2]+['    XMM '+', '.join(f'_ac1_xmm{i} __attribute__((unused)) = c->xmm[{i}]' for i in idx)+';']
     for line in lines[2:-1]:
         code,separator,comment=line.partition('/*')
-        va=re.match(r'\s*([0-9A-F]{8}):',comment)
-        va=int(va[1],16) if va else None
         code=re.sub(r'c->xmm\[(\d)\]',r'_ac1_xmm\1',code)
-        code=statement.sub(lambda m:bracket(m,va),code)
-        code=re.sub(r'\breturn;',leave,code)
+        code=statement.sub(bracket,code)
+        code=re.sub(r'\breturn;','{ '+store+' return; }',code)
         output.append(code+separator+comment)
     # A body may also leave by falling off its end.
-    return '\n'.join(output+['    '+store_mask(ret),lines[-1]])
+    return '\n'.join(output+['    '+store,lines[-1]])
 
 
 # Header helpers that read or write the x87 register stack, tags or TOP.
@@ -4677,21 +4396,13 @@ def c_statements(code: str) -> list[str]:
     return [s for s in out if s.strip()]
 
 
-def native_x87_function(body: str, regions=None) -> str:
-    """Experimental x87 lowering: the register stack in double locals.
+def native_x87_function(body: str) -> str:
+    """x87 lowering: the register stack in double locals.
 
     Within a basic block the stack depth is static, so st(i) is a fixed local.
     Each block anchors on c->fpu_top; slots load lazily from c->st[] and dirty
     slots plus TOP are written back before branches, labels, calls and returns.
 
-    With `regions` (function_facts.X87Region.lowering(): each label's static
-    depth and whether its predecessors disagree, each call's proven net depth)
-    TOP stays in its local across blocks: it is stored only where it can be
-    observed (calls, returns, fnstsw, edges into a disagreeing join) and
-    reloaded only after a call of unknown stack effect or at such a join. A
-    call of known effect adds its depth to the local instead. Dirty slots are
-    still written back at every block boundary. Where the code disagrees with
-    the proof, the block-anchored lowering is returned.
     Arithmetic is unchanged (binary64, as before). Dropped: per-instruction
     MMX/init checks, FPU IP/DP/opcode stores, tag-word and dirty bookkeeping,
     which only fnstenv/fnsave/fxsave, MMX entry and stack-fault semantics
@@ -4726,16 +4437,6 @@ def native_x87_function(body: str, regions=None) -> str:
     def anchor():
         state.update(d=0,loaded=set(),dirty=set())
         return ['_ac1_x87_top = (uint32_t)c->fpu_top;']
-    def sync_slots():
-        code=[f'c->st[(_ac1_x87_top + {r}u) & 7u] = _ac1_st{r};' for r in sorted(state['dirty'])]
-        state['dirty']=set()
-        return code
-    if regions is not None:
-        block_anchored=native_x87_function(body)
-        if block_anchored==body:return body
-    labels=regions['labels'] if regions else {}
-    joins=lambda targets:any(labels.get(int(t,16),(True,0))[0] for t in targets)
-    terminal=False
     def rewrite(text):
         pre,out,pos=[],[],0
         while True:
@@ -4766,17 +4467,8 @@ def native_x87_function(body: str, regions=None) -> str:
         code=re.sub(r'ac1_x87_integer\(c,(.*?),0x[0-9A-F]+u\)',lambda m:'ac1_x87_integer_native(c,'+m[1]+')',code)
         label=re.fullmatch(r'\s*L_([0-9A-F]{8}):\s*',code)
         if label:
-            info=labels.get(int(label[1],16)) if regions else None
-            if info is None or info[0]:
-                output+=['    '+' '.join(sync()),code.rstrip(),'    '+' '.join(anchor())]
-            else:
-                # Every predecessor reaches this label with the same TOP local.
-                if not terminal and state['d']!=info[1]:return block_anchored
-                output+=['    '+' '.join(sync_slots()),code.rstrip()]
-                state.update(d=info[1],loaded=set(),dirty=set())
-            terminal=False;continue
-        va=re.match(r'\s*([0-9A-F]{8}):',comment)
-        va=int(va[1],16) if va else None
+            output+=['    '+' '.join(sync()),code.rstrip(),'    '+' '.join(anchor())]
+            continue
         pieces=[]
         for statement in c_statements(code):
             s=statement.strip()
@@ -4785,26 +4477,11 @@ def native_x87_function(body: str, regions=None) -> str:
             if escapes and re.search(r'\b(?:fpush|fpop)\(c|\*fst\(c,',s):return body
             pre,s2=rewrite(s)
             branch=re.search(r'\bgoto\b|\breturn\b|\bswitch\b',s)
-            guest_call=escapes and any(n in ('AC1_CALL','dispatch','dispatch_jmp') for n in names)
-            if regions and not escapes and branch and not re.search(r'\breturn\b|\bswitch\b',s) \
-                    and not joins(re.findall(r'\bgoto L_([0-9A-F]{8});',s)):
-                pieces+=pre+sync_slots()+[s2]
-            elif regions and guest_call and not branch:
-                if va not in regions['calls']:return block_anchored
-                delta=regions['calls'][va]
-                pieces+=pre+sync()+[s2]
-                if delta is None:pieces+=anchor()
-                else:state.update(d=state['d']+delta,loaded=set(),dirty=set())
-            elif regions and escapes and not branch:
-                # Host helpers that run no guest code leave TOP alone.
-                pieces+=pre+sync()+[s2];state.update(loaded=set(),dirty=set())
-            elif escapes or branch:
+            if escapes or branch:
                 pieces+=pre+sync()+[s2]+(anchor() if escapes else [])
             elif 'ac1_x87_status(c)' in s:
                 pieces+=pre+[f'c->fpu_top = (int)((_ac1_x87_top - {state["d"]}u) & 7u);',s2]
             else:pieces+=pre+[s2]
-            terminal=not re.search(r'\b(?:if|switch|while|for)\b',s) and \
-                bool(re.search(r'\b(?:goto L_[0-9A-F]{8}|return)\s*;\s*\}?\s*$',s))
         text=' '.join(p.strip() for p in pieces if p.strip())
         if text or comment:output.append(indent+text+(' ' if text and separator else '')+separator+comment)
     output.append('    '+' '.join(sync()))
@@ -4812,21 +4489,6 @@ def native_x87_function(body: str, regions=None) -> str:
 
 
 _X87_FREE_HELPERS = None
-
-
-def local_register_selection(selection: str, lifted: set[int]) -> set[int]:
-    """Explicit per-function admission; malformed/unlifted entries fail closed."""
-    if selection == 'off':
-        return set()
-    if selection == 'all':
-        return lifted
-    if not re.fullmatch(r'(?:0x)?[0-9a-fA-F]{8}(?:,(?:0x)?[0-9a-fA-F]{8})*', selection):
-        raise ValueError('local-regs must be off, all, or comma-separated eight-digit hexadecimal VAs')
-    selected = {int(part, 16) for part in selection.split(',')}
-    if selected - lifted:
-        raise ValueError('local-regs selection is not lifted: ' +
-                         ', '.join(f'0x{va:08X}' for va in sorted(selected - lifted)))
-    return selected
 
 
 def profile_count_entry(body: str, address: int) -> str:
@@ -4846,10 +4508,8 @@ def profile_count_entry(body: str, address: int) -> str:
 
 def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: Path,
               functions_per_tu: int, translation_unit_buckets: int = 0,
-              emission_cache=None, direct_calls: bool = True, native_overrides=None,
-              flag_liveness: str = 'off', local_regs: str = 'off', profile_counts=(),
-              x87: str = 'exact', xmm_abi: str = 'off', branch_fences: str = 'all',
-              x87_regions: str = 'off', gpr_speculation: str = 'off', private_abi: str = '') -> dict:
+              emission_cache=None, native_overrides=None, whole_program: bool = False,
+              profile_counts=()) -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
@@ -4990,13 +4650,13 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     bindings = validate_native_bindings(native_overrides or [], functions, set(lifted), read_va, lifter.md)
     regions = validate_region_bindings(native_overrides or [], functions, set(lifted), read_va, lifter.md)
     if set(bindings) & set(regions): raise ValueError('leaf and region entries overlap')
-    stored_entries = flag_image_addresses(pe, set(lifted)) if flag_liveness == 'abi' else set()
+    stored_entries = flag_image_addresses(pe, set(lifted)) if whole_program else set()
     pe.close()
     # Specialize after the complete success set is known. Cached bodies remain
     # independent of catalog membership; failed/removed callees cannot become
     # dangling C symbols. Bink uses this emitter with its own image base.
     direct_callees, direct_sites = {}, 0
-    if direct_calls and image_base == 0x00400000:
+    if image_base == 0x00400000:
         successful = set(lifted)
         for index, address in enumerate(lifted):
             bodies[index], direct_callees[address], sites = specialize_direct_calls(bodies[index], successful)
@@ -5006,100 +4666,30 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     # a guest label. Their copies keep the independent per-function CFG form,
     # whose calls and returns keep every flag, before any contract or local
     # GPR declaration can enter those copied/split bodies.
-    region_mode = 'cfg' if flag_liveness == 'abi' else flag_liveness
     region_members = {int(member['address'], 0) for entry in regions.values()
                       for member in entry['members']}
-    region_bodies = [flag_liveness_function(body, region_mode) if address in region_members else ''
+    region_bodies = [flag_liveness_function(body) if address in region_members and whole_program else
+                     body if address in region_members else ''
                      for address, body in zip(lifted, bodies)] if regions else []
-    if flag_liveness == 'abi':
+    x87_native_count = local_count = local_xmm_count = 0
+    local_excluded = []
+    if whole_program:
         by_address = dict(zip(lifted, bodies))
         call_targets, jump_targets = flag_indirect_targets(by_address, functions, stored_entries)
         contracted, abi_report = flag_contract_program(
             by_address, set(bindings) | set(regions), call_targets, jump_targets)
-        bodies = [contracted[a] for a in lifted]
-    elif flag_liveness != 'off':
-        bodies = [flag_liveness_function(body, flag_liveness) for body in bodies]
-    if x87 not in ('exact', 'native'):
-        raise ValueError('x87 must be exact or native')
-    x87_native_count = x87_region_count = 0
-    if x87_regions not in ('off', 'on'):
-        raise ValueError('x87_regions must be off or on')
-    if x87_regions == 'on' and x87 != 'native':
-        raise ValueError('x87 regions need --x87 native')
-    region_facts = None
-    if gpr_speculation not in ('off', 'on'):
-        raise ValueError('gpr_speculation must be off or on')
-    facts_program = None
-    def program_facts():
-        nonlocal facts_program
-        if facts_program is None:
-            import function_facts
-            facts_program = function_facts.Program(catalog=output_dir / 'functions.json')
-        return facts_program
-    if x87_regions == 'on':
-        # TOP proofs from the recovered CFG and decoded x86 (function_facts.py).
-        import function_facts
-        program = program_facts()
-        all_facts = {a: program.facts(a) for a in program.functions}
-        deltas = function_facts.x87_deltas(program, all_facts)
-        region_facts = lambda a: (function_facts.x87_region(a, all_facts[a], deltas.get).lowering()
-                                  if a in all_facts else None)
-    if x87 == 'native':
         for index, address in enumerate(lifted):
-            transformed = native_x87_function(bodies[index])
-            x87_native_count += transformed != bodies[index]
-            if region_facts and transformed != bodies[index]:
-                lowering = region_facts(address)
-                if lowering is not None:
-                    regional = native_x87_function(bodies[index], lowering)
-                    x87_region_count += regional != transformed
-                    transformed = regional
-            bodies[index] = transformed
-    if xmm_abi not in ('off', 'on'):
-        raise ValueError('xmm_abi must be off or on')
-    if branch_fences not in ('all', 'backward'):
-        raise ValueError('branch_fences must be all or backward')
-    xmm_contracts, xmm_report = {}, None
-    if xmm_abi == 'on':
-        by_address = dict(zip(lifted, bodies))
-        if flag_liveness != 'abi':
-            stored_entries = flag_image_addresses(pe, set(lifted))
-            call_targets, jump_targets = flag_indirect_targets(by_address, functions, stored_entries)
-        xmm_contracts, xmm_report = xmm_contract_program(
-            by_address, set(bindings) | set(regions), call_targets, jump_targets)
-    selected_locals = local_register_selection(local_regs, set(lifted))
-    local_count, local_xmm_count, local_excluded = 0, 0, []
-    speculated_sites = 0
-    private_mask = [r for r in ('eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi') if r in private_abi.split(',')]
-    if set(filter(None, private_abi.split(','))) - set(private_mask) or (private_mask and 'esp' not in private_mask) \
-            or len(private_mask) > 4:
-        raise ValueError('private_abi is up to four GPR names including esp, comma-separated')
-    private_set = set()
-    if private_mask:
-        # Entries whose body takes GPR locals get a private body; bound
-        # functions, regions and counted entries keep the ordinary one.
-        for index, address in enumerate(lifted):
-            if (address in selected_locals and address not in bindings and address not in regions
-                    and address not in profile_counts and bodies[index].startswith(f'void L_{address:08X}(CPU *c)\n{{')
-                    and local_register_function(bodies[index], branch_fences) != bodies[index]):
-                private_set.add(address)
-    for index, address in enumerate(lifted):
-        if address in selected_locals:
-            speculate = None
-            if gpr_speculation == 'on' and address in program_facts().functions:
-                import function_facts
-                speculate = function_facts.gpr_live_after_calls(program_facts().gpr_facts(address))
-                speculated_sites += sum(bool(m & function_facts.GPR_CALLEE_SAVED) for m in speculate.values())
-            private = (dict(mask=private_mask, callees=private_set, self=address in private_set)
-                       if private_mask else None)
-            gprs = local_register_function(bodies[index], branch_fences, speculate, private)
-            transformed = local_xmm_function(gprs, xmm_contracts.get(address))
-            local_xmm_count += transformed != gprs
-            if transformed != bodies[index]:
+            body = contracted[address]
+            transformed = native_x87_function(body)
+            x87_native_count += transformed != body
+            gprs = local_register_function(transformed)
+            local = local_xmm_function(gprs)
+            local_xmm_count += local != gprs
+            if local != transformed:
                 local_count += 1
             else:
                 local_excluded.append(f'0x{address:08X}')
-            bodies[index] = transformed
+            bodies[index] = local
     bodies = [fence_backward_branches(body) for body in bodies]
     # Keep L_VA as the one public entry for direct transfers AND the dispatch
     # table. Retain a private, callable translated oracle behind that entry.
@@ -5117,9 +4707,6 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         if address in count_entries:
             bodies[index] = profile_count_entry(bodies[index], address)
     bodies = [drop_unrecorded_eip_markers(declare_local_memory_base(body)) for body in bodies]
-    for index, address in enumerate(lifted):
-        if address in private_set:
-            bodies[index] = private_abi_finish(bodies[index], address, private_mask)
     if translation_unit_buckets < 0:
         raise ValueError("translation_unit_buckets must be zero or positive")
     if not translation_unit_buckets and functions_per_tu < 1:
@@ -5143,11 +4730,8 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         callees = set().union(*(direct_callees.get(a, set()) for a in addresses))
         direct_prototypes += len(callees)
         native_header = '#include "ac1_native.h"\n' if any(a in bindings or a in regions for a in addresses) else ''
-        private_protos = "".join(
-            f"AC1_PRIVATE ac1_pregs P_{a:08X}(CPU *, " + ", ".join("uint32_t" for _ in private_mask) + ");\n"
-            for a in sorted(callees & private_set))
         return (tu_header + native_header +
-                "".join(f"void L_{a:08X}(CPU *);\n" for a in sorted(callees)) + private_protos + "\n")
+                "".join(f"void L_{a:08X}(CPU *);\n" for a in sorted(callees)) + "\n")
 
     tu_names = emit_region_sources(regions,lifted,region_bodies,output_dir,tu_header) if regions else []
     if translation_unit_buckets:
@@ -5247,13 +4831,8 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "direct_callee_declarations": direct_prototypes,
         "native_overrides": [f"0x{a:08X}" for a in sorted(bindings)],
         "flag_abi": abi_report,
-        "xmm_abi": xmm_report,
-        'x87': {'mode': x87, 'native_count': x87_native_count, 'regions': x87_regions,
-                'region_count': x87_region_count},
-        'gpr_speculation': {'mode': gpr_speculation, 'call_sites': speculated_sites},
-        'private_abi': {'registers': private_mask, 'functions': len(private_set)},
-        'local_regs': {'requested': local_regs, 'admitted_count': local_count,
-                       'xmm_admitted_count': local_xmm_count,
+        'x87_native_count': x87_native_count,
+        'local_regs': {'admitted_count': local_count, 'xmm_admitted_count': local_xmm_count,
                        'excluded_functions': local_excluded},
     }
 
@@ -5391,30 +4970,6 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=CONFIG_PATH,
                         help="discovery configuration (allows private seed-set A/B comparisons)")
     parser.add_argument("--selftest", action="store_true", help="run the focused block-entry ordering check")
-    parser.add_argument('--branch-fences', choices=('all', 'backward'), default='all',
-                        help='backward: compiler fences only on branches to an equal or lower address (every loop '
-                             'has one); all: on every goto of a GPR-local function')
-    parser.add_argument('--xmm-abi', choices=('off', 'on'), default='off',
-                        help='on: whole-program XMM entry/return contracts narrow the syncs of XMM locals '
-                             'at calls, entries and returns')
-    parser.add_argument('--private-abi', default='',
-                        help='comma-separated GPRs (esp and up to three more) that direct calls between GPR-local '
-                             'functions pass in host registers through P_ bodies (experimental; empty: off)')
-    parser.add_argument('--gpr-speculation', choices=('off', 'on'), default='off',
-                        help='on: after guest calls, live callee-saved GPR locals are reloaded by value '
-                             'speculation (the struct is still read and wins on a mismatch; experimental)')
-    parser.add_argument('--x87-regions', choices=('off', 'on'), default='off',
-                        help='on: native x87 keeps TOP in its local across blocks where function_facts proves '
-                             'the stack depth (experimental)')
-    parser.add_argument('--x87', choices=('exact', 'native'), default='native',
-                        help='native keeps the x87 stack in block-local doubles without tag/env bookkeeping; '
-                             'exact keeps the full x87 model')
-    parser.add_argument('--local-regs', default='all', metavar='off|all|VA,...',
-                        help='function-gated GPR and XMM locals; off restores CPU-struct registers')
-    parser.add_argument('--flag-liveness', choices=('off', 'straight', 'cfg', 'abi'), default='abi',
-                        help='constant-mask flag liveness; abi: whole-program entry/return contracts, cfg: per function')
-    parser.add_argument("--no-direct-calls", action="store_true",
-                        help="keep constant main-catalog transfers in dispatch for A/B comparisons")
     parser.add_argument('--profile-count-entries', default='',
                         help='comma-separated hex entries to instrument in a dedicated count-only build (max 32)')
     parser.add_argument("--binary", type=Path)
@@ -5430,20 +4985,12 @@ def main() -> int:
     parser.add_argument("--initializer-tables", type=Path,
                         default=ROOT / "config/startup_initializers.json",
                         help="fingerprint-pinned JSON containing executable initializer pointer tables")
-    parser.add_argument("--initializer-group", choices=("all", "c_initterm_e", "cpp_initializer", "none"),
-                        default="all", help="which pinned initializer pointer table(s) to seed")
     parser.add_argument("--functions-per-tu", type=int,
                         help="maximum generated functions per C translation unit")
     parser.add_argument("--translation-unit-buckets", type=int,
                         help="fixed address-hash partition count; overrides functions-per-tu grouping")
     parser.add_argument("--no-emission-cache", action="store_true",
                         help="disable the persistent generated-body cache")
-    parser.add_argument("--no-code-immediates", action="store_true",
-                        help="disable callback discovery from decoded MOV/PUSH imm32 operands")
-    parser.add_argument("--no-indexed-tables", action="store_true",
-                        help="disable initialized-data function-table discovery")
-    parser.add_argument("--no-register-switches", action="store_true",
-                        help="disable guarded register-loaded switch recovery for A/B comparison")
     args = parser.parse_args()
     config_path = args.config.resolve()
     if args.selftest:
@@ -5519,25 +5066,17 @@ def main() -> int:
         )
     initializer_report = None
     initializer_config_hash = None
-    if args.initializer_group != "none":
-        sys.path.insert(0, str(ROOT / "tools"))
-        from analyze_initializer_tables import analyze as analyze_initializer_tables
-        initializer_path = args.initializer_tables.resolve()
-        initializer_bytes = initializer_path.read_bytes()
-        initializer_config = json.loads(initializer_bytes)
-        initializer_config_hash = sha256_bytes(initializer_bytes)
-        input_fingerprints["initializer_tables"] = (initializer_path, initializer_config_hash)
-        if args.initializer_group != "all":
-            initializer_config["tables"] = [
-                table for table in initializer_config["tables"]
-                if table["name"] == args.initializer_group
-            ]
-            if not initializer_config["tables"]:
-                parser.error(f"initializer table group {args.initializer_group!r} is not configured")
-        initializer_report = analyze_initializer_tables(binary, initializer_config)
-        if any(table["unique_non_executable_pointer_count"] for table in initializer_report["tables"]):
-            parser.error("initializer table contains non-null pointers outside executable PE sections")
-        extra_seeds.extend(initializer_report["unique_executable_pointers_across_tables"])
+    sys.path.insert(0, str(ROOT / "tools"))
+    from analyze_initializer_tables import analyze as analyze_initializer_tables
+    initializer_path = args.initializer_tables.resolve()
+    initializer_bytes = initializer_path.read_bytes()
+    initializer_config = json.loads(initializer_bytes)
+    initializer_config_hash = sha256_bytes(initializer_bytes)
+    input_fingerprints["initializer_tables"] = (initializer_path, initializer_config_hash)
+    initializer_report = analyze_initializer_tables(binary, initializer_config)
+    if any(table["unique_non_executable_pointer_count"] for table in initializer_report["tables"]):
+        parser.error("initializer table contains non-null pointers outside executable PE sections")
+    extra_seeds.extend(initializer_report["unique_executable_pointers_across_tables"])
     extra_seeds = sorted(set(extra_seeds))
     output_dir.mkdir(parents=True, exist_ok=True)
     report_path = output_dir / "lift-report.json"
@@ -5546,9 +5085,7 @@ def main() -> int:
     discovery_start = time.perf_counter()
     (info, dis, catalog, discovery_failures, queued, entry, iat, callback_edges,
      immediate_summary, indexed_summary) = discover_entry_cone(
-        binary, pcrecomp, max_functions, max_depth, extra_seeds,
-        code_immediates=not args.no_code_immediates, indexed_tables=not args.no_indexed_tables,
-        register_switches=not args.no_register_switches)
+        binary, pcrecomp, max_functions, max_depth, extra_seeds)
     discovery_seconds = time.perf_counter() - discovery_start
     catalog_doc = {
         "binary_sha256": binary_hash,
@@ -5580,7 +5117,6 @@ def main() -> int:
         "code_immediate_discovery": immediate_summary,
         "indexed_table_discovery": indexed_summary,
         "register_switch_discovery": {
-            "enabled": not args.no_register_switches,
             "site_count": len({site["jump"] for spec in catalog.values()
                                for site in spec.get("register_switches", [])}),
             "added_blocks": sum(spec.get("register_switch_added_blocks", 0) for spec in catalog.values()),
@@ -5620,13 +5156,9 @@ def main() -> int:
     try:
         lift_result = emit_lift(binary, pcrecomp, catalog_doc["functions"], output_dir,
                                 functions_per_tu, translation_unit_buckets,
-                                emission_cache, direct_calls=not args.no_direct_calls,
-                                native_overrides=config.get('native_overrides', []),
-                                flag_liveness=args.flag_liveness, local_regs=args.local_regs,
-                                profile_counts=[int(s, 16) for s in args.profile_count_entries.split(',') if s],
-                                x87=args.x87, xmm_abi=args.xmm_abi, branch_fences=args.branch_fences,
-                                x87_regions=args.x87_regions, gpr_speculation=args.gpr_speculation,
-                                private_abi=args.private_abi)
+                                emission_cache, native_overrides=config.get('native_overrides', []),
+                                whole_program=True,
+                                profile_counts=[int(s, 16) for s in args.profile_count_entries.split(',') if s])
     except Exception:
         if emission_cache is not None:
             emission_cache.close()
@@ -5642,17 +5174,9 @@ def main() -> int:
         "lift_failures": lift_result["lift_failures"],
         "unsupported_count": todo_count,
         "relocation_entries": lift_result["relocation_entries"],
-        "flag_liveness": args.flag_liveness,
         "flag_abi": lift_result["flag_abi"],
-        "xmm_abi": args.xmm_abi,
-        "branch_fences": args.branch_fences,
-        "x87_regions": args.x87_regions,
-        "gpr_speculation": args.gpr_speculation,
-        "private_abi": args.private_abi,
-        "function_facts_sha256": sha256(Path(__file__).with_name('function_facts.py')),
-        "xmm_abi_report": lift_result["xmm_abi"],
         "local_regs": lift_result["local_regs"],
-        "x87": lift_result["x87"],
+        "x87_native_count": lift_result["x87_native_count"],
         "direct_call_sites": lift_result["direct_call_sites"],
         "profile_count_entries": lift_result['profile_count_entries'],
         "direct_callee_declarations": lift_result["direct_callee_declarations"],

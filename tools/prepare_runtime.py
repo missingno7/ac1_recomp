@@ -79,79 +79,6 @@ void ac1_scheduler_return_checkpoint(CPU *c);
 #endif
 '''
 
-CALL_HELPERS += r'''
-/* Private call ABI between translated functions (lift_ac1.py --private-abi).
- * A function's P_ body takes the chosen guest registers as arguments and
- * returns them in x0-x3 (swiftcall on AArch64), so they never cross a direct
- * guest call in the CPU struct; its L_ entry adapts the struct for the
- * dispatch table, natives and the runtime, which keep the ordinary ABI. The
- * dispatcher fallback and the scheduler checkpoint observe the struct, so the
- * call macros write the registers there around them. */
-typedef struct { uint64_t r0, r1, r2, r3; } ac1_pregs;
-#if defined(__clang__) && defined(__aarch64__)
-#define AC1_PRIVATE __attribute__((swiftcall))
-#else
-#define AC1_PRIVATE
-#endif
-#if defined(AC1_NO_DIRECT_CALLS)
-#define AC1_PRIVATE_DIRECT(c) 0
-#else
-#define AC1_PRIVATE_DIRECT(c) ((c)->calls && AC1_HOST_SP() >= (c)->calls->stack_floor)
-#endif
-#define AC1_PCALL1(c, fn, target, a0) do { \
-    CPU *_ac = (c); \
-    if (__builtin_expect(!AC1_PRIVATE_DIRECT(_ac), 0)) { \
-        _ac->a0 = _ac1_regs.a0; dispatch(_ac, (target)); _ac1_regs.a0 = _ac->a0; \
-    } else { \
-        ac1_pregs _ac1_o = fn(_ac, _ac1_regs.a0); \
-        _ac1_regs.a0 = (uint32_t)_ac1_o.r0; \
-        ac1_call_state *_as = _ac->calls; \
-        if (__builtin_expect(++_as->returns >= _as->return_threshold, 0)) { \
-            _ac->a0 = _ac1_regs.a0; ac1_scheduler_return_checkpoint(_ac); _ac1_regs.a0 = _ac->a0; \
-        } \
-    } \
-} while (0)
-#define AC1_PCALL2(c, fn, target, a0, a1) do { \
-    CPU *_ac = (c); \
-    if (__builtin_expect(!AC1_PRIVATE_DIRECT(_ac), 0)) { \
-        _ac->a0 = _ac1_regs.a0; _ac->a1 = _ac1_regs.a1; dispatch(_ac, (target)); _ac1_regs.a0 = _ac->a0; _ac1_regs.a1 = _ac->a1; \
-    } else { \
-        ac1_pregs _ac1_o = fn(_ac, _ac1_regs.a0, _ac1_regs.a1); \
-        _ac1_regs.a0 = (uint32_t)_ac1_o.r0; _ac1_regs.a1 = (uint32_t)_ac1_o.r1; \
-        ac1_call_state *_as = _ac->calls; \
-        if (__builtin_expect(++_as->returns >= _as->return_threshold, 0)) { \
-            _ac->a0 = _ac1_regs.a0; _ac->a1 = _ac1_regs.a1; ac1_scheduler_return_checkpoint(_ac); _ac1_regs.a0 = _ac->a0; _ac1_regs.a1 = _ac->a1; \
-        } \
-    } \
-} while (0)
-#define AC1_PCALL3(c, fn, target, a0, a1, a2) do { \
-    CPU *_ac = (c); \
-    if (__builtin_expect(!AC1_PRIVATE_DIRECT(_ac), 0)) { \
-        _ac->a0 = _ac1_regs.a0; _ac->a1 = _ac1_regs.a1; _ac->a2 = _ac1_regs.a2; dispatch(_ac, (target)); _ac1_regs.a0 = _ac->a0; _ac1_regs.a1 = _ac->a1; _ac1_regs.a2 = _ac->a2; \
-    } else { \
-        ac1_pregs _ac1_o = fn(_ac, _ac1_regs.a0, _ac1_regs.a1, _ac1_regs.a2); \
-        _ac1_regs.a0 = (uint32_t)_ac1_o.r0; _ac1_regs.a1 = (uint32_t)_ac1_o.r1; _ac1_regs.a2 = (uint32_t)_ac1_o.r2; \
-        ac1_call_state *_as = _ac->calls; \
-        if (__builtin_expect(++_as->returns >= _as->return_threshold, 0)) { \
-            _ac->a0 = _ac1_regs.a0; _ac->a1 = _ac1_regs.a1; _ac->a2 = _ac1_regs.a2; ac1_scheduler_return_checkpoint(_ac); _ac1_regs.a0 = _ac->a0; _ac1_regs.a1 = _ac->a1; _ac1_regs.a2 = _ac->a2; \
-        } \
-    } \
-} while (0)
-#define AC1_PCALL4(c, fn, target, a0, a1, a2, a3) do { \
-    CPU *_ac = (c); \
-    if (__builtin_expect(!AC1_PRIVATE_DIRECT(_ac), 0)) { \
-        _ac->a0 = _ac1_regs.a0; _ac->a1 = _ac1_regs.a1; _ac->a2 = _ac1_regs.a2; _ac->a3 = _ac1_regs.a3; dispatch(_ac, (target)); _ac1_regs.a0 = _ac->a0; _ac1_regs.a1 = _ac->a1; _ac1_regs.a2 = _ac->a2; _ac1_regs.a3 = _ac->a3; \
-    } else { \
-        ac1_pregs _ac1_o = fn(_ac, _ac1_regs.a0, _ac1_regs.a1, _ac1_regs.a2, _ac1_regs.a3); \
-        _ac1_regs.a0 = (uint32_t)_ac1_o.r0; _ac1_regs.a1 = (uint32_t)_ac1_o.r1; _ac1_regs.a2 = (uint32_t)_ac1_o.r2; _ac1_regs.a3 = (uint32_t)_ac1_o.r3; \
-        ac1_call_state *_as = _ac->calls; \
-        if (__builtin_expect(++_as->returns >= _as->return_threshold, 0)) { \
-            _ac->a0 = _ac1_regs.a0; _ac->a1 = _ac1_regs.a1; _ac->a2 = _ac1_regs.a2; _ac->a3 = _ac1_regs.a3; ac1_scheduler_return_checkpoint(_ac); _ac1_regs.a0 = _ac->a0; _ac1_regs.a1 = _ac->a1; _ac1_regs.a2 = _ac->a2; _ac1_regs.a3 = _ac->a3; \
-        } \
-    } \
-} while (0)
-'''
-
 # Project-owned additions to the pinned CPU ABI. No donor input/hash is changed.
 FP_STATE_FIELDS = r'''
     uint64_t mmx[8];
@@ -205,24 +132,12 @@ DIRECT_ACCESS_HELPERS = r'''/* Guest memory accessors are force-inlined: in very
 __attribute__((visibility("hidden")))
 #endif
 extern uint8_t *ac1_direct_arena;
-#ifdef AC1_VECTOR_ACCESS
-/* A 16-byte memcpy is still an llvm.memcpy call when GVN runs, which blocks
- * forwarding to narrower loads, and SROA turns the XMM it copies into two
- * integers. One unaligned vector access keeps the value a vector. */
-typedef uint8_t ac1_unaligned_v16 __attribute__((vector_size(16), aligned(1), may_alias));
-#endif
 AC1_ACCESSOR_INLINE void ac1_direct_read(uint32_t a, void *o, size_t w)
 {
-#ifdef AC1_VECTOR_ACCESS
-    if (w == 16) { *(ac1_unaligned_v16 *)o = *(const ac1_unaligned_v16 *)(ac1_direct_arena + a); return; }
-#endif
     memcpy(o, ac1_direct_arena + a, w);
 }
 AC1_ACCESSOR_INLINE void ac1_direct_write(uint32_t a, const void *i, size_t w)
 {
-#ifdef AC1_VECTOR_ACCESS
-    if (w == 16) { *(ac1_unaligned_v16 *)(ac1_direct_arena + a) = *(const ac1_unaligned_v16 *)i; return; }
-#endif
     memcpy(ac1_direct_arena + a, i, w);
 }
 #define guest_execution_read(a, o, w) ac1_direct_read((a), (o), (w))
@@ -1058,16 +973,8 @@ def local_memory_helpers(text):
         dependent=current
     prototypes=[];definitions=[]
     overrides={
-      'ac1_direct_read':'''
-#ifdef AC1_VECTOR_ACCESS
-    if (w == 16) { *(ac1_unaligned_v16 *)o = *(const ac1_unaligned_v16 *)(_ac1_base + a); return; }
-#endif
-    memcpy(o, _ac1_base + a, w);''',
-      'ac1_direct_write':'''
-#ifdef AC1_VECTOR_ACCESS
-    if (w == 16) { *(ac1_unaligned_v16 *)(_ac1_base + a) = *(const ac1_unaligned_v16 *)i; return; }
-#endif
-    memcpy(_ac1_base + a, i, w);''',
+      'ac1_direct_read':'memcpy(o, _ac1_base + a, w);',
+      'ac1_direct_write':'memcpy(_ac1_base + a, i, w);',
       'ac1_direct_atomic_cell':'return !(a & 3u) ? (uint32_t *)(_ac1_base + a) : NULL;'}
     for name,f in functions.items():
         if name not in dependent:continue

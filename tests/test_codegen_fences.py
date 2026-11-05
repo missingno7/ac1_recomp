@@ -60,12 +60,7 @@ class LoopFenceTests(unittest.TestCase):
             'L_00401008:',
             '    AC1_SET_GUEST_EIP(c, 0x00401008u);',
             '    c->esp += 4; return; /* 00401008: ret */', '}'])
-        everywhere = lift.local_register_function(body, 'all')
-        backward = lift.fence_backward_branches(lift.local_register_function(body, 'backward'))
-        self.assertEqual(everywhere.count(lift.LOOP_FENCE), 2)
-        self.assertEqual(backward.count(lift.LOOP_FENCE), 1)
-        fenced = [line for line in backward.splitlines() if lift.LOOP_FENCE in line]
-        self.assertIn('goto L_00401000;', fenced[0])
+        self.assertEqual(lift.local_register_function(body).count(lift.LOOP_FENCE), 2)
 
     @unittest.skipUnless(shutil.which('gcc'), 'native C compiler required')
     def test_polling_loop_sees_a_store_from_another_thread(self):
@@ -74,7 +69,7 @@ class LoopFenceTests(unittest.TestCase):
         work = common.ROOT/'work/fence-tests'
         work.mkdir(parents=True, exist_ok=True)
         generated = lift.declare_local_memory_base(
-            lift.fence_backward_branches(lift.local_register_function(polling_body(), 'backward')))
+            lift.fence_backward_branches(lift.local_register_function(polling_body())))
         self.assertIn(lift.LOOP_FENCE, generated)
         source = ('#include "cpu.h"\n#include "ac1_local_memory.h"\n#define AC1_SET_GUEST_EIP(c, va) ((void)0)\n' +
                   generated + r'''
