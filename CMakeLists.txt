@@ -89,26 +89,8 @@ target_include_directories(ac1_runtime PUBLIC src/runtime "${AC1_GENERATED_DIR}"
 if(AC1_TRACE_EIP)
   target_compile_definitions(ac1_runtime PRIVATE AC1_TRACE_EIP)
 endif()
-# Direct mode measured 1.7x faster loading and ~2-4x faster menu frames than
-# checked per-access region lookup. OFF restores checked accesses that report
-# unmapped guest addresses as guest stops (useful when debugging bad pointers).
-if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-  set(ac1_direct_default ON)
-else()
-  set(ac1_direct_default OFF)
-endif()
-option(AC1_DIRECT_MEMORY "Inline guest accesses into one reserved 4 GiB arena (64-bit hosts)" ${ac1_direct_default})
-if(AC1_DIRECT_MEMORY)
-  target_compile_definitions(ac1_runtime PRIVATE AC1_DIRECT_MEMORY)
-endif()
-option(AC1_FORCE_INLINE_X87 "Force-inline the audited x87 integer conversion helper" OFF)
-if(AC1_FORCE_INLINE_X87)
-  target_compile_definitions(ac1_runtime PRIVATE AC1_FORCE_INLINE_X87=1)
-endif()
-option(AC1_FORCE_INLINE_ACCESSORS "Force-inline guest memory accessors in generated code" ON)
-if(NOT AC1_FORCE_INLINE_ACCESSORS)
-  target_compile_definitions(ac1_runtime PRIVATE AC1_NO_FORCE_INLINE)
-endif()
+# One reserved 4 GiB arena maps guest VA a at arena + a.
+target_compile_definitions(ac1_runtime PRIVATE AC1_DIRECT_MEMORY)
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(ac1_runtime PRIVATE -fwrapv -fno-strict-aliasing -ffp-contract=off)
   set_source_files_properties(src/runtime/ac1_runtime.c PROPERTIES

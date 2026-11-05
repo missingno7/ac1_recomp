@@ -3942,7 +3942,7 @@ def fence_backward_branches(body: str) -> str:
 
 def xmm_free_helpers(cpu_header: str) -> frozenset:
     """Prepared CPU-header helpers never touch c->xmm; only guest calls can."""
-    names=set(re.findall(r'^(?:static inline|AC1_ACCESSOR_INLINE|AC1_X87_INTEGER_INLINE)\s+[^\n(]*?\b(\w+)\s*\(',cpu_header,re.M))
+    names=set(re.findall(r'^(?:static inline|AC1_ACCESSOR_INLINE)\s+[^\n(]*?\b(\w+)\s*\(',cpu_header,re.M))
     names|=set(re.findall(r'^#define\s+(\w+)\(',cpu_header,re.M))
     if re.search(r'\bxmm\s*\[',re.sub(r'^\s*XMM\s+xmm\[8\];','',cpu_header,flags=re.M)):
         raise ValueError('prepared CPU header accesses XMM state; audit the XMM-local sync points')
@@ -4041,7 +4041,7 @@ def native_x87_function(body: str) -> str:
     global _X87_FREE_HELPERS
     if _X87_FREE_HELPERS is None:
         header=(ROOT/'src/runtime/cpu.h').read_text(encoding='utf-8')
-        names=set(re.findall(r'^(?:static inline|AC1_ACCESSOR_INLINE|AC1_X87_INTEGER_INLINE)\s+[^\n(]*?\b(\w+)\s*\(',header,re.M))
+        names=set(re.findall(r'^(?:static inline|AC1_ACCESSOR_INLINE)\s+[^\n(]*?\b(\w+)\s*\(',header,re.M))
         names|=set(re.findall(r'^#define\s+(\w+)\(',header,re.M))|{'AC1_SET_GUEST_EIP'}
         # Lifter passes emit ac1_x87_integer_native and the masked shift clones;
         # the header read here may predate them.

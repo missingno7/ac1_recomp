@@ -1,6 +1,6 @@
 # Short traced startup for divergence analysis: runs ac1_startup.exe with
-# import tracing for a fixed time and keeps stderr. Same environment as
-# tools/bench_title.ps1 so traced and benchmark runs follow the same path.
+# import tracing for a fixed time and keeps stderr, hiding the intro videos to take
+# a fixed path through startup.
 param(
     [string]$BuildDir = 'build/host-direct',
     [int]$Seconds = 40,

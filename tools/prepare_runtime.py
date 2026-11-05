@@ -111,13 +111,8 @@ static inline void ac1_x87_set_tag(CPU *c, unsigned reg, unsigned tag) {
 '''
 
 DIRECT_ACCESS_HELPERS = r'''/* Guest memory accessors are force-inlined: in very large generated
- * functions GCC otherwise emits calls (and variable-size memcpy). The CMake
- * option AC1_FORCE_INLINE_ACCESSORS=OFF defines AC1_NO_FORCE_INLINE for A/B. */
-#ifdef AC1_NO_FORCE_INLINE
-#define AC1_ACCESSOR_INLINE static inline
-#else
+ * functions GCC otherwise emits calls (and variable-size memcpy). */
 #define AC1_ACCESSOR_INLINE static inline __attribute__((always_inline))
-#endif
 /* AC1 direct memory: one process-wide 4 GiB arena maps guest VA a at
  * ac1_direct_arena + a, so lifted fixed-width accesses become plain loads and
  * stores. A plain global (not _Thread_local, which MinGW lowers to emutls
@@ -805,28 +800,6 @@ def pinned_donor(relative: str, expected_hash: str) -> tuple[bytes, str]:
     )
 
 
-X87_INTEGER_INLINE = r'''
-/* Independent A/B gate: keep the integer-conversion algorithm unchanged. */
-#if defined(AC1_FORCE_INLINE_X87)
-#if defined(__GNUC__) || defined(__clang__)
-#define AC1_X87_INTEGER_INLINE static inline __attribute__((always_inline))
-#else
-#error AC1_FORCE_INLINE_X87 requires always_inline compiler support
-#endif
-#else
-#define AC1_X87_INTEGER_INLINE static inline
-#endif
-'''
-
-
-def x87_inline_helpers(text: str) -> str:
-    """Gate the observed out-of-line integer helper without changing its body."""
-    signature='static inline uint64_t ac1_x87_integer('
-    if text.count(signature)!=1:
-        raise SystemExit('unexpected CPU x87 integer-conversion helper shape')
-    return text.replace(signature,X87_INTEGER_INLINE+'\nAC1_X87_INTEGER_INLINE uint64_t ac1_x87_integer(',1)
-
-
 def logical_flags_clear_af(text: str) -> str:
     """AND/OR/XOR/TEST leave AF undefined: clear it, as QEMU and Bochs do.
 
@@ -925,7 +898,7 @@ def flag_local_helpers(text: str) -> str:
 def helper_functions(text):
     """Find pinned inline bodies; mask comments/strings to preserve edit offsets."""
     masked=re.sub(r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',lambda m:re.sub(r'[^\n]',' ',m[0]),text,flags=re.S)
-    pattern=re.compile(r'(?m)^(static inline|AC1_ACCESSOR_INLINE|AC1_X87_INTEGER_INLINE)\s+([^\n{};]+?)\b(\w+)\s*\(([^{};]*?)\)\s*\{')
+    pattern=re.compile(r'(?m)^(static inline|AC1_ACCESSOR_INLINE)\s+([^\n{};]+?)\b(\w+)\s*\(([^{};]*?)\)\s*\{')
     functions={}
     for m in pattern.finditer(masked):
         depth=1;end=m.end()
@@ -1370,7 +1343,6 @@ void guest_execution_write(uint32_t address, const void *input, size_t width)
                 text = text.replace(hits[0], hits[0].replace(
                     "static inline ", "AC1_ACCESSOR_INLINE ", 1))
             text = masked_flag_helpers(logical_flags_clear_af(text))
-            text = x87_inline_helpers(text)
             text, aliases, base_helpers = local_memory_helpers(text)
             alias_path = output.with_name("ac1_local_memory.h")
             if not alias_path.exists() or alias_path.read_text(encoding="utf-8") != aliases:
