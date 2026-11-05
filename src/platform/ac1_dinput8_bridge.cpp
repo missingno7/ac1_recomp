@@ -408,7 +408,6 @@ public:
 struct EnumDevicesCollector {
     PendingEnumBatch *batch = nullptr;
     bool failed = false;
-    bool replace_pads = false;
 };
 
 BOOL CALLBACK collect_device_instance_w(LPCDIDEVICEINSTANCEW instance,
@@ -419,7 +418,8 @@ BOOL CALLBACK collect_device_instance_w(LPCDIDEVICEINSTANCEW instance,
         if (collector) collector->failed = true;
         return DIENUM_STOP;
     }
-    if (collector->replace_pads && (GET_DIDEVICE_TYPE(instance->dwDevType) == DI8DEVTYPE_GAMEPAD || GET_DIDEVICE_TYPE(instance->dwDevType) == DI8DEVTYPE_JOYSTICK)) return DIENUM_CONTINUE;
+    /* Controllers reach the game through XInput only. */
+    if ((GET_DIDEVICE_TYPE(instance->dwDevType) == DI8DEVTYPE_GAMEPAD || GET_DIDEVICE_TYPE(instance->dwDevType) == DI8DEVTYPE_JOYSTICK)) return DIENUM_CONTINUE;
     if (!append_enum_record(collector->batch, instance)) {
         collector->failed = true;
         return DIENUM_STOP;
@@ -453,7 +453,7 @@ int invoke_enum_devices(GuestObject &object, const uint32_t *args,
     PendingEnumBatch &batch = pending->second;
     batch.record_size = sizeof(DIDEVICEINSTANCEW);
     const bool pad = ac1_pad_discovery_connected();
-    EnumDevicesCollector collector{&batch, false, pad};
+    EnumDevicesCollector collector{&batch, false};
     const HRESULT result = reinterpret_cast<IDirectInput8W *>(object.native)
         ->EnumDevices(args[1], collect_device_instance_w, &collector, args[4]);
     if (SUCCEEDED(result) && pad && (args[1] == DI8DEVCLASS_ALL || args[1] == DI8DEVCLASS_GAMECTRL || args[1] == DI8DEVTYPE_GAMEPAD)) {
