@@ -100,7 +100,31 @@ static inline XMM v_rdxm(uint8_t *b, uint64_t a) { v16 t = *(v16 *)(b + a); XMM 
     return h, b, n
 
 
-VARIANTS = {'base': lambda h, b: (h, b, 0), 'stack64': stack64, 'split': lambda h, b: (h + SPLIT, b, 0),
+def lanefp(head, body):
+    """Stack-forwarded lanes stay floats, when all four of a rebuild's lanes came from floats."""
+    lanes = set(re.findall(r'(_ac1_lane_[0-9A-F]+) = ac1_f32_bits\(', body))
+    other = set(re.findall(r'(_ac1_lane_[0-9A-F]+) = (?!ac1_f32_bits\()', body)) - lanes
+    lanes -= other
+    n = [0]
+    def rebuild(m):
+        names = [x.strip() for x in m[1].split(',')]
+        if not all(x in lanes for x in names): return m[0]
+        n[0] += 1
+        return 'ac1_xmm_from_f32(' + ', '.join(names) + ')'
+    used = {}
+    b2 = re.sub(r'ac1_xmm_from_u32\(([^()]*)\)', rebuild, body)
+    keep = {x for args in re.findall(r'ac1_xmm_from_u32\(([^;]*?)\);', b2) for x in re.findall(r'_ac1_lane_[0-9A-F]+', args)}
+    fp = lanes - keep
+    for x in fp:
+        b2 = re.sub(rf'\b{x} = ac1_f32_bits\(([^;]*)\);', rf'{x} = \1;', b2)
+        b2 = re.sub(rf'uint32_t {x}\b', f'float {x}', b2)
+    h = head + r"""
+static inline XMM ac1_xmm_from_f32(float a, float b, float c, float d) { XMM x; x.vf32 = (__typeof__(x.vf32)){a, b, c, d}; return x; }
+"""
+    return h, b2, n[0]
+
+
+VARIANTS = {'base': lambda h, b: (h, b, 0), 'stack64': stack64, 'split': lambda h, b: (h + SPLIT, b, 0), 'lanefp': lanefp,
             'vec': lambda h, b: (h + VEC, b, 0), 'stack64+split': stack64_split, 'stack64+vec': stack64_vec}
 
 
