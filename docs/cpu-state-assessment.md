@@ -547,3 +547,31 @@ return only those it can change (its own writes, struct reloads after its
 ordinary calls, its private callees' returns). That removes the leaf penalty
 without transitive footprints. If it shows none, the private ABI is rejected
 as well.
+
+**Phone city A/B: the private ABI is rejected.** Today's default build against
+`-PrivateAbi ecx,esp,esi,edi`, main thread, sampled cycles over 20 s of the city
+replay, in the order A B B A twice. The baseline APK is c33daae; its default
+generated code is byte-identical to today's on all 40 shared hot units. One
+baseline run was lost to a USB drop and excluded, leaving 3 A and 4 B runs.
+
+| Mcycles per frame | baseline (3 runs) | private ABI (4 runs) | change |
+|---|---|---|---|
+| translated game code | 33.52 (32.89-33.93) | 33.12 (32.32-33.63) | -1.2% |
+| runtime | 6.41 | 6.98 | +9% |
+| everything else | 11.89 | 14.57 | +23% |
+| main thread total | 51.81 (50.28-53.29) | 54.67 (51.66-56.35) | +5.5% |
+
+The game-code ranges overlap completely, so the -1.2% is within run-to-run
+noise (about 3% between identical builds). The increase outside game code is
+in `clock_gettime`, `strcmp` and host import handlers, which the ABI does not
+change. Part of it is time-driven work divided by fewer frames, CPU and GPU
+clocks differed between runs, and one private-ABI run was close to the baseline
+(51.66 total), so its cause is not established. Frame rates are confounded by
+those clocks. The APK grows 13% (38.9 to 44.1 MB).
+
+The 39% saving per call in the isolated chain did not reach gameplay. The
+chain is nearly all call protocol, while real frames are not, and real
+functions pay for the protocol with spills and larger leaves. Per-function
+signatures could remove the leaf penalty, but with no measurable gain to
+protect, they do not justify the added analysis. `--private-abi` and
+`--gpr-speculation` stay off, and this supersedes the pinning proposal above.
