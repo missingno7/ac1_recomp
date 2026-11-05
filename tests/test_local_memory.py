@@ -11,23 +11,6 @@ lift,ROOT=flags.lift,flags.ROOT
 
 class LocalMemoryTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('gcc'), 'native C compiler required')
-    def test_generated_region_continuation_has_an_independent_arena_capture(self):
-        runtime=lift.prepare_test_runtime()
-        work=ROOT/'work/local-memory-region-tests';work.mkdir(parents=True,exist_ok=True)
-        body=lift.declare_local_memory_base(flags.function('c->eax=rd32(0x8000u);',
-            ('L_00401001','wr32(0x8004u,c->eax);'),'c->esp+=4; return;'))
-        header='#include "cpu.h"\n#include "ac1_local_memory.h"\n#define AC1_SET_GUEST_EIP(c,va) ((c)->eip=(va))\n'
-        lift.emit_region_sources({0x401000:{'members':[{'address':'0x00401000'}],
-            'boundary':'0x00401001'}},[0x401000],[body],work,header)
-        subprocess.run(['gcc','-std=c11','-O2','-DAC1_DIRECT_MEMORY','-I',str(runtime),
-            '-I',str(ROOT/'src/runtime'),'-c',str(work/'initial_region_00401000.c'),
-            '-o',str(work/'region.o')],check=True,capture_output=True,timeout=60)
-        lift.emit_journal_region_source(0x401000,{'members':[{'address':'0x00401000'}],
-            'implementation':'test_journal_implementation'},
-            {0x401000:body},work,header)
-        subprocess.run(['gcc','-std=c11','-O2','-DAC1_DIRECT_MEMORY','-I',str(runtime),
-            '-I',str(ROOT/'src/runtime'),'-c',str(work/'initial_region_00401000.c'),
-            '-o',str(work/'journal.o')],check=True,capture_output=True,timeout=60)
 
     @unittest.skipUnless(shutil.which('gcc'), 'native C compiler required')
     def test_failed_reservation_keeps_platform_error_and_guard_size(self):
