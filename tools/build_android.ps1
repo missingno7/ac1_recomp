@@ -29,7 +29,6 @@ if (-not (Test-Path -LiteralPath (Join-Path $AndroidSdk 'platforms\android-35\an
     throw "Android SDK platform 35 was not found under '$AndroidSdk'. Pass -AndroidSdk or set ANDROID_HOME."
 }
 & (Join-Path $PSScriptRoot 'build.ps1') -PrepareOnly -Python $Python
-if ($LASTEXITCODE -ne 0) { throw 'Native input preparation failed' }
 
 function Get-JavaMajor([string]$JavaInstallRoot) {
     $releaseFile = Join-Path $JavaInstallRoot 'release'
