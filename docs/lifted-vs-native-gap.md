@@ -33,7 +33,8 @@ full-state differential testing.
    against 5. A static model cannot say why it stalls, and no explanation here
    should be read as accounting for those 83 cycles.
 2. **Two small information fixes beat the hand-written native code statically
-   on 0x428540, but this does not generalize.** Across the hot corpus the same
+   on 0x428540 (151 against 169 instructions, 49 against 54 memory operations
+   counting CPU-struct accesses in both), but this does not generalize.** Across the hot corpus the same
    fixes leave instruction counts flat and raise host spills. 0x428540 is an
    outlier built almost entirely from one idiom.
 3. **The native reconstructions do not run by default.** `AC1_NATIVE_OVERRIDES`
@@ -58,8 +59,8 @@ differences on the three leaves tested, and they are evidence rather than proof.
   A reduced case forwards correctly, so LLVM is not at fault.
 - **Recoverable safely:** yes, it is a pure accessor change and needs no analysis
   (exact, no assumption).
-- **Frequency:** improves 17 of 74 hot functions, none regress. Corpus-wide
-  effect is small: loads -1%, `fcvt` -3%, instructions about -0.3%.
+- **Frequency:** improves 17 of 74 hot functions, and none worsen by more than
+  2% (2 worsen slightly). Corpus-wide effect is small: loads -1%, `fcvt` -3%, instructions about -0.3%.
 - **Improvement:** one unaligned vector access for `rdxm`/`wrxm`. Two 8-byte
   accesses were tried and are worse (0x653400: 102 → 157 instructions).
 
@@ -71,8 +72,8 @@ differences on the three leaves tested, and they are evidence rather than proof.
   difference, so it cannot relate two slots.
 - **Recoverable safely:** not from x86 alone. x86 addresses do wrap at 4 GB, so
   dropping that needs a mirrored arena, or a guard like the native plans use.
-- **Frequency:** 47 of 74 functions improve, 7 worsen (0xA84FF0 by 334
-  instructions). Together with finding 1: stores -5%, `fcvt` -11%, instructions
+- **Frequency:** 47 of 74 functions improve, 10 are unchanged, and 7 worsen by
+  more than 2% (0xA84FF0 by 334 instructions). Together with finding 1: stores -5%, `fcvt` -11%, instructions
   flat, spill loads +73%, spill stores +56%. Total memory operations rise from
   about 138 to 143 per weighted function, so traffic partly moves from guest
   memory to the host stack. The cause of the spills is not yet established.
