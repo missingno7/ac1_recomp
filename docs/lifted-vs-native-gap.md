@@ -42,6 +42,9 @@ model. The default mode reverses the 0x428540 ordering. `llvm-mca` does not mode
 store-to-load forwarding, which is where this gap sits, so its cycle numbers are
 not used to explain anything here.
 
+**The "native" rows for 0x653400 and 0x1176DE0 are not a native reference.** See
+"Why two native rewrites measured slower" below.
+
 ## Main results
 
 1. **The reference gap comes from memory traffic, not a longer data chain, but
@@ -162,6 +165,50 @@ later write kills them before the return.
    operations across the corpus as tested. Investigate the spills first.
 4. **Not worth pursuing now:** general stack promotion, given its ceiling and
    proof burden, and float-typed lanes.
+
+## Why two native rewrites measured slower
+
+The phone measured native bodies slower than lifted on 0x653400 (70 against 29
+cycles) and 0x1176DE0 (39 against 35). Those numbers should not be read as the
+cost of native code. The fault is in how the rewrites are written, at least for
+0x653400.
+
+**The measurement holds.** Both sides run in one binary with the same setup and
+no plan or `ac1_native_invoke`. The build uses the same flags as generated code,
+apart from line tables. On 0x653400 the code accounts exactly for the instruction
+counter: lifted 102 + 14 setup = 116; native 257 on its path + 14 = 271. On
+0x1176DE0 the two do not close: 158 static instructions + 14 is 172, against 178
+measured, and the setup there was not counted separately.
+
+**The rewrite is the cause.** The helpers work one lane at a time on a union, and
+the bodies keep `XMM` arrays on the host stack. On 0x653400 LLVM's loop vectorizer
+then interleaves the outer row loop into two passes of 69 instructions, built from
+`ld2`, `xtn`, `shrn`, `shll`, `orr` and `st2`. The arrays also bring in the stack
+guard, and without a local arena the global arena pointer is reloaded after stores.
+
+| Static instructions on the path | 0x653400 | 0x1176DE0 |
+|---|---|---|
+| Lifted | 102 | 118 |
+| Native as measured | 257 | 158 |
+| No stack guard | 246 | 144 |
+| No loop vectorizer | 197 | 158 |
+| Local arena | 251 | 153 |
+| `AC1_VECTOR_ACCESS` | 257 | 158 |
+| Vector types, no arrays | 93 | 84 |
+
+Each row is one change to the measured source, except the last, which rewrites the
+body with vector types, shuffles and vector compares, and builds with
+`AC1_VECTOR_ACCESS`. The last row keeps the same exact final state as the audited
+bodies. On the host (x86) it matched both the lifted and the current native body
+on 2,000 random full states for each function, with all three return values of
+0x1176DE0 covered, and a deliberately broken copy differed on all 2,000. The inputs
+were ordinary floats, so NaN behaviour was not tested.
+
+Not verified: these are static counts, and the rewrite has not run on ARM64, on
+the phone or in the game. Nothing here says what it would cost in cycles. On
+0x1176DE0 both bodies show about 18 stall cycles and the gap is 4 cycles, so the
+fault is shown for 0x653400 and only suspected there. The source is unchanged;
+the rewrite is private lab code, and `ac1_native_0042EE70` uses the same helpers.
 
 ## Open questions
 
