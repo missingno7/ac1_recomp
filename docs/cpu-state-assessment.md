@@ -588,7 +588,32 @@ read-only, FPS from `dumpsys SurfaceFlinger --frametimeline -all`) ran at 38.6
 fps, p95 33 ms, GPU 84% busy at 422 MHz. The main thread was 89-96% busy, but
 only 42.8% of it was game code (25.1 Mcycles per frame, against about 33.8 in
 the replay), and 11.8% was `clock_gettime` polling. So that spot is lighter in
-game code than the replay and is not CPU-bound by it. A useful benchmark spot
-needs a frame rate well below this, high game-code cycles per frame and little
-polling. The main thread also moved between cpu2, cpu3, cpu4 and cpu7 in that
-session, so it is not confined to the X4 and benchmarks must not assume so.
+game code than the replay and is not CPU-bound by it.
+
+A busy gameplay sample (a crowd with guards alerted, same session, 20 s) is the
+first usable measurement of the real problem:
+
+| | quiet gameplay | busy gameplay |
+|---|---|---|
+| FPS | 38.6 | 28.5 (p50 33 ms, p95 42 ms, worst 275 ms) |
+| game code, Mcycles per frame | 25.1 | 37.2 |
+| runtime | 9.9 | 10.3 |
+| DXVK and driver | 5.0 | 6.5 |
+| other host code | 11.8 | 12.8 |
+| `clock_gettime` polling | 6.9 | 5.7 |
+| main thread total | 58.7 | 72.5 |
+| GPU | 84% busy at 422 MHz | 90% busy at 366 MHz |
+
+Game code accounts for 12.1 of the 13.8 Mcycles added per frame, and no
+function exceeds 2.2% of the main thread, so the extra cost is spread widely.
+The main thread is 87% busy at its capped clock.
+
+The main thread ran on cpu7 (X4) for 98.5-99.8% of its sampled cycles, so core
+placement is not a problem. Toybox `top` showed other CPUs in single snapshots;
+simpleperf's per-sample CPU is the reliable source (a multi-event profile shows
+IPC 2.29 on cpu7 and about 1.47 on the A720 cores).
+
+All big cores were capped at 2.38 GHz during these samples (`scaling_max_freq`,
+against 3.40 GHz for the X4 and 3.15 GHz for the A720), while Android reported
+thermal status 0. The phone was connected over USB and earlier runs saw 2.35-2.65
+GHz on cpu7. What sets the cap is not established.
