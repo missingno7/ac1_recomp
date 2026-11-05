@@ -14,7 +14,7 @@ class LocalMemoryTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('gcc'), 'native C compiler required')
     def test_failed_reservation_keeps_platform_error_and_guard_size(self):
-        runtime=lift.prepare_test_runtime()
+        runtime=lift.RUNTIME
         work=ROOT/'work/local-memory-tests';work.mkdir(parents=True,exist_ok=True)
         exe=work/'reserve-failure.exe'
         subprocess.run(['gcc',*(['-D_GNU_SOURCE=1'] if os.name!='nt' else []),'-std=c11','-O2','-I',str(runtime),'-I',str(ROOT/'src/runtime'),
@@ -35,7 +35,7 @@ class LocalMemoryTests(unittest.TestCase):
                 self.assertEqual(lift.declare_local_memory_base(candidate).count('AC1_DECLARE_LOCAL_ARENA'),1)
 
     def test_transitive_memory_helpers_do_not_read_global_base(self):
-        runtime=lift.prepare_test_runtime()
+        runtime=lift.RUNTIME
         cpu=(runtime/'cpu.h').read_text()
         section=cpu.split('/* AC1_LOCAL_MEMORY_HELPERS */',1)[1]
         self.assertNotIn('ac1_direct_arena',section)
@@ -50,7 +50,7 @@ class LocalMemoryTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name=='nt' and shutil.which('gcc'), 'Windows native fault oracle required')
     def test_precise_read_and_write_fault_eip_and_full_cpu_observers(self):
-        runtime=lift.prepare_test_runtime()
+        runtime=lift.RUNTIME
         work=ROOT/'work/local-memory-eip-tests';work.mkdir(parents=True,exist_ok=True)
         for operation in ('c->ebx=rd32(0x8000u);','wr32(0x8000u,c->ebx); c->ebx=0;'):
             body=flags.function('c->eax=flags_add_m(c,c->eax,1u,4,0x3Fu);',
@@ -67,7 +67,7 @@ class LocalMemoryTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('gcc'), 'native C compiler required')
     def test_two_real_arenas_full_cpu_memory_and_compiled_base_stability(self):
-        runtime=lift.prepare_test_runtime()
+        runtime=lift.RUNTIME
         work=ROOT/'work/local-memory-tests';work.mkdir(parents=True,exist_ok=True)
         common=['gcc',*(['-D_GNU_SOURCE=1'] if os.name!='nt' else []),'-std=c11','-O2','-fwrapv','-fno-strict-aliasing','-ffp-contract=off',
                 '-DAC1_DIRECT_MEMORY','-I',str(runtime),'-I',str(ROOT/'src/runtime')]

@@ -1,4 +1,4 @@
-/* Generated from pinned MIT pcrecomp guest_mem.c; see prepare_runtime.py. */
+/* Adapted from MIT pcrecomp guest_mem.c. */
 #define HDR   16u            /* [size][magic][class][-] before every heap block */
 #define MAGIC 0x48454150u    /* 'HEAP' */
 #define GRAN  0x10000u       /* the reservation unit */

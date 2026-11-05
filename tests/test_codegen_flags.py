@@ -21,7 +21,7 @@ def function(*instructions):
 class MaskedHelperTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
     def test_masked_helpers_all_masks_widths_and_boundary_values(self):
-        runtime = lift.prepare_test_runtime()
+        runtime = lift.RUNTIME
         work = ROOT / 'work/codegen-tests'
         work.mkdir(parents=True, exist_ok=True)
         operations = [('add', 4), ('sub', 4), ('adc', 4), ('sbb', 4),

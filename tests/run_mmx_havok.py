@@ -122,7 +122,7 @@ def run() -> None:
     functions = [by_address[address] for address in ADDRESSES]
 
     module = load_lifter()
-    runtime_include = module.prepare_test_runtime()
+    runtime_include = module.RUNTIME
     tooling_args = argparse.Namespace(python=args.python, pcrecomp=args.pcrecomp)
     _python, pcrecomp = module.resolve_tooling(config, tooling_args)
     generated_dir = WORK / "generated"

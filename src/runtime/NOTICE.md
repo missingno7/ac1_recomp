@@ -1,8 +1,8 @@
 # Runtime sources
 
-The guest memory, PE loader, clock and heap adapters were copied from the user's current local DukeMP working tree. `tools/prepare_runtime.py` records and checks the exact source hashes; `work/runtime-provenance.json` records each input. AC1 startup services live separately in `ac1_runtime.c`.
+The guest memory, PE loader, clock and heap adapters were copied from the user's local DukeMP working tree and are now maintained here.
 
-The checked scalar-copy adaptation in `tools/prepare_runtime.py` follows the existing approach in the user's local Mafia runtime (`src/runtime/guest_memory.c`): validate the entire guest interval before copying across separate host allocations. It preserves the one-region pointer API and the pinned Duke inputs; it does not read or modify the Mafia checkout during builds.
+The checked scalar-copy adaptation in `src/runtime/guest_memory.c` follows the existing approach in the user's local Mafia runtime (`src/runtime/guest_memory.c`): validate the entire guest interval before copying across separate host allocations. It preserves the one-region pointer API and the pinned Duke inputs; it does not read or modify the Mafia checkout during builds.
 
 The ordinary-return scheduler slice in `ac1_runtime.c` follows the per-thread counter and deadline strategy in the local DukeMP `src/runtime/guest_scheduler.c`. AC1 checks its deadline every 64 generated-function returns; API checkpoints retain their immediate scheduling behavior. The implementation uses AC1's existing scheduler and keeps guest execution serialized.
 
@@ -42,23 +42,13 @@ original AC1 assets, translated game code or their linked private executables.
 
 Generated game functions are private local build products under ignored `work/`. APKs and host executables that include those translations are likewise local build products. No game executable, assets, or translated game functions belong in the source repository.
 
-`tools/lift_ac1.py` lowers MMX through the CPU-owned eight-register file generated
-by `tools/prepare_runtime.py`. AC1 and Bink share this lowering, including packed
+`tools/lift_ac1.py` lowers MMX through the CPU-owned eight-register file in
+`src/runtime/cpu.h`, including packed
 integer saturation, full-width shift counts, shuffles, unpacking and SSE-era
-MMX conversions. Registers persist across translated calls. The original Havok
-interval proofs and native oracle remain regression tests; those routines now
-use the same CPU state as audio and Bink.
+MMX conversions. Registers persist across translated calls.
 
-The transformation preserves every pinned donor hash and records the prepared
-header hash in runtime provenance. Its project-owned helpers set TOP to zero
-and all tags valid on MMX entry; EMMS empties the tags without changing TOP or
-register payloads. Raw significands and exponent words survive environment
-saves, including after EMMS. x87 writes synchronize their physical-register
-MMX views when MMX next enters. An x87 data instruction while MMX is active
-produces an exact-address diagnostic and stops the translated function.
-Because environment images have no separate MMX-mode bit, FRSTOR conservatively
-recognizes a full, TOP-zero stack containing an MMX-shaped `0xffff` exponent;
-an unusual full x87 stack containing negative NaNs can trigger that diagnostic.
+These runtime files began as copies of the DukeMP sources named above and are now
+maintained here. The pcrecomp licence is in `src/runtime/LICENSE.pcrecomp.txt`.
 
 FNSTENV/FLDENV use the 28-byte protected-mode environment; FNSAVE/FRSTOR add
 eight logical ST registers in 80-bit format for 108 bytes. Control/status words,

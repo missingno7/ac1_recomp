@@ -43,8 +43,6 @@ try {
         & $Python -B tools/lift_ac1.py "--profile-count-entries=$ProfileCountEntries"
         if ($LASTEXITCODE -ne 0) { throw 'AC1 generation failed' }
     }
-    & $Python -B tools/prepare_runtime.py
-    if ($LASTEXITCODE -ne 0) { throw 'CPU adapter preparation failed' }
     if ($PrepareOnly) {
         Write-Host ('Native inputs prepared in {0:N2} s' -f $Timer.Elapsed.TotalSeconds)
         return

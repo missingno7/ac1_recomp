@@ -238,7 +238,7 @@ def cmd_snapshot(a):
     flags, flags_source = android_flags()
     report = json.loads((ROOT/'work/lift_initial/lift-report.json').read_text())
     git = run(['git', '-C', ROOT, 'rev-parse', 'HEAD']).stdout.strip()
-    dirty = run(['git', '-C', ROOT, 'status', '--porcelain', '--', 'tools/lift_ac1.py', 'tools/prepare_runtime.py',
+    dirty = run(['git', '-C', ROOT, 'status', '--porcelain', '--', 'tools/lift_ac1.py',
                  'config/ac1_dx9.json', 'src/runtime']).stdout.split('\n')
     total = profile['total']
     manifest = dict(

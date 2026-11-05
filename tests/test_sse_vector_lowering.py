@@ -114,7 +114,7 @@ class SSEVectorLoweringTests(unittest.TestCase):
         path.write_text('\n'.join(source) + '\n')
         exe = work / 'sse_vector.exe'
         subprocess.run(['gcc', '-O2', '-std=gnu11', '-fwrapv', '-fno-strict-aliasing', '-ffp-contract=off',
-                        '-I', str(lift.prepare_test_runtime()), str(path), str(ROOT / 'tests/sse_vector_semantics.c'),
+                        '-I', str(lift.RUNTIME), str(path), str(ROOT / 'tests/sse_vector_semantics.c'),
                         '-lm', '-o', str(exe)], check=True, capture_output=True, timeout=120)
         run = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)

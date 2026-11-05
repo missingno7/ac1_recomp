@@ -28,7 +28,7 @@ def compile_and_run(source, name, *flags):
     (work/f'{name}.c').write_text(source)
     executable = work/f'{name}.exe'
     subprocess.run(['gcc', '-O2', '-fwrapv', '-fno-strict-aliasing', *flags,
-                    '-I', str(lift.prepare_test_runtime()), str(work/f'{name}.c'),
+                    '-I', str(lift.RUNTIME), str(work/f'{name}.c'),
                     *[str(common.ROOT/'tests'/extra) for extra in ('flag_abi_semantics.c',) if name.startswith('program')],
                     '-o', str(executable)], check=True, capture_output=True, timeout=120)
     return subprocess.run([str(executable)], capture_output=True, text=True, timeout=60)
@@ -194,7 +194,7 @@ class FlagContractTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
     def test_helper_tables_match_the_prepared_header(self):
-        header = (lift.prepare_test_runtime()/'cpu.h').read_text(encoding='utf-8')
+        header = (lift.RUNTIME/'cpu.h').read_text(encoding='utf-8')
         definitions = {}   # every preprocessor variant of each helper
         for m in re.finditer(r'^(?:static|AC1_\w+_INLINE)\b[^\n;{(]*?\b(\w+)\s*\([^;{]*\)\s*\{', header, re.M):
             depth, end = 1, m.end()
@@ -375,7 +375,7 @@ class FlagContractTests(unittest.TestCase):
         self.assertIn('flags_add_m_l(&_ac1_f, _ac1_regs.eax, 0x1u, 4, 0x00u)', sources)
         for name in result['translation_units']:
             subprocess.run(['gcc', '-O2', '-std=c11', '-Werror=implicit-function-declaration',
-                            '-I', str(lift.prepare_test_runtime()), '-I', str(work), '-c', str(work/name),
+                            '-I', str(lift.RUNTIME), '-I', str(work), '-c', str(work/name),
                             '-o', str(work/(name+'.obj'))], check=True, capture_output=True, timeout=60)
 
 

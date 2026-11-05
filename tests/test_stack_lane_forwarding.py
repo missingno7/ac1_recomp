@@ -69,7 +69,7 @@ class StackLaneForwardingTests(unittest.TestCase):
         path.write_text(source)
         exe = path.with_suffix('.exe')
         subprocess.run(['gcc', '-O2', '-std=gnu11', '-fwrapv', '-fno-strict-aliasing', '-ffp-contract=off',
-                        '-DAC1_DIRECT_MEMORY', '-I', str(lift.prepare_test_runtime()), str(path),
+                        '-DAC1_DIRECT_MEMORY', '-I', str(lift.RUNTIME), str(path),
                         str(ROOT / 'tests/stack_lane_semantics.c'), '-o', str(exe)],
                        check=True, capture_output=True, timeout=60)
         run = subprocess.run([str(exe)], check=True, capture_output=True, text=True, timeout=30)

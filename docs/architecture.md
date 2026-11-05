@@ -17,10 +17,7 @@ One pipeline turns one pinned executable into one native program.
    - GPR and XMM locals: registers live in locals between calls.
    - Stack lane forwarding, and direct calls between lifted functions.
 4. **Emission** into 1,000 stable translation units under `work/lift_initial`.
-5. **Runtime preparation** (`tools/prepare_runtime.py`) copies pinned donor sources
-   and applies project transformations. `src/runtime/cpu.h` is its output, so
-   change the transformation rather than the header.
-6. **Compilation** with GCC on Windows or NDK Clang on Android, always with
+5. **Compilation** with GCC on Windows or NDK Clang on Android, always with
    `-fwrapv -fno-strict-aliasing -ffp-contract=off`.
 
 ## Guest state
@@ -32,7 +29,8 @@ host address `arena + a`.
 
 ## Calls
 
-- **Direct guest calls** are C calls to `L_<VA>`.
+- **Direct guest calls** are plain C calls to `L_<VA>`. Calls on a loop also count
+  returns, so a guest thread that never reaches an import still offers the baton.
 - **Everything else** goes through `dispatch`. Targets in the lifted range use a
   small cache and a 16-byte line index. Imports have unique tokens and go to their
   handlers. COM methods go to the D3D9, DirectInput or DirectSound bridges.

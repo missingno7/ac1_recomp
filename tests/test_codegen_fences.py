@@ -65,7 +65,7 @@ class LoopFenceTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('gcc'), 'native C compiler required')
     def test_polling_loop_sees_a_store_from_another_thread(self):
         """The fenced backward branch keeps the load in the loop at -O2."""
-        runtime = lift.prepare_test_runtime()
+        runtime = lift.RUNTIME
         work = common.ROOT/'work/fence-tests'
         work.mkdir(parents=True, exist_ok=True)
         generated = lift.declare_local_memory_base(

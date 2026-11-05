@@ -54,6 +54,4 @@ and accepted and rejected mechanisms are in `docs/decisions.md`.
   `tools/build_android.ps1` packages for ARM64. `tests/run_all.py` is the host test gate.
 - Add observed missing executable targets to `initial_discovery.startup_seeds`. Fix
   translator issues in `tools/lift_ac1.py`, never in generated C.
-- Runtime source copies and CPU header transformations live in
-  `tools/prepare_runtime.py`, so preserve its pinned inputs. `src/runtime/cpu.h` is its output.
 - New file-writing services must keep the original installation read-only.

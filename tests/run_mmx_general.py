@@ -24,7 +24,7 @@ def run():
     spec = importlib.util.spec_from_file_location("mmx_general_lift", ROOT / "tools/lift_ac1.py")
     lift = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(lift)
-    include = lift.prepare_test_runtime()
+    include = lift.RUNTIME
     sys.path[:0] = [str(lift.DUKE_DEFAULT / "tools/pe"), str(lift.DUKE_DEFAULT / "tools/disasm"),
                     str(lift.DUKE_DEFAULT / "tools/lift")]
     from pe_analyze import analyze_pe, build_iat_map

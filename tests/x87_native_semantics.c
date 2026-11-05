@@ -29,7 +29,7 @@ int main(void) {
         CPU seed,exact,native;
         unsigned char expected[0x40];
         memset(&seed,0x5a,sizeof seed);
-        seed.eax=random32();seed.ecx=random32();seed.esp=0x8000;seed.calls=NULL;
+        seed.eax=random32();seed.ecx=random32();seed.esp=0x8000;
         seed.fp_initialized=1;seed.fpu_cw=0x0e7fu;seed.fpu_sw=0;seed.mmx_active=0;seed.mxcsr=0x1f80u;
         seed.fpu_top=(int)(random32()&7u);
         for(unsigned r=0;r<8;++r)seed.st[r]=(double)(int32_t)random32()/4096.0;

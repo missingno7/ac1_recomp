@@ -27,7 +27,7 @@ CONFIG_PATH = ROOT / "config/ac1_dx9.json"
 DUKE_DEFAULT = Path("D:/Prog/dukemp_recomp/.deps/pcrecomp")
 PYTHON_DEFAULT = Path("D:/Prog/dukemp_recomp/.venv/Scripts/python.exe")
 OUT_DEFAULT = ROOT / "work/lift_initial"
-_TEST_RUNTIME = None
+RUNTIME = ROOT / "src/runtime"
 AC1_ARRAY_CTOR_HELPER = 0x00F9FA43
 AC1_SCHEMA_CALLBACK_HELPER = 0x00438EF0
 AC1_READER_CALLBACK_HELPER = 0x009312F0
@@ -36,20 +36,6 @@ AC1_ARG2_CALLBACK_HELPERS = {
     AC1_READER_CALLBACK_HELPER: "reader_callback",
 }
 
-
-def prepare_test_runtime() -> Path:
-    """Build pinned test headers privately, without changing tracked runtime copies."""
-    global _TEST_RUNTIME
-    if _TEST_RUNTIME is None:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("ac1_test_prepare_runtime", ROOT / "tools/prepare_runtime.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        module.ROOT = ROOT / "work/test_runtime"
-        module.FINGERPRINT_HEADER = module.ROOT / "src/runtime/ac1_fingerprint.h"
-        module.main()
-        _TEST_RUNTIME = module.ROOT / "src/runtime"
-    return _TEST_RUNTIME
 
 # Retain the original Havok interval proofs as regression checks. Emission
 # now uses CPU-owned MMX registers for every function in AC1 and Bink.
@@ -1706,7 +1692,7 @@ def run_ac1_switch_selftest(binary: Path, pcrecomp: Path) -> None:
                 table_page.write_bytes(original_page)
                 command = [
                     compiler, "-std=c11", "-O0", "-DAC1_TRACE_EIP",
-                    "-I", str(prepare_test_runtime()),
+                    "-I", str(RUNTIME),
                     str(ROOT / "tests/memmove_semantics.c"), str(generated_c),
                     str(ROOT / "src/runtime/guest_memory.c"),
                     str(ROOT / "src/runtime/guest_clock.c"), "-lm", "-o", str(executable),
@@ -1944,7 +1930,7 @@ int main(void) {
 }
 '''
         source_path.write_text(source, encoding="utf-8")
-        command = [compiler, "-std=c11", "-O0", "-I", str(prepare_test_runtime()),
+        command = [compiler, "-std=c11", "-O0", "-I", str(RUNTIME),
                    str(source_path), str(ROOT / "src/runtime/guest_memory.c"),
                    str(ROOT / "src/runtime/guest_clock.c"), "-o", str(executable)]
         build = subprocess.run(command, text=True, capture_output=True)
@@ -3452,7 +3438,7 @@ FLAG_HELPER_READS = {'eflags_pack': FLAG_ALL, 'op_rcl': FLAG_BITS['cf'], 'op_rcr
 # Shifts and rotates change no flag for a zero count. Value: count argument index.
 FLAG_COUNTED_HELPERS = {'op_shl': 1, 'op_shr': 1, 'op_sar': 1, 'op_rol': 1, 'op_ror': 1,
                         'op_rcl': 1, 'op_rcr': 1, 'op_shld': 2, 'op_shrd': 2}
-# Shifts with constant-mask `_m` clones (prepare_runtime.py): the lanes they may write.
+# Shifts with constant-mask `_m` clones in cpu.h: the lanes they may write.
 FLAG_MASKED_SHIFTS = {name: FLAG_ALL & ~(FLAG_BITS['af'] | FLAG_BITS['of'])
                       for name in ('op_shl', 'op_shr', 'op_sar', 'op_shld', 'op_shrd')}
 FLAG_MASKED_SHIFT_CLONES = frozenset(name + '_m' for name in FLAG_MASKED_SHIFTS)
@@ -3598,7 +3584,7 @@ def flag_contract_solve(flow, R, E, e_call, e_jump):
     return live, after, reads, writes
 
 
-# Flag writers with clones on the local `ac1_flags` (prepare_runtime.py), besides
+# Flag writers with clones on the local `ac1_flags` in cpu.h, besides
 # the masked `_m` helpers.
 FLAG_LOCAL_CLONES = frozenset({'sse_compare', 'fcompare_eflags', 'do_sahf', 'op_rol', 'op_ror',
                                'op_bsf', 'op_bsr'} | {name + '_m' for name in [*FLAG_HELPERS, *FLAG_MASKED_SHIFTS]})
@@ -3944,7 +3930,7 @@ def fence_backward_branches(body: str) -> str:
     a loop is not hoisted out of it: a polling loop sees a value another thread
     stores. GPR-local bodies already fence each goto; this covers the rest,
     which before relied on the EIP observer in every memory accessor (kept only
-    for AC1_TRACE_EIP builds, see prepare_runtime.py).
+    for AC1_TRACE_EIP builds).
     """
     out = []
     for line in body.splitlines():
@@ -3963,9 +3949,7 @@ def xmm_free_helpers(cpu_header: str) -> frozenset:
     names|=set(re.findall(r'^#define\s+(\w+)\(',cpu_header,re.M))
     if re.search(r'\bxmm\s*\[',re.sub(r'^\s*XMM\s+xmm\[8\];','',cpu_header,flags=re.M)):
         raise ValueError('prepared CPU header accesses XMM state; audit the XMM-local sync points')
-    # ac1_x87_integer_native and the masked shift clones are emitted by lifter
-    # passes; the header read at lift time can predate them (prepare_runtime.py
-    # runs after the lifter).
+    # ac1_x87_integer_native and the masked shift clones are named by lifter passes.
     return frozenset((names|{'AC1_SET_GUEST_EIP','ac1_x87_integer_native'}|FLAG_MASKED_SHIFT_CLONES)-{'AC1_CALL','RECOMP_TODO'})
 
 

@@ -52,7 +52,7 @@ class DirectCallsTests(unittest.TestCase):
             exe = work / f"check-{direct_memory}.exe"
             subprocess.run(["gcc", "-O2", "-fwrapv", "-fno-strict-aliasing",
                 *(["-DAC1_DIRECT_MEMORY"] if direct_memory else []),
-                "-I", str(lift.prepare_test_runtime()), str(source),
+                "-I", str(lift.RUNTIME), str(source),
                 str(ROOT / "tests/direct_calls_semantics.c"), "-o", str(exe)], check=True,
                 capture_output=True, timeout=60)
             result = subprocess.run([str(exe)], check=True, capture_output=True, text=True, timeout=15)

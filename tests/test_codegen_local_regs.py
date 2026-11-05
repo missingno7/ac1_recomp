@@ -30,7 +30,7 @@ class LocalRegisterTests(unittest.TestCase):
         work=ROOT/'work/local-regs-tests';work.mkdir(parents=True,exist_ok=True)
         path=work/'dirty.c';path.write_text(generated);exe=path.with_suffix('.exe')
         subprocess.run(['gcc','-O2','-std=c11','-fwrapv','-fno-strict-aliasing',
-            '-I',str(lift.prepare_test_runtime()),str(path),str(ROOT/'tests/local_dirty_semantics.c'),
+            '-I',str(lift.RUNTIME),str(path),str(ROOT/'tests/local_dirty_semantics.c'),
             '-o',str(exe)],check=True,capture_output=True,timeout=60)
         run=subprocess.run([str(exe)],check=True,capture_output=True,text=True,timeout=30)
         self.assertIn('4096 dirty CFG full CPU and observer cases',run.stdout)
@@ -53,7 +53,7 @@ class LocalRegisterTests(unittest.TestCase):
         work=ROOT/'work/local-regs-tests';work.mkdir(parents=True,exist_ok=True)
         path=work/'stack.c';path.write_text(generated);exe=path.with_suffix('.exe')
         subprocess.run(['gcc','-O2','-std=c11','-fwrapv','-fno-strict-aliasing','-DAC1_DIRECT_MEMORY',
-            '-I',str(lift.prepare_test_runtime()),str(path),str(ROOT/'tests/local_stack_semantics.c'),
+            '-I',str(lift.RUNTIME),str(path),str(ROOT/'tests/local_stack_semantics.c'),
             '-o',str(exe)],check=True,capture_output=True,timeout=60)
         run=subprocess.run([str(exe)],check=True,capture_output=True,text=True,timeout=30)
         self.assertIn('4096 local push/pop CPU and stack memory cases passed',run.stdout)
@@ -87,13 +87,13 @@ class LocalRegisterTests(unittest.TestCase):
         work=ROOT/'work/local-regs-tests';work.mkdir(parents=True,exist_ok=True)
         path=work/'xmm.c';path.write_text(generated);exe=path.with_suffix('.exe')
         subprocess.run(['gcc','-O2','-std=c11','-fwrapv','-fno-strict-aliasing',
-            '-I',str(lift.prepare_test_runtime()),str(path),str(ROOT/'tests/local_xmm_semantics.c'),
+            '-I',str(lift.RUNTIME),str(path),str(ROOT/'tests/local_xmm_semantics.c'),
             '-o',str(exe)],check=True,capture_output=True,timeout=60)
         run=subprocess.run([str(exe)],check=True,capture_output=True,text=True,timeout=30)
         self.assertIn('4096 XMM-local full CPU, call and return cases passed',run.stdout)
 
     def test_xmm_free_helpers_cover_the_prepared_header(self):
-        header=(lift.prepare_test_runtime()/'cpu.h').read_text()
+        header=(lift.RUNTIME/'cpu.h').read_text()
         free=lift.xmm_free_helpers(header)
         for name in ('push32','pop32','fst','fpush','sse_compare','flags_add_m','ac1_x87_integer','rdxm','wrxm'):
             self.assertIn(name,free)
@@ -103,7 +103,7 @@ class LocalRegisterTests(unittest.TestCase):
             lift.xmm_free_helpers(header+'\nstatic inline void leak(CPU *c) { c->xmm[0].u32[0]=0; }\n')
 
     def test_flags_helpers_do_not_access_gprs(self):
-        header = (lift.prepare_test_runtime() / 'cpu.h').read_text()
+        header = (lift.RUNTIME / 'cpu.h').read_text()
         count = 0
         for match in re.finditer(r'\b(flags_\w+)\([^{};]*\)\s*\{', header):
             depth, end = 1, match.end()
@@ -152,7 +152,7 @@ class LocalRegisterTests(unittest.TestCase):
         self.assertEqual(lift.local_register_function(escaped),escaped)
 
     def test_audited_pure_and_stack_helpers_use_only_declared_cpu_fields(self):
-        header=(lift.prepare_test_runtime()/'cpu.h').read_text()
+        header=(lift.RUNTIME/'cpu.h').read_text()
         self.assertRegex(header,re.compile(r'^#define STACK_BASE\(c\) 0u$',re.M))
         for name in (lift.LOCAL_GPR_FREE_HELPERS-{'AC1_SET_GUEST_EIP'}) | lift.LOCAL_ESP_HELPERS:
             bodies=[]
@@ -201,7 +201,7 @@ class LocalRegisterTests(unittest.TestCase):
         generated=work/'scalar-stack.c';generated.write_text(source)
         exe=generated.with_suffix('.exe')
         subprocess.run(['gcc','-O2','-std=c11','-fwrapv','-fno-strict-aliasing',
-            '-I',str(lift.prepare_test_runtime()),str(generated),str(ROOT/'tests/local_scalar_semantics.c'),
+            '-I',str(lift.RUNTIME),str(generated),str(ROOT/'tests/local_scalar_semantics.c'),
             '-o',str(exe)],check=True,capture_output=True,timeout=60)
         run=subprocess.run([str(exe)],check=True,capture_output=True,text=True,timeout=30)
         self.assertIn('4096 scalar-local full CPU and stack cases',run.stdout)
@@ -227,7 +227,7 @@ class LocalRegisterTests(unittest.TestCase):
                           lift.local_register_function(body))
         exe = source.with_suffix('.exe')
         subprocess.run(['gcc', '-std=c11', '-O2', '-fwrapv', '-fno-strict-aliasing',
-                        '-I', str(lift.prepare_test_runtime()), str(source),
+                        '-I', str(lift.RUNTIME), str(source),
                         str(ROOT / 'tests/codegen_local_regs_semantics.c'), '-o', str(exe)],
                        check=True, capture_output=True, timeout=60)
         result = subprocess.run([str(exe)], check=True, capture_output=True, text=True, timeout=15)

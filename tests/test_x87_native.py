@@ -40,7 +40,7 @@ class NativeX87Tests(unittest.TestCase):
         path.write_text(source)
         exe = path.with_suffix('.exe')
         subprocess.run(['gcc', '-O2', '-std=c11', '-fwrapv', '-fno-strict-aliasing', '-ffp-contract=off',
-                        '-I', str(lift.prepare_test_runtime()), str(path), str(ROOT / 'tests/x87_native_semantics.c'),
+                        '-I', str(lift.RUNTIME), str(path), str(ROOT / 'tests/x87_native_semantics.c'),
                         '-lm', '-o', str(exe)], check=True, capture_output=True, timeout=60)
         run = subprocess.run([str(exe)], check=True, capture_output=True, text=True, timeout=30)
         self.assertIn('4096 native-x87 functional CPU and memory cases passed', run.stdout)
