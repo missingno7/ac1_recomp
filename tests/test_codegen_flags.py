@@ -1,9 +1,7 @@
-"""Flag dataflow edges and compiled masked-helper differential oracle."""
-import re
+"""Compiled masked-helper differential oracle."""
 import shutil
 import subprocess
 import unittest
-from unittest.mock import patch
 
 import test_lift_code_immediates as common
 
@@ -20,87 +18,7 @@ def function(*instructions):
     return '\n'.join(lines + ['}'])
 
 
-class FlagLivenessTests(unittest.TestCase):
-    def masks(self, source, mode='cfg'):
-        return re.findall(r'flags_\w+_m\(.*?, (0x[0-9A-F]+)u\)',
-                          lift.flag_liveness_function(source, mode))
-
-    def test_straight_line_and_return_contract(self):
-        source = function('c->eax = flags_add(c, c->eax, 1, 4);',
-                          'flags_sub(c, rd32(c->eax), 3, 4);', 'guest_ret(c, 0); return;')
-        self.assertEqual(self.masks(source), ['0x00', '0x3F'])
-        self.assertEqual(lift.flag_liveness_function(source, 'off'), source)
-
-    def test_diamond_and_backedge_union(self):
-        source = function('flags_sub(c, c->eax, 0, 4);',
-                          'if (c->zf) goto L_00401004;',
-                          'flags_sub(c, c->eax, 2, 4);',
-                          'goto L_00401005;',
-                          ('L_00401004', 'if (c->cf) goto L_00401000;'),
-                          ('L_00401005', 'flags_add(c, 1, 2, 4);'), 'guest_ret(c, 0); return;')
-        source = source.replace('    AC1_SET_GUEST_EIP(c, 0x00401000u);',
-                                'L_00401000:\n    AC1_SET_GUEST_EIP(c, 0x00401000u);')
-        self.assertEqual(self.masks(source), ['0x09', '0x00', '0x3F'])
-        self.assertEqual(self.masks(source, 'straight')[0], '0x3F')
-
-    def test_sparse_entry_guard_is_outside_lowest_block(self):
-        source = function(('L_00401000', 'flags_add(c, 1, 2, 4);'),
-                          'if (c->zf) goto L_00401000;',
-                          ('L_00401002', 'guest_ret(c, 0); return;'))
-        source = source.replace('{\n', '{\n    goto L_00401002;\n', 1)
-        prefix, pending, groups = lift.codegen_instruction_groups(source)
-        self.assertEqual(prefix[-1], '    goto L_00401002;')
-        self.assertFalse(pending)
-        self.assertNotIn('goto L_00401002;', '\n'.join(groups[0]))
-        self.assertEqual(self.masks(source), ['0x3F'])
-
-    def test_preserved_lanes_and_carry_input(self):
-        source = function('flags_add(c, 1, 2, 4);', 'flags_incs(c, 3, 4);',
-                          'flags_logicz(c, 5, 4);', 'c->eax = flags_adc(c, 4, 5, 4);',
-                          'guest_ret(c, 0); return;')
-        self.assertEqual(self.masks(source), ['0x00', '0x00', '0x01', '0x3F'])
-        # INC never reads CF; its masked helper leaves it untouched. A later
-        # ADC would require the earlier producer when no logical kill intervenes.
-        source = function('flags_add(c, 1, 2, 4);', 'flags_incs(c, 3, 4);',
-                          'flags_adc(c, 4, 5, 4);', 'guest_ret(c, 0); return;')
-        self.assertEqual(self.masks(source), ['0x01', '0x00', '0x3F'])
-
-    def test_observers_escapes_and_unknown_helpers(self):
-        for observer in ('dispatch(c, c->eax);', 'dispatch_jmp(c, c->eax); return;',
-                         '/* indirect jmp */ dispatch_jmp(c, c->eax); return;',
-                         'SET8H(c->eax, (c->sf<<7)|(c->zf<<6)|(c->af<<4)|(c->pf<<2)|2|c->cf); /* 00401001: lahf */',
-                         'push32(c, eflags_pack(c));', 'ac1_unknown(c);',
-                         'RECOMP_TODO(0x401000, "trap");',
-                         'c->eax = (c->sf << 7) | (c->zf << 6) | (c->af << 4) | (c->pf << 2) | c->cf;'):
-            source = function('flags_add(c, 1, 2, 4);', observer,
-                              'flags_sub(c, 3, 4, 4);', 'guest_ret(c, 0); return;')
-            # LAHF needs its five observed lanes; others need all six.
-            expected = '0x1F' if 'c->sf <<' in observer else '0x3F'
-            self.assertEqual(self.masks(source)[0], expected, observer)
-
-    def test_seh_and_intra_instruction_loops_are_untouched(self):
-        source = function('flags_add(c, 1, 2, 4); /* fs:[0] */', 'guest_ret(c, 0); return;')
-        self.assertEqual(lift.flag_liveness_function(source), source)
-        source = function('while (c->ecx) { flags_sub(c, 1, 2, 4); if(c->zf) break; }',
-                          'guest_ret(c, 0); return;')
-        self.assertEqual(lift.flag_liveness_function(source), source)
-
-    def test_generated_direct_transfers_with_masks(self):
-        import test_lift_direct_calls as direct
-        original = lift.specialize_direct_calls
-        def transform(*args):
-            body, callees, count = original(*args)
-            return lift.flag_liveness_function(body), callees, count
-        with patch.object(lift, 'specialize_direct_calls', side_effect=transform):
-            direct.DirectCallsTests('test_generated_calls_and_tail_transfers').test_generated_calls_and_tail_transfers()
-
-    def test_generated_switches_with_masks(self):
-        import test_lift_register_switches as switches
-        original = lift.lift_exact_function
-        with patch.object(lift, 'lift_exact_function',
-                          side_effect=lambda *a, **k: lift.flag_liveness_function(original(*a, **k))):
-            switches.RegisterSwitchTests().test_compile_execute_local_cases_default_ret8_and_unknown_fallback()
-
+class MaskedHelperTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
     def test_masked_helpers_all_masks_widths_and_boundary_values(self):
         runtime = lift.prepare_test_runtime()

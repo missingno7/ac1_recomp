@@ -15,9 +15,7 @@ WORK = ROOT / "work/mmx_evidence/oracle"
 sys.dont_write_bytecode = True
 
 
-def run(*, flag_liveness='off', local_regs='off', x87_inline=False):
-    if local_regs not in ('off','all'):
-        raise ValueError('MMX oracle local_regs must be off or all')
+def run():
     start = time.perf_counter()
     WORK.mkdir(parents=True, exist_ok=True)
     spec = importlib.util.spec_from_file_location("mmx_general_lift", ROOT / "tools/lift_ac1.py")
@@ -34,7 +32,6 @@ def run(*, flag_liveness='off', local_regs='off', x87_inline=False):
     if not cc or not cxx or not shutil.which("objcopy"):
         raise RuntimeError("gcc, g++ and objcopy are required for native MMX oracle checks")
 
-    inline_options = ['-DAC1_FORCE_INLINE_X87=1'] if x87_inline else []
     operations = []
     binary = ("movq paddb paddw paddd paddq psubb psubw psubd psubq paddsb paddsw psubsb psubsw "
               "paddusb paddusw psubusb psubusw pand pandn por pxor pcmpeqb pcmpeqw pcmpeqd "
@@ -92,7 +89,7 @@ def run(*, flag_liveness='off', local_regs='off', x87_inline=False):
         if lowering is None:
             raise RuntimeError(f"MMX probe did not lower: {ins.mnemonic} {ins.op_str}")
         body=f"void probe_{name}(CPU *c)\n{{\n    " + " ".join(lowering) + "\n}"
-        if local_regs=='all':body=lift.local_xmm_function(lift.local_register_function(body))
+        body=lift.local_xmm_function(lift.local_register_function(body))
         source += body+'\n'
         declarations.append(f"void probe_{name}(CPU *);")
         asm = ("movq %1, %%mm0\n\tmovq %2, %%mm1\n\tmovq %2, %%xmm0\n\t"
@@ -112,15 +109,14 @@ def run(*, flag_liveness='off', local_regs='off', x87_inline=False):
         if lowering is None:
             raise RuntimeError(f"state probe did not lower: {ins.mnemonic}")
         body=f"void probe_{name}(CPU *c)\n{{\n    " + " ".join(lowering) + "\n}"
-        if local_regs=='all':body=lift.local_xmm_function(lift.local_register_function(body))
+        body=lift.local_xmm_function(lift.local_register_function(body))
         source += body+'\n'
         declarations.append(f"void probe_{name}(CPU *);")
     mix_raw = bytes.fromhex("d9e8c3")
     mix_spec = {"address":0x600000,"size":3,"blocks":[{"start":0x600000,"end":0x600003,
                 "instructions":[(0x600000,2),(0x600002,1)]}]}
     mix_body = lift.lift_exact_function(lifter,mix_spec,lambda va,n:mix_raw[va-0x600000:va-0x600000+n],X86_OP_IMM,X86_OP_MEM)
-    mix_body=lift.flag_liveness_function(mix_body,flag_liveness)
-    if local_regs=='all':mix_body=lift.local_xmm_function(lift.local_register_function(mix_body))
+    mix_body=lift.local_xmm_function(lift.local_register_function(mix_body))
     source += "#define AC1_SET_GUEST_EIP(c,va) ((c)->eip=(va))\n" + mix_body
     declarations += ["void L_00600000(CPU *);", "void L_00834A90(CPU *);", "void L_1801E500(CPU *);"]
     (WORK / "ops.c").write_text(source)
@@ -140,22 +136,21 @@ def run(*, flag_liveness='off', local_regs='off', x87_inline=False):
             "start":block.start,"end":block.end,"successors":block.successors,"is_exit":block.is_exit,
             "instructions":[(i.address,i.size) for i in block.instructions]} for block in fn.blocks.values()]}
         output=WORK / tag
-        result=lift.emit_lift(binary,lift.DUKE_DEFAULT,[spec],output,100,
-                              flag_liveness=flag_liveness,local_regs=local_regs)
+        result=lift.emit_lift(binary,lift.DUKE_DEFAULT,[spec],output,100,whole_program=True)
         if result["lift_failures"]:
             raise RuntimeError(str(result["lift_failures"]))
         units += [output / name for name in result["translation_units"]]
     objects=[]
     for index, unit in enumerate([WORK / "ops.c", *units]):
         obj=WORK / f"generated_{index}.o"
-        command=[cc,*inline_options,"-std=c11","-O2","-Wall","-Wextra","-Werror","-fwrapv","-fno-strict-aliasing",
+        command=[cc,"-std=c11","-O2","-Wall","-Wextra","-Werror","-fwrapv","-fno-strict-aliasing",
                  "-I",str(include),"-c",str(unit),"-o",str(obj)]
         result=subprocess.run(command,capture_output=True,text=True)
         if result.returncode:
             raise RuntimeError(result.stdout+result.stderr)
         commands.append(command);objects.append(obj)
     exe=WORK / "compare.exe"
-    command=[cxx,*inline_options,"-std=c++17","-O2","-Wall","-Wextra","-Werror","-I",str(include),"-I",str(WORK),
+    command=[cxx,"-std=c++17","-O2","-Wall","-Wextra","-Werror","-I",str(include),"-I",str(WORK),
              str(ROOT / "tests/mmx_general_native.cpp"),*[str(obj) for obj in objects],"-o",str(exe)]
     commands.append(command)
     result=subprocess.run(command,capture_output=True,text=True)
@@ -166,7 +161,6 @@ def run(*, flag_liveness='off', local_regs='off', x87_inline=False):
     if result.returncode:
         raise RuntimeError(result.stdout+result.stderr)
     report={"operations":len(operations),"output":result.stdout,"commands":commands,
-            "flag_liveness":flag_liveness,"local_regs":local_regs,"x87_inline":x87_inline,
             "seconds":round(time.perf_counter()-start,3)}
     (WORK / "report.json").write_text(json.dumps(report,indent=2)+"\n")
     print(result.stdout.strip())
@@ -174,10 +168,4 @@ def run(*, flag_liveness='off', local_regs='off', x87_inline=False):
 
 
 if __name__ == "__main__":
-    import argparse
-    parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--flag-liveness',choices=('off','straight','cfg'),default='off')
-    parser.add_argument('--local-regs',choices=('off','all'),default='off')
-    parser.add_argument('--x87-inline',action='store_true')
-    args=parser.parse_args()
-    run(flag_liveness=args.flag_liveness,local_regs=args.local_regs,x87_inline=args.x87_inline)
+    run()

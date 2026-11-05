@@ -3,7 +3,6 @@
 #include "ac1_runtime.h"
 #include "ac1_guest_time.h"
 #include "ac1_profile.h"
-#include "ac1_native.h"
 #include "ac1_virtual_query.h"
 #include "ac1_memory_diagnostics.h"
 #include "ac1_profile_int.h"
@@ -8061,7 +8060,6 @@ int ac1_run(const char *exe_path)
 
     if (setjmp(stop_runtime) == 0) {
         runtime_stop_ready = 1;
-        ac1_native_init();
         const uint32_t bink_attach_arguments[3] = {
             bink_image.load_base, 1u, 0u /* DLL_PROCESS_ATTACH, reserved */
         };
@@ -8145,7 +8143,6 @@ cleanup:
         free(scheduler);
         scheduler = NULL;
     }
-    ac1_native_shutdown();
 #if defined(_WIN32) || defined(__ANDROID__)
     if (dinput8_configured) {
         ac1_dinput8_shutdown();

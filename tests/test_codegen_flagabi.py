@@ -84,16 +84,12 @@ class FlagContractTests(unittest.TestCase):
         self.assertEqual(masks(out[0x401100]), ['0x09'])
         self.assertEqual(masks(out[0x401200]), ['0x08'])
 
-    def test_imports_and_native_entries_keep_the_incoming_flags(self):
-        for transfer, pinned in (('push32(c, 0x00401002u); dispatch(c, 0x00500000u);', ()),
-                                 (call(0x401100, 0x401002), {0x401100})):
-            caller = function(0x401000, 'flags_sub(c, c->eax, 5, 4);', transfer,
-                              'if (c->cf) c->eax = 0u;', 'c->esp += 4; return;')
-            native = function(0x401100, 'c->eax = flags_add(c, c->eax, 1, 4);', 'c->esp += 4; return;')
-            out, report = lift.flag_contract_program({0x401000: caller, 0x401100: native}, pinned)
-            self.assertEqual(masks(out[0x401000]), ['0x01'], transfer)
-        self.assertEqual(masks(out[0x401100]), ['0x3F'])   # conservative per-function masks
-        self.assertEqual(report['native_contracts'], {'0x00401100': [0, 1]})
+    def test_imports_keep_the_incoming_flags(self):
+        caller = function(0x401000, 'flags_sub(c, c->eax, 5, 4);',
+                          'push32(c, 0x00401002u); dispatch(c, 0x00500000u);',
+                          'if (c->cf) c->eax = 0u;', 'c->esp += 4; return;')
+        out, _ = lift.flag_contract_program({0x401000: caller})
+        self.assertEqual(masks(out[0x401000]), ['0x01'])
 
     def test_indirect_transfers_use_only_possible_targets(self):
         caller = function(0x401000, 'flags_sub(c, c->eax, 5, 4);',
@@ -340,12 +336,12 @@ class FlagContractTests(unittest.TestCase):
         }
         call_targets, jump_targets = lift.flag_indirect_targets(bodies, [])
         self.assertEqual(call_targets, {0x401200})
-        contracted, report = lift.flag_contract_program(bodies, (), call_targets, jump_targets)
+        contracted, report = lift.flag_contract_program(bodies, call_targets, jump_targets)
         self.assertEqual(masks(contracted[0x401000]), ['0x08', '0x01', '0x09', '0x3F', '0x08'])
         self.assertEqual(re.findall(r'op_s\w+?_m(?:_l)?\(.*?, (0x[0-9A-F]+)u\)', contracted[0x401000]), ['0x01', '0x08'])
         self.assertEqual([masks(contracted[a]) for a in (0x401100, 0x401200, 0x401300, 0x401400, 0x401500)],
                          [['0x01'], ['0x1A'], ['0x18'], ['0x00'], ['0x00']])
-        variants = [('cfg', [lift.flag_liveness_function(b) for b in bodies.values()]),
+        variants = [('plain', list(bodies.values())),
                     ('abi', list(contracted.values())),
                     ('abi_local', [lift.local_register_function(b) for b in contracted.values()])]
         source = '#include "cpu.h"\n#define AC1_SET_GUEST_EIP(c,va) ((c)->eip=(va))\n'
@@ -356,7 +352,7 @@ class FlagContractTests(unittest.TestCase):
         source += 'void variant_dispatch(int v, CPU *c, uint32_t t) {\n    switch (t) {\n'
         for a in sorted(bodies):
             source += (f'    case 0x{a:08X}u: if (v == 2) abi_local_L_{a:08X}(c); '
-                       f'else if (v) abi_L_{a:08X}(c); else cfg_L_{a:08X}(c); return;\n')
+                       f'else if (v) abi_L_{a:08X}(c); else plain_L_{a:08X}(c); return;\n')
         source += '    case 0x00500000u: c->esp += 4; return;\n    }\n    abort();\n}\n'
         source += (f'const unsigned variant_entries = {len(bodies)};\n'
                    'void variant_entry(int v, CPU *c, unsigned e) {\n'
@@ -372,44 +368,16 @@ class FlagContractTests(unittest.TestCase):
         pe, specs = fake_pe({0x401000: bytes.fromhex('e8fb00000083c400c3'), 0x401100: bytes.fromhex('83c001c3')})
         work = common.ROOT/'work/flagabi-emitter-tests'; work.mkdir(parents=True, exist_ok=True)
         with pe:
-            result = lift.emit_lift(work/'synthetic.exe', lift.DUKE_DEFAULT, specs, work, 1, flag_liveness='abi')
+            result = lift.emit_lift(work/'synthetic.exe', lift.DUKE_DEFAULT, specs, work, 1, whole_program=True)
         self.assertEqual(result['flag_abi']['functions'], 2)
         self.assertIn('{ 0x00401100u, L_00401100 }', (work/'initial_dispatch.c').read_text())
         sources = '\n'.join((work/name).read_text() for name in result['translation_units'])
         self.assertNotIn('ac1_abi_', sources)
-        self.assertIn('flags_add_m_l(&_ac1_f, c->eax, 0x1u, 4, 0x00u)', sources)
+        self.assertIn('flags_add_m_l(&_ac1_f, _ac1_regs.eax, 0x1u, 4, 0x00u)', sources)
         for name in result['translation_units']:
             subprocess.run(['gcc', '-O2', '-std=c11', '-Werror=implicit-function-declaration',
                             '-I', str(lift.prepare_test_runtime()), '-I', str(work), '-c', str(work/name),
                             '-o', str(work/(name+'.obj'))], check=True, capture_output=True, timeout=60)
-
-    @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
-    def test_region_oracles_keep_per_function_masks_with_contracts_and_locals(self):
-        pe, specs = fake_pe({0x401000: bytes.fromhex('e8fb000000eb0083c400c3'),
-                             0x401100: bytes.fromhex('83c001c3'),
-                             0x401200: bytes.fromhex('e8fbfdffff83c400c3')})
-        region = {0x401000: dict(boundary='0x00401007', context_bytes=64,
-                  members=[dict(address=hex(va)) for va in (0x401000, 0x401100)],
-                  implementation='test_region', plan='test_prepare', pending='test_pending')}
-        work = common.ROOT/'work/flagabi-region-tests'; work.mkdir(parents=True, exist_ok=True)
-        with pe, patch.object(lift, 'validate_region_bindings', return_value=region):
-            result = lift.emit_lift(work/'synthetic.exe', lift.DUKE_DEFAULT, specs, work, 1,
-                                    flag_liveness='abi', local_regs='all')
-        region_source = (work/'initial_region_00401000.c').read_text()
-        self.assertNotIn('_ac1_regs', region_source)
-        self.assertIn('ac1_region_00401000_m_00401100(c)', region_source)
-        self.assertEqual(set(masks(region_source)), {'0x3F'})
-        sources = '\n'.join((work/name).read_text() for name in result['translation_units'])
-        self.assertIn('flags_add_m_l(&_ac1_f, _ac1_regs.eax, 0x1u, 4, 0x00u)', sources)
-        self.assertEqual(result['flag_abi']['native_entries'], 1)
-        runtime = lift.prepare_test_runtime()
-        for direct in (False, True):
-            for name in result['translation_units']:
-                subprocess.run(['gcc', '-O2', '-std=c11', '-Werror=implicit-function-declaration',
-                                *(['-DAC1_DIRECT_MEMORY'] if direct else []),
-                                '-I', str(runtime), '-I', str(common.ROOT/'src/runtime'), '-I', str(work),
-                                '-c', str(work/name), '-o', str(work/(name+'.obj'))],
-                               check=True, capture_output=True, timeout=60)
 
 
 if __name__ == '__main__': unittest.main()

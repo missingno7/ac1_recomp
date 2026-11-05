@@ -127,7 +127,7 @@ def run() -> None:
     _python, pcrecomp = module.resolve_tooling(config, tooling_args)
     generated_dir = WORK / "generated"
     generated_dir.mkdir(parents=True, exist_ok=True)
-    result = module.emit_lift(binary, pcrecomp, functions, generated_dir, 100, 0, None)
+    result = module.emit_lift(binary, pcrecomp, functions, generated_dir, 100, whole_program=True)
     failures = result.get("lift_failures", [])
     if failures or len(result.get("lifted", [])) != len(ADDRESSES):
         raise RuntimeError(f"failed to emit both MMX routines: {failures}")

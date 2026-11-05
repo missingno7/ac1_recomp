@@ -19,7 +19,7 @@ class NativeX87Tests(unittest.TestCase):
         instructions = list(lifter.md.disasm(raw, 0x401000))
         spec = {'address': 0x401000, 'size': len(raw), 'blocks': [{'start': 0x401000, 'end': 0x401000+len(raw),
                 'instructions': [[i.address, i.size] for i in instructions]}]}
-        return lift.flag_liveness_function(lift.lift_exact_function(lifter, spec, read, X86_OP_IMM, X86_OP_MEM))
+        return lift.lift_exact_function(lifter, spec, read, X86_OP_IMM, X86_OP_MEM)
 
     @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
     def test_block_local_stack_matches_exact_lowering(self):
@@ -53,7 +53,7 @@ class NativeX87Tests(unittest.TestCase):
         instructions = list(lifter.md.disasm(raw, base))
         spec = {'address': base, 'size': len(raw), 'blocks': [{'start': base, 'end': base+len(raw),
                 'instructions': [[i.address, i.size] for i in instructions]}]}
-        body = lift.flag_liveness_function(lift.lift_exact_function(lifter, spec, read, X86_OP_IMM, X86_OP_MEM))
+        body = lift.lift_exact_function(lifter, spec, read, X86_OP_IMM, X86_OP_MEM)
         return body, instructions
 
     def test_stack_observers_keep_the_exact_lowering(self):

@@ -187,7 +187,7 @@ class LocalRegisterTests(unittest.TestCase):
         instructions=list(lifter.md.disasm(raw,0x401000))
         spec={'address':0x401000,'size':len(raw),'blocks':[{'start':0x401000,'end':0x401000+len(raw),
             'instructions':[[i.address,i.size] for i in instructions]}]}
-        plain=lift.flag_liveness_function(lift.lift_exact_function(lifter,spec,read,X86_OP_IMM,X86_OP_MEM))
+        plain=lift.lift_exact_function(lifter,spec,read,X86_OP_IMM,X86_OP_MEM)
         local=lift.local_register_function(plain)
         self.assertNotIn('memcpy(',local)
         self.assertIn('_ac1_regs.esp = _ac1_pop;',local)   # POP ESP takes the loaded value
@@ -222,30 +222,29 @@ class LocalRegisterTests(unittest.TestCase):
         self.assertIn('/* indirect jmp */ dispatch_jmp(c,', body)
         work = ROOT / 'work/local-regs-tests'
         work.mkdir(parents=True, exist_ok=True)
-        for flags in ('off', 'cfg'):
-            source = work / f'tail-{flags}.c'
-            source.write_text('#include "cpu.h"\n#define AC1_SET_GUEST_EIP(c,va) ((c)->eip=(va))\n' +
-                              lift.local_register_function(lift.flag_liveness_function(body, flags)))
-            exe = source.with_suffix('.exe')
-            subprocess.run(['gcc', '-std=c11', '-O2', '-fwrapv', '-fno-strict-aliasing',
-                            '-I', str(lift.prepare_test_runtime()), str(source),
-                            str(ROOT / 'tests/codegen_local_regs_semantics.c'), '-o', str(exe)],
-                           check=True, capture_output=True, timeout=60)
-            result = subprocess.run([str(exe)], check=True, capture_output=True, text=True, timeout=15)
-            self.assertIn('1000 leading-comment import tails', result.stdout)
+        source = work / 'tail.c'
+        source.write_text('#include "cpu.h"\n#define AC1_SET_GUEST_EIP(c,va) ((c)->eip=(va))\n' +
+                          lift.local_register_function(body))
+        exe = source.with_suffix('.exe')
+        subprocess.run(['gcc', '-std=c11', '-O2', '-fwrapv', '-fno-strict-aliasing',
+                        '-I', str(lift.prepare_test_runtime()), str(source),
+                        str(ROOT / 'tests/codegen_local_regs_semantics.c'), '-o', str(exe)],
+                       check=True, capture_output=True, timeout=60)
+        result = subprocess.run([str(exe)], check=True, capture_output=True, text=True, timeout=15)
+        self.assertIn('1000 leading-comment import tails', result.stdout)
 
     def test_generated_direct_transfers_with_local_registers(self):
         original = lift.specialize_direct_calls
         def transform(*args):
             body, callees, count = original(*args)
-            return lift.local_register_function(lift.flag_liveness_function(body)), callees, count
+            return lift.local_register_function(body), callees, count
         with patch.object(lift, 'specialize_direct_calls', side_effect=transform):
             direct.DirectCallsTests('test_generated_calls_and_tail_transfers').test_generated_calls_and_tail_transfers()
 
     def test_register_switch_execution_with_local_registers(self):
         original = lift.lift_exact_function
         with patch.object(lift, 'lift_exact_function', side_effect=lambda *a, **k:
-                          lift.local_register_function(lift.flag_liveness_function(original(*a, **k)))):
+                          lift.local_register_function(original(*a, **k))):
             switches.RegisterSwitchTests().test_compile_execute_local_cases_default_ret8_and_unknown_fallback()
 
 

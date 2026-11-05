@@ -3568,11 +3568,11 @@ def flag_contract_rows(body, lifted):
     return dict(prefix=prefix, pending=pending, groups=groups, rows=rows, entry=entry, opaque=opaque)
 
 
-def flag_contract_solve(flow, R, E, e_call, e_jump, native=frozenset()):
+def flag_contract_solve(flow, R, E, e_call, e_jump):
     """Per-group live-in; a call reads its callee's entry demand, then defines all flags.
 
-    Imports and native bindings return with the incoming flags (host code does
-    not write them), so demand after them also reads through them.
+    Imports return with the incoming flags (host code does not write them), so
+    demand after them also reads through them.
     """
     reads, writes = [], []
     for row in flow['rows']:
@@ -3580,7 +3580,7 @@ def flag_contract_solve(flow, R, E, e_call, e_jump, native=frozenset()):
         if row['call']:
             kind, target = row['call']
             read |= E[target] if kind == 'direct' else e_call
-            if kind == 'import' or target in native:
+            if kind == 'import':
                 write = 0
                 if row['tail']: read |= R
         if row['ret']: read |= R
@@ -3614,7 +3614,7 @@ def flag_sync(flags, store):
                    for f in FLAG_FIELDS if flags & FLAG_BITS[f])
 
 
-def flag_contract_emit(flow, masks, after, own_return, entry, E, e_call, e_jump, native):
+def flag_contract_emit(flow, masks, after, own_return, entry, E, e_call, e_jump):
     """Masked helpers on function-local flags; the CPU struct holds flags only
     where a contract needs them: a callee's entry demand before a call, the
     demand after it (reloaded), our return demand before a return. Groups
@@ -3632,7 +3632,6 @@ def flag_contract_emit(flow, masks, after, own_return, entry, E, e_call, e_jump,
         guarded = bool(re.search(r'\b(?:if|while|for|switch)\b', FLAG_X87_CHECK.sub('', code)))
         local = (all(n in FLAG_TRANSPARENT_HELPERS or n in FLAG_LOCAL_CLONES for n in names)
                  and not re.search(r'\bc\b', re.sub(r'\b\w+\(c(?=\s*[,)])|\bc->\w+', '', rest))
-                 and target not in native
                  and not (kind in ('direct', 'indirect') and guarded and not row['tail']))
         if not local:
             reload = flag_sync(FLAG_ALL, False)
@@ -3669,7 +3668,7 @@ def flag_contract_emit(flow, masks, after, own_return, entry, E, e_call, e_jump,
                                                    if line.strip()] + ['}'])
 
 
-def flag_contract_program(bodies, pinned=(), call_targets=None, jump_targets=None):
+def flag_contract_program(bodies, call_targets=None, jump_targets=None):
     """Whole-program EFLAGS contracts, one emitted body per function.
 
     E(F) is what F reads at entry before defining it; R(F) what callers read
@@ -3678,10 +3677,9 @@ def flag_contract_program(bodies, pinned=(), call_targets=None, jump_targets=Non
     and imports (host code may call back) read the entry demand of any possible
     target, and the demand after them joins R of every such target; indirect
     jumps read and pass on demand likewise. Possible targets default to every
-    entry. Native bindings keep conservative per-function masks.
+    entry.
     """
     lifted = set(bodies)
-    native = frozenset(pinned) & lifted
     call_targets = lifted if call_targets is None else set(call_targets) & lifted
     jump_targets = lifted if jump_targets is None else set(jump_targets) & lifted
     flows = {a: flag_contract_rows(b, lifted) for a, b in bodies.items()}
@@ -3696,7 +3694,7 @@ def flag_contract_program(bodies, pinned=(), call_targets=None, jump_targets=Non
     while queue:
         a = queue.popleft(); queued.discard(a); solves += 1
         flow = flows[a]
-        live, after, _, _ = flag_contract_solve(flow, R[a], E, e_call, e_jump, native)
+        live, after, _, _ = flag_contract_solve(flow, R[a], E, e_call, e_jump)
         wake = set()
         entry = live[flow['entry']] if live else 0
         if entry & E[a] != E[a]: raise ValueError(f'non-monotone FLAGABI entry demand at 0x{a:08X}')
@@ -3724,23 +3722,20 @@ def flag_contract_program(bodies, pinned=(), call_targets=None, jump_targets=Non
     for a, body in bodies.items():
         flow = flows[a]
         opaque.update(flow['opaque'])
-        if a in native:
-            contracted[a] = flag_liveness_function(body, 'cfg'); continue
-        _, after, reads, _ = flag_contract_solve(flow, R[a], E, e_call, e_jump, native)
+        _, after, reads, _ = flag_contract_solve(flow, R[a], E, e_call, e_jump)
         masks = [row['lanes'] & (out | r) for row, out, r in zip(flow['rows'], after, reads)]
         eligible = [row['eligible'] for row in flow['rows']]
         masked += sum(eligible)
         live_bits += sum(bin(m).count('1') for m, e in zip(masks, eligible) if e)
-        contracted[a] = flag_contract_emit(flow, masks, after, R[a], E[a], E, e_call, e_jump, native)
+        contracted[a] = flag_contract_emit(flow, masks, after, R[a], E[a], E, e_call, e_jump)
     report = dict(
-        functions=len(bodies), native_entries=len(native), solves=solves,
+        functions=len(bodies), solves=solves,
         indirect_call_targets=len(call_targets), indirect_jump_targets=len(jump_targets),
         indirect_entry_demand=e_call, indirect_jump_entry_demand=e_jump,
         indirect_return_demand=d_call, indirect_jump_return_demand=d_jump,
         entry_demand_functions=sum(bool(v) for v in E.values()),
         return_demand_functions=sum(bool(v) for v in R.values()),
         indirect_targets_with_entry_demand=[f'0x{a:08X}' for a in sorted(jump_targets) if E[a]],
-        native_contracts={f'0x{a:08X}': [E[a], R[a]] for a in sorted(native)},
         masked_helpers=masked, live_flag_lanes=live_bits,
         opaque_helpers=dict(opaque.most_common()))
     return contracted, report
@@ -3778,97 +3773,6 @@ def flag_indirect_targets(bodies, functions, stored=frozenset()):
     return taken - interior, taken
 
 
-def flag_liveness_function(body: str, mode: str = 'cfg') -> str:
-    """Only kill writes proved dead in emitted semantics, never x86 undefined bits.
-
-    Calls, escapes, unknown CPU helpers and full flag observations are barriers.
-    Functions using FS/GS (including SEH) retain their complete original flags.
-    Return flags stay live: this is deliberately not a cross-call FLAGABI pass.
-    """
-    if mode == 'off' or re.search(r'\b(?:fs|gs):|c->(?:fs|gs)\b|\b(?:seh|longjmp)\b', body, re.I):
-        return body
-    prefix, pending, groups = codegen_instruction_groups(body)
-    if not groups:
-        return body
-    texts = [re.sub(r'/\*.*?\*/', '', '\n'.join(group), flags=re.S) for group in groups]
-    labels = {label: i for i, text in enumerate(texts)
-              for label in re.findall(r'^(L_[0-9A-F]{8}):', text, re.M)}
-    reads, writes, successors, eligible = [], [], [], []
-    for i, text in enumerate(texts):
-        calls = re.findall(r'\b(flags_\w+)\(c\s*,', text)
-        # Repeated string bodies and atomics contain intra-instruction control
-        # flow; retain those bodies until an instruction-local CFG is modeled.
-        simple = (len(calls) == 1 and calls[0] in FLAG_HELPERS and
-                  not re.search(r'\b(?:if|while|for|goto|return)\b|atomic_', text))
-        write = FLAG_HELPERS[calls[0]] if simple else 0
-        read = sum(bit for flag, bit in FLAG_BITS.items() if re.search(r'\bc->' + flag + r'\b', text))
-        if calls and calls[0] in ('flags_adc', 'flags_sbb'):
-            read |= FLAG_BITS['cf']
-        pointer_uses = re.sub(r'\bc->\w+', 'member', text)
-        safe = '|'.join(FLAG_HELPERS) + '|AC1_SET_GUEST_EIP|push32|pop32'
-        pointer_uses = re.sub(r'\b(?:' + safe + r')\(c(?=[,)])', 'safe(', pointer_uses)
-        if re.search(r'\bc\b|RECOMP_TODO\(|ac1_unsupported_instruction\(', pointer_uses):
-            read = FLAG_ALL
-        if re.search(r'/\*\s*[0-9A-Fa-f]{8}:\s*(?:lahf|pushfd|pushf)\b', '\n'.join(groups[i])):
-            read = FLAG_ALL
-        targets = re.findall(r'\bgoto (L_[0-9A-F]{8});', text)
-        edges = {labels[t] for t in targets if t in labels}
-        # A direct unconditional goto has no fallthrough. Conditional returns
-        # and switch-like generated blocks conservatively retain fallthrough.
-        terminal = bool(re.search(r'^\s*(?:goto L_[0-9A-F]{8};|(?:dispatch_jmp|guest_ret)\()',
-                                  text, re.M))
-        if not terminal and i + 1 < len(groups):
-            edges.add(i + 1)
-        if i + 1 == len(groups) or 'return;' in text or any(t not in labels for t in targets):
-            read = FLAG_ALL
-        if mode == 'straight' and (targets or i + 1 < len(groups) and
-                                  re.search(r'^L_[0-9A-F]{8}:', texts[i + 1], re.M)):
-            read = FLAG_ALL
-        reads.append(read)
-        writes.append(write)
-        successors.append(edges)
-        eligible.append(simple)
-    live = [0] * len(groups)
-    changed = True
-    while changed:
-        changed = False
-        for i in reversed(range(len(groups))):
-            out = 0
-            for target in successors[i]:
-                out |= live[target]
-            value = reads[i] | (out & ~writes[i])
-            if value != live[i]:
-                live[i] = value
-                changed = True
-    output = prefix + pending
-    for i, group in enumerate(groups):
-        if eligible[i]:
-            out = 0
-            for target in successors[i]:
-                out |= live[target]
-            # Include same-instruction observations/barriers conservatively.
-            mask = writes[i] & (out | reads[i])
-            text = '\n'.join(group)
-            match = re.search(r'\b(' + '|'.join(FLAG_HELPERS) + r')\(c\s*,', text)
-            depth, end = 1, match.end()
-            # The initial '(' precedes c; scan after the first comma. Nested
-            # operand expressions remain evaluated even with a zero mask.
-            while depth and end < len(text):
-                if text[end] == '(':
-                    depth += 1
-                elif text[end] == ')':
-                    depth -= 1
-                end += 1
-            if depth:
-                raise ValueError('unbalanced generated flag helper')
-            text = text[:end - 1] + f', 0x{mask:02X}u' + text[end - 1:]
-            text = text[:match.start()] + match.group(1) + '_m' + text[match.start() + len(match.group(1)):]
-            output.extend(text.splitlines())
-        else:
-            output.extend(group)
-    return '\n'.join(output + ['}'])
-
-
 def specialize_direct_calls(body: str, lifted: set[int]) -> tuple[str, set[int], int]:
     """Bind only successful main-image entries, after cached bodies are lifted.
 
@@ -3886,63 +3790,6 @@ def specialize_direct_calls(body: str, lifted: set[int]) -> tuple[str, set[int],
         return f"AC1_CALL(c, L_{target:08X}, 0x{target:08X}u)"
     body = re.sub(r"\bdispatch\(c, 0x([0-9A-Fa-f]{8})u\)", replace, body)
     return body, callees, count
-
-
-def native_instruction_hash(spec: dict, read_va) -> str:
-    """Hash sparse recovered code, including each instruction's VA and size."""
-    import struct
-    instructions = sorted({(a, n) for b in spec['blocks'] for a, n in b['instructions']})
-    digest = hashlib.sha256()
-    for address, size in instructions:
-        raw = read_va(address, size)
-        if len(raw) != size: raise ValueError(f"short native code read at 0x{address:08X}")
-        digest.update(struct.pack('<IH', address, size))
-        digest.update(raw)
-    return digest.hexdigest()
-
-
-def validate_native_bindings(entries: list, functions: list[dict], lifted: set[int], read_va, md) -> dict:
-    specs = {f['address']: f for f in functions}
-    result = {}
-    for entry in entries:
-        if entry.get('kind') == 'region':
-            continue
-        address = int(entry['address'], 0)
-        if address in result: raise ValueError(f"duplicate native binding 0x{address:08X}")
-        if address not in lifted: raise ValueError(f"native binding 0x{address:08X} has no translated oracle")
-        for key in ('implementation', 'plan'):
-            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', entry[key]):
-                raise ValueError(f"native binding 0x{address:08X}: invalid C identifier {key}")
-        spec = specs[address]
-        actual = native_instruction_hash(spec, read_va)
-        if actual != entry['instruction_sha256']:
-            raise ValueError(f"native binding 0x{address:08X}: instruction hash expected {entry['instruction_sha256']}, got {actual}")
-        # Verification executes both bodies on a serialized guest owner. Calls,
-        # imports and external tail transfers could yield or affect host state.
-        addresses = {a for b in spec['blocks'] for a, _ in b['instructions']}
-        for block in spec['blocks']:
-            for va, size in block['instructions']:
-                insn = next(md.disasm(read_va(va, size), va, count=1))
-                if insn.mnemonic.startswith(('call', 'int', 'sys', 'lock')):
-                    raise ValueError(f"native oracle 0x{address:08X} is not a pure leaf: {va:08X} {insn.mnemonic}")
-                if insn.mnemonic.startswith(('j', 'loop')):
-                    from capstone.x86 import X86_OP_IMM
-                    if not insn.operands or insn.operands[0].type != X86_OP_IMM or insn.operands[0].imm not in addresses:
-                        raise ValueError(f"native oracle 0x{address:08X} has external/indirect transfer at 0x{va:08X}")
-        result[address] = entry
-    return result
-
-
-def wrap_native_binding(body: str, address: int, entry: dict) -> str:
-    signature = f'void L_{address:08X}(CPU *c)'
-    if body.count(signature) != 1: raise ValueError(f"native binding 0x{address:08X}: unexpected function signature")
-    original = f'ac1_translated_{address:08X}'
-    body = body.replace(signature, f'static void {original}(CPU *c)', 1)
-    impl, plan = entry['implementation'], entry['plan']
-    return (body + f'\nvoid {impl}(CPU *);\nint {plan}(const CPU *, ac1_native_plan *);\n'
-            f'ac1_native_binding ac1_binding_{address:08X} = {{.va=0x{address:08X}u, '
-            f'.name="{impl}", .body={impl}, .plan={plan}}};\n'
-            f'void L_{address:08X}(CPU *c) {{ ac1_native_invoke(c, &ac1_binding_{address:08X}, {original}); }}\n')
 
 
 # Audited pinned helpers only: every CPU access is flag state, with no GPR
@@ -3972,224 +3819,6 @@ def local_stack_operations(body: str) -> str:
     body = LOCAL_PUSH.sub(lambda m: f'{m[1]}{{ uint32_t _ac1_push = {m[2]}; c->esp -= 4u; wr32(c->esp, _ac1_push); }}', body)
     body = LOCAL_POP.sub(lambda m: f'{m[1]}{{ uint32_t _ac1_pop = rd32(c->esp); c->esp += 4u; {m[2]} = _ac1_pop; }}', body)
     return LOCAL_POP_DISCARD.sub(lambda m: f'{m[1]}c->esp += 4u;', body)
-def validate_region_bindings(entries, functions, lifted, read_va, md):
-    specs = {f['address']: f for f in functions}
-    result = {}
-    for entry in entries:
-        if entry.get('kind') != 'region': continue
-        address = int(entry['address'], 0)
-        if address in result: raise ValueError(f'duplicate native region {address:08X}')
-        if address not in lifted: raise ValueError(f'region {address:08X} has no translated oracle')
-        for key in ('implementation', 'plan', 'pending'):
-            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', entry[key]): raise ValueError(f'invalid region C identifier {key}')
-        journal = entry.get('verification') == 'write_journal'
-        if not 0 <= int(entry['context_bytes']) <= 8192: raise ValueError('region context must fit bounded storage')
-        for key in ('residual_predicate', 'residual_hook'):
-            if key in entry and not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', entry[key]):
-                raise ValueError(f'invalid region C identifier {key}')
-        if native_instruction_hash(specs[address], read_va) != entry['instruction_sha256']:
-            raise ValueError(f'region {address:08X}: entry instruction hash changed')
-        members = {}
-        for member in entry['members']:
-            va = int(member['address'], 0)
-            if va in members or va not in lifted: raise ValueError(f'region {address:08X}: duplicate/missing member {va:08X}')
-            if native_instruction_hash(specs[va], read_va) != member['instruction_sha256']:
-                raise ValueError(f'region {address:08X}: member {va:08X} instruction hash changed')
-            ranges = member.get('subsumed_ranges', [])
-            if not ranges: raise ValueError(f'region {address:08X}: member {va:08X} has no subsumed ranges')
-            for region_range in ranges:
-                lo, hi = int(region_range['start'], 0), int(region_range['end'], 0)
-                bounds=[(a,a+n) for block in specs[va]['blocks'] for a,n in block['instructions']]
-                if lo < min(a for a,z in bounds) or hi > max(z for a,z in bounds) or lo >= hi:
-                    raise ValueError(f'region {address:08X}: invalid subsumed range {lo:08X}..{hi:08X}')
-                if hashlib.sha256(read_va(lo, hi-lo)).hexdigest() != region_range['sha256']:
-                    raise ValueError(f'region {address:08X}: subsumed range hash changed at {lo:08X}')
-            members[va] = member
-        if address not in members: raise ValueError(f'region {address:08X}: entry absent from pinned members')
-        boundary = int(entry['boundary'], 0) if not journal else None
-        if not journal and boundary not in {b['start'] for b in specs[address]['blocks']}:
-            raise ValueError(f'region {address:08X}: effect boundary is not a recovered block entry')
-        guards = {(int(t['site'],0),int(t['target'],0)) for t in entry.get('guarded_transfers',[])}
-        indirect = {int(t['site'],0):{int(v,0) for v in t['targets']} for t in entry.get('indirect_calls',[])}
-        for call in entry.get('indirect_calls',[]):
-            if not {int(v,0) for v in call.get('native_targets',call['targets'])} <= {int(v,0) for v in call['targets']}:
-                raise ValueError('region native callback whitelist is outside closed callback set')
-        seen_guards=set();seen_indirect=set()
-        for va in members:
-            spec = specs[va]
-            instructions = {a for b in spec['blocks'] for a, _ in b['instructions']}
-            for b in spec['blocks']:
-                for pc, size in b['instructions']:
-                    if not journal and va == address and pc >= boundary: continue
-                    if not any(int(r['start'],0) <= pc and pc+size <= int(r['end'],0)
-                               for r in members[va]['subsumed_ranges']):
-                        raise ValueError(f'region {address:08X}: uncovered instruction {pc:08X}')
-                    insn = next(md.disasm(read_va(pc,size),pc,count=1))
-                    if insn.mnemonic.startswith(('int','sys','lock')) or insn.mnemonic in ('xadd','cmpxchg','cmpxchg8b','in','out','hlt','cli','sti'):
-                        raise ValueError(f'region {address:08X}: unsafe instruction {pc:08X} {insn.mnemonic}')
-                    if insn.mnemonic.startswith(('call','j','loop')):
-                        from capstone.x86 import X86_OP_IMM
-                        if not insn.operands or insn.operands[0].type != X86_OP_IMM:
-                            if journal and pc in indirect:
-                                if not indirect[pc] <= members.keys(): raise ValueError('region indirect whitelist has unpinned target')
-                                seen_indirect.add(pc);continue
-                            if journal and (pc,0) in guards: seen_guards.add((pc,0));continue
-                            raise ValueError(f'region {address:08X}: unclosed indirect transfer {pc:08X}')
-                        target = insn.operands[0].imm
-                        if target not in instructions and target not in members:
-                            if journal and (pc,target) in guards: seen_guards.add((pc,target));continue
-                            raise ValueError(f'region {address:08X}: unpinned target {target:08X} at {pc:08X}')
-        if guards != seen_guards or set(indirect) != seen_indirect: raise ValueError('region has stale guarded/indirect transfer declaration')
-        result[address] = entry
-    return result
-
-
-def emit_region_sources(regions, lifted, bodies, output_dir, tu_header):
-    originals = dict(zip(lifted,bodies))
-    for address, entry in regions.items():
-        if entry.get('verification') == 'write_journal':
-            emit_journal_region_source(address,entry,originals,output_dir,tu_header)
-            continue
-        members = {int(m['address'],0) for m in entry['members']}
-        boundary = int(entry['boundary'],0)
-        name = lambda va: f'ac1_region_{address:08X}_m_{va:08X}'
-        declarations = '\n'.join(f'static void {name(va)}(CPU *);' for va in sorted(members) if va != address)
-        def close_calls(body):
-            body = re.sub(r'AC1_CALL\(c,\s*L_([0-9A-F]{8}),\s*0x[0-9A-F]+u\)',
-                          lambda m: f'{name(int(m[1],16))}(c)' if int(m[1],16) in members else
-                                    f'ac1_native_region_forbidden(c,0x{m[1]}u)',body)
-            body = re.sub(r'dispatch(?:_jmp)?\(c,\s*([^;)]+)\)',r'ac1_native_region_forbidden(c,\1)',body)
-            return body
-        root = originals[address]
-        marker = f'L_{boundary:08X}:\n'
-        if root.count(marker) != 1: raise ValueError(f'region {address:08X}: missing unique boundary label')
-        prefix = root.replace(marker,marker+f'    AC1_SET_GUEST_EIP(c,0x{boundary:08X}u); return;\n')
-        oracle = close_calls(prefix).replace(f'void L_{address:08X}(CPU *c)',f'void ac1_region_oracle_{address:08X}(CPU *c)',1)
-        clones=[]
-        for va in sorted(members-{address}):
-            clones.append(close_calls(originals[va]).replace(f'void L_{va:08X}(CPU *c)',f'static void {name(va)}(CPU *c)',1))
-        residual = prefix.replace(f'void L_{address:08X}(CPU *c)',f'void ac1_region_residual_{address:08X}(CPU *c, const ac1_region_plan *plan)',1)
-        sites={int(s['site'],0):s for s in entry.get('residual_calls',[])}
-        for site,s in sites.items():
-            target=int(s['target'],0)
-            expression=rf'AC1_CALL\(c, L_{target:08X}, 0x{target:08X}u\)(?=;[^\n]* /\* {site:08X}:)'
-            replacement=(f'{{ if({entry["residual_predicate"]}(c,plan,0x{site:08X}u)) {name(target)}(c); '
-                         f'else {{ c->esp += {4+int(s["ret_pop"])}u; }} }}')
-            residual,n=re.subn(expression,replacement,residual)
-            if n!=1: raise ValueError(f'region residual call site {site:08X}: matched {n}')
-        residual=close_calls(residual)
-        for hook in entry.get('residual_hooks',[]):
-            pc=int(hook,0)
-            token=f'    AC1_SET_GUEST_EIP(c, 0x{pc:08X}u);'
-            if residual.count(token)!=1: raise ValueError(f'region residual hook {pc:08X}: not unique')
-            residual=residual.replace(token,f'    {entry["residual_hook"]}(c,plan,0x{pc:08X}u);\n'+token)
-        tail='void ac1_region_continue_%08X(CPU *c)\n{\n    AC1_DECLARE_LOCAL_ARENA;\n'%address+root[root.index(marker):]
-        extra=''
-        if entry.get('residual_calls'): extra+=f'int {entry["residual_predicate"]}(const CPU *,const ac1_region_plan *,uint32_t);\n'
-        if entry.get('residual_hooks'): extra+=f'void {entry["residual_hook"]}(CPU *,const ac1_region_plan *,uint32_t);\n'
-        source=tu_header+'#include "ac1_native.h"\n'+extra+declarations+'\n'+'\n\n'.join(clones+[oracle,residual,tail])+'\n'
-        write_text_if_changed(output_dir/f'initial_region_{address:08X}.c',source)
-    return [f'initial_region_{va:08X}.c' for va in sorted(regions)]
-
-
-def emit_journal_region_source(address,entry,originals,output_dir,tu_header):
-    members={int(m['address'],0) for m in entry['members']}
-    graph={va:{int(v,16) for v in re.findall(r'AC1_CALL\(c,\s*L_([0-9A-F]{8}),',originals[va])}&members for va in members}
-    graph[address].update(int(v,0) for call in entry.get('indirect_calls',[]) for v in call['targets'])
-    visited=set();path=[];recursive=set()
-    def visit(va):
-        if va in path: recursive.update(path[path.index(va):]);return
-        if va in visited:return
-        path.append(va)
-        for child in graph[va]:visit(child)
-        path.pop();visited.add(va)
-    for va in members:visit(va)
-    # These adapters have no CPU argument and deliberately intercept writes.
-    # Keep their existing memory API; ordinary guest bodies capture the base.
-    journal_header=tu_header.replace('#include "ac1_local_memory.h"',
-                                    '#define AC1_DECLARE_LOCAL_ARENA ((void)0)')
-    source=journal_header+'#define AC1_REGION_JOURNAL_ADAPTERS\n#include "ac1_region_journal.h"\n'
-    # This project-owned SIMD implementation is compiled in the journal TU so
-    # its stack/output writes use exactly the same transactional adapters.
-    # Rename every external leaf the file defines, or each one would be
-    # defined twice (here and in ac1_native_leaf.c's own object).
-    math_names=[]
-    leaf_source=(ROOT/'src/runtime/ac1_native_leaf.c').read_text(encoding='utf-8')
-    for va in sorted({int(v,16) for v in re.findall(r'^(?:int|void) ac1_native_([0-9A-F]{8})(?:_plan)?\(',leaf_source,re.M)}):
-        for suffix in ('','_plan'):
-            old=f'ac1_native_{va:08X}{suffix}';new=f'ac1_r_{address:08X}_math_{va:08X}{suffix}'
-            math_names.append(old);source+=f'#define {old} {new}\n'
-    source+='#include "ac1_native_leaf.c"\n'+''.join(f'#undef {n}\n' for n in math_names)
-    for flavor in ('oracle','fused'):
-        name=lambda va:f'ac1_r_{address:08X}_{flavor}_{va:08X}'
-        def qualifier(va):
-            # Keep large unchanged pose/CRT kernels as direct private calls.
-            # Forcing the entire recursive-sized cone through GCC's SRA uses
-            # gigabytes and duplicates cold math paths without removing work.
-            inline=flavor=='fused' and va not in recursive and va<0x00f90000 and (va in (address,0x654090,0x6c4ff0) or originals[va].count('\n')<220)
-            return 'static inline __attribute__((always_inline)) void' if inline else 'static void'
-        source+='\n'.join(f'{qualifier(v)} {name(v)}(CPU *);' for v in sorted(members))+'\n'
-        for va in sorted(members):
-            body=originals[va].replace(f'void L_{va:08X}(CPU *c)',f'{qualifier(va)} {name(va)}(CPU *c)',1)
-            if flavor=='fused' and va in (0x653400,0x42ee70):
-                start=body.index('{')+1
-                fast=f'ac1_r_{address:08X}_math_{va:08X}'
-                body=body[:start]+f'\n    if({fast}_plan(c,NULL)) {{ {fast}(c);return; }}\n'+body[start:]
-            body=re.sub(r'AC1_CALL\(c,\s*L_([0-9A-F]{8}),\s*0x[0-9A-F]+u\)',
-                lambda m:f'{name(int(m[1],16))}(c)' if int(m[1],16) in members else f'ac1_native_region_forbidden(c,0x{m[1]}u)',body)
-            for indirect in entry.get('indirect_calls',[]):
-                pc=int(indirect['site'],0)
-                expression=rf'dispatch\(c, ([^;]+)\)(?=;[^\n]* /\* {pc:08X}:)'
-                native_targets={int(v,0) for v in indirect.get('native_targets',indirect['targets'])}
-                cases=' '.join(f'case {v}u: '+(name(int(v,0)) if flavor=='oracle' or int(v,0) in native_targets else f'ac1_r_{address:08X}_oracle_{int(v,0):08X}')+'(c);break;' for v in indirect['targets'])
-                body,n=re.subn(expression,lambda m:'{ uint32_t target='+m[1]+'; switch(target) { '+cases+' default: ac1_native_region_forbidden(c,target); } }',body)
-                if va==address and n!=1: raise ValueError(f'journal indirect site {pc:08X} matched {n}')
-            body=re.sub(r'dispatch(?:_jmp)?\(c,\s*([^;)]+)\)',r'ac1_native_region_forbidden(c,\1)',body)
-            # All writes in this closed TU must go through the CPU adapters.
-            if re.search(r'\b(?:guest_atomic_|guest_execution_write\s*\(|memcpy\s*\(|memmove\s*\(|memset\s*\()',body):
-                raise ValueError(f'journal region {address:08X}: unaudited write helper in {va:08X}')
-            source+=body+'\n\n'
-    source+=f'''void ac1_region_oracle_{address:08X}(CPU *c) {{ ac1_r_{address:08X}_oracle_{address:08X}(c); }}
-void {entry['implementation']}(CPU *c,const ac1_region_plan *plan) {{
-    (void)plan; CPU local; memcpy(&local,c,sizeof(local));
-    ac1_r_{address:08X}_fused_{address:08X}(&local); memcpy(c,&local,sizeof(local));
-}}
-'''
-    write_text_if_changed(output_dir/f'initial_region_{address:08X}.c',source)
-
-
-def wrap_region_binding(body, address, entry):
-    original=f'ac1_translated_{address:08X}'
-    body=body.replace(f'void L_{address:08X}(CPU *c)',f'static void {original}(CPU *c)',1)
-    impl,prepare,pending=entry['implementation'],entry['plan'],entry['pending']
-    if entry.get('verification') == 'write_journal':
-        return body+f'''
-void {impl}(CPU *,const ac1_region_plan *);
-void ac1_region_oracle_{address:08X}(CPU *);
-void ac1_native_journal_invoke(CPU *,ac1_native_region *,void (*)(CPU *),void (*)(CPU *));
-ac1_native_region ac1_region_binding_{address:08X} = {{.va=0x{address:08X}u,
- .name="{impl}",.body={impl}}};
-void L_{address:08X}(CPU *c) {{ if(!ac1_region_binding_{address:08X}.enabled) {{ {original}(c);return; }}
- ac1_native_journal_invoke(c,&ac1_region_binding_{address:08X},
- {original},ac1_region_oracle_{address:08X}); }}
-'''
-    return body+f'''
-void {impl}(CPU *, const ac1_region_plan *);
-int {prepare}(const CPU *, ac1_region_plan *);
-void {pending}(const CPU *, ac1_pending_upload *);
-void ac1_region_oracle_{address:08X}(CPU *);
-void ac1_region_continue_{address:08X}(CPU *);
-ac1_native_region ac1_region_binding_{address:08X} = {{.va=0x{address:08X}u,
- .boundary={entry['boundary']}u, .name="{impl}", .context_size={int(entry['context_bytes'])},
- .prepare={prepare}, .body={impl}, .pending={pending}}};
-void L_{address:08X}(CPU *c) {{ if(!ac1_region_binding_{address:08X}.enabled) {{ {original}(c);return; }}
- ac1_native_region_invoke(c,&ac1_region_binding_{address:08X},
- {original},ac1_region_oracle_{address:08X},ac1_region_continue_{address:08X}); }}
-'''
-
-
-
-
 def declare_local_memory_base(body: str) -> str:
     """Capture the stable arena for every generated CPU entry, including oracles."""
     pattern = r'(?m)^(?:static )?void \w+\(CPU \*c\)\s*\{'
@@ -4494,8 +4123,7 @@ _X87_FREE_HELPERS = None
 def profile_count_entry(body: str, address: int) -> str:
     """Count public entries in a dedicated build; normal bodies stay identical.
 
-    Applied after native wrapping so direct calls and indirect dispatch count
-    once, including native fallbacks. This mode is for counts, never timing.
+    This mode is for counts, never timing.
     """
     pattern = rf'(void L_{address:08X}\(CPU \*c\)\s*\{{)'
     replacement = (r'\1\n    extern void ac1_profile_entry(uint32_t);\n'
@@ -4508,7 +4136,7 @@ def profile_count_entry(body: str, address: int) -> str:
 
 def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: Path,
               functions_per_tu: int, translation_unit_buckets: int = 0,
-              emission_cache=None, native_overrides=None, whole_program: bool = False,
+              emission_cache=None, whole_program: bool = False,
               profile_counts=()) -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
@@ -4647,9 +4275,6 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
             instruction_counts[address] = spec["instruction_count"]
         except Exception as exc:  # preserve other real bodies when one is unsupported
             failures.append({"address": address, "error": repr(exc)})
-    bindings = validate_native_bindings(native_overrides or [], functions, set(lifted), read_va, lifter.md)
-    regions = validate_region_bindings(native_overrides or [], functions, set(lifted), read_va, lifter.md)
-    if set(bindings) & set(regions): raise ValueError('leaf and region entries overlap')
     stored_entries = flag_image_addresses(pe, set(lifted)) if whole_program else set()
     pe.close()
     # Specialize after the complete success set is known. Cached bodies remain
@@ -4662,22 +4287,12 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
             bodies[index], direct_callees[address], sites = specialize_direct_calls(bodies[index], successful)
             direct_sites += sites
     abi_report = None
-    # Region oracles are a closed call graph, and continuations split a body at
-    # a guest label. Their copies keep the independent per-function CFG form,
-    # whose calls and returns keep every flag, before any contract or local
-    # GPR declaration can enter those copied/split bodies.
-    region_members = {int(member['address'], 0) for entry in regions.values()
-                      for member in entry['members']}
-    region_bodies = [flag_liveness_function(body) if address in region_members and whole_program else
-                     body if address in region_members else ''
-                     for address, body in zip(lifted, bodies)] if regions else []
     x87_native_count = local_count = local_xmm_count = 0
     local_excluded = []
     if whole_program:
         by_address = dict(zip(lifted, bodies))
         call_targets, jump_targets = flag_indirect_targets(by_address, functions, stored_entries)
-        contracted, abi_report = flag_contract_program(
-            by_address, set(bindings) | set(regions), call_targets, jump_targets)
+        contracted, abi_report = flag_contract_program(by_address, call_targets, jump_targets)
         for index, address in enumerate(lifted):
             body = contracted[address]
             transformed = native_x87_function(body)
@@ -4691,14 +4306,6 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
                 local_excluded.append(f'0x{address:08X}')
             bodies[index] = local
     bodies = [fence_backward_branches(body) for body in bodies]
-    # Keep L_VA as the one public entry for direct transfers AND the dispatch
-    # table. Retain a private, callable translated oracle behind that entry.
-    region_bodies = [declare_local_memory_base(body) for body in region_bodies]
-    for index, address in enumerate(lifted):
-        if address in bindings:
-            bodies[index] = wrap_native_binding(bodies[index], address, bindings[address])
-        elif address in regions:
-            bodies[index] = wrap_region_binding(bodies[index], address, regions[address])
     count_entries = set(profile_counts)
     if len(count_entries) > 32 or count_entries - set(lifted):
         raise ValueError('profile counts require at most 32 successfully lifted entries: ' +
@@ -4729,11 +4336,10 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         # Per-shard prototypes avoid parsing all 100k entries in every TU.
         callees = set().union(*(direct_callees.get(a, set()) for a in addresses))
         direct_prototypes += len(callees)
-        native_header = '#include "ac1_native.h"\n' if any(a in bindings or a in regions for a in addresses) else ''
-        return (tu_header + native_header +
+        return (tu_header +
                 "".join(f"void L_{a:08X}(CPU *);\n" for a in sorted(callees)) + "\n")
 
-    tu_names = emit_region_sources(regions,lifted,region_bodies,output_dir,tu_header) if regions else []
+    tu_names = []
     if translation_unit_buckets:
         buckets = partition_functions_by_bucket(
             [{"address": address, "body": body}
@@ -4756,25 +4362,10 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     # each bounded initial_NNNN.c translation unit alongside this file.
     write_text_if_changed(output_dir / "initial.c",
         "/* Generated function bodies are split across initial_NNNN.c files. */\n")
-    if image_base == 0x00400000:
-        registry = ['/* Generated native binding registry; no guest bytes. */', '#include "ac1_native.h"']
-        registry.extend(f'extern ac1_native_binding ac1_binding_{a:08X};' for a in sorted(bindings))
-        registry.append('ac1_native_binding *const ac1_native_bindings[] = {')
-        registry.extend(f'    &ac1_binding_{a:08X},' for a in sorted(bindings))
-        if not bindings: registry.append('    NULL,')
-        registry.extend(['};', f'const size_t ac1_native_binding_count = {len(bindings)}u;', ''])
-        registry.extend(f'extern ac1_native_region ac1_region_binding_{a:08X};' for a in sorted(regions))
-        registry.append('ac1_native_region *const ac1_native_regions[] = {')
-        registry.extend(f'    &ac1_region_binding_{a:08X},' for a in sorted(regions))
-        if not regions: registry.append('    NULL,')
-        registry.extend(['};',f'const size_t ac1_native_region_count = {len(regions)}u;',''])
-        write_text_if_changed(output_dir / 'initial_native.c', '\n'.join(registry))
     active_tus = set(tu_names)
     for old_tu in output_dir.glob("initial_[0-9][0-9][0-9][0-9].c"):
         if old_tu.name not in active_tus:
             old_tu.unlink()
-    for old_tu in output_dir.glob('initial_region_*.c'):
-        if old_tu.name not in active_tus: old_tu.unlink()
 
     list_path = output_dir / "initial_list.h"
     list_lines = [
@@ -4829,7 +4420,6 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "direct_call_sites": direct_sites,
         "profile_count_entries": [f'{a:08X}' for a in sorted(count_entries)],
         "direct_callee_declarations": direct_prototypes,
-        "native_overrides": [f"0x{a:08X}" for a in sorted(bindings)],
         "flag_abi": abi_report,
         'x87_native_count': x87_native_count,
         'local_regs': {'admitted_count': local_count, 'xmm_admitted_count': local_xmm_count,
@@ -5156,8 +4746,7 @@ def main() -> int:
     try:
         lift_result = emit_lift(binary, pcrecomp, catalog_doc["functions"], output_dir,
                                 functions_per_tu, translation_unit_buckets,
-                                emission_cache, native_overrides=config.get('native_overrides', []),
-                                whole_program=True,
+                                emission_cache, whole_program=True,
                                 profile_counts=[int(s, 16) for s in args.profile_count_entries.split(',') if s])
     except Exception:
         if emission_cache is not None:
@@ -5180,7 +4769,6 @@ def main() -> int:
         "direct_call_sites": lift_result["direct_call_sites"],
         "profile_count_entries": lift_result['profile_count_entries'],
         "direct_callee_declarations": lift_result["direct_callee_declarations"],
-        "native_overrides": lift_result["native_overrides"],
         "translation_unit_buckets": lift_result["translation_unit_buckets"],
         "outputs": {
             "c": output.name,
