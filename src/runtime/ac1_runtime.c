@@ -98,6 +98,7 @@ struct ac1_guest_thread {
     uint32_t static_tls_data, static_tls_vector;
     uint32_t affinity_mask;
     uint32_t tls_values[AC1_TLS_SLOTS];
+    uint32_t guest_last_error;
     CPU cpu;
 #ifdef _WIN32
     HANDLE host;
@@ -122,6 +123,7 @@ struct ac1_guest_thread {
 };
 
 struct ac1_scheduler {
+    unsigned critical_section_waiters;
 #ifdef _WIN32
     CRITICAL_SECTION mutex;
     CONDITION_VARIABLE condition;
@@ -170,7 +172,8 @@ static char host_game_directory[32768];
 #endif
 static uint32_t command_line_guest_address;
 static struct { uint32_t handle; pcrecomp_heap *heap; } private_heaps[AC1_MAX_PRIVATE_HEAPS];
-static _Thread_local uint32_t last_error;
+static _Thread_local uint32_t unbound_last_error;
+#define last_error (*(active_guest_thread ? &active_guest_thread->guest_last_error : &unbound_last_error))
 static uint32_t max_guest_handles;
 static uint32_t unhandled_exception_filter;
 static char user_data_root[32768];
@@ -199,7 +202,6 @@ static SRWLOCK guest_monitor_lock = SRWLOCK_INIT;
 static int d3d9_configured;
 #endif
 static uint8_t tls_used[AC1_TLS_SLOTS];
-static _Thread_local uint32_t tls_values[AC1_TLS_SLOTS];
 static _Thread_local uint32_t static_tls_data_base;
 static _Thread_local uint32_t static_tls_vector_base;
 static const uint8_t *static_tls_template;
@@ -487,7 +489,6 @@ static void run_guest_thread(ac1_guest_thread *thread)
         static_tls_data_base = thread->static_tls_data;
         static_tls_vector_base = thread->static_tls_vector;
         guest_thread_affinity_mask = thread->affinity_mask;
-        memcpy(tls_values, thread->tls_values, sizeof(tls_values));
         last_error = 0u;
         com_init_count = 0u;
         com_apartment_model = UINT32_MAX;
@@ -1550,7 +1551,6 @@ static int initialize_static_tls(pe32_module *image, char *error, size_t error_c
     memcpy(index_pointer, &index, sizeof(index));
     wr32(AC1_TIB_BASE + 0x2cu, static_tls_vector_base);
     tls_used[index] = 1u;
-    tls_values[index] = static_tls_data_base;
     return 1;
 }
 
@@ -2394,6 +2394,11 @@ static int dispatch_d3d9_method(CPU *cpu, uint32_t target)
 }
 #endif
 
+uint32_t ac1_guest_thread_id(CPU *cpu)
+{
+    return guest_thread_for_cpu(cpu)->id;
+}
+
 static uint32_t current_host_thread_id(void)
 {
     if (active_guest_thread) return active_guest_thread->id;
@@ -2527,19 +2532,23 @@ static unsigned heap_op(const import_record *import)
 
 static int handle_heap_allocation(CPU *cpu, const import_record *import, unsigned op);
 
+uint32_t ac1_tls_get_value(CPU *cpu, uint32_t index)
+{
+    ac1_guest_thread *thread = guest_thread_for_cpu(cpu);
+    if (index >= AC1_TLS_SLOTS || !tls_used[index]) {
+        thread->guest_last_error = 87u;
+        return 0u;
+    }
+    thread->guest_last_error = 0u;
+    return thread->tls_values[index];
+}
+
 static int handle_heap_import(CPU *cpu, const import_record *import)
 {
     if (!import) return 0;
     const unsigned op = classify_import(heap_ops, import, heap_op);
     if (op == HEAP_TLS_GET) {
-        uint32_t index = rd32(cpu->esp + 4u);
-        if (index >= AC1_TLS_SLOTS || !tls_used[index]) {
-            cpu->eax = 0u;
-            last_error = 87u;
-        } else {
-            cpu->eax = tls_values[index];
-            last_error = 0u;
-        }
+        cpu->eax = ac1_tls_get_value(cpu, rd32(cpu->esp + 4u));
         return_stdcall(cpu, 4u);
         return 1;
     }
@@ -2549,7 +2558,7 @@ static int handle_heap_import(CPU *cpu, const import_record *import)
             cpu->eax = 0u;
             last_error = 87u;
         } else {
-            tls_values[index] = rd32(cpu->esp + 8u);
+            active_guest_thread->tls_values[index] = rd32(cpu->esp + 8u);
             cpu->eax = 1u;
         }
         return_stdcall(cpu, 8u);
@@ -2678,7 +2687,7 @@ static int handle_heap_import(CPU *cpu, const import_record *import)
             last_error = 8u;
         } else {
             tls_used[index] = 1u;
-            tls_values[index] = 0u;
+            active_guest_thread->tls_values[index] = 0u;
             cpu->eax = index;
         }
         return_stdcall(cpu, 0u);
@@ -2691,14 +2700,14 @@ static int handle_heap_import(CPU *cpu, const import_record *import)
             last_error = 87u;
         } else {
             tls_used[index] = 0u;
-            tls_values[index] = 0u;
+            active_guest_thread->tls_values[index] = 0u;
             cpu->eax = 1u;
         }
         return_stdcall(cpu, 4u);
         return 1;
     }
     if (!strcmp(name, "GetCurrentThreadId")) {
-        cpu->eax = current_host_thread_id();
+        cpu->eax = ac1_guest_thread_id(cpu);
         return_stdcall(cpu, 0);
         return 1;
     }
@@ -2830,6 +2839,87 @@ static void trace_critical_section_span(const CPU *cpu, const char *name,
     }
 }
 
+/* Guest code runs under the baton, so the fields need no atomics. */
+static int critical_section_acquire(ac1_guest_thread *thread, uint32_t address)
+{
+    uint32_t owner = rd32(address + 12u);
+    if (owner == thread->id) {
+        wr32(address + 4u, rd32(address + 4u) + 1u);
+        wr32(address + 8u, rd32(address + 8u) + 1u);
+        return 1;
+    }
+    if (owner || rd32(address + 4u) != UINT32_MAX) return 0;
+    wr32(address + 4u, 0u);
+    wr32(address + 8u, 1u);
+    wr32(address + 12u, thread->id);
+    return 1;
+}
+
+/* Takes the section or marks the thread blocked on it; the next checkpoint waits. */
+static void critical_section_enter(ac1_guest_thread *thread, uint32_t address)
+{
+    if (critical_section_acquire(thread, address)) return;
+    if (!thread->scheduler) stop_guest("contended EnterCriticalSection has no guest scheduler", address);
+    if (trace_imports)
+        fprintf(stderr, "AC1 CS wait: thread=%u section=0x%08x owner=%u lockcount=%u\n",
+                thread->id, address, rd32(address + 12u), rd32(address + 4u));
+    thread->blocked = 1;
+    thread->wait_kind = AC1_WAIT_CRITICAL_SECTION;
+    thread->wait_handle = address;
+    thread->wait_deadline = 0u;
+    thread->checkpoint_cause = AC1_HANDOFF_CS;
+    ++thread->scheduler->critical_section_waiters;
+}
+
+void ac1_enter_critical_section(CPU *cpu, uint32_t address)
+{
+    ac1_guest_thread *thread = guest_thread_for_cpu(cpu);
+    critical_section_enter(thread, address);
+    if (thread->blocked) scheduler_checkpoint_for_thread(thread);
+}
+
+static void critical_section_hand_off(ac1_guest_thread *thread, uint32_t address)
+{
+    ac1_scheduler *scheduler = thread->scheduler;
+    scheduler_lock(scheduler);
+    for (unsigned i = 0; i < scheduler->count; ++i) {
+        ac1_guest_thread *waiter = &scheduler->threads[i];
+        if (!waiter->blocked || waiter->finished ||
+            waiter->wait_kind != AC1_WAIT_CRITICAL_SECTION || waiter->wait_handle != address)
+            continue;
+        if (!critical_section_acquire(waiter, address)) break;
+        waiter->blocked = 0;
+        --scheduler->critical_section_waiters;
+        ++waiter->wait_completions;
+        waiter->wait_result = 0u;
+        if (trace_imports)
+            fprintf(stderr, "AC1 CS handoff: section=0x%08x waiter=%u lockcount=%u recursion=%u\n",
+                    address, waiter->id, rd32(address + 4u), rd32(address + 8u));
+        if (waiter->priority > thread->priority) thread->checkpoint_force = 1;
+        break;
+    }
+    scheduler_unlock(scheduler);
+}
+
+static void critical_section_leave(ac1_guest_thread *thread, uint32_t address)
+{
+    uint32_t recursion = rd32(address + 8u);
+    if (rd32(address + 12u) != thread->id || !recursion)
+        stop_guest("LeaveCriticalSection called by a non-owner", address);
+    wr32(address + 8u, --recursion);
+    if (!recursion) wr32(address + 12u, 0u);
+    wr32(address + 4u, rd32(address + 4u) - 1u);
+    if (!recursion && thread->scheduler && thread->scheduler->critical_section_waiters)
+        critical_section_hand_off(thread, address);
+}
+
+void ac1_leave_critical_section(CPU *cpu, uint32_t address)
+{
+    ac1_guest_thread *thread = guest_thread_for_cpu(cpu);
+    critical_section_leave(thread, address);
+    if (thread->checkpoint_force) scheduler_checkpoint_for_thread(thread);
+}
+
 enum { CS_NONE = 1, CS_INIT_SPIN, CS_INIT, CS_DELETE, CS_ENTER, CS_LEAVE, CS_TRY_ENTER };
 static uint8_t critical_section_ops[AC1_IMPORT_LIMIT];
 
@@ -2883,94 +2973,14 @@ static int handle_critical_section_import(CPU *cpu, const import_record *import)
         return 1;
     }
 
-    uint32_t owner = rd32(address + 12u);
-    uint32_t thread = current_host_thread_id();
-    if (enter || try_enter) {
-        if (owner == thread) {
-            (void)guest_atomic_xadd32(address + 4u, 1u);
-            wr32(address + 8u, rd32(address + 8u) + 1u);
-            cpu->eax = 1u;
-        } else if (!owner) {
-            uint32_t prior = guest_atomic_xadd32(address + 4u, 1u);
-            if (prior == UINT32_MAX) {
-                wr32(address + 8u, 1u);
-                wr32(address + 12u, thread);
-                cpu->eax = 1u;
-            } else {
-                (void)guest_atomic_xadd32(address + 4u, UINT32_MAX);
-                cpu->eax = 0u;
-                if (enter) {
-                    if (!active_guest_thread || !active_scheduler)
-                        stop_guest("contended EnterCriticalSection has no guest scheduler", import->token);
-                    if (trace_imports)
-                        fprintf(stderr,
-                                "AC1 CS wait: thread=%u section=0x%08x owner=%u lockcount=%u\n",
-                                active_guest_thread->id, address, owner,
-                                rd32(address + 4u));
-                    active_guest_thread->blocked = 1;
-                    active_guest_thread->wait_kind = AC1_WAIT_CRITICAL_SECTION;
-                    active_guest_thread->wait_handle = address;
-                    active_guest_thread->wait_deadline = 0u;
-                }
-            }
-        } else {
-            cpu->eax = 0u;
-            if (enter) {
-                if (!active_guest_thread || !active_scheduler)
-                    stop_guest("contended EnterCriticalSection has no guest scheduler", import->token);
-                if (trace_imports)
-                    fprintf(stderr,
-                            "AC1 CS wait: thread=%u section=0x%08x owner=%u lockcount=%u\n",
-                            active_guest_thread->id, address, owner,
-                            rd32(address + 4u));
-                active_guest_thread->blocked = 1;
-                active_guest_thread->wait_kind = AC1_WAIT_CRITICAL_SECTION;
-                active_guest_thread->wait_handle = address;
-                active_guest_thread->wait_deadline = 0u;
-            }
-        }
-        return_stdcall(cpu, 4u);
-        return 1;
-    }
-
-    if (owner != thread || !rd32(address + 8u))
-        stop_guest("LeaveCriticalSection called by a non-owner", import->token);
-    uint32_t recursion = rd32(address + 8u) - 1u;
-    wr32(address + 8u, recursion);
-    if (!recursion) {
-        wr32(address + 12u, 0u);
-    }
-    (void)guest_atomic_xadd32(address + 4u, UINT32_MAX);
-    if (!recursion) {
-        if (active_scheduler) {
-            scheduler_lock(active_scheduler);
-            for (unsigned i = 0; i < active_scheduler->count; ++i) {
-                ac1_guest_thread *waiter = &active_scheduler->threads[i];
-                if (!waiter->blocked || waiter->finished ||
-                    waiter->wait_kind != AC1_WAIT_CRITICAL_SECTION ||
-                    waiter->wait_handle != address)
-                    continue;
-                uint32_t previous = guest_atomic_xadd32(address + 4u, 1u);
-                if (previous != UINT32_MAX) {
-                    (void)guest_atomic_xadd32(address + 4u, UINT32_MAX);
-                    break;
-                }
-                wr32(address + 8u, 1u);
-                wr32(address + 12u, waiter->id);
-                waiter->blocked = 0;
-                ++waiter->wait_completions;
-                waiter->wait_result = 0u;
-                if (trace_imports)
-                    fprintf(stderr,
-                            "AC1 CS handoff: section=0x%08x waiter=%u lockcount=%u recursion=%u\n",
-                            address, waiter->id, rd32(address + 4u),
-                            rd32(address + 8u));
-                if (active_guest_thread && waiter->priority > active_guest_thread->priority)
-                    active_guest_thread->checkpoint_force = 1;
-                break;
-            }
-            scheduler_unlock(active_scheduler);
-        }
+    ac1_guest_thread *thread = guest_thread_for_cpu(cpu);
+    if (enter) {
+        critical_section_enter(thread, address);
+        cpu->eax = !thread->blocked;
+    } else if (try_enter) {
+        cpu->eax = (uint32_t)critical_section_acquire(thread, address);
+    } else {
+        critical_section_leave(thread, address);
     }
     return_stdcall(cpu, 4u);
     return 1;
@@ -7245,7 +7255,6 @@ int ac1_run(const char *exe_path)
     guest_affinity_mask = 0u;
     guest_thread_affinity_mask = 0u;
     memset(tls_used, 0, sizeof(tls_used));
-    memset(tls_values, 0, sizeof(tls_values));
     memset(private_heaps, 0, sizeof(private_heaps));
     memset(sync_objects, 0, sizeof(sync_objects));
     memset(virtual_alloc_bases, 0, sizeof(virtual_alloc_bases));
@@ -7395,10 +7404,8 @@ int ac1_run(const char *exe_path)
         goto cleanup;
     }
     memset(tls_used, 0, sizeof(tls_used));
-    memset(tls_values, 0, sizeof(tls_values));
     /* The executable is the first and only loaded module in this profile. */
     tls_used[0] = 1u;
-    tls_values[0] = static_tls_data_base;
 
     scheduler = (ac1_scheduler *)calloc(1, sizeof(*scheduler));
     if (!scheduler) {
@@ -7411,6 +7418,7 @@ int ac1_run(const char *exe_path)
     ac1_guest_thread *primary = &scheduler->threads[0];
     primary->scheduler = scheduler;
     primary->slot = 0u;
+    primary->tls_values[0] = static_tls_data_base;
     primary->id = current_host_thread_id();
     primary->stack_base = AC1_STACK_BASE;
     primary->stack_size = AC1_STACK_SIZE;

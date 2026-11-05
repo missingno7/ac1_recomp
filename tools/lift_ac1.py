@@ -3427,7 +3427,8 @@ FLAG_TRANSPARENT_HELPERS = frozenset({
     'ac1_x87_set_tag', 'ac1_x87_status', 'ac1_x87_integer', 'ac1_x87_save',
     'ac1_x87_restore', 'ac1_x87_store_env', 'ac1_x87_load_env', 'ac1_mmx_enter',
     'ac1_mmx_read', 'ac1_mmx_write', 'ac1_mmx_emms', 'ac1_mmx_from_ps', 'ac1_mmx_to_ps',
-    'guest_rdtsc', 'guest_cpuid',
+    'guest_rdtsc', 'guest_cpuid', 'ac1_tls_get_value', 'ac1_enter_critical_section',
+    'ac1_leave_critical_section', 'ac1_guest_thread_id', 'AC1_YIELD',
 })
 FLAG_HELPER_WRITES = {
     'sse_compare': FLAG_ALL, 'fcompare_eflags': FLAG_ALL, 'eflags_unpack': FLAG_ALL,
@@ -3774,8 +3775,38 @@ def specialize_direct_calls(body: str, lifted: set[int]) -> tuple[str, set[int],
     return body, callees, count
 
 
+# KERNEL32 imports called through their IAT slot that become plain helper calls.
+# They return with the stack the caller expects, so the return address is never
+# pushed: bytes below ESP are the callee's, and a real DLL overwrites them too.
+BOUND_IMPORTS = {
+    'TlsGetValue': 'c->eax = ac1_tls_get_value(c, rd32(c->esp)); c->esp += 4u; AC1_YIELD(c);',
+    'EnterCriticalSection': 'ac1_enter_critical_section(c, rd32(c->esp)); c->esp += 4u; AC1_YIELD(c);',
+    'LeaveCriticalSection': 'ac1_leave_critical_section(c, rd32(c->esp)); c->esp += 4u; AC1_YIELD(c);',
+    'GetCurrentThreadId': 'c->eax = ac1_guest_thread_id(c); AC1_YIELD(c);',
+}
+BOUND_IMPORT_HELPERS = frozenset({'ac1_tls_get_value', 'ac1_enter_critical_section',
+                                  'ac1_leave_critical_section', 'ac1_guest_thread_id', 'AC1_YIELD'})
+IAT_CALL = re.compile(r'\{ uint32_t _ct = rd32\(\(GVA\(0x([0-9A-F]{8})\)\)\); '
+                      r'push32\(c, 0x[0-9A-F]{8}u\); dispatch\(c, _ct\); \}')
+
+
+def bind_imports(body: str, slots: dict[int, str]) -> str:
+    return IAT_CALL.sub(lambda m: BOUND_IMPORTS[slots[int(m[1], 16)]] if int(m[1], 16) in slots else m[0], body)
+
+
+def iat_bound_slots(pe) -> dict[int, str]:
+    """IAT slot of each bound KERNEL32 import."""
+    import pefile
+    if not hasattr(pe, 'parse_data_directories'):
+        return {}
+    pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
+    return {imp.address: imp.name.decode() for entry in getattr(pe, 'DIRECTORY_ENTRY_IMPORT', [])
+            if entry.dll.lower() == b'kernel32.dll' for imp in entry.imports
+            if imp.name and imp.name.decode() in BOUND_IMPORTS}
+
+
 def plain_direct_calls(body: str) -> str:
-    """Direct calls outside every loop are plain C calls.
+    """Direct calls outside every loop are plain C calls, and need no yield.
 
     Any cycle in the linear body crosses backward gotos whose spans cover it, so
     a call outside those spans cannot repeat without returning to a caller.
@@ -3788,7 +3819,8 @@ def plain_direct_calls(body: str) -> str:
     for first, last in spans:
         in_loop[first:last + 1] = [True] * (last + 1 - first)
     plain = re.compile(r'\bAC1_CALL\(c, (L_[0-9A-F]{8}), 0x[0-9A-F]{8}u\)')
-    return '\n'.join(line if loop else plain.sub(r'\1(c)', line) for line, loop in zip(lines, in_loop))
+    return '\n'.join(line if loop else plain.sub(r'\1(c)', line).replace(' AC1_YIELD(c);', '')
+                     for line, loop in zip(lines, in_loop))
 
 
 # Audited pinned helpers only: every CPU access is flag state, with no GPR
@@ -3803,6 +3835,8 @@ LOCAL_GPR_FREE_HELPERS = frozenset({
     # x87 helpers that read or write only flags, x87 control/status and init state.
     'fcompare', 'fcompare_eflags', 'do_sahf', 'ac1_x87_status', 'ac1_fp_init',
     'ac1_x87_integer_native', 'ac1_x87_integer_native_slow',
+    'ac1_tls_get_value', 'ac1_enter_critical_section', 'ac1_leave_critical_section',
+    'ac1_guest_thread_id', 'AC1_YIELD',
 })
 LOCAL_ESP_HELPERS = frozenset({'push32', 'pop32'})
 # push/pop as arithmetic on ESP plus one guest store or load, so ESP stays a
@@ -3873,7 +3907,7 @@ def local_register_function(body: str) -> str:
         changed.update(re.findall(r'(?:\+\+|--)\s*\(*\s*c->('+'|'.join(registers)+r')\b',text))
         changed.update(re.findall(r'\bSET(?:8[HL]|16)\(\s*\(*\s*c->('+'|'.join(registers)+r')\b',text))
         macros=set(re.findall(r'\b([A-Z][A-Z0-9_]+)\(',text))
-        if macros-{'AC1_SET_GUEST_EIP','R8H','R8L','R16','SET8H','SET8L','SET16'}:
+        if macros-{'AC1_SET_GUEST_EIP','AC1_YIELD','R8H','R8L','R16','SET8H','SET8L','SET16'}:
             changed.update(gpr.findall(text))
         writes.append(changed)
         targets=re.findall(r'\bgoto (L_[0-9A-F]{8});',text)
@@ -3950,7 +3984,7 @@ def xmm_free_helpers(cpu_header: str) -> frozenset:
     if re.search(r'\bxmm\s*\[',re.sub(r'^\s*XMM\s+xmm\[8\];','',cpu_header,flags=re.M)):
         raise ValueError('prepared CPU header accesses XMM state; audit the XMM-local sync points')
     # ac1_x87_integer_native and the masked shift clones are named by lifter passes.
-    return frozenset((names|{'AC1_SET_GUEST_EIP','ac1_x87_integer_native'}|FLAG_MASKED_SHIFT_CLONES)-{'AC1_CALL','RECOMP_TODO'})
+    return frozenset((names|{'AC1_SET_GUEST_EIP','ac1_x87_integer_native'}|FLAG_MASKED_SHIFT_CLONES|BOUND_IMPORT_HELPERS)-{'AC1_CALL','RECOMP_TODO'})
 
 
 _XMM_FREE_HELPERS = None
@@ -4046,7 +4080,7 @@ def native_x87_function(body: str) -> str:
         names|=set(re.findall(r'^#define\s+(\w+)\(',header,re.M))|{'AC1_SET_GUEST_EIP'}
         # Lifter passes emit ac1_x87_integer_native and the masked shift clones;
         # the header read here may predate them.
-        _X87_FREE_HELPERS=frozenset((names|{'ac1_x87_integer_native'}|FLAG_MASKED_SHIFT_CLONES)-{'AC1_CALL','RECOMP_TODO'}-X87_STACK_HELPERS)
+        _X87_FREE_HELPERS=frozenset((names|{'ac1_x87_integer_native'}|FLAG_MASKED_SHIFT_CLONES|BOUND_IMPORT_HELPERS)-{'AC1_CALL','RECOMP_TODO'}-X87_STACK_HELPERS)
     free=_X87_FREE_HELPERS
     lines=body.splitlines()
     if len(lines)<3 or lines[1]!='{' or lines[-1]!='}':raise ValueError('unexpected lifted function shape for native x87')
@@ -4272,6 +4306,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         except Exception as exc:  # preserve other real bodies when one is unsupported
             failures.append({"address": address, "error": repr(exc)})
     stored_entries = flag_image_addresses(pe, set(lifted))
+    bound_slots = iat_bound_slots(pe)
     pe.close()
     # Specialize after the complete success set is known. Cached bodies remain
     # independent of catalog membership; failed/removed callees cannot become
@@ -4280,6 +4315,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     successful = set(lifted)
     for index, address in enumerate(lifted):
         bodies[index], direct_callees[address], sites = specialize_direct_calls(bodies[index], successful)
+        bodies[index] = bind_imports(bodies[index], bound_slots)
         direct_sites += sites
     abi_report = None
     x87_native_count = local_count = local_xmm_count = 0

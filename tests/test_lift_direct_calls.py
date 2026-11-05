@@ -58,6 +58,25 @@ class DirectCallsTests(unittest.TestCase):
             result = subprocess.run([str(exe)], check=True, capture_output=True, text=True, timeout=15)
             self.assertIn("1000 nested/tail cases", result.stdout)
 
+    def test_bound_imports_replace_only_their_own_iat_calls(self):
+        call = '{ uint32_t _ct = rd32((GVA(0x%08X))); push32(c, 0x00401006u); dispatch(c, _ct); }'
+        body = ' '.join((call % 0x1915000, call % 0x1915004, call % 0x1915008))
+        bound = lift.bind_imports(body, {0x1915000: 'TlsGetValue', 0x1915004: 'EnterCriticalSection'})
+        self.assertIn('c->eax = ac1_tls_get_value(c, rd32(c->esp)); c->esp += 4u;', bound)
+        self.assertIn('ac1_enter_critical_section(c, rd32(c->esp)); c->esp += 4u;', bound)
+        self.assertIn(call % 0x1915008, bound)
+        self.assertEqual(bound.count('dispatch(c, _ct)'), 1)
+
+    def test_yields_stay_only_on_loops(self):
+        body = '\n'.join(['void L_00401000(CPU *c)', '{',
+                          '    ac1_enter_critical_section(c, 0u); c->esp += 4u; AC1_YIELD(c);',
+                          'L_00401005:',
+                          '    ac1_leave_critical_section(c, 0u); c->esp += 4u; AC1_YIELD(c);',
+                          '    if (c->eax) goto L_00401005;', '}'])
+        lines = lift.plain_direct_calls(body).split('\n')
+        self.assertEqual(lines[2], '    ac1_enter_critical_section(c, 0u); c->esp += 4u;')
+        self.assertIn('AC1_YIELD(c);', lines[4])
+
     def test_only_calls_on_a_loop_keep_the_return_count(self):
         body = '\n'.join([
             'void L_00401000(CPU *c)', '{',

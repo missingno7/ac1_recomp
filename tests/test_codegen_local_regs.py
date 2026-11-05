@@ -154,7 +154,7 @@ class LocalRegisterTests(unittest.TestCase):
     def test_audited_pure_and_stack_helpers_use_only_declared_cpu_fields(self):
         header=(lift.RUNTIME/'cpu.h').read_text()
         self.assertRegex(header,re.compile(r'^#define STACK_BASE\(c\) 0u$',re.M))
-        for name in (lift.LOCAL_GPR_FREE_HELPERS-{'AC1_SET_GUEST_EIP'}) | lift.LOCAL_ESP_HELPERS:
+        for name in (lift.LOCAL_GPR_FREE_HELPERS-{'AC1_SET_GUEST_EIP'}-lift.BOUND_IMPORT_HELPERS) | lift.LOCAL_ESP_HELPERS:
             bodies=[]
             for match in re.finditer(r'\b'+name+r'\([^{};]*\)\s*\{',header):
                 depth,end=1,match.end()

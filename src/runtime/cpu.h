@@ -143,10 +143,17 @@ void ac1_scheduler_return_checkpoint(CPU *c);
  * A guest loop can run indefinitely only through a call in a loop, so a direct
  * call on a loop counts its return; any other direct call is a plain C call. */
 #define AC1_RETURN_INTERVAL 256u
-#define AC1_CALL(c, fn, target) do { \
-    fn(c); \
+#define AC1_YIELD(c) do { \
     if (__builtin_expect(++(c)->returns >= AC1_RETURN_INTERVAL, 0)) ac1_scheduler_return_checkpoint(c); \
 } while (0)
+#define AC1_CALL(c, fn, target) do { fn(c); AC1_YIELD(c); } while (0)
+
+/* The imports that make up nearly all import traffic, bound at generation time.
+ * They touch no guest register, so generated code keeps its registers in locals. */
+uint32_t ac1_tls_get_value(CPU *c, uint32_t index);
+void ac1_enter_critical_section(CPU *c, uint32_t section);
+void ac1_leave_critical_section(CPU *c, uint32_t section);
+uint32_t ac1_guest_thread_id(CPU *c);
 
 static inline void ac1_fp_init(CPU *c) {
     if (!c->fp_initialized) {

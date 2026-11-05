@@ -9,22 +9,24 @@ static const uint32_t section_address = 0x2574fff0u;
 
 static int call_section(const char *name, uint32_t address)
 {
-    CPU cpu = {0};
+    static ac1_guest_thread guest;
+    memset(&guest, 0, sizeof guest);
+    guest.id = 1u;
     import_record import = {0};
     strcpy(import.dll, "KERNEL32.dll");
     strcpy(import.name, name);
     import.token = 0xf100020cu;
-    cpu.esp = 0x10000u;
-    cpu.eip = 0x7a568eu;
-    wr32(cpu.esp, 0x7a5694u);
-    wr32(cpu.esp + 4u, address);
-    wr32(cpu.esp + 8u, 0x1000u);
+    guest.cpu.esp = 0x10000u;
+    guest.cpu.eip = 0x7a568eu;
+    wr32(guest.cpu.esp, 0x7a5694u);
+    wr32(guest.cpu.esp + 4u, address);
+    wr32(guest.cpu.esp + 8u, 0x1000u);
     runtime_stop_ready = 1;
     if (setjmp(stop_runtime)) { runtime_stop_ready = 0; return 0; }
-    CHECK(handle_critical_section_import(&cpu, &import));
+    CHECK(handle_critical_section_import(&guest.cpu, &import));
     runtime_stop_ready = 0;
-    CHECK(cpu.eip == 0x7a5694u);
-    CHECK(cpu.esp == 0x10000u + (!strcmp(name, "InitializeCriticalSectionAndSpinCount") ? 12u : 8u));
+    CHECK(guest.cpu.eip == 0x7a5694u);
+    CHECK(guest.cpu.esp == 0x10000u + (!strcmp(name, "InitializeCriticalSectionAndSpinCount") ? 12u : 8u));
     return 1;
 }
 
