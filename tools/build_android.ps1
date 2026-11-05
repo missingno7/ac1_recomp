@@ -19,7 +19,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $abiTag = if ($Abi -eq 'arm64-v8a') { 'arm64' } else { 'x86_64' }
-$vectorAccess = if ($VectorAccess) { 'ON' } else { 'OFF' }
+$vectorAccessCMake = if ($VectorAccess) { 'ON' } else { 'OFF' }
 # Check the two external native providers before generating any game code.
 foreach ($component in @('avformat', 'avcodec', 'swscale', 'avutil')) {
     $archive = Join-Path $repoRoot "work\bink_native\ffmpeg-android-$abiTag\install\lib\lib$component.a"
@@ -95,7 +95,7 @@ try {
             -DANDROID_PLATFORM=29 -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=RelWithDebInfo `
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=$jniAbi" `
             -DAC1_NATIVE_BINK=ON -DAC1_DIRECT_MEMORY=ON -DAC1_FORCE_INLINE_ACCESSORS=ON -DAC1_TRACE_EIP=OFF `
-            "-DAC1_VECTOR_ACCESS=$vectorAccess"
+            "-DAC1_VECTOR_ACCESS=$vectorAccessCMake"
         if ($LASTEXITCODE) { throw 'Android native CMake configuration failed' }
         & $cmake --build $nativeBuild --parallel $Jobs
         if ($LASTEXITCODE) { throw 'Android native Make build failed' }
@@ -105,7 +105,7 @@ try {
     }
     # Recreate the ZIP: incremental packaging can retain large gaps after a .so shrinks.
     if (Test-Path -LiteralPath $apkPath) { Remove-Item -LiteralPath $apkPath -Force }
-    & .\gradlew.bat --no-daemon "--max-workers=$Jobs" "-Pac1Abi=$Abi" "-Pac1VectorAccess=$vectorAccess" @prebuiltArgument assembleDebug
+    & .\gradlew.bat --no-daemon "--max-workers=$Jobs" "-Pac1Abi=$Abi" "-Pac1VectorAccess=$vectorAccessCMake" @prebuiltArgument assembleDebug
     $buildExit = $LASTEXITCODE
 } finally {
     Pop-Location
