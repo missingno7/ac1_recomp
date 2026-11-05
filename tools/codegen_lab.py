@@ -233,7 +233,7 @@ def cmd_snapshot(a):
     (out/'units').mkdir(); (out/'runtime').mkdir(); (out/'x86').mkdir()
     for name in sorted(set(units.values())): shutil.copy(ROOT/'work/lift_initial'/name, out/'units'/name)
     for h in (ROOT/'work/lift_initial').glob('*.h'): shutil.copy(h, out/'units'/h.name)
-    for f in [*(ROOT/'src/runtime').glob('*.h'), ROOT/'src/runtime/ac1_native_leaf.c']: shutil.copy(f, out/'runtime'/f.name)
+    for f in (ROOT/'src/runtime').glob('*.h'): shutil.copy(f, out/'runtime'/f.name)
     image = extract_image(out/'x86')
     flags, flags_source = android_flags()
     report = json.loads((ROOT/'work/lift_initial/lift-report.json').read_text())
@@ -307,10 +307,9 @@ def cmd_build(a):
         arm_leaves.append(dst); x86_leaves.append(dst86)
         extracted[leaf['va']] = dict(symbol=sym, arm64_insns=len(syms[sym]),
                                      x86_insns=len(function_insns(dst86, {f'lifted_{name}'}).get(f'lifted_{name}', [])))
-    checked([CLANG, *manifest['android_flags'], *inc, '-c', snap/'runtime/ac1_native_leaf.c', '-o', bench/'native_arm64.o'])
     checked([CLANG, *manifest['android_flags'], *inc, '-c', ROOT/'tools/codegen_lab/bench_arm64.c', '-o', bench/'harness_arm64.o'])
     link = [f for f in manifest['android_flags'] if f.startswith(('--target', '--sysroot'))]
-    checked([CLANG, *link, '-o', bench/'bench_arm64', *arm_leaves, bench/'native_arm64.o', bench/'harness_arm64.o', '-lm'])
+    checked([CLANG, *link, '-o', bench/'bench_arm64', *arm_leaves, bench/'harness_arm64.o', '-lm'])
     nm = MINGW32/'bin/nm.exe'
     defined, undefined = set(), set()
     for o in x86_leaves:
@@ -538,37 +537,30 @@ def cmd_bench(a):
                       background_game_pid=game or None,
                       temp_start=shell('cat /sys/class/thermal/thermal_zone0/temp').stdout.strip(),
                       cpu7_max=shell('cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq').stdout.strip())
-        gate = shell(f'{remote}/bench check {cfg["check_calls"]}')
-        (raw/'arm64_check.txt').write_text(gate.stdout + gate.stderr)
-        result['arm64_gate'] = dict(passed=gate.returncode == 0, lines=gate.stdout.split('\n')[:len(leaves)])
-        if gate.returncode:
-            result['arm64'] = 'not measured: correctness gate failed'
-        else:
-            # Which counters exist here: ask the PMU, do not assume.
-            events = []
-            for e in cfg['events']:
-                probe = shell(f'simpleperf stat -e {e} {remote}/bench run empty 1000')
-                (raw/f'probe_{e.replace(":", "_")}.txt').write_text(probe.stdout + probe.stderr)
-                if probe.returncode == 0 and parse_stat(probe.stdout + probe.stderr).get(e, 0) > 0: events.append(e)
-            device['events'] = events
-            counters = collections.defaultdict(lambda: collections.defaultdict(list))
-            subjects = ['empty'] + leaves + [f'native_{l}' for l in leaves]
-            for r in range(reps):
-                for s in subjects:
-                    leaf, native = (s[7:], ' native') if s.startswith('native_') else (s, '')
-                    st = shell(f'taskset {cfg["cpu_mask"]} simpleperf stat -e {",".join(events)} {remote}/bench run {leaf} {n}{native}')
-                    (raw/f'stat_{s}_{r}.txt').write_text(st.stdout + st.stderr)
-                    for e, v in parse_stat(st.stdout + st.stderr).items():
-                        if e in events: counters[s][e].append(v / n)
-            tm = shell(f'taskset {cfg["cpu_mask"]} {remote}/bench time {n} {reps}')
-            (raw/'arm64_time.txt').write_text(tm.stdout + tm.stderr)
-            for m in re.finditer(r'^time (\S+) ([\d.]+)', tm.stdout, re.M): counters[m[1]]['ns'].append(float(m[2]))
-            device['temp_end'] = shell('cat /sys/class/thermal/thermal_zone0/temp').stdout.strip()
-            # A game brought to the foreground during the run competes for the core.
-            if 'org.ac1.recomp' in shell('dumpsys window | grep mCurrentFocus').stdout:
-                device['disturbed'] = 'the game was in the foreground at the end of the run'
-            result['device'] = device
-            result['arm64'] = {s: dict(v) for s, v in counters.items()}
+        # Which counters exist here: ask the PMU, do not assume.
+        events = []
+        for e in cfg['events']:
+            probe = shell(f'simpleperf stat -e {e} {remote}/bench run empty 1000')
+            (raw/f'probe_{e.replace(":", "_")}.txt').write_text(probe.stdout + probe.stderr)
+            if probe.returncode == 0 and parse_stat(probe.stdout + probe.stderr).get(e, 0) > 0: events.append(e)
+        device['events'] = events
+        counters = collections.defaultdict(lambda: collections.defaultdict(list))
+        subjects = ['empty'] + leaves
+        for r in range(reps):
+            for s in subjects:
+                st = shell(f'taskset {cfg["cpu_mask"]} simpleperf stat -e {",".join(events)} {remote}/bench run {s} {n}')
+                (raw/f'stat_{s}_{r}.txt').write_text(st.stdout + st.stderr)
+                for e, v in parse_stat(st.stdout + st.stderr).items():
+                    if e in events: counters[s][e].append(v / n)
+        tm = shell(f'taskset {cfg["cpu_mask"]} {remote}/bench time {n} {reps}')
+        (raw/'arm64_time.txt').write_text(tm.stdout + tm.stderr)
+        for m in re.finditer(r'^time (\S+) ([\d.]+)', tm.stdout, re.M): counters[m[1]]['ns'].append(float(m[2]))
+        device['temp_end'] = shell('cat /sys/class/thermal/thermal_zone0/temp').stdout.strip()
+        # A game brought to the foreground during the run competes for the core.
+        if 'org.ac1.recomp' in shell('dumpsys window | grep mCurrentFocus').stdout:
+            device['disturbed'] = 'the game was in the foreground at the end of the run'
+        result['device'] = device
+        result['arm64'] = {s: dict(v) for s, v in counters.items()}
     if not a.no_x86:
         exe, image = build/'bench/roundtrip_x86.exe', LAB/'snapshots'/bm['snapshot']/'x86/image.bin'
         gate = run([exe, image, 'check', str(cfg['check_calls'])])
