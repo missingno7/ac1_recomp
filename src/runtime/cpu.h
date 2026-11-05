@@ -306,12 +306,24 @@ static inline void ac1_x87_set_tag(CPU *c, unsigned reg, unsigned tag) {
 __attribute__((visibility("hidden")))
 #endif
 extern uint8_t *ac1_direct_arena;
+#ifdef AC1_VECTOR_ACCESS
+/* A 16-byte memcpy is still an llvm.memcpy call when GVN runs, which blocks
+ * forwarding to narrower loads, and SROA turns the XMM it copies into two
+ * integers. One unaligned vector access keeps the value a vector. */
+typedef uint8_t ac1_unaligned_v16 __attribute__((vector_size(16), aligned(1), may_alias));
+#endif
 AC1_ACCESSOR_INLINE void ac1_direct_read(uint32_t a, void *o, size_t w)
 {
+#ifdef AC1_VECTOR_ACCESS
+    if (w == 16) { *(ac1_unaligned_v16 *)o = *(const ac1_unaligned_v16 *)(ac1_direct_arena + a); return; }
+#endif
     memcpy(o, ac1_direct_arena + a, w);
 }
 AC1_ACCESSOR_INLINE void ac1_direct_write(uint32_t a, const void *i, size_t w)
 {
+#ifdef AC1_VECTOR_ACCESS
+    if (w == 16) { *(ac1_unaligned_v16 *)(ac1_direct_arena + a) = *(const ac1_unaligned_v16 *)i; return; }
+#endif
     memcpy(ac1_direct_arena + a, i, w);
 }
 #define guest_execution_read(a, o, w) ac1_direct_read((a), (o), (w))
@@ -1425,6 +1437,10 @@ AC1_ACCESSOR_INLINE void ac1_base_ac1_direct_read(uint8_t * const _ac1_base, con
 #else
     (void)_ac1_observer;
 #endif
+    
+#ifdef AC1_VECTOR_ACCESS
+    if (w == 16) { *(ac1_unaligned_v16 *)o = *(const ac1_unaligned_v16 *)(_ac1_base + a); return; }
+#endif
     memcpy(o, _ac1_base + a, w);
 }
 AC1_ACCESSOR_INLINE void ac1_base_ac1_direct_write(uint8_t * const _ac1_base, const CPU * const _ac1_observer, uint32_t a, const void *i, size_t w) {
@@ -1433,6 +1449,10 @@ AC1_ACCESSOR_INLINE void ac1_base_ac1_direct_write(uint8_t * const _ac1_base, co
     __asm__ __volatile__("" : : "m"(_ac1_observer->eip));
 #else
     (void)_ac1_observer;
+#endif
+    
+#ifdef AC1_VECTOR_ACCESS
+    if (w == 16) { *(ac1_unaligned_v16 *)(_ac1_base + a) = *(const ac1_unaligned_v16 *)i; return; }
 #endif
     memcpy(_ac1_base + a, i, w);
 }

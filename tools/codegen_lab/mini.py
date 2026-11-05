@@ -125,6 +125,7 @@ static inline XMM ac1_xmm_from_f32(float a, float b, float c, float d) { XMM x; 
 
 
 VARIANTS = {'base': lambda h, b: (h, b, 0), 'stack64': stack64, 'split': lambda h, b: (h + SPLIT, b, 0), 'lanefp': lanefp,
+            'vector_access': lambda h, b: ('#define AC1_VECTOR_ACCESS\n' + h, b, 0),
             'vec': lambda h, b: (h + VEC, b, 0), 'stack64+split': stack64_split, 'stack64+vec': stack64_vec}
 
 

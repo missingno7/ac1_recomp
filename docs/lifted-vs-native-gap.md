@@ -170,3 +170,23 @@ later write kills them before the return.
 - Why 64-bit stack addressing raises spills.
 - All percentages rest on the current hot corpus and on weights from crowded
   gameplay; they are static apart from those weights.
+
+## Opt-in: vector guest accesses
+
+Finding 1 is available as `AC1_VECTOR_ACCESS` (`tools/build.ps1 -VectorAccess`,
+`tools/build_android.ps1 -VectorAccess`, lab variant `vector_access`). It changes
+only how 16-byte guest accesses are expressed, in `ac1_direct_read` and
+`ac1_direct_write` and their arena clones, so it needs no regeneration. It is off
+by default, and a build without it compiles those accessors as before.
+
+Measured through the real header on the hot corpus, compared with the default
+(static, one compile at a time with production flags): instructions -0.3%, memory
+loads -1%, `fcvt` -3%, bytes stored +1%; 17 functions improve, 55 are unchanged,
+and none worsen by more than 2%. Full-state differentials found no differences
+on 2,000 random states for each of 0x428540, 0x653400, 0x1176DE0 and 0x42EE70, and
+`tests/test_vector_access.py` covers aligned, unaligned and overlapping accesses
+and fails on a deliberately broken accessor.
+
+Not verified: no CMake, Gradle or game build has used the switch (the build
+scripts were only parse-checked), it has not run on the phone or in the game,
+and whether it changes cycles is unmeasured.

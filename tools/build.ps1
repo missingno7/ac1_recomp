@@ -29,6 +29,8 @@ param(
     [string]$ProfileCountEntries = '',
     # Checked per-access guest memory (diagnosable bad pointers) instead of the direct arena.
     [switch]$CheckedMemory,
+    # 16-byte guest accesses as one vector access instead of memcpy (experimental).
+    [switch]$VectorAccess,
     [string]$GameExe = 'C:\Program Files (x86)\GOG.com\Assassins Creed\AssassinsCreed_Dx9.exe',
     # Reuse an existing build's generator; Ninja is the default for a new one.
     [ValidateSet('Ninja', 'MinGW Makefiles')][string]$Generator
@@ -100,6 +102,7 @@ try {
     # Explicit, because an option default never overrides an existing CMake cache entry.
     $ConfigureArgs += "-DAC1_FORCE_INLINE_X87=$(if ($X87Inline) { 'ON' } else { 'OFF' })"
     $ConfigureArgs += "-DAC1_DIRECT_MEMORY=$(if ($CheckedMemory) { 'OFF' } else { 'ON' })"
+    $ConfigureArgs += "-DAC1_VECTOR_ACCESS=$(if ($VectorAccess) { 'ON' } else { 'OFF' })"
     if ($Target -eq 'Host') {
         $ConfigureArgs += '-DCMAKE_C_COMPILER=C:/msys64/mingw64/bin/gcc.exe'
         $ConfigureArgs += '-DCMAKE_CXX_COMPILER=C:/msys64/mingw64/bin/g++.exe'

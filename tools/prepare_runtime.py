@@ -205,12 +205,24 @@ DIRECT_ACCESS_HELPERS = r'''/* Guest memory accessors are force-inlined: in very
 __attribute__((visibility("hidden")))
 #endif
 extern uint8_t *ac1_direct_arena;
+#ifdef AC1_VECTOR_ACCESS
+/* A 16-byte memcpy is still an llvm.memcpy call when GVN runs, which blocks
+ * forwarding to narrower loads, and SROA turns the XMM it copies into two
+ * integers. One unaligned vector access keeps the value a vector. */
+typedef uint8_t ac1_unaligned_v16 __attribute__((vector_size(16), aligned(1), may_alias));
+#endif
 AC1_ACCESSOR_INLINE void ac1_direct_read(uint32_t a, void *o, size_t w)
 {
+#ifdef AC1_VECTOR_ACCESS
+    if (w == 16) { *(ac1_unaligned_v16 *)o = *(const ac1_unaligned_v16 *)(ac1_direct_arena + a); return; }
+#endif
     memcpy(o, ac1_direct_arena + a, w);
 }
 AC1_ACCESSOR_INLINE void ac1_direct_write(uint32_t a, const void *i, size_t w)
 {
+#ifdef AC1_VECTOR_ACCESS
+    if (w == 16) { *(ac1_unaligned_v16 *)(ac1_direct_arena + a) = *(const ac1_unaligned_v16 *)i; return; }
+#endif
     memcpy(ac1_direct_arena + a, i, w);
 }
 #define guest_execution_read(a, o, w) ac1_direct_read((a), (o), (w))
@@ -1046,8 +1058,16 @@ def local_memory_helpers(text):
         dependent=current
     prototypes=[];definitions=[]
     overrides={
-      'ac1_direct_read':'memcpy(o, _ac1_base + a, w);',
-      'ac1_direct_write':'memcpy(_ac1_base + a, i, w);',
+      'ac1_direct_read':'''
+#ifdef AC1_VECTOR_ACCESS
+    if (w == 16) { *(ac1_unaligned_v16 *)o = *(const ac1_unaligned_v16 *)(_ac1_base + a); return; }
+#endif
+    memcpy(o, _ac1_base + a, w);''',
+      'ac1_direct_write':'''
+#ifdef AC1_VECTOR_ACCESS
+    if (w == 16) { *(ac1_unaligned_v16 *)(_ac1_base + a) = *(const ac1_unaligned_v16 *)i; return; }
+#endif
+    memcpy(_ac1_base + a, i, w);''',
       'ac1_direct_atomic_cell':'return !(a & 3u) ? (uint32_t *)(_ac1_base + a) : NULL;'}
     for name,f in functions.items():
         if name not in dependent:continue
