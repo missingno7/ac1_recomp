@@ -25,6 +25,58 @@ Limits that apply to every number below:
   paths exist, never how much each costs in gameplay.
 - **Skid.** Hot instructions are neighbourhoods, not exact culprits.
 
+## Live crowd capture, 2026-11-05
+
+A later capture changes the ranking below. It attached to the running game, on
+the same build (c33daae, matched by build ID), during a crowd. It has stacks and
+PMU counters, but only 2,935 stack samples over 8 s of one scene, so treat its
+shares as rough.
+
+**22.3% of main-thread cycles are under the game's occlusion wait** (`0x00AA40B0`).
+The thread is spinning for the GPU there, so that work cannot shorten a frame
+while the GPU is the thing being waited for.
+
+| Share of main thread | Outside the wait | Inside the wait |
+|---|---|---|
+| Game code | 54.2% | 0.2% |
+| Clock reads | 0.5% | 8.0% |
+| Audio mixer and service | 3.0% | 5.4% |
+| Import handlers | 0.7% | 4.7% |
+| D3D9 bridge | 5.2% | 0.1% |
+| Dispatch core | 3.5% | 0.4% |
+| Locks and atomics | 2.8% | 2.3% |
+
+So most of findings 1 and 2 below is spinning, not lost productive time. Each
+pass of the spin runs `SwitchToThread`, the scheduler, the audio service and clock
+reads. The remaining productive non-game work is mainly the D3D9 bridge, dispatch,
+audio and DXVK.
+
+**The platform caps both processors while the game runs.** During play the X4 limit
+was 2.38 GHz (hardware 3.40) and the GPU limit was 366 MHz (table up to 1000), at
+35% battery, about 47°C chip temperature and thermal status 0, with
+`sys.siop.level=1`. At idle, moments earlier, the limits were 2.75 GHz and 680 MHz.
+So the old "2.38 GHz at 9-11% battery" was not caused by low battery. What sets
+the cap is not established; a Samsung policy is suspected, not shown. GPU busy was
+85-88% at that capped clock, and the main thread ran at the cap.
+
+**PMU counters, main thread, 12 s each** (user space, two separate runs):
+
+| Measure | Value |
+|---|---|
+| IPC | 2.77-2.80 |
+| Backend stalls | 44% of cycles |
+| Frontend stalls | 12% of cycles (13% in game code, 9% elsewhere) |
+| L1I refills | 5.6 per 1,000 instructions |
+| L1I TLB refills | 3.1 per 1,000 instructions |
+| Full iTLB walks | 0.07 per 1,000 instructions |
+| Branch mispredictions | 1.3 per 1,000 instructions |
+| L2 data refills | 1.5 per 1,000 instructions |
+
+Backend stalls dominate. Instruction fetch is real but bounded, so hot-code ordering
+can address only part of 12%. iTLB walks are rare.
+
+Frame intervals stayed on 120 Hz multiples, at 25 and 33.3 ms in that scene.
+
 ## Exclusive categories
 
 Mcycles per frame. This replaces the "runtime" and "other host" split in
@@ -55,7 +107,8 @@ else. Non-game cost is nearly flat per frame between the scenes.
 ## Ranked findings
 
 "Ceiling" is the sampled cost of the category: the most that could vanish, not an
-expected saving.
+expected saving. These findings predate the live capture, whose wait split lowers
+the real ceilings of 1-3 sharply.
 
 ### 1. Imports are resolved at run time by comparing strings
 
@@ -148,26 +201,21 @@ expected saving.
   remove only the call, because the atomic itself stays. Confidence low that this
   matters.
 
-## Work against waiting
-
-The stack capture has 6.83% of its cycles under the game's occlusion wait
-(`0x00AA40B0`), led by clock reads, audio service and bridge calls. So some of
-findings 2-4 run inside a GPU wait, and removing them there would not shorten the
-frame. The crowd capture has no stacks, so this split is unknown for gameplay.
-
-The main thread was 87% busy, but that includes active waiting, so it does not
-prove a CPU limit.
-
 ## Suggested order
+
+Updated for the live capture. None of this has been implemented.
 
 | Order | Action | Why |
 |---|---|---|
-| 1 | Static import binding | Firmest saving, largest category, and it matches the design rule |
-| 2 | Remove the native wrapper | Certain, and part of static selection |
-| 3 | Audio early return | Small and local, if the cause is confirmed |
-| 4 | One stack capture and one PMU capture on the current build | Settles clocks, waits and instruction fetch |
-| 5 | Hot-code ordering file | Only if the PMU capture shows fetch pressure |
+| 1 | Find what sets the 2.38 GHz and 366 MHz caps | The largest unknown: the GPU wait is 22% of the main thread |
+| 2 | Measure with the wait separated | Otherwise CPU work and spinning stay mixed |
+| 3 | Reduce backend stalls in game code | Game code is 54% of the thread and backend stalls are 44% of cycles |
+| 4 | Remove the native wrapper | Certain and part of static selection, though only 0.7% |
+| 5 | Static import binding | Simplifies the runtime; little frame time unless spinning matters |
+| 6 | D3D9 bridge lookup and audio early return | Productive costs, 5.2% and 3.0% |
+| 7 | Hot-code ordering file | Bounded by the 12% of cycles in frontend stalls, and needs a measurement |
 
-The capture in step 4 needs the phone. None of this has been implemented.
+Spinning less in the wait could still help indirectly, for example by leaving
+power and thermal budget for the GPU, but that is untested.
 
 Private scripts and data are in `work/phone/audit/`.
