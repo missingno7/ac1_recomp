@@ -575,3 +575,20 @@ functions pay for the protocol with spills and larger leaves. Per-function
 signatures could remove the leaf penalty, but with no measurable gain to
 protect, they do not justify the added analysis. `--private-abi` and
 `--gpr-speculation` stay off, and this supersedes the pinning proposal above.
+
+**Limit on the verdict above.** The city replay ends in an in-game cutscene,
+not in gameplay, so the A/B says nothing about scenes where frame rate really
+drops. The private ABI is unproven rather than disproven, and its code stays
+until it is measured in gameplay. The same limit applies to every percentage
+in this document that comes from the city profile. The replay is no longer
+used for performance decisions.
+
+A first live gameplay sample (the user's own session, release build, 20 s,
+read-only, FPS from `dumpsys SurfaceFlinger --frametimeline -all`) ran at 38.6
+fps, p95 33 ms, GPU 84% busy at 422 MHz. The main thread was 89-96% busy, but
+only 42.8% of it was game code (25.1 Mcycles per frame, against about 33.8 in
+the replay), and 11.8% was `clock_gettime` polling. So that spot is lighter in
+game code than the replay and is not CPU-bound by it. A useful benchmark spot
+needs a frame rate well below this, high game-code cycles per frame and little
+polling. The main thread also moved between cpu2, cpu3, cpu4 and cpu7 in that
+session, so it is not confined to the X4 and benchmarks must not assume so.
