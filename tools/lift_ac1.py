@@ -3093,9 +3093,9 @@ class IndexedTableDiscovery:
     Counts describe the last sweep's unique tables/stopping entries, rather
     than multiplying the same rejection by callers or discovery waves.
     """
-    def __init__(self, info, dis, enabled=True, entry_cap=1024):
-        self.info, self.dis, self.enabled, self.entry_cap = info, dis, enabled, entry_cap
-        self.ranges = initialized_table_ranges(info) if enabled else []
+    def __init__(self, info, dis, entry_cap=1024):
+        self.info, self.dis, self.entry_cap = info, dis, entry_cap
+        self.ranges = initialized_table_ranges(info)
         self.references = collections.defaultdict(dict)
         self.prescaled = set()
         self.edges = collections.defaultdict(list)
@@ -3186,7 +3186,7 @@ class IndexedTableDiscovery:
         if self.depth_rejections:
             rejections["depth_limit"] = self.depth_rejections
         return {
-            "enabled": self.enabled, "entry_cap": self.entry_cap, "waves": self.waves,
+            "entry_cap": self.entry_cap, "waves": self.waves,
             "pending_sweep": self.needs_sweep(results),
             "candidate_table_count": len({table for table, _ in self.references}),
             "table_count": len({table["table"] for table in self.tables if table["entry_count"]}),
@@ -3199,8 +3199,7 @@ class IndexedTableDiscovery:
 
 
 def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_depth: int,
-                        extra_seeds: list[int], code_immediates: bool = True,
-                        indexed_tables: bool = True, register_switches: bool = True):
+                        extra_seeds: list[int]):
     sys.path[:0] = [str(pcrecomp / "tools/pe"), str(pcrecomp / "tools/disasm")]
     from pe_analyze import analyze_pe, build_iat_map
     from disasm32 import Disassembler
@@ -3209,7 +3208,7 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
     code = binary.read_bytes()
     iat = build_iat_map(info)
     dis = Disassembler(code, info.image_base, info.sections)
-    install_ac1_jump_table_bounds(dis, register_switches=register_switches)
+    install_ac1_jump_table_bounds(dis)
     entry = info.image_base + info.entry_point_rva
     initial_seeds = sorted({entry, *extra_seeds})
     queue = collections.deque((seed, 0) for seed in initial_seeds)
@@ -3223,7 +3222,7 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
     immediate_queued = set()
     immediate_rejected = collections.Counter()
     immediate_waves = 0
-    indexed = IndexedTableDiscovery(info, dis, indexed_tables)
+    indexed = IndexedTableDiscovery(info, dis)
     while (queue or immediate_pending or indexed.needs_sweep(results)) and len(results) < max_functions:
         if not queue:
             # First exhaust the direct/ABI-specific cone, so instruction spans
@@ -3296,19 +3295,18 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
             results[address]["register_switch_added_blocks"] = function.register_switch_added_blocks
         instruction_spans.add_function(results[address])
         indexed.collect(function, address, depth, max_depth)
-        if code_immediates:
-            for edge in constant_code_immediate_edges(function):
-                target = edge["target"]
-                if not (info.code_start <= target < info.code_end and dis.is_code_address(target)):
-                    immediate_rejected["non_executable"] += 1
-                elif edge.pop("manual_call"):
-                    immediate_rejected["manual_call"] += 1
-                elif depth >= max_depth:
-                    immediate_rejected["depth_limit"] += 1
-                else:
-                    immediate_pending[target].append({
-                        **edge, "caller": address, "role": "code_immediate", "depth": depth + 1,
-                    })
+        for edge in constant_code_immediate_edges(function):
+            target = edge["target"]
+            if not (info.code_start <= target < info.code_end and dis.is_code_address(target)):
+                immediate_rejected["non_executable"] += 1
+            elif edge.pop("manual_call"):
+                immediate_rejected["manual_call"] += 1
+            elif depth >= max_depth:
+                immediate_rejected["depth_limit"] += 1
+            else:
+                immediate_pending[target].append({
+                    **edge, "caller": address, "role": "code_immediate", "depth": depth + 1,
+                })
         tail_target = direct_tail_thunk_target(function)
         if (tail_target is not None and
                 validate_callback_code_entry(tail_target, dis, info, iat, instruction_spans)):
@@ -3369,7 +3367,6 @@ def discover_entry_cone(binary: Path, pcrecomp: Path, max_functions: int, max_de
     for edges in indexed.edges.values():
         callback_edges.extend(edges)
     immediate_summary = {
-        "enabled": code_immediates,
         "waves": immediate_waves,
         "accepted_edges": sum(map(len, immediate_edges.values())),
         "rejected_candidates": dict(sorted(immediate_rejected.items())),
@@ -4136,8 +4133,7 @@ def profile_count_entry(body: str, address: int) -> str:
 
 def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: Path,
               functions_per_tu: int, translation_unit_buckets: int = 0,
-              emission_cache=None, whole_program: bool = False,
-              profile_counts=()) -> dict:
+              emission_cache=None, profile_counts=()) -> dict:
     sys.path.insert(0, str(pcrecomp / "tools/lift"))
     import pefile
     from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
@@ -4275,36 +4271,34 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
             instruction_counts[address] = spec["instruction_count"]
         except Exception as exc:  # preserve other real bodies when one is unsupported
             failures.append({"address": address, "error": repr(exc)})
-    stored_entries = flag_image_addresses(pe, set(lifted)) if whole_program else set()
+    stored_entries = flag_image_addresses(pe, set(lifted))
     pe.close()
     # Specialize after the complete success set is known. Cached bodies remain
     # independent of catalog membership; failed/removed callees cannot become
-    # dangling C symbols. Bink uses this emitter with its own image base.
+    # dangling C symbols.
     direct_callees, direct_sites = {}, 0
-    if image_base == 0x00400000:
-        successful = set(lifted)
-        for index, address in enumerate(lifted):
-            bodies[index], direct_callees[address], sites = specialize_direct_calls(bodies[index], successful)
-            direct_sites += sites
+    successful = set(lifted)
+    for index, address in enumerate(lifted):
+        bodies[index], direct_callees[address], sites = specialize_direct_calls(bodies[index], successful)
+        direct_sites += sites
     abi_report = None
     x87_native_count = local_count = local_xmm_count = 0
     local_excluded = []
-    if whole_program:
-        by_address = dict(zip(lifted, bodies))
-        call_targets, jump_targets = flag_indirect_targets(by_address, functions, stored_entries)
-        contracted, abi_report = flag_contract_program(by_address, call_targets, jump_targets)
-        for index, address in enumerate(lifted):
-            body = contracted[address]
-            transformed = native_x87_function(body)
-            x87_native_count += transformed != body
-            gprs = local_register_function(transformed)
-            local = local_xmm_function(gprs)
-            local_xmm_count += local != gprs
-            if local != transformed:
-                local_count += 1
-            else:
-                local_excluded.append(f'0x{address:08X}')
-            bodies[index] = local
+    by_address = dict(zip(lifted, bodies))
+    call_targets, jump_targets = flag_indirect_targets(by_address, functions, stored_entries)
+    contracted, abi_report = flag_contract_program(by_address, call_targets, jump_targets)
+    for index, address in enumerate(lifted):
+        body = contracted[address]
+        transformed = native_x87_function(body)
+        x87_native_count += transformed != body
+        gprs = local_register_function(transformed)
+        local = local_xmm_function(gprs)
+        local_xmm_count += local != gprs
+        if local != transformed:
+            local_count += 1
+        else:
+            local_excluded.append(f'0x{address:08X}')
+        bodies[index] = local
     bodies = [fence_backward_branches(body) for body in bodies]
     count_entries = set(profile_counts)
     if len(count_entries) > 32 or count_entries - set(lifted):
@@ -4746,7 +4740,7 @@ def main() -> int:
     try:
         lift_result = emit_lift(binary, pcrecomp, catalog_doc["functions"], output_dir,
                                 functions_per_tu, translation_unit_buckets,
-                                emission_cache, whole_program=True,
+                                emission_cache,
                                 profile_counts=[int(s, 16) for s in args.profile_count_entries.split(',') if s])
     except Exception:
         if emission_cache is not None:

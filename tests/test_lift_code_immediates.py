@@ -92,7 +92,7 @@ class CodeImmediateTests(unittest.TestCase):
         self.assertFalse(lift.code_immediate_has_function_boundary(target, dis, {}))
         self.assertTrue(lift.code_immediate_has_function_boundary(target, dis, {target: {}}))
 
-    def discover(self, enabled=True, max_depth=32, max_functions=100):
+    def discover(self, max_depth=32, max_functions=100):
         # A discovers B; B discovers unaligned C. Direct root D contains a
         # rejected instruction boundary and midpoint. B also points into C's
         # second instruction, testing revalidation within the same wave.
@@ -130,7 +130,7 @@ class CodeImmediateTests(unittest.TestCase):
         with (patch.dict(sys.modules, modules), patch.object(lift, "install_ac1_jump_table_bounds"),
               patch.object(Path, "read_bytes", return_value=b""), patch.object(sys, "path", sys.path[:])):
             return lift.discover_entry_cone(Path("fixture"), ROOT, max_functions,
-                                            max_depth, [], enabled)
+                                            max_depth, [])
 
     def test_closure_provenance_and_rejections(self):
         _, _, catalog, failures, remaining, _, _, edges, summary, _ = self.discover()
@@ -146,12 +146,6 @@ class CodeImmediateTests(unittest.TestCase):
             "interior_instruction": 2, "mid_instruction": 1,
             "invalid_entry": 1, "manual_call": 1, "non_executable": 2,
             "not_function_boundary": 1})
-
-    def test_disable_restores_direct_cone(self):
-        result = self.discover(enabled=False)
-        self.assertEqual(set(result[2]), {0x1000, 0x1200})
-        self.assertFalse(result[7])
-        self.assertFalse(result[8]["enabled"])
 
     def test_limits_are_observable(self):
         result = self.discover(max_depth=1)

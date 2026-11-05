@@ -2,15 +2,13 @@
 param(
     [string]$AndroidSdk = "$env:LOCALAPPDATA/Android/Sdk",
     [string]$HostBin = 'C:/msys64/mingw64/bin',
-    [string]$GeneratedDir = '',
-    [string]$BinkGeneratedDir = ''
+    [string]$GeneratedDir = ''
 )
 # Small contracts and one-file syntax checks only. No game build or execution.
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path "$PSScriptRoot/..").Path
 # Windows PowerShell leaves $PSScriptRoot empty in parameter defaults.
 if (-not $GeneratedDir) { $GeneratedDir = "$root/work/lift_initial" }
-if (-not $BinkGeneratedDir) { $BinkGeneratedDir = "$root/work/lift_bink" }
 $output = "$root/work/audio"
 New-Item -ItemType Directory -Force $output | Out-Null
 function Check([string]$exe, [string[]]$arguments) {
@@ -44,10 +42,9 @@ try {
             $flags = @("--target=$abi-linux-android29",'-fsyntax-only','-fPIC','-Wall','-Wextra',
                 '-Werror=return-type','-DAC1_HOST_D3D9=1','-DAC1_DIRECT_MEMORY=1',
                 '-DAC1_PROFILE_HOOKS=1','-DRECOMP_FS_SIMULATED','-Isrc/runtime','-Isrc/platform',
-                "-I$GeneratedDir","-I$BinkGeneratedDir")
+                "-I$GeneratedDir")
             if ($source.EndsWith('.cpp')) { $compiler = "$ndk/clang++.exe"; $flags += '-std=c++17' }
             else { $flags += @('-std=c11','-Werror=implicit-function-declaration') }
-            if ($source -eq 'src/runtime/ac1_runtime.c') { $flags += '-DAC1_NATIVE_BINK=1' }
             Check $compiler ($flags + $source)
         }
         # Link only the two host-owned audio files against the real API29 NDK

@@ -368,7 +368,7 @@ class FlagContractTests(unittest.TestCase):
         pe, specs = fake_pe({0x401000: bytes.fromhex('e8fb00000083c400c3'), 0x401100: bytes.fromhex('83c001c3')})
         work = common.ROOT/'work/flagabi-emitter-tests'; work.mkdir(parents=True, exist_ok=True)
         with pe:
-            result = lift.emit_lift(work/'synthetic.exe', lift.DUKE_DEFAULT, specs, work, 1, whole_program=True)
+            result = lift.emit_lift(work/'synthetic.exe', lift.DUKE_DEFAULT, specs, work, 1)
         self.assertEqual(result['flag_abi']['functions'], 2)
         self.assertIn('{ 0x00401100u, L_00401100 }', (work/'initial_dispatch.c').read_text())
         sources = '\n'.join((work/name).read_text() for name in result['translation_units'])

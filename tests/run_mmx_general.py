@@ -15,6 +15,9 @@ WORK = ROOT / "work/mmx_evidence/oracle"
 sys.dont_write_bytecode = True
 
 
+BINK_SHA256="603d0a96d1f27422f88d78b20ca525975ebe5e0d7667e62b98a3db80766702b4"
+
+
 def run():
     start = time.perf_counter()
     WORK.mkdir(parents=True, exist_ok=True)
@@ -124,10 +127,12 @@ def run():
     (WORK / "ops_native.inc").write_text("\n".join(natives) + "\nstatic Operator operators[] = {\n" + ",\n".join(rows) + "\n};\n")
 
     units = []
-    for config_name, address, tag in (("ac1_dx9.json",0x834A90,"audio"),("binkw32.json",0x1801E500,"bink")):
-        config=json.loads((ROOT / "config" / config_name).read_text())
-        binary=Path(config["binary"])
-        if hashlib.sha256(binary.read_bytes()).hexdigest()!=config["sha256"]:
+    game=json.loads((ROOT / "config/ac1_dx9.json").read_text())
+    # Real MMX routines with hand-checked references; the DLL is a test input only.
+    for binary,digest,address,tag in ((game["binary"],game["sha256"],0x834A90,"audio"),
+                                      (str(Path(game["binary"]).with_name("binkw32.dll")),BINK_SHA256,0x1801E500,"bink")):
+        binary=Path(binary)
+        if hashlib.sha256(binary.read_bytes()).hexdigest()!=digest:
             raise RuntimeError(f"pinned binary changed: {binary}")
         info=analyze_pe(str(binary)); dis=Disassembler(binary.read_bytes(),info.image_base,info.sections)
         lift.install_ac1_jump_table_bounds(dis)
@@ -136,7 +141,7 @@ def run():
             "start":block.start,"end":block.end,"successors":block.successors,"is_exit":block.is_exit,
             "instructions":[(i.address,i.size) for i in block.instructions]} for block in fn.blocks.values()]}
         output=WORK / tag
-        result=lift.emit_lift(binary,lift.DUKE_DEFAULT,[spec],output,100,whole_program=True)
+        result=lift.emit_lift(binary,lift.DUKE_DEFAULT,[spec],output,100)
         if result["lift_failures"]:
             raise RuntimeError(str(result["lift_failures"]))
         units += [output / name for name in result["translation_units"]]

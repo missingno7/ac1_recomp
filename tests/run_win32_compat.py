@@ -23,17 +23,6 @@ STUB.mkdir(exist_ok=True)
     "static const ac1_lifted_entry ac1_lifted_functions[1]={{0,0}};\n"
     "static const size_t ac1_lifted_function_count=0;\n"
     "static ac1_lifted_fn ac1_lifted_lookup(uint32_t a) { (void)a;return 0; }\n")
-(STUB / "bink_dispatch.h").write_text(
-    "typedef void (*bink_lifted_fn)(CPU *);\n"
-    "static bink_lifted_fn bink_lifted_lookup(uint32_t a) { (void)a;return 0; }\n")
-(STUB / "bink_module.h").write_text('''#define BINK_MODULE_SHA256 "syntax-only"
-#define BINK_MODULE_PREFERRED_BASE 0x10000000u
-#define BINK_MODULE_IMAGE_SIZE 0x10000u
-#define BINK_MODULE_ENTRY_RVA 0u
-#define BINK_MODULE_EXPORT_COUNT 1u
-typedef struct {const char *name; uint16_t ordinal;uint32_t guest_va;} bink_export_record;
-static const bink_export_record bink_export_records[1]={{0}};
-''')
 (STUB / "ac1_fingerprint.h").write_text('#define AC1_EXPECTED_EXE_SHA256 "syntax-only"\n')
 
 
@@ -63,7 +52,7 @@ run("profile-build", [GCC, "-std=c11", "-Isrc/runtime", "tests/ac1_profile_int_f
 run("profile-contract", [OUT / "profile_fixture.exe"])
 syntax = ["-fsyntax-only", "-std=c11", "-Wall", "-Wextra", "-Werror=implicit-function-declaration",
           "-Werror=return-type", "-Isrc/runtime", f"-I{STUB}"]
-run("host-syntax", [GCC, *syntax, "-DAC1_HOST_D3D9=1", "-DAC1_NATIVE_BINK=1",
+run("host-syntax", [GCC, *syntax, "-DAC1_HOST_D3D9=1",
                      "src/runtime/ac1_runtime.c", "src/runtime/ac1_files.c"])
 run("android-syntax", [NDK / "clang.exe", "--target=aarch64-linux-android28", *syntax,
                         "src/runtime/ac1_runtime.c", "src/runtime/ac1_files.c"])

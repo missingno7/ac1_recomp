@@ -17,7 +17,7 @@ gcc = "C:/msys64/mingw64/bin/gcc.exe"
 env = dict(os.environ, PATH="C:/msys64/mingw64/bin;"+os.environ["PATH"])
 common = [gcc, "-O2", "-g", "-ffunction-sections", "-fdata-sections", "-Isrc/runtime"]
 commands = [
-    common+["-fwhole-program", "-Iwork/lift_initial", "-Iwork/lift_bink", "-c",
+    common+["-fwhole-program", "-Iwork/lift_initial", "-c",
             "tests/scheduler_contract.c", "-o", str(out/"fixture.obj")],
     common+[str(out/"fixture.obj"), "src/runtime/guest_memory.c", "src/runtime/guest_clock.c", "src/runtime/ac1_guest_time.c",
             "src/runtime/ac1_files.c", "src/runtime/ac1_profile.c", "-Wl,--gc-sections",

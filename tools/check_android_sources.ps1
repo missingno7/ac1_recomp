@@ -2,7 +2,6 @@
 param(
     [string]$AndroidSdk = "$env:LOCALAPPDATA/Android/Sdk",
     [string]$GeneratedDir = "$PSScriptRoot/../work/lift_initial",
-    [string]$BinkGeneratedDir = "$PSScriptRoot/../work/lift_bink",
     [string]$DxvkInclude = "$PSScriptRoot/../work/dxvk/prepared/include/native",
     [string]$FFmpegInclude = "$PSScriptRoot/../work/bink_native/ffmpeg-android-arm64/install/include",
     [string]$FFmpegConfigInclude = $FFmpegInclude
@@ -15,7 +14,7 @@ $common = @('--target=aarch64-linux-android29', '-fsyntax-only', '-fPIC',
     '-Wall', '-Wextra', '-Werror=return-type', '-Werror=implicit-function-declaration',
     '-fwrapv', '-fno-strict-aliasing', '-ffp-contract=off',
     '-DAC1_HOST_D3D9=1', '-DAC1_DIRECT_MEMORY=1', '-DAC1_PROFILE_HOOKS=1', '-DRECOMP_FS_SIMULATED',
-    "-I$root/src/runtime", "-I$root/src/platform", "-I$GeneratedDir", "-I$BinkGeneratedDir",
+    "-I$root/src/runtime", "-I$root/src/platform", "-I$GeneratedDir",
     "-I$DxvkInclude/windows", "-I$DxvkInclude/directx", "-I$FFmpegConfigInclude", "-I$FFmpegInclude")
 $sources = @(
     'src/runtime/ac1_runtime.c', 'src/runtime/ac1_profile.c', 'src/runtime/ac1_network.c',
@@ -30,7 +29,6 @@ foreach ($source in $sources) {
     Write-Output "ARM64 syntax: $source"
     $extra = @('-std=c11')
     if ($source.EndsWith('.cpp')) { $extra = @('-std=c++17') }
-    if ($source -eq 'src/runtime/ac1_runtime.c') { $extra += '-DAC1_NATIVE_BINK=1' }
     & $clang @common @extra "$root/$source"
     if ($LASTEXITCODE -ne 0) { $failed += $source }
 }

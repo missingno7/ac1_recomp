@@ -106,14 +106,13 @@ class IndexedTableTests(unittest.TestCase):
                                code_start=0x1000, code_end=0x1800, sections=[self.section()])
         return info, Disassembler, reads
 
-    def discover(self, enabled=True, **kwargs):
+    def discover(self, **kwargs):
         info, disassembler, reads = self.environment(**kwargs)
         modules = {"pe_analyze": SimpleNamespace(analyze_pe=lambda _: info, build_iat_map=lambda _: {}),
                    "disasm32": SimpleNamespace(Disassembler=disassembler)}
         with (patch.dict(sys.modules, modules), patch.object(lift, "install_ac1_jump_table_bounds"),
               patch.object(Path, "read_bytes", return_value=b""), patch.object(sys, "path", sys.path[:])):
-            result = lift.discover_entry_cone(Path("fixture"), ROOT, 100, 32, [],
-                                             indexed_tables=enabled)
+            result = lift.discover_entry_cone(Path("fixture"), ROOT, 100, 32, [])
         return result, reads
 
     def test_recursive_closure_and_provenance(self):
@@ -130,13 +129,11 @@ class IndexedTableTests(unittest.TestCase):
         self.assertEqual(result[9]["rejected_candidates"], {"null_run": 2})
         self.assertNotIn(0x1FFC, reads)  # forward from the displacement itself
 
-    def test_disable_and_bounded_switch_exclusion(self):
-        for kwargs in ({"enabled": False}, {"switch": True}):
-            result, reads = self.discover(**kwargs)
-            self.assertEqual(set(result[2]), {0x1000})
-            self.assertFalse(result[7])
-            self.assertNotIn(0x2000, reads)
-        result, _ = self.discover(switch=True)
+    def test_bounded_switch_exclusion(self):
+        result, reads = self.discover(switch=True)
+        self.assertEqual(set(result[2]), {0x1000})
+        self.assertFalse(result[7])
+        self.assertNotIn(0x2000, reads)
         self.assertEqual(result[9]["rejected_candidates"], {"bounded_switch": 1})
 
     def test_stop_at_first_bad_entry_without_skipping_it(self):

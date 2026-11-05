@@ -56,11 +56,7 @@ static ac1_guest_thread *active_guest_thread = &scheduler.threads[0];
 static pcrecomp_heap *process_heap;
 static ac1_files *guest_files;
 static uint32_t last_error, image_base = 0x100000, image_size_loaded = 0x10000;
-static struct {
-    uint32_t load_base;
-} bink_image;
-static int bink_image_mapped;
-static char bink_module_path[32768], exe_path_copy[32768], guest_current_directory[32768],
+static char exe_path_copy[32768], guest_current_directory[32768],
     userdata[32768];
 static unsigned char memory[4 * 1024 * 1024];
 static uint32_t next_heap = 0x200000, allocs[4096];

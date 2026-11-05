@@ -233,7 +233,6 @@ public static class AC1BenchProcessTree {
             & $Python -B tools/lift_ac1.py; if ($LASTEXITCODE) { throw 'AC1 lift failed' }
         }
         & $Python -B tools/prepare_runtime.py; if ($LASTEXITCODE) { throw 'Runtime preparation failed' }
-        & $Python -B tools/lift_bink.py --if-needed; if ($LASTEXITCODE) { throw 'Bink generation failed' }
         $ninjaExists = Test-Path $ninja
         $makeBuildDir = "build/bench-$key-make"
         $generator = if (Test-Path "$makeBuildDir/CMakeCache.txt") { 'MinGW Makefiles' } elseif ($ninjaExists) { 'Ninja' } else { 'MinGW Makefiles' }

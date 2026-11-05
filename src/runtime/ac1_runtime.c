@@ -15,8 +15,6 @@
 #include "ac1_files.h"
 #include "initial_dispatch.h"
 #include "ac1_lookup_cache.h"
-#include "bink_dispatch.h"
-#include "bink_module.h"
 #include "ac1_fingerprint.h"
 #include "../platform/ac1_pad_discovery.h"
 #include "../platform/ac1_audio_win32.h"
@@ -259,11 +257,7 @@ static uint32_t guest_affinity_mask;
 static _Thread_local uint32_t guest_thread_affinity_mask;
 static uint32_t image_base;
 static uint32_t image_size_loaded;
-static pe32_module bink_image;
-static int bink_image_mapped;
-static char bink_module_path[32768];
 #ifdef __ANDROID__
-static char bink_host_path[32768];
 #endif
 #if defined(_WIN32) || defined(__ANDROID__)
 static ac1_window_win32 *window_bridge;
@@ -2556,8 +2550,6 @@ static int handle_module_import(CPU *cpu, const import_record *import)
         uint32_t name = rd32(cpu->esp + 4u);
         if (!name) cpu->eax = image_base;
         else if (guest_string_equal(name, "kernel32.dll")) cpu->eax = AC1_KERNEL32_HANDLE;
-        else if (bink_image_mapped && guest_string_equal(name, "binkw32.dll"))
-            cpu->eax = bink_image.load_base;
         else { cpu->eax = 0; last_error = 126u; }
         return_stdcall(cpu, 4u);
         return 1;
@@ -2569,8 +2561,6 @@ static int handle_module_import(CPU *cpu, const import_record *import)
         const char *module_path = NULL;
         if (!module || module == image_base)
             module_path = exe_path_copy;
-        else if (bink_image_mapped && module == bink_image.load_base)
-            module_path = bink_module_path;
         if (!module_path) {
             cpu->eax = 0u;
             last_error = 126u;
@@ -2597,39 +2587,11 @@ static int handle_module_import(CPU *cpu, const import_record *import)
         uint32_t module = rd32(cpu->esp + 4u);
         uint32_t name = rd32(cpu->esp + 8u);
         const import_record *resolved = NULL;
-        uint32_t bink_export = 0u;
-        char export_error[192] = {0};
         if (module == AC1_KERNEL32_HANDLE)
             resolved = find_named_import("KERNEL32.dll", name);
         else if (module == image_base)
             resolved = find_named_import("AssassinsCreed_Dx9.exe", name);
-        else if (bink_image_mapped && module == bink_image.load_base) {
-            if (name <= 0xffffu) {
-                (void)pe32_export_by_ordinal(&bink_image, (uint16_t)name,
-                                             &bink_export, export_error,
-                                             sizeof(export_error));
-            } else {
-                char export_name[256];
-                size_t remaining = 0u;
-                int terminated = 0;
-                while (remaining < sizeof(export_name)) {
-                    if (name > UINT32_MAX - (uint32_t)remaining ||
-                        !guest_memory_try_ptr(name + (uint32_t)remaining, 1u))
-                        stop_guest("GetProcAddress Bink export name is unmapped", import->token);
-                    export_name[remaining] = (char)rd8(name + (uint32_t)remaining);
-                    if (!export_name[remaining]) {
-                        terminated = 1;
-                        break;
-                    }
-                    ++remaining;
-                }
-                if (!terminated)
-                    stop_guest("GetProcAddress Bink export name is unterminated", import->token);
-                (void)pe32_export_by_name(&bink_image, export_name, &bink_export,
-                                          export_error, sizeof(export_error));
-            }
-        }
-        cpu->eax = resolved ? resolved->token : bink_export;
+        cpu->eax = resolved ? resolved->token : 0u;
         if (!cpu->eax) last_error = 127u; /* ERROR_PROC_NOT_FOUND */
         return_stdcall(cpu, 8u);
         return 1;
@@ -6693,7 +6655,6 @@ static int handle_optional_eax_import(CPU *cpu, const import_record *import)
     return 1;
 }
 
-#if defined(AC1_NATIVE_BINK)
 #include "../platform/ac1_bink_native.h"
 #ifndef _WIN32
 #include "../platform/ac1_audio_mixer.h"
@@ -6708,7 +6669,7 @@ typedef struct {
 } ac1_native_bink_file;
 static ac1_bink_provider *native_bink;
 static ac1_native_bink_file native_bink_files[16];
-static int native_bink_enabled, native_bink_silent;
+static int native_bink_silent;
 static uint32_t native_bink_allocator, native_bink_free;
 static uint64_t native_bink_frames, native_bink_copies, native_bink_pcm_frames, native_bink_trace_at;
 #ifdef _WIN32
@@ -6718,7 +6679,7 @@ static void *native_bink_audio;
 static void native_bink_trace(int force)
 {
     uint64_t now = guest_monotonic_ns();
-    if (!trace_imports || !native_bink_enabled ||
+    if (!trace_imports ||
         (!force && now - native_bink_trace_at < UINT64_C(1000000000))) return;
     native_bink_trace_at = now;
     fprintf(stderr, "AC1 native Bink progress: DoFrame=%llu CopyToBuffer=%llu PCM-frames=%llu audio=%s%s\n",
@@ -6801,26 +6762,20 @@ static void native_bink_shutdown(void)
 }
 static void native_bink_reset(void)
 {
-    const char *translated = getenv("AC1_BINK_TRANSLATED");
     const char *silent = getenv("AC1_BINK_SILENT");
-    native_bink_enabled = !(translated && !strcmp(translated, "1"));
     native_bink_silent = silent && !strcmp(silent, "1");
     native_bink_allocator = native_bink_free = 0u;
     native_bink_frames = native_bink_copies = native_bink_pcm_frames = native_bink_trace_at = 0u;
-    if (trace_imports || native_bink_silent)
-        fprintf(stderr, "AC1 Bink provider: %s%s\n", native_bink_enabled ? "native FFmpeg" : "translated DLL",
-                native_bink_enabled && native_bink_silent ? " (explicit silent-audio mode)" : "");
 }
 static int native_bink_factory(uint32_t address)
 {
     const import_record *factory = find_import(address);
-    if (factory && !factory->by_ordinal && equal_ascii_fold(factory->dll, "binkw32.dll") &&
-        !strcmp(factory->name, "_BinkOpenDirectSound@4")) return 1;
-    uint32_t original = 0u; char error[128];
-    return pe32_export_by_name(&bink_image, "_BinkOpenDirectSound@4", &original, error, sizeof error) && original == address;
+    return factory && !factory->by_ordinal && equal_ascii_fold(factory->dll, "binkw32.dll") &&
+           !strcmp(factory->name, "_BinkOpenDirectSound@4");
 }
-static int handle_native_bink_import(CPU *cpu, const import_record *import)
+static int handle_bink_import(CPU *cpu, const import_record *import)
 {
+    if (!import || !equal_ascii_fold(import->dll, "binkw32.dll")) return 0;
     static const struct { const char *name; unsigned argc; } api[] = {
         {"_BinkWait@4",1}, {"_BinkSetSoundTrack@8",2}, {"_BinkShouldSkip@4",1},
         {"_BinkNextFrame@4",1}, {"_BinkSetSoundSystem@8",2}, {"_BinkDoFrame@4",1},
@@ -6928,67 +6883,6 @@ static int handle_native_bink_import(CPU *cpu, const import_record *import)
     return_stdcall(cpu,api[op].argc*4u);
     return 1;
 }
-#endif
-
-static int handle_bink_import(CPU *cpu, const import_record *import)
-{
-    uint32_t export_address = 0u;
-    char error[192] = {0};
-    int found;
-
-    if (!import || !equal_ascii_fold(import->dll, "binkw32.dll")) return 0;
-    if (!bink_image_mapped)
-        stop_guest("Bink import executed before its module was mapped", import->token);
-    if (import->by_ordinal) {
-        found = pe32_export_by_ordinal(&bink_image, import->ordinal,
-                                      &export_address, error, sizeof(error));
-    } else {
-        found = pe32_export_by_name(&bink_image, import->name,
-                                    &export_address, error, sizeof(error));
-    }
-    if (!found) {
-        char message[320];
-        if (import->by_ordinal)
-            snprintf(message, sizeof(message),
-                     "pinned Bink export #%u is unavailable: %s",
-                     (unsigned)import->ordinal, error);
-        else
-            snprintf(message, sizeof(message),
-                     "pinned Bink export %s is unavailable: %s",
-                     import->name, error);
-        stop_guest(message, import->token);
-    }
-
-#if defined(AC1_NATIVE_BINK)
-    if (native_bink_enabled) return handle_native_bink_import(cpu, import);
-#endif
-
-    uint32_t allocator = 0u, free_callback = 0u;
-    int check_set_memory = !import->by_ordinal &&
-                           !strcmp(import->name, "_BinkSetMemory@8");
-    if (check_set_memory) {
-        if (!guest_memory_try_ptr(cpu->esp + 4u, 8u) ||
-            !guest_memory_try_ptr(0x18027C8Cu, 8u))
-            stop_guest("BinkSetMemory arguments or callback globals are unmapped",
-                       import->token);
-        allocator = rd32(cpu->esp + 4u);
-        free_callback = rd32(cpu->esp + 8u);
-    }
-    dispatch(cpu, export_address);
-    if (check_set_memory) {
-        uint32_t stored_allocator = rd32(0x18027C8Cu);
-        uint32_t stored_free = rd32(0x18027C90u);
-        if (stored_allocator != allocator || stored_free != free_callback)
-            stop_guest("BinkSetMemory did not store the supplied guest callbacks",
-                       export_address);
-        fprintf(stderr,
-                "AC1 BinkSetMemory: export=0x%08x allocator=0x%08x free=0x%08x stored=0x%08x,0x%08x\n",
-                export_address, allocator, free_callback,
-                stored_allocator, stored_free);
-    }
-    return 1;
-}
-
 /* Called by generated code for direct calls, jumps and returns. Imports are
  * assigned unique IAT tokens and stop here until a measured implementation is
  * added; an unknown guest address is equally fatal and includes its caller. */
@@ -7420,13 +7314,6 @@ void dispatch(CPU *cpu, uint32_t target)
     ac1_lifted_fn function = ac1_lifted_lookup_cached(
         target, ac1_main_lifted_lookup_cache_enabled,
         ac1_main_lifted_lookup_cache, profile_lifted_lookup);
-    if (!function && bink_image_mapped && target >= bink_image.load_base &&
-        (uint64_t)target < (uint64_t)bink_image.load_base + bink_image.image_size) {
-        bink_lifted_fn bink_function = bink_lifted_lookup(target);
-        if (!bink_function)
-            stop_guest("no generated Bink function for guest target", target);
-        function = bink_function;
-    }
     if (!function)
         stop_guest("no generated function for guest target", target);
 
@@ -7591,97 +7478,6 @@ static int initialize_android_guest_paths(const char *host_exe_path)
 }
 #endif
 
-static int load_pinned_bink_module(char *error, size_t error_capacity)
-{
-    uint8_t *file_bytes = NULL;
-    size_t file_size = 0u;
-    uint8_t digest[32];
-    char hash[65];
-    int path_length;
-
-#ifdef __ANDROID__
-    path_length = snprintf(bink_module_path, sizeof(bink_module_path),
-                           "%s\\%s", guest_current_directory, "binkw32.dll");
-    if (path_length < 0 || (size_t)path_length >= sizeof(bink_module_path)) {
-        snprintf(error, error_capacity, "pinned Bink DLL path is too long");
-        return 0;
-    }
-    int host_path_length = snprintf(bink_host_path, sizeof(bink_host_path),
-                                    "%s/%s", host_game_directory,
-                                    "binkw32.dll");
-    if (host_path_length < 0 ||
-        (size_t)host_path_length >= sizeof(bink_host_path)) {
-        snprintf(error, error_capacity, "pinned Bink host path is too long");
-        return 0;
-    }
-    if (!read_file(bink_host_path, &file_bytes, &file_size,
-                   error, error_capacity))
-        return 0;
-#else
-    path_length = snprintf(bink_module_path, sizeof(bink_module_path),
-                           "%s/%s", guest_current_directory, "binkw32.dll");
-    if (path_length < 0 || (size_t)path_length >= sizeof(bink_module_path)) {
-        snprintf(error, error_capacity, "pinned Bink DLL path is too long");
-        return 0;
-    }
-#ifdef _WIN32
-    for (size_t i = 0u; i < (size_t)path_length; ++i)
-        if (bink_module_path[i] == '/') bink_module_path[i] = '\\';
-#endif
-    if (!read_file(bink_module_path, &file_bytes, &file_size,
-                   error, error_capacity))
-        return 0;
-#endif
-    sha256(file_bytes, file_size, digest);
-    digest_hex(digest, hash);
-    if (strcmp(hash, BINK_MODULE_SHA256)) {
-        snprintf(error, error_capacity,
-                 "Bink DLL SHA-256 mismatch: expected %s, found %s",
-                 BINK_MODULE_SHA256, hash);
-        free(file_bytes);
-        return 0;
-    }
-    if (!pe32_load(file_bytes, file_size, BINK_MODULE_PREFERRED_BASE,
-                   &bink_image, error, error_capacity)) {
-        free(file_bytes);
-        return 0;
-    }
-    free(file_bytes);
-    if (bink_image.preferred_base != BINK_MODULE_PREFERRED_BASE ||
-        bink_image.load_base != BINK_MODULE_PREFERRED_BASE ||
-        bink_image.image_size != BINK_MODULE_IMAGE_SIZE ||
-        bink_image.entry_rva != BINK_MODULE_ENTRY_RVA) {
-        snprintf(error, error_capacity,
-                 "pinned Bink PE layout mismatch: preferred=0x%08x load=0x%08x size=0x%08x entry=0x%08x",
-                 bink_image.preferred_base, bink_image.load_base,
-                 bink_image.image_size, bink_image.entry_rva);
-        pe32_unload(&bink_image);
-        return 0;
-    }
-    for (size_t i = 0u; i < BINK_MODULE_EXPORT_COUNT; ++i) {
-        uint32_t by_name = 0u, by_ordinal = 0u;
-        const bink_export_record *record = &bink_export_records[i];
-        if (!pe32_export_by_name(&bink_image, record->name, &by_name,
-                                 error, error_capacity) ||
-            !pe32_export_by_ordinal(&bink_image, record->ordinal, &by_ordinal,
-                                    error, error_capacity) ||
-            by_name != record->guest_va || by_ordinal != record->guest_va) {
-            if (!error[0])
-                snprintf(error, error_capacity,
-                         "pinned Bink export map mismatch at %s ordinal %u",
-                         record->name, (unsigned)record->ordinal);
-            pe32_unload(&bink_image);
-            return 0;
-        }
-    }
-    if (!pe32_link_imports(&bink_image, resolve_import, NULL,
-                           error, error_capacity)) {
-        pe32_unload(&bink_image);
-        return 0;
-    }
-    return 1;
-}
-
 static uint64_t read_scheduler_return_slice_ns(void)
 {
     const char *setting = getenv("AC1_SCHEDULER_SLICE_US");
@@ -7804,11 +7600,7 @@ int ac1_run(const char *exe_path)
     memset(heap_ops, 0, sizeof(heap_ops));
     memset(critical_section_ops, 0, sizeof(critical_section_ops));
     memset(clock_ops, 0, sizeof(clock_ops));
-    memset(&bink_image, 0, sizeof(bink_image));
-    bink_image_mapped = 0;
-    bink_module_path[0] = '\0';
 #ifdef __ANDROID__
-    bink_host_path[0] = '\0';
     host_game_directory[0] = '\0';
 #endif
     process_heap = NULL;
@@ -7846,9 +7638,7 @@ int ac1_run(const char *exe_path)
     if (trace_imports)
         fprintf(stderr, "AC1 dispatch guard: limit=%llu (0 disables)\n",
                 (unsigned long long)dispatch_limit);
-#if defined(AC1_NATIVE_BINK)
     native_bink_reset();
-#endif
     trace_import_count = 0;
     trace_callback_count = 0;
     trace_file_read_count = 0;
@@ -7916,17 +7706,6 @@ int ac1_run(const char *exe_path)
         unlock_ac1_run();
         return 4;
     }
-    if (!load_pinned_bink_module(error, sizeof(error))) {
-        snprintf(last_run_error, sizeof(last_run_error),
-                 "pinned Bink module load failed: %s", error);
-        fprintf(stderr, "AC1 native runtime: %s\n", last_run_error);
-        pe32_unload(&image);
-        memset(imports, 0, sizeof(imports));
-        import_count = 0;
-        bink_module_path[0] = '\0';
-        unlock_ac1_run();
-        return 4;
-    }
 #ifdef AC1_DIRECT_MEMORY
     space = guest_address_space_create_direct();
 #else
@@ -7935,20 +7714,16 @@ int ac1_run(const char *exe_path)
     if (!space) {
         snprintf(last_run_error, sizeof(last_run_error), "guest address-space allocation failed");
         fprintf(stderr, "AC1 native runtime: guest address-space allocation failed\n");
-        pe32_unload(&bink_image);
-        bink_module_path[0] = '\0';
         pe32_unload(&image);
         unlock_ac1_run();
         return 5;
     }
     guest_address_space_select(space);
-    if (!map_module_image(&image) || !map_module_image(&bink_image)) {
+    if (!map_module_image(&image)) {
         snprintf(last_run_error, sizeof(last_run_error), "guest image mapping failed");
         fprintf(stderr, "AC1 native runtime: guest image mapping failed\n");
         guest_address_space_select(NULL);
         guest_address_space_destroy(space);
-        pe32_unload(&bink_image);
-        bink_module_path[0] = '\0';
         pe32_unload(&image);
         unlock_ac1_run();
         return 5;
@@ -7964,7 +7739,6 @@ int ac1_run(const char *exe_path)
     }
 #endif
 #endif
-    bink_image_mapped = 1;
 #ifdef __ANDROID__
     guest_files = ac1_files_create_with_guest_root(host_game_directory,
                                                    guest_current_directory);
@@ -8060,20 +7834,6 @@ int ac1_run(const char *exe_path)
 
     if (setjmp(stop_runtime) == 0) {
         runtime_stop_ready = 1;
-        const uint32_t bink_attach_arguments[3] = {
-            bink_image.load_base, 1u, 0u /* DLL_PROCESS_ATTACH, reserved */
-        };
-        uint32_t bink_attach_result = 0u;
-        uint32_t bink_entry = bink_image.load_base + bink_image.entry_rva;
-        if (!invoke_guest_stdcall_callback(cpu, bink_entry,
-                                           bink_attach_arguments, 3u,
-                                           &bink_attach_result))
-            stop_guest("Bink DllMain PROCESS_ATTACH frame setup failed", bink_entry);
-        if (!bink_attach_result)
-            stop_guest("Bink DllMain rejected DLL_PROCESS_ATTACH", bink_entry);
-        fprintf(stderr,
-                "AC1 Bink attached: base=0x%08x entry=0x%08x result=0x%08x\n",
-                bink_image.load_base, bink_entry, bink_attach_result);
         dispatch(cpu, cpu->eip);
         runtime_stop_ready = 0;
         if (cpu->esp == stack_top && rd32(stack_top - 4u) == AC1_RETURN_SENTINEL) {
@@ -8149,9 +7909,7 @@ cleanup:
         dinput8_configured = 0;
     }
 #endif
-#if defined(AC1_NATIVE_BINK)
     native_bink_shutdown();
-#endif
     ac1_network_reset();
     ac1_crypto_reset();
 #if defined(_WIN32) || defined(__ANDROID__)
@@ -8205,14 +7963,11 @@ cleanup:
         if (static_tls_data_base) guest_memory_release(static_tls_data_base);
         guest_memory_release(AC1_TIB_BASE);
         guest_memory_release(AC1_STACK_BASE);
-        if (bink_image_mapped) (void)guest_memory_remove(bink_image.load_base);
         (void)guest_memory_remove(image.load_base);
     }
 #ifdef AC1_DIRECT_MEMORY
     ac1_direct_arena = NULL;
 #endif
-    bink_image_mapped = 0;
-    bink_module_path[0] = '\0';
     static_tls_data_base = 0;
     static_tls_vector_base = 0;
     static_tls_template = NULL;
@@ -8221,7 +7976,6 @@ cleanup:
     static_tls_index_address = 0u;
     guest_address_space_select(NULL);
     guest_address_space_destroy(space);
-    pe32_unload(&bink_image);
     pe32_unload(&image);
     memset(imports, 0, sizeof(imports));
     import_count = 0;

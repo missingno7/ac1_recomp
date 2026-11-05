@@ -1697,10 +1697,6 @@ static int wc_misc_import(CPU *cpu, const import_record *import, wc_state *s)
         if (equal_ascii_fold(name, "kernel32.dll") || equal_ascii_fold(name, "kernel32")) {
             RET(AC1_KERNEL32_HANDLE, 1);
         }
-        if (bink_image_mapped &&
-            (equal_ascii_fold(name, "binkw32.dll") || equal_ascii_fold(name, bink_module_path))) {
-            RET(bink_image.load_base, 1);
-        }
         if (equal_ascii_fold(name, exe_path_copy) ||
             equal_ascii_fold(name, "AssassinsCreed_Dx9.exe")) {
             RET(image_base, 1);
@@ -1709,8 +1705,7 @@ static int wc_misc_import(CPU *cpu, const import_record *import, wc_state *s)
         RET(0, 1);
     }
     if (IS("FreeLibrary")) {
-        int ok = A(1) == AC1_KERNEL32_HANDLE || A(1) == image_base ||
-                 (bink_image_mapped && A(1) == bink_image.load_base);
+        int ok = A(1) == AC1_KERNEL32_HANDLE || A(1) == image_base;
         if (!ok) {
             last_error = 6;
         }
