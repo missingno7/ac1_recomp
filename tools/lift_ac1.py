@@ -3788,6 +3788,23 @@ def specialize_direct_calls(body: str, lifted: set[int]) -> tuple[str, set[int],
     return body, callees, count
 
 
+def plain_direct_calls(body: str) -> str:
+    """Direct calls outside every loop are plain C calls.
+
+    Any cycle in the linear body crosses backward gotos whose spans cover it, so
+    a call outside those spans cannot repeat without returning to a caller.
+    """
+    lines = body.split('\n')
+    labels = {m[1]: i for i, line in enumerate(lines) for m in [re.fullmatch(r'(L_[0-9A-F]{8}):', line.strip())] if m}
+    spans = [(labels[target], i) for i, line in enumerate(lines)
+             for target in re.findall(r'\bgoto (L_[0-9A-F]{8});', line) if labels.get(target, i + 1) <= i]
+    in_loop = [False] * len(lines)
+    for first, last in spans:
+        in_loop[first:last + 1] = [True] * (last + 1 - first)
+    plain = re.compile(r'\bAC1_CALL\(c, (L_[0-9A-F]{8}), 0x[0-9A-F]{8}u\)')
+    return '\n'.join(line if loop else plain.sub(r'\1(c)', line) for line, loop in zip(lines, in_loop))
+
+
 # Audited pinned helpers only: every CPU access is flag state, with no GPR
 # pointer escaping or diagnostic callback. Unit tests check the actual header.
 LOCAL_GPR_FREE_HELPERS = frozenset({
@@ -4306,7 +4323,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     for index, address in enumerate(lifted):
         if address in count_entries:
             bodies[index] = profile_count_entry(bodies[index], address)
-    bodies = [drop_unrecorded_eip_markers(declare_local_memory_base(body)) for body in bodies]
+    bodies = [plain_direct_calls(drop_unrecorded_eip_markers(declare_local_memory_base(body))) for body in bodies]
     if translation_unit_buckets < 0:
         raise ValueError("translation_unit_buckets must be zero or positive")
     if not translation_unit_buckets and functions_per_tu < 1:

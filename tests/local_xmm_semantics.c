@@ -30,7 +30,7 @@ int main(void) {
     for(unsigned i=0;i<4096;++i) {
         CPU seed,actual,expected;
         memset(&seed,0x5a,sizeof seed);
-        seed.eax=random32();seed.ecx=random32();seed.esp=0x8000;static ac1_call_state state;seed.calls=&state;
+        seed.eax=random32();seed.ecx=random32();seed.esp=0x8000;
         for(unsigned r=0;r<8;++r)for(unsigned k=0;k<4;++k)seed.xmm[r].f32[k]=(float)(int32_t)random32()/65536.0f;
         actual=seed;digest=1469598103934665603ull;calls=0;plain_L_00401000(&actual);
         expected=actual;uint64_t expected_digest=digest;unsigned expected_calls=calls;

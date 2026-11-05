@@ -21,7 +21,7 @@ int main(void) {
         CPU seed,actual,expected;
         memset(&seed,0x5a,sizeof seed);
         seed.eax=random32();seed.ecx=random32();seed.edx=random32();seed.ebx=random32();
-        seed.esp=0x8000;seed.ebp=random32();seed.esi=random32();seed.edi=random32();seed.calls=NULL;
+        seed.esp=0x8000;seed.ebp=random32();seed.esi=random32();seed.edi=random32();
         seed.cf=i&1;
         actual=seed;digest=1469598103934665603ull;calls=0;plain_L_00401000(&actual);
         expected=actual;uint64_t expected_digest=digest;unsigned expected_calls=calls;

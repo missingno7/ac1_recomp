@@ -49,18 +49,38 @@ class DirectCallsTests(unittest.TestCase):
         source.write_text('#include "cpu.h"\n#define AC1_SET_GUEST_EIP(c,va) ((c)->eip=(va))\n'
                           'void L_00401100(CPU *);void L_00401200(CPU *);\n' + "\n".join(bodies))
         for direct_memory in (False, True):
-            for direct_calls in (False, True):
-                exe = work / f"check-{direct_memory}-{direct_calls}.exe"
-                flags = (["-DAC1_DIRECT_MEMORY"] if direct_memory else []) + (
-                    [] if direct_calls else ["-DAC1_NO_DIRECT_CALLS"])
-                subprocess.run(["gcc", "-O2", "-fwrapv", "-fno-strict-aliasing", *flags,
-                    "-I", str(lift.prepare_test_runtime()), str(source),
-                    str(ROOT / "tests/direct_calls_semantics.c"), "-o", str(exe)], check=True,
-                    capture_output=True, timeout=60)
-                result = subprocess.run([str(exe)], check=True, capture_output=True, text=True, timeout=15)
-                self.assertIn("2000 nested/tail cases", result.stdout)
-                stopped = subprocess.run([str(exe), "depth"], capture_output=True, timeout=15)
-                self.assertEqual(stopped.returncode, 82, stopped.stderr)
+            exe = work / f"check-{direct_memory}.exe"
+            subprocess.run(["gcc", "-O2", "-fwrapv", "-fno-strict-aliasing",
+                *(["-DAC1_DIRECT_MEMORY"] if direct_memory else []),
+                "-I", str(lift.prepare_test_runtime()), str(source),
+                str(ROOT / "tests/direct_calls_semantics.c"), "-o", str(exe)], check=True,
+                capture_output=True, timeout=60)
+            result = subprocess.run([str(exe)], check=True, capture_output=True, text=True, timeout=15)
+            self.assertIn("1000 nested/tail cases", result.stdout)
+
+    def test_only_calls_on_a_loop_keep_the_return_count(self):
+        body = '\n'.join([
+            'void L_00401000(CPU *c)', '{',
+            '    AC1_CALL(c, L_00401100, 0x00401100u); /* before the loop */',
+            'L_00401005:',
+            '    AC1_CALL(c, L_00401200, 0x00401200u); /* in the loop */',
+            '    if (c->eax) goto L_00401020;',
+            'L_00401010:',
+            '    AC1_CALL(c, L_00401300, 0x00401300u); /* reached through two back edges */',
+            '    if (c->ecx) goto L_00401005;',
+            '    return;',
+            'L_00401020:',
+            '    AC1_CALL(c, L_00401400, 0x00401400u); /* jumps back past itself */',
+            '    goto L_00401010;',
+            'L_00401030:',
+            '    AC1_CALL(c, L_00401500, 0x00401500u); /* after every back edge */',
+            '}'])
+        lines = lift.plain_direct_calls(body).split('\n')
+        self.assertIn('    L_00401100(c); /* before the loop */', lines)
+        self.assertIn('    AC1_CALL(c, L_00401200, 0x00401200u); /* in the loop */', lines)
+        self.assertIn('    AC1_CALL(c, L_00401300, 0x00401300u); /* reached through two back edges */', lines)
+        self.assertIn('    AC1_CALL(c, L_00401400, 0x00401400u); /* jumps back past itself */', lines)
+        self.assertIn('    L_00401500(c); /* after every back edge */', lines)
 
 
 if __name__ == "__main__":

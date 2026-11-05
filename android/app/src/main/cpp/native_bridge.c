@@ -162,7 +162,6 @@ static jint run_original(JNIEnv *env, jstring exe_path, jstring userdata_path,
     setenv("AC1_D3D9_FORCE_WINDOWED", "1", 1);
     /* Like the host gameplay launchers: worker loops legitimately exceed the
      * startup-diagnostic dispatch budget once the device runs at speed. */
-    setenv("AC1_DISPATCH_LIMIT", "0", 1);
     uint32_t render_width, render_height;
     select_render_size(&render_width, &render_height);
     dxvkAndroidSetRenderSize(render_width, render_height);

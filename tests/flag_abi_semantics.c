@@ -29,7 +29,6 @@ static uint32_t random32(void) {
 int main(void) {
     for(unsigned i=0;i<4096;++i) {
         CPU seed={0},expected={0};
-        ac1_call_state calls={0},expected_calls={0};
         unsigned char expected_memory[64];
         seed.eax=random32();seed.ebx=random32();seed.ecx=random32();seed.edx=random32();
         seed.esi=random32();seed.edi=random32();seed.ebp=random32()&7u;
@@ -39,17 +38,14 @@ int main(void) {
         seed.esp=0x8000;
         for(version=0;version<3;++version) {
             CPU actual=seed;
-            memset(&calls,0,sizeof calls);actual.calls=&calls;
-            calls.stack_floor=(i>>6)&1?UINTPTR_MAX:0u;   /* tracing: every call through dispatch */
             memset(memory+0x7fe0,0x55,64);
             variant_entry(version,&actual,(i>>7)%variant_entries);
-            actual.cf=actual.pf=actual.af=actual.zf=actual.sf=actual.of=0;actual.calls=NULL;
+            actual.cf=actual.pf=actual.af=actual.zf=actual.sf=actual.of=0;
             if(!version) {
-                expected=actual;expected_calls=calls;memcpy(expected_memory,memory+0x7fe0,64);
+                expected=actual;memcpy(expected_memory,memory+0x7fe0,64);
                 continue;
             }
             assert(!memcmp(&actual,&expected,sizeof actual));
-            assert(!memcmp(&calls,&expected_calls,sizeof calls));
             assert(!memcmp(expected_memory,memory+0x7fe0,64));
         }
     }

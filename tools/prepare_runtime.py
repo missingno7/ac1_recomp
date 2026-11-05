@@ -27,56 +27,17 @@ SOURCE_FILES = {
     "src/runtime/cpu.h": ("work/generated/cpu.h", "ded33fb92194b50c42d80f03ec9142f3517bb62400545ca57f00e903e3383dfe"),
 }
 
-# CPU copies made for host callbacks retain this pointer: dispatch accounting
-# belongs to the guest thread, not to the snapshot of its architectural state.
-CALL_STATE_DECL = r'''
-typedef struct ac1_call_state {
-    uint64_t count;
-    /* Generated code calls directly while the host stack pointer is at or
-     * above `stack_floor` and enters the dispatcher below it. The runtime puts
-     * the floor near the end of the thread's host stack, or at UINTPTR_MAX so
-     * that tracing sees every call; the dispatcher stops below `stack_limit`. */
-    uintptr_t stack_floor, stack_limit;
-    /* Target of the innermost dispatched (not direct) call, for diagnostics. */
-    uint32_t last_target;
-    /* Generated code counts returns and enters the runtime's checkpoint only
-     * when `returns` reaches `return_threshold` (0: after every return). The
-     * runtime adds them to `count`, the dispatch budget, when it resets them. */
-    uint32_t returns, return_threshold;
-} ac1_call_state;
-'''
 CALL_HELPERS = r'''
 void ac1_scheduler_return_checkpoint(CPU *c);
 
-/* The host stack pointer, without forcing a frame pointer. */
-#if defined(__x86_64__)
-#define AC1_HOST_SP() __extension__({ uintptr_t _sp; __asm__("movq %%rsp, %0" : "=r"(_sp)); _sp; })
-#elif defined(__aarch64__)
-#define AC1_HOST_SP() __extension__({ uintptr_t _sp; __asm__("mov %0, sp" : "=r"(_sp)); _sp; })
-#else
-#define AC1_HOST_SP() ((uintptr_t)__builtin_frame_address(0))
-#endif
-
-/* Unbound CPUs (tests, a thread's first transfer), tracing and a nearly
- * exhausted host stack take the dispatcher, which binds, traces or stops. A
- * direct call otherwise costs the stack comparison and the return count; the
- * runtime's checkpoints keep the dispatch budget. */
-#if defined(AC1_NO_DIRECT_CALLS)
-#define AC1_CALL(c, fn, target) dispatch((c), (target))
-#else
+/* One serialized guest thread runs at a time, so a thread must offer the baton.
+ * A guest loop can run indefinitely only through a call in a loop, so a direct
+ * call on a loop counts its return; any other direct call is a plain C call. */
+#define AC1_RETURN_INTERVAL 256u
 #define AC1_CALL(c, fn, target) do { \
-    CPU *_ac = (c); \
-    ac1_call_state *_as = _ac->calls; \
-    if (__builtin_expect(!_as || AC1_HOST_SP() < _as->stack_floor, 0)) { \
-        dispatch(_ac, (target)); \
-    } else { \
-        fn(_ac); \
-        _as = _ac->calls; \
-        if (__builtin_expect(++_as->returns >= _as->return_threshold, 0)) \
-            ac1_scheduler_return_checkpoint(_ac); \
-    } \
+    fn(c); \
+    if (__builtin_expect(++(c)->returns >= AC1_RETURN_INTERVAL, 0)) ac1_scheduler_return_checkpoint(c); \
 } while (0)
-#endif
 '''
 
 # Project-owned additions to the pinned CPU ABI. No donor input/hash is changed.
@@ -1255,7 +1216,7 @@ void guest_execution_write(uint32_t address, const void *input, size_t width)
                 raise SystemExit(f"unexpected pcrecomp CPU header shape: {source}")
             text = text.replace(
                 marker,
-                FP_STATE_FIELDS + "    ac1_call_state *calls;\n" + marker + "\n\n/* Project-owned native dispatcher, called by generated code. */\n"
+                FP_STATE_FIELDS + "    uint32_t returns;\n" + marker + "\n\n/* Project-owned native dispatcher, called by generated code. */\n"
                 "void dispatch(CPU *cpu, uint32_t target);\n"
                 "void dispatch_jmp(CPU *cpu, uint32_t target);\n"
                 "void ac1_unsupported_instruction(uint32_t guest_va, const char *reason);\n" + CALL_HELPERS + FP_STATE_BASIC,
@@ -1263,7 +1224,6 @@ void guest_execution_write(uint32_t address, const void *input, size_t width)
             cpu_start = "typedef struct {\n    uint32_t eax"
             if text.count(cpu_start) != 1:
                 raise SystemExit(f"unexpected pinned CPU declaration: {source}")
-            text = text.replace(cpu_start, CALL_STATE_DECL + cpu_start)
             x87_helpers = {
                 "static inline void   fpush(CPU *c, double v) { c->fpu_top = (c->fpu_top - 1) & 7; c->st[c->fpu_top] = v; }":
                     "static inline void fpush(CPU *c, double v) { if(!ac1_x87_check(c,c->eip)) return; "

@@ -61,15 +61,7 @@ extern uintptr_t ac1_android_d3d9_guest_hwnd(void *context, uint32_t guest_hwnd)
 #define AC1_TIB_SIZE 0x00001000u
 #define AC1_IMPORT_BASE 0xF1000000u
 #define AC1_RETURN_SENTINEL 0xFFFFF000u
-#define AC1_DISPATCH_LIMIT_DEFAULT UINT64_C(200000000)
-/* Guest calls stop ("guest call depth exceeded") with this much host stack
- * left for the dispatcher, imports and the host APIs they reach. */
-#define AC1_HOST_STACK_RESERVE (256u * 1024u)
-/* Guest returns and imports between reads of the scheduler's slice clock: a
- * read (QueryPerformanceCounter) every 64 returns was ~2% of the main thread,
- * and every 256 returns still ~1.4% on the phone (vDSO clock_gettime). 1024
- * returns take tens of microseconds, far below the 1 ms slice. */
-#define AC1_RETURN_CLOCK_INTERVAL 1024u
+/* Ordinary imports between reads of the scheduler's slice clock. */
 #define AC1_IMPORT_CLOCK_INTERVAL 256u
 #define AC1_IMPORT_LIMIT 2048u
 #define AC1_PROCESS_HEAP_HANDLE 0xE0000001u
@@ -102,8 +94,6 @@ struct ac1_guest_thread {
     ac1_scheduler *scheduler;
     unsigned slot;
     uint32_t id, handle, start, parameter, exit_code, image_delta;
-    uint64_t guest_dispatches;
-    ac1_call_state calls;
     uint32_t stack_base, stack_size, tib_base;
     uint32_t static_tls_data, static_tls_vector;
     uint32_t affinity_mask;
@@ -166,58 +156,7 @@ static _Thread_local unsigned trace_import_count;
 static _Thread_local unsigned trace_import_window;
 static _Thread_local unsigned trace_callback_count;
 static _Thread_local unsigned trace_file_read_count;
-/* Cold lifecycle/diagnostic code can still use the active thread. Dispatch
- * and generated direct calls use CPU->calls and never read emulated TLS. */
-static _Thread_local ac1_call_state unbound_calls;
-static inline ac1_call_state *current_calls(void)
-{
-    return active_guest_thread ? &active_guest_thread->calls : &unbound_calls;
-}
-#define last_guest_target (current_calls()->last_target)
-#define dispatch_count (current_calls()->count)
-static uint64_t dispatch_limit = AC1_DISPATCH_LIMIT_DEFAULT;
-
-/* Run on the host thread that executes the guest thread. */
-static void bind_host_stack(ac1_call_state *calls)
-{
-    uintptr_t low = 0u;
-#ifdef _WIN32
-    MEMORY_BASIC_INFORMATION region;
-    if (VirtualQuery(&low, &region, sizeof(region)) == sizeof(region))
-        low = (uintptr_t)region.AllocationBase;
-#else
-    pthread_attr_t attributes;
-    void *address = NULL;
-    size_t size = 0u;
-    if (pthread_getattr_np(pthread_self(), &attributes) == 0) {
-        if (pthread_attr_getstack(&attributes, &address, &size) == 0) low = (uintptr_t)address;
-        pthread_attr_destroy(&attributes);
-    }
-#endif
-    if (!low)
-        fprintf(stderr, "AC1 host stack bounds unavailable: the guest call depth guard is off on this thread\n");
-    calls->stack_limit = low ? low + AC1_HOST_STACK_RESERVE : 0u;
-    calls->stack_floor = trace_imports ? UINTPTR_MAX : calls->stack_limit;
-}
-
-/* Generated and dispatched calls count their returns into `returns`; the
- * dispatch budget sees them once they are settled into `count`. Imports and
- * COM methods are counted by the dispatcher itself. */
-static void settle_returns(ac1_call_state *calls)
-{
-    calls->count += calls->returns;
-    calls->returns = 0u;
-}
-
-static void stop_guest(const char *reason, uint32_t target);
-static void check_dispatch_budget(const ac1_call_state *calls, uint32_t target)
-{
-    if (!dispatch_limit || calls->count + calls->returns <= dispatch_limit) return;
-    char reason[128];
-    snprintf(reason, sizeof(reason), "guest dispatch budget exceeded (limit=%llu)",
-             (unsigned long long)dispatch_limit);
-    stop_guest(reason, target);
-}
+#define last_guest_target (active_guest_thread ? active_guest_thread->cpu.eip : 0u)
 #define AC1_SCHEDULER_RETURN_SLICE_NS UINT64_C(1000000)
 static uint64_t trace_wait_interval_ns;
 static pcrecomp_heap *process_heap;
@@ -544,7 +483,6 @@ static void run_guest_thread(ac1_guest_thread *thread)
          * is waiting, including SetThreadAffinityMask. */
         active_guest_thread = thread;
         thread->return_slice_deadline = guest_monotonic_ns() + AC1_SCHEDULER_RETURN_SLICE_NS;
-        thread->calls.returns = 0u;
         guest_address_space_select(scheduler->space);
         static_tls_data_base = thread->static_tls_data;
         static_tls_vector_base = thread->static_tls_vector;
@@ -554,10 +492,7 @@ static void run_guest_thread(ac1_guest_thread *thread)
         com_init_count = 0u;
         com_apartment_model = UINT32_MAX;
         g_image_delta = thread->image_delta;
-        dispatch_count = 0u;
-        bind_host_stack(&thread->calls);
         trace_import_count = 0u;
-        last_guest_target = thread->start;
     }
 
     if (can_run && setjmp(thread->exit_env) == 0) {
@@ -577,7 +512,6 @@ static void run_guest_thread(ac1_guest_thread *thread)
     runtime_stop_ready = 0;
 
     scheduler_lock(scheduler);
-    thread->guest_dispatches = dispatch_count;
     thread->finished = 1;
     if (scheduler->failed) {
         if (scheduler->owner != 0u) ac1_profile_handoff(AC1_HANDOFF_EXIT);
@@ -653,15 +587,12 @@ static void scheduler_stop_and_join(ac1_scheduler *scheduler)
         if (thread->stack_base) guest_memory_release(thread->stack_base);
     }
     unsigned joined = 0u;
-    uint64_t worker_dispatches = 0u;
     for (unsigned i = 1u; i < scheduler->count; ++i) {
         ac1_guest_thread *thread = &scheduler->threads[i];
         if (thread->spawned) ++joined;
-        worker_dispatches += thread->guest_dispatches;
     }
-    fprintf(stderr, "AC1 scheduler summary: workers created=%u started=%u exited-before-teardown=%u joined=%u blocked-at-teardown=%u guest-dispatches=%llu\n",
-            created, started, exited_before_teardown, joined, blocked_at_teardown,
-            (unsigned long long)worker_dispatches);
+    fprintf(stderr, "AC1 scheduler summary: workers created=%u started=%u exited-before-teardown=%u joined=%u blocked-at-teardown=%u\n",
+            created, started, exited_before_teardown, joined, blocked_at_teardown);
     active_guest_thread = NULL;
     active_scheduler = NULL;
     scheduler_destroy_primitives(scheduler);
@@ -730,8 +661,7 @@ static int create_guest_thread(CPU *cpu, const import_record *import)
     /* Lifted C recursion uses a separate native stack. Android's default 1 MiB
      * overflowed in the original recursive loader at 0x0093C740; even dispatch
      * alone needs about 4 KiB per frame in the x86_64 diagnostic build. Guest
-     * calls nest on this stack until the dispatcher stops 256 KiB short of its
-     * end, independently of the guest x86 stack. */
+     * calls nest on this stack, independently of the guest x86 stack. */
     pthread_attr_t native_attributes;
     int host_error = pthread_attr_init(&native_attributes);
     if (!host_error) {
@@ -1068,7 +998,6 @@ static void scheduler_checkpoint_for_thread(ac1_guest_thread *thread)
     android_repin_guest_thread();
 #endif
     thread->return_slice_deadline = guest_monotonic_ns() + AC1_SCHEDULER_RETURN_SLICE_NS;
-    settle_returns(&thread->calls);
     thread->import_batch = 0u;
     if ((stopping || failed) && thread->slot != 0u)
         longjmp(thread->exit_env, 1);
@@ -1086,22 +1015,10 @@ static void scheduler_checkpoint(void)
 void ac1_scheduler_return_checkpoint(CPU *cpu)
 {
     ac1_guest_thread *thread = guest_thread_for_cpu(cpu);
-    ac1_scheduler *scheduler = thread->scheduler;
-    /* Callers count `returns` inline and enter here once it reaches the
-     * threshold, every AC1_RETURN_CLOCK_INTERVAL returns. */
-    ac1_call_state *calls = cpu->calls ? cpu->calls : &thread->calls;
-    calls->return_threshold = AC1_RETURN_CLOCK_INTERVAL;
-    if (!scheduler || !thread || scheduler->count < 2u) {
-        settle_returns(calls);
-        check_dispatch_budget(calls, cpu->eip);
-        scheduler_checkpoint_for_thread(thread);
-        return;
-    }
+    cpu->returns = 0u;
+    if (!thread->scheduler || thread->scheduler->count < 2u) return;
     if (!thread->return_slice_deadline)
         thread->return_slice_deadline = guest_monotonic_ns() + AC1_SCHEDULER_RETURN_SLICE_NS;
-    if (calls->returns < AC1_RETURN_CLOCK_INTERVAL) return;
-    settle_returns(calls);
-    check_dispatch_budget(calls, cpu->eip);
     if (guest_monotonic_ns() < thread->return_slice_deadline) return;
     scheduler_checkpoint_for_thread(thread);
 }
@@ -6996,32 +6913,21 @@ static int run_import_handlers(CPU *cpu, const import_record *import)
 void dispatch(CPU *cpu, uint32_t target)
 {
     AC1_PROFILE_COUNT(dispatches);
-    if (!cpu) stop_guest("null CPU state", target);
-    if (!cpu->calls) cpu->calls = &guest_thread_for_cpu(cpu)->calls;
-    ac1_call_state *calls = cpu->calls;
     const uint32_t guest_callsite = cpu->eip;
-    check_dispatch_budget(calls, target);
-    if (AC1_HOST_SP() < calls->stack_limit)
-        stop_guest("guest call depth exceeded", target);
-
     /* Indirect transfers into the main catalog (virtual calls, callbacks, jump
      * tables); imports and COM tokens lie outside this range. */
     if (target - lifted_line_base < (lifted_line_count << 4)) {
         ac1_lifted_fn function = ac1_lifted_lookup_cached(
             target, ac1_main_lifted_lookup_cache, profile_lifted_lookup);
         if (function) {
-            uint32_t previous_target = calls->last_target;
-            calls->last_target = target;
             function(cpu);
-            calls->last_target = previous_target;
-            if (++calls->returns >= calls->return_threshold) ac1_scheduler_return_checkpoint(cpu);
+            if (++cpu->returns >= AC1_RETURN_INTERVAL) ac1_scheduler_return_checkpoint(cpu);
             return;
         }
     }
 
     const import_record *import = find_import(target);
     if (import) {
-        ++calls->count;
         if (trace_imports) {
             if (trace_import_count < 128u) {
                 if (import->by_ordinal)
@@ -7110,11 +7016,11 @@ void dispatch(CPU *cpu, uint32_t target)
     }
 
 #if defined(AC1_HOST_D3D9)
-    if (dispatch_d3d9_method(cpu, target)) { ++calls->count; return; }
+    if (dispatch_d3d9_method(cpu, target)) return;
 #endif
 #if defined(_WIN32) || defined(__ANDROID__)
-    if (dispatch_dinput8_method(cpu, target)) { ++calls->count; return; }
-    if (dispatch_ds8_method(cpu, target)) { ++calls->count; return; }
+    if (dispatch_dinput8_method(cpu, target)) return;
+    if (dispatch_ds8_method(cpu, target)) return;
 #endif
 
     stop_guest("no generated function for guest target", target);
@@ -7227,19 +7133,6 @@ static int initialize_android_guest_paths(const char *host_exe_path)
 }
 #endif
 
-static uint64_t read_dispatch_limit(void)
-{
-    const char *setting = getenv("AC1_DISPATCH_LIMIT");
-    if (!setting || !*setting) return AC1_DISPATCH_LIMIT_DEFAULT;
-    if (setting[0] == '-') return AC1_DISPATCH_LIMIT_DEFAULT;
-    char *end = NULL;
-    errno = 0;
-    unsigned long long value = strtoull(setting, &end, 0);
-    if (errno == ERANGE || end == setting || *end != '\0')
-        return AC1_DISPATCH_LIMIT_DEFAULT;
-    return (uint64_t)value;
-}
-
 #ifdef AC1_DIRECT_MEMORY
 uint8_t *ac1_direct_arena;
 
@@ -7313,7 +7206,6 @@ int ac1_run(const char *exe_path)
 #endif
     memset(ac1_main_lifted_lookup_cache, 0, sizeof(ac1_main_lifted_lookup_cache));
     build_lifted_line_index();
-    dispatch_limit = read_dispatch_limit();
     {
         const char *setting = getenv("AC1_TRACE_WAITS");
         unsigned seconds = setting ? (unsigned)strtoul(setting, NULL, 10) : 0u;
@@ -7359,9 +7251,6 @@ int ac1_run(const char *exe_path)
     memset(virtual_alloc_bases, 0, sizeof(virtual_alloc_bases));
     const char *trace_setting = getenv("AC1_TRACE_IMPORTS");
     trace_imports = trace_setting && *trace_setting && strcmp(trace_setting, "0");
-    if (trace_imports)
-        fprintf(stderr, "AC1 dispatch guard: limit=%llu (0 disables)\n",
-                (unsigned long long)dispatch_limit);
     native_bink_reset();
     trace_import_count = 0;
     trace_callback_count = 0;
@@ -7533,7 +7422,6 @@ int ac1_run(const char *exe_path)
     ac1_profile_init();
     ac1_profile_guest(0, primary->id, &primary->cpu.eip, &scheduler->owner);
     primary->return_slice_deadline = guest_monotonic_ns() + AC1_SCHEDULER_RETURN_SLICE_NS;
-    primary->calls.returns = 0u;
     wr32(AC1_TIB_BASE + 0x20u, 1u);
     wr32(AC1_TIB_BASE + 0x24u, primary->id);
     CPU *cpu = &primary->cpu;
@@ -7545,9 +7433,6 @@ int ac1_run(const char *exe_path)
     image_base = image.load_base;
     image_size_loaded = image.image_size;
     wr32(cpu->esp, AC1_RETURN_SENTINEL);
-    dispatch_count = 0;
-    bind_host_stack(&primary->calls);
-    last_guest_target = cpu->eip;
     g_image_delta = image.load_base - image.preferred_base;
 
     printf("AC1 native entry: image=0x%08x size=0x%08x entry=0x%08x imports=%zu\n",
@@ -7559,8 +7444,7 @@ int ac1_run(const char *exe_path)
         dispatch(cpu, cpu->eip);
         runtime_stop_ready = 0;
         if (cpu->esp == stack_top && rd32(stack_top - 4u) == AC1_RETURN_SENTINEL) {
-            printf("AC1 entry returned naturally after %llu guest dispatches\n",
-                   (unsigned long long)dispatch_count);
+            printf("AC1 entry returned naturally\n");
             result = 0;
         } else {
             snprintf(last_run_error, sizeof(last_run_error),
@@ -7571,9 +7455,8 @@ int ac1_run(const char *exe_path)
         }
     } else {
         runtime_stop_ready = 0;
-        fprintf(stderr, "AC1 guest stop: %s; main-dispatched=0x%08x main-EIP=0x%08x main-ESP=0x%08x main-EAX=0x%08x main-dispatches=%llu\n",
-                stop_reason, last_guest_target, cpu->eip, cpu->esp, cpu->eax,
-                (unsigned long long)dispatch_count);
+        fprintf(stderr, "AC1 guest stop: %s; main-EIP=0x%08x main-ESP=0x%08x main-EAX=0x%08x\n",
+                stop_reason, cpu->eip, cpu->esp, cpu->eax);
         if (!(scheduler && scheduler->failed))
             trace_receiver_snapshot(cpu);
         if (scheduler && scheduler->failed) {

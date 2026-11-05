@@ -23,7 +23,7 @@ int main(void) {
         memset(&seed,0x5a,sizeof seed);
         seed.eax=random32();seed.ecx=random32();seed.edx=random32();seed.ebx=random32();
         seed.ebp=random32();seed.edi=random32();seed.esi=(i&8)?random32():0;
-        seed.esp=0x8000+(i&31);seed.calls=NULL;
+        seed.esp=0x8000+(i&31);
         seed.cf=i&1;seed.pf=(i>>1)&1;seed.af=(i>>2)&1;
         seed.zf=(i>>3)&1;seed.sf=(i>>4)&1;seed.of=(i>>5)&1;
         memset(memory+0x7ff0,0xa5,0x100);

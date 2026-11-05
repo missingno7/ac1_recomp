@@ -358,10 +358,9 @@ class FlagContractTests(unittest.TestCase):
                    'void variant_entry(int v, CPU *c, unsigned e) {\n'
                    f'    static const uint32_t entries[] = {{{", ".join(f"0x{a:08X}u" for a in sorted(bodies))}}};\n'
                    '    c->esp -= 4; wr32(c->esp, 0x00400000u); variant_dispatch(v, c, entries[e]);\n}\n')
-        for force_dispatch in (False, True):
-            run = compile_and_run(source, f'program-{force_dispatch}', *(['-DAC1_NO_DIRECT_CALLS'] if force_dispatch else []))
-            self.assertEqual(run.returncode, 0, run.stderr)
-            self.assertIn('4096 CFG/contract/local whole-program cases passed', run.stdout)
+        run = compile_and_run(source, 'program')
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn('4096 CFG/contract/local whole-program cases passed', run.stdout)
 
     @unittest.skipUnless(shutil.which('gcc'), 'native compiler required')
     def test_real_emitter_keeps_one_public_body_per_function(self):
