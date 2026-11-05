@@ -18,8 +18,8 @@ class DirectCallsTests(unittest.TestCase):
     def test_only_successful_main_entries_are_specialized(self):
         source = ("dispatch(c, 0x00401100u); dispatch(c, 0xF1000000u); "
                   "dispatch(c, 0x18001000u); dispatch(c, _ct); "
-                  "dispatch_jmp(c, 0x00401100u); dispatch(c, 0x00401375u);")
-        body, callees, count = lift.specialize_direct_calls(source, {0x401100, 0x401375})
+                  "dispatch_jmp(c, 0x00401100u);")
+        body, callees, count = lift.specialize_direct_calls(source, {0x401100})
         self.assertEqual(count, 1)
         self.assertEqual(callees, {0x401100})
         self.assertEqual(body, source.replace("dispatch(c, 0x00401100u)",

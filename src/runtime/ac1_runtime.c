@@ -91,16 +91,6 @@ extern uintptr_t ac1_android_d3d9_guest_hwnd(void *context, uint32_t guest_hwnd)
 
 static ac1_lifted_lookup_cache_slot
     ac1_main_lifted_lookup_cache[AC1_LIFTED_LOOKUP_CACHE_SLOTS];
-static int ac1_main_lifted_lookup_cache_enabled = 1;
-
-static void reset_main_lifted_lookup_cache(void)
-{
-    const char *setting = getenv("AC1_LIFTED_LOOKUP_CACHE");
-    memset(ac1_main_lifted_lookup_cache, 0,
-           sizeof(ac1_main_lifted_lookup_cache));
-    ac1_main_lifted_lookup_cache_enabled =
-        !(setting && strcmp(setting, "0") == 0);
-}
 
 _Thread_local uint32_t g_image_delta;
 
@@ -170,11 +160,6 @@ struct ac1_scheduler {
 static _Thread_local jmp_buf stop_runtime;
 static _Thread_local int runtime_stop_ready;
 static int trace_imports;
-static int trace_object_types;
-static int object_type_registry_traced;
-static unsigned object_type_parent_records;
-static unsigned object_type_descriptor_count;
-static int crt_handoff_logged;
 static int get_adapters_info_deferred_logged;
 static _Thread_local unsigned trace_import_count;
 /* Imports still to trace after a userdata file is created (AC1_TRACE_IMPORTS). */
@@ -212,7 +197,7 @@ static void bind_host_stack(ac1_call_state *calls)
     if (!low)
         fprintf(stderr, "AC1 host stack bounds unavailable: the guest call depth guard is off on this thread\n");
     calls->stack_limit = low ? low + AC1_HOST_STACK_RESERVE : 0u;
-    calls->stack_floor = trace_imports || trace_object_types ? UINTPTR_MAX : calls->stack_limit;
+    calls->stack_floor = trace_imports ? UINTPTR_MAX : calls->stack_limit;
 }
 
 /* Generated and dispatched calls count their returns into `returns`; the
@@ -233,9 +218,8 @@ static void check_dispatch_budget(const ac1_call_state *calls, uint32_t target)
              (unsigned long long)dispatch_limit);
     stop_guest(reason, target);
 }
-static uint64_t scheduler_return_slice_ns = UINT64_C(1000000);
+#define AC1_SCHEDULER_RETURN_SLICE_NS UINT64_C(1000000)
 static uint64_t trace_wait_interval_ns;
-static int scheduler_batch_imports = 1;
 static pcrecomp_heap *process_heap;
 static ac1_files *guest_files;
 static char exe_path_copy[32768];
@@ -559,8 +543,7 @@ static void run_guest_thread(ac1_guest_thread *thread)
          * baton. The primary thread can still service imports while this worker
          * is waiting, including SetThreadAffinityMask. */
         active_guest_thread = thread;
-        thread->return_slice_deadline = scheduler_return_slice_ns
-            ? guest_monotonic_ns() + scheduler_return_slice_ns : 0u;
+        thread->return_slice_deadline = guest_monotonic_ns() + AC1_SCHEDULER_RETURN_SLICE_NS;
         thread->calls.returns = 0u;
         guest_address_space_select(scheduler->space);
         static_tls_data_base = thread->static_tls_data;
@@ -1031,7 +1014,7 @@ static void scheduler_checkpoint_for_thread(ac1_guest_thread *thread)
      * not mandatory context switches. Blocking, explicit yield, thread start
      * and a newly readied higher-priority peer remain immediate boundaries.
      * Only the baton owner reads/writes these fields during guest execution. */
-    if (scheduler_batch_imports && scheduler_return_slice_ns && !force &&
+    if (!force &&
         !thread->blocked && !thread->suspended && !scheduler->failed &&
         !scheduler->stopping && cause != AC1_HANDOFF_YIELD &&
         cause != AC1_HANDOFF_START) {
@@ -1084,11 +1067,9 @@ static void scheduler_checkpoint_for_thread(ac1_guest_thread *thread)
 #ifdef __ANDROID__
     android_repin_guest_thread();
 #endif
-    if (scheduler_return_slice_ns) {
-        thread->return_slice_deadline = guest_monotonic_ns() + scheduler_return_slice_ns;
-        settle_returns(&thread->calls);
-        thread->import_batch = 0u;
-    }
+    thread->return_slice_deadline = guest_monotonic_ns() + AC1_SCHEDULER_RETURN_SLICE_NS;
+    settle_returns(&thread->calls);
+    thread->import_batch = 0u;
     if ((stopping || failed) && thread->slot != 0u)
         longjmp(thread->exit_env, 1);
     if (failed) stop_guest(failure_reason[0] ? failure_reason : "guest worker failed", target);
@@ -1101,25 +1082,23 @@ static void scheduler_checkpoint(void)
 
 /* Generated-function returns are cooperative yield opportunities, not blocking
  * API boundaries. Amortize their scheduler scan while keeping API checkpoints
- * above immediate. A zero slice setting preserves the legacy every-return path. */
+ * above immediate. */
 void ac1_scheduler_return_checkpoint(CPU *cpu)
 {
     ac1_guest_thread *thread = guest_thread_for_cpu(cpu);
     ac1_scheduler *scheduler = thread->scheduler;
     /* Callers count `returns` inline and enter here once it reaches the
-     * threshold: every AC1_RETURN_CLOCK_INTERVAL returns, or every return with
-     * the legacy zero slice. */
+     * threshold, every AC1_RETURN_CLOCK_INTERVAL returns. */
     ac1_call_state *calls = cpu->calls ? cpu->calls : &thread->calls;
-    calls->return_threshold = scheduler_return_slice_ns ? AC1_RETURN_CLOCK_INTERVAL : 0u;
-    if (!scheduler || !thread || scheduler->count < 2u ||
-        scheduler_return_slice_ns == 0u) {
+    calls->return_threshold = AC1_RETURN_CLOCK_INTERVAL;
+    if (!scheduler || !thread || scheduler->count < 2u) {
         settle_returns(calls);
         check_dispatch_budget(calls, cpu->eip);
         scheduler_checkpoint_for_thread(thread);
         return;
     }
     if (!thread->return_slice_deadline)
-        thread->return_slice_deadline = guest_monotonic_ns() + scheduler_return_slice_ns;
+        thread->return_slice_deadline = guest_monotonic_ns() + AC1_SCHEDULER_RETURN_SLICE_NS;
     if (calls->returns < AC1_RETURN_CLOCK_INTERVAL) return;
     settle_returns(calls);
     check_dispatch_budget(calls, cpu->eip);
@@ -6890,32 +6869,20 @@ static int handle_bink_import(CPU *cpu, const import_record *import)
 /* O(1) main-catalog lookup: line_first[k] is the index of the first lifted
  * function at or after lifted_line_base + 16*k, so a lookup is one table read
  * plus a forward step within one 16-byte line (most lines hold at most one
- * entry). Equivalent to the generated table's lower-bound binary search,
- * which dominated lookup misses (~17 steps over ~102k entries). */
+ * entry). */
 static uint32_t *lifted_line_first;
 static uint32_t lifted_line_base, lifted_line_count;
-/* A/B switches: AC1_LIFTED_LINE_INDEX=0 keeps the binary search,
- * AC1_DISPATCH_FAST=0 disables the dispatch fast path below. */
-static int dispatch_fast_enabled = 1;
-
-static int env_switch_enabled(const char *name)
-{
-    const char *value = getenv(name);
-    return !(value && strcmp(value, "0") == 0);
-}
-
-static ac1_lifted_fn lifted_lookup_o1(uint32_t target);
-
 static void build_lifted_line_index(void)
 {
-    dispatch_fast_enabled = env_switch_enabled("AC1_DISPATCH_FAST");
-    if (lifted_line_first || !ac1_lifted_function_count ||
-        !env_switch_enabled("AC1_LIFTED_LINE_INDEX")) return;
+    if (lifted_line_first) return;
     const uint32_t first = ac1_lifted_functions[0].guest_va & ~15u;
     const uint32_t last = ac1_lifted_functions[ac1_lifted_function_count - 1u].guest_va;
     const uint32_t count = ((last - first) >> 4) + 1u;
     uint32_t *table = (uint32_t *)malloc((size_t)count * sizeof(uint32_t));
-    if (!table) return;  /* lookups keep using the binary search */
+    if (!table) {
+        fprintf(stderr, "AC1 lifted line index allocation failed\n");
+        abort();
+    }
     size_t index = 0;
     for (uint32_t line = 0; line < count; ++line) {
         const uint32_t line_va = first + (line << 4);
@@ -6927,27 +6894,10 @@ static void build_lifted_line_index(void)
     lifted_line_base = first;
     lifted_line_count = count;
     lifted_line_first = table;
-    /* Exactness check against the generated binary search: every entry, its
-     * neighbours (shared 16-byte lines, interior and invalid addresses), and
-     * both range ends. ~306k lookups, a few milliseconds at startup. */
-    for (size_t i = 0; i < ac1_lifted_function_count; ++i) {
-        const uint32_t va = ac1_lifted_functions[i].guest_va;
-        const uint32_t probes[3] = {va, va + 1u, va - 1u};
-        for (unsigned k = 0; k < 3u; ++k) {
-            if (lifted_lookup_o1(probes[k]) != ac1_lifted_lookup(probes[k])) {
-                fprintf(stderr, "AC1 lifted line index mismatch at 0x%08x; using binary search\n",
-                        probes[k]);
-                free(lifted_line_first);
-                lifted_line_first = NULL;
-                return;
-            }
-        }
-    }
 }
 
 static ac1_lifted_fn lifted_lookup_o1(uint32_t target)
 {
-    if (!lifted_line_first) return ac1_lifted_lookup(target);
     const uint32_t line = (target - lifted_line_base) >> 4;
     if (target < lifted_line_base || line >= lifted_line_count) return 0;
     size_t index = lifted_line_first[line];
@@ -7043,26 +6993,6 @@ static int run_import_handlers(CPU *cpu, const import_record *import)
     return 0;
 }
 
-/* Diagnose the original allocator's null result without changing its result. */
-static void dispatch_allocator_diagnostic(CPU *cpu, uint32_t target,
-                                          ac1_lifted_fn function)
-{
-    static uint32_t observed_target;
-    uint32_t args[8] = {0};
-    uint32_t object = cpu->ecx;
-    if (guest_memory_try_ptr(cpu->esp + 4u, sizeof(args)))
-        for (unsigned i = 0; i < 8; ++i) args[i] = rd32(cpu->esp + 4u + i * 4u);
-    if (observed_target != target) {
-        observed_target = target;
-        fprintf(stderr, "AC1 guest allocator: target=0x%08x this=0x%08x\n", target, object);
-    }
-    function(cpu);
-    if (!cpu->eax)
-        fprintf(stderr, "AC1 guest allocator returned NULL: target=0x%08x this=0x%08x args=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-                target, object, args[0], args[1], args[2], args[3],
-                args[4], args[5], args[6], args[7]);
-}
-
 void dispatch(CPU *cpu, uint32_t target)
 {
     AC1_PROFILE_COUNT(dispatches);
@@ -7074,143 +7004,19 @@ void dispatch(CPU *cpu, uint32_t target)
     if (AC1_HOST_SP() < calls->stack_limit)
         stop_guest("guest call depth exceeded", target);
 
-    /* Fast path for indirect transfers into the main catalog (virtual calls,
-     * callbacks, jump tables): imports, COM tokens and Bink lie outside this
-     * range, so their handling below is unchanged; tracing keeps the slow
-     * path, as does the logged CRT handoff. */
-    if (dispatch_fast_enabled && !trace_imports && !trace_object_types && lifted_line_first &&
-        target != 0x00401375u &&
-        target - lifted_line_base < (lifted_line_count << 4)) {
+    /* Indirect transfers into the main catalog (virtual calls, callbacks, jump
+     * tables); imports and COM tokens lie outside this range. */
+    if (target - lifted_line_base < (lifted_line_count << 4)) {
         ac1_lifted_fn function = ac1_lifted_lookup_cached(
-            target, ac1_main_lifted_lookup_cache_enabled,
-            ac1_main_lifted_lookup_cache, profile_lifted_lookup);
+            target, ac1_main_lifted_lookup_cache, profile_lifted_lookup);
         if (function) {
             uint32_t previous_target = calls->last_target;
             calls->last_target = target;
-            if (guest_callsite == 0x007A4544u)
-                dispatch_allocator_diagnostic(cpu, target, function);
-            else function(cpu);
+            function(cpu);
             calls->last_target = previous_target;
             if (++calls->returns >= calls->return_threshold) ac1_scheduler_return_checkpoint(cpu);
             return;
         }
-    }
-
-    if (trace_object_types && !object_type_registry_traced &&
-        target == 0x0085B160u) {
-        object_type_registry_traced = 1;
-        const uint32_t count_address = 0x01928098u;
-        const uint32_t array_address = 0x01A19EE0u;
-        if (!guest_memory_try_ptr(count_address, 1u)) {
-            fprintf(stderr, "AC1 ObjectTypeInfo registry: count byte is unmapped\n");
-        } else {
-            uint32_t count = rd8(count_address);
-            uint64_t array_bytes = (uint64_t)count * 4u;
-            fprintf(stderr,
-                    "AC1 ObjectTypeInfo registry: caller=0x%08x array=0x%08x count=%u stride=4\n",
-                    cpu->eip, array_address, count);
-            if (count && !guest_memory_try_ptr(array_address, (size_t)array_bytes)) {
-                fprintf(stderr,
-                        "AC1 ObjectTypeInfo registry: populated array range is unmapped (bytes=%llu)\n",
-                        (unsigned long long)array_bytes);
-            } else {
-                for (uint32_t i = 0u; i < count; ++i) {
-                    uint32_t object = rd32(array_address + i * 4u);
-                    uint32_t vtable = 0u, col = 0u, type_descriptor = 0u;
-                    uint32_t methods[3] = {0u, 0u, 0u};
-                    char name[192];
-                    name[0] = '\0';
-                    int object_ok = object && guest_memory_try_ptr(object, 4u);
-                    if (object_ok) vtable = rd32(object);
-                    int vtable_ok = vtable >= 4u &&
-                        guest_memory_try_ptr(vtable - 4u, 20u);
-                    if (vtable_ok) {
-                        col = rd32(vtable - 4u);
-                        for (unsigned slot = 0u; slot < 3u; ++slot)
-                            methods[slot] = rd32(vtable + slot * 4u);
-                    }
-                    int col_ok = col && guest_memory_try_ptr(col, 20u);
-                    int type_ok = 0;
-                    int object_type_name = 0;
-                    if (col_ok && rd32(col) == 0u) {
-                        type_descriptor = rd32(col + 12u);
-                        type_ok = type_descriptor &&
-                            guest_memory_try_ptr(type_descriptor, 12u);
-                    }
-                    if (type_ok && type_descriptor <= UINT32_MAX - 8u) {
-                        uint32_t name_address = type_descriptor + 8u;
-                        size_t n = 0u;
-                        int name_terminated = 0;
-                        while (n + 1u < sizeof(name) &&
-                               name_address <= UINT32_MAX - (uint32_t)n &&
-                               guest_memory_try_ptr(name_address + (uint32_t)n, 1u)) {
-                            name[n] = (char)rd8(name_address + (uint32_t)n);
-                            if (!name[n]) {
-                                name_terminated = 1;
-                                break;
-                            }
-                            ++n;
-                        }
-                        name[n] = '\0';
-                        object_type_name = name_terminated &&
-                            strstr(name, "ObjectTypeInfo@") != NULL;
-                    }
-                    int method_in_image[3];
-                    for (unsigned slot = 0u; slot < 3u; ++slot)
-                        method_in_image[slot] = methods[slot] >= image_base &&
-                            (uint64_t)methods[slot] <
-                                (uint64_t)image_base + image_size_loaded;
-                    fprintf(stderr,
-                            "AC1 ObjectTypeInfo[%u]: object=0x%08x vtable=0x%08x COL=0x%08x TD=0x%08x slots=0x%08x,0x%08x,0x%08x checks=obj:%d,rtti:%d,name:%d,method-in-image:%d,%d,%d name=\"%s\"\n",
-                            i, object, vtable, col, type_descriptor,
-                            methods[0], methods[1], methods[2],
-                            object_ok, vtable_ok && col_ok && type_ok,
-                            object_type_name, method_in_image[0],
-                            method_in_image[1], method_in_image[2], name);
-                }
-            }
-        }
-    }
-
-    if (trace_imports && cpu->eip == 0x00F9FA67u)
-        fprintf(stderr, "AC1 CRT callback: target=0x%08x index=%u table=0x%08x stride=%u context=0x%08x\n",
-                target, rd32(cpu->ebp - 0x1cu), rd32(cpu->ebp + 8u),
-                rd32(cpu->ebp + 12u), rd32(cpu->ebp + 20u));
-
-    if (trace_imports && target == 0x00933370u && cpu->eip == 0x00937546u &&
-        (calls->count <= 8u || calls->count % 100000u == 0u)) {
-        uint32_t stack[4] = {0};
-        uint32_t node = 0u, node_plus4 = 0u, node_plus7 = 0u, edi_value = 0u;
-        uint32_t header[4] = {0};
-        for (unsigned i = 0; i < 4u; ++i) {
-            uint32_t address = cpu->esp + 4u + i * 4u;
-            if (guest_memory_try_ptr(address, 4u)) stack[i] = rd32(address);
-        }
-        if (guest_memory_try_ptr(cpu->esi, 4u)) node = rd32(cpu->esi);
-        if (guest_memory_try_ptr(cpu->esi + 4u, 4u)) node_plus4 = rd32(cpu->esi + 4u);
-        if (guest_memory_try_ptr(cpu->esi + 7u, 1u)) node_plus7 = rd8(cpu->esi + 7u);
-        if (guest_memory_try_ptr(cpu->edi, 4u)) edi_value = rd32(cpu->edi);
-        uint32_t header_address = node & ~7u;
-        if (guest_memory_try_ptr(header_address, sizeof(header)))
-            for (unsigned i = 0; i < 4u; ++i) header[i] = rd32(header_address + i * 4u);
-        fprintf(stderr, "AC1 parser sample: dispatch=%llu esp=0x%08x eax=0x%08x ebx=0x%08x ecx=0x%08x edx=0x%08x esi=0x%08x edi=0x%08x args=%08x,%08x,%08x,%08x node=%08x,%08x,%08x edi0=%08x header=%08x,%08x,%08x,%08x\n",
-                (unsigned long long)calls->count, cpu->esp, cpu->eax,
-                cpu->ebx, cpu->ecx, cpu->edx, cpu->esi, cpu->edi,
-                stack[0], stack[1], stack[2], stack[3], node,
-                node_plus4, node_plus7, edi_value,
-                header[0], header[1], header[2], header[3]);
-    }
-
-    if (trace_imports && cpu->eip == 0x00FD2180u && trace_callback_count < 32u) {
-        uint32_t fields[5] = {0};
-        for (unsigned i = 0; i < 5u; ++i) {
-            uint32_t address = cpu->esi + i * 4u;
-            if (guest_memory_try_ptr(address, 4u)) fields[i] = rd32(address);
-        }
-        fprintf(stderr, "AC1 callback-table sample[%u]: target=0x%08x esi=0x%08x ecx=0x%08x eax=0x%08x edi=0x%08x edx=0x%08x record=%08x,%08x,%08x,%08x,%08x\n",
-                trace_callback_count++, target, cpu->esi, cpu->ecx, cpu->eax,
-                cpu->edi, cpu->edx, fields[0], fields[1], fields[2],
-                fields[3], fields[4]);
     }
 
     const import_record *import = find_import(target);
@@ -7311,64 +7117,7 @@ void dispatch(CPU *cpu, uint32_t target)
     if (dispatch_ds8_method(cpu, target)) { ++calls->count; return; }
 #endif
 
-    ac1_lifted_fn function = ac1_lifted_lookup_cached(
-        target, ac1_main_lifted_lookup_cache_enabled,
-        ac1_main_lifted_lookup_cache, profile_lifted_lookup);
-    if (!function)
-        stop_guest("no generated function for guest target", target);
-
-    if (target == 0x00401375u && !crt_handoff_logged) {
-        crt_handoff_logged = 1;
-        fprintf(stderr,
-                "AC1 CRT handoff: WinMain thunk=0x%08x return=0x%08x hInstance=0x%08x hPrev=0x%08x cmdline=0x%08x show=0x%08x\n",
-                target, rd32(cpu->esp), rd32(cpu->esp + 4u), rd32(cpu->esp + 8u),
-                rd32(cpu->esp + 12u), rd32(cpu->esp + 16u));
-    }
-
-    uint32_t previous_target = calls->last_target;
-    calls->last_target = target;
-    if (guest_callsite == 0x007A4544u)
-        dispatch_allocator_diagnostic(cpu, target, function);
-    else function(cpu);
-    if (trace_object_types && guest_callsite == 0x0085B197u) {
-        uint32_t descriptor = cpu->eax;
-        unsigned descriptor_index = object_type_descriptor_count++;
-        if (!descriptor || !guest_memory_try_ptr(descriptor, 0x11u)) {
-            fprintf(stderr,
-                    "AC1 ObjectTypeInfo descriptor[%u]: returned=0x%08x fields=unmapped\n",
-                    descriptor_index, descriptor);
-        } else {
-            uint32_t parent_array = rd32(descriptor + 4u);
-            uint32_t parent_count = rd8(descriptor + 0x10u);
-            fprintf(stderr,
-                    "AC1 ObjectTypeInfo descriptor[%u]: returned=0x%08x parent_array=0x%08x count=%u\n",
-                    descriptor_index, descriptor, parent_array, parent_count);
-            if (parent_count &&
-                !guest_memory_try_ptr(parent_array, (size_t)parent_count * 4u)) {
-                fprintf(stderr,
-                        "AC1 ObjectTypeInfo descriptor[%u]: parent array range is unmapped\n",
-                        descriptor_index);
-            } else {
-                for (uint32_t i = 0u; i < parent_count; ++i) {
-                    if (object_type_parent_records >= 4096u) {
-                        fprintf(stderr,
-                                "AC1 ObjectTypeInfo parent callback collection stopped at 4096 entries\n");
-                        break;
-                    }
-                    uint32_t callback = rd32(parent_array + i * 4u);
-                    int method_in_image = callback >= image_base &&
-                        (uint64_t)callback <
-                            (uint64_t)image_base + image_size_loaded;
-                    fprintf(stderr,
-                            "AC1 ObjectTypeInfo descriptor[%u] parent[%u]: target=0x%08x method-in-image=%d\n",
-                            descriptor_index, i, callback, method_in_image);
-                    ++object_type_parent_records;
-                }
-            }
-        }
-    }
-    calls->last_target = previous_target;
-    if (++calls->returns >= calls->return_threshold) ac1_scheduler_return_checkpoint(cpu);
+    stop_guest("no generated function for guest target", target);
 }
 
 void dispatch_jmp(CPU *cpu, uint32_t target)
@@ -7478,20 +7227,6 @@ static int initialize_android_guest_paths(const char *host_exe_path)
 }
 #endif
 
-static uint64_t read_scheduler_return_slice_ns(void)
-{
-    const char *setting = getenv("AC1_SCHEDULER_SLICE_US");
-    if (!setting || !*setting) return UINT64_C(1000000);
-    if (setting[0] == '-') return UINT64_C(1000000);
-    char *end = NULL;
-    errno = 0;
-    unsigned long long value = strtoull(setting, &end, 0);
-    if (errno == ERANGE || end == setting || *end != '\0' ||
-        value > UINT64_MAX / UINT64_C(1000))
-        return UINT64_C(1000000);
-    return (uint64_t)value * UINT64_C(1000);
-}
-
 static uint64_t read_dispatch_limit(void)
 {
     const char *setting = getenv("AC1_DISPATCH_LIMIT");
@@ -7576,14 +7311,9 @@ int ac1_run(const char *exe_path)
 #ifdef __ANDROID__
     android_pin_guest_thread(); /* the caller's thread runs the main guest thread */
 #endif
-    reset_main_lifted_lookup_cache();
+    memset(ac1_main_lifted_lookup_cache, 0, sizeof(ac1_main_lifted_lookup_cache));
     build_lifted_line_index();
     dispatch_limit = read_dispatch_limit();
-    scheduler_return_slice_ns = read_scheduler_return_slice_ns();
-    {
-        const char *setting = getenv("AC1_SCHEDULER_BATCH_IMPORTS");
-        scheduler_batch_imports = !setting || strcmp(setting, "0");
-    }
     {
         const char *setting = getenv("AC1_TRACE_WAITS");
         unsigned seconds = setting ? (unsigned)strtoul(setting, NULL, 10) : 0u;
@@ -7629,12 +7359,6 @@ int ac1_run(const char *exe_path)
     memset(virtual_alloc_bases, 0, sizeof(virtual_alloc_bases));
     const char *trace_setting = getenv("AC1_TRACE_IMPORTS");
     trace_imports = trace_setting && *trace_setting && strcmp(trace_setting, "0");
-    const char *type_trace_setting = getenv("AC1_TRACE_OBJECT_TYPES");
-    trace_object_types = type_trace_setting && *type_trace_setting &&
-                         strcmp(type_trace_setting, "0");
-    object_type_registry_traced = 0;
-    object_type_parent_records = 0u;
-    object_type_descriptor_count = 0u;
     if (trace_imports)
         fprintf(stderr, "AC1 dispatch guard: limit=%llu (0 disables)\n",
                 (unsigned long long)dispatch_limit);
@@ -7642,7 +7366,6 @@ int ac1_run(const char *exe_path)
     trace_import_count = 0;
     trace_callback_count = 0;
     trace_file_read_count = 0;
-    crt_handoff_logged = 0;
     get_adapters_info_deferred_logged = 0;
 #ifdef __ANDROID__
     if (!initialize_android_guest_paths(exe_path)) {
@@ -7809,8 +7532,7 @@ int ac1_run(const char *exe_path)
     active_guest_thread = primary;
     ac1_profile_init();
     ac1_profile_guest(0, primary->id, &primary->cpu.eip, &scheduler->owner);
-    primary->return_slice_deadline = scheduler_return_slice_ns
-        ? guest_monotonic_ns() + scheduler_return_slice_ns : 0u;
+    primary->return_slice_deadline = guest_monotonic_ns() + AC1_SCHEDULER_RETURN_SLICE_NS;
     primary->calls.returns = 0u;
     wr32(AC1_TIB_BASE + 0x20u, 1u);
     wr32(AC1_TIB_BASE + 0x24u, primary->id);

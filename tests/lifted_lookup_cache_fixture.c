@@ -67,10 +67,10 @@ int main(void)
     const uint32_t first = fixture_functions[101u].guest_va;
     const unsigned first_slot = (first * UINT32_C(0x9e3779b1)) >> 22;
     const ac1_lifted_fn first_expected = fixture_functions[101u].function;
-    ok &= check(ac1_lifted_lookup_cached(first, 1, cache, ac1_lifted_lookup) == first_expected,
+    ok &= check(ac1_lifted_lookup_cached(first, cache, ac1_lifted_lookup) == first_expected,
                 "first exact lookup uses binary-search fallback");
     const unsigned calls_after_first = fallback_calls;
-    ok &= check(ac1_lifted_lookup_cached(first, 1, cache, ac1_lifted_lookup) == first_expected,
+    ok &= check(ac1_lifted_lookup_cached(first, cache, ac1_lifted_lookup) == first_expected,
                 "repeated exact address hits cache");
     ok &= check(fallback_calls == calls_after_first,
                 "cache hit skips binary-search fallback");
@@ -89,21 +89,21 @@ int main(void)
     if (collision_index < FIXTURE_FUNCTION_COUNT) {
         const uint32_t collision = fixture_functions[collision_index].guest_va;
         const ac1_lifted_fn expected = fixture_functions[collision_index].function;
-        ok &= check(ac1_lifted_lookup_cached(collision, 1, cache, ac1_lifted_lookup) == expected,
+        ok &= check(ac1_lifted_lookup_cached(collision, cache, ac1_lifted_lookup) == expected,
                     "collision resolves through exact fallback");
-        ok &= check(ac1_lifted_lookup_cached(first, 1, cache, ac1_lifted_lookup) == first_expected,
+        ok &= check(ac1_lifted_lookup_cached(first, cache, ac1_lifted_lookup) == first_expected,
                     "collision cannot return the wrong function pointer");
     }
 
     const unsigned calls_before_unknown = fallback_calls;
     const uint32_t interior = fixture_functions[101u].guest_va + 1u;
-    ok &= check(ac1_lifted_lookup_cached(interior, 1, cache, ac1_lifted_lookup) == NULL,
+    ok &= check(ac1_lifted_lookup_cached(interior, cache, ac1_lifted_lookup) == NULL,
                 "interior target remains unresolved");
-    ok &= check(ac1_lifted_lookup_cached(interior, 1, cache, ac1_lifted_lookup) == NULL,
+    ok &= check(ac1_lifted_lookup_cached(interior, cache, ac1_lifted_lookup) == NULL,
                 "unknown targets are not negatively cached");
     ok &= check(fallback_calls == calls_before_unknown + 2u,
                 "repeated unknown targets both use fallback");
-    ok &= check(ac1_lifted_lookup_cached(0x18000000u, 1, cache, ac1_lifted_lookup) == NULL,
+    ok &= check(ac1_lifted_lookup_cached(0x18000000u, cache, ac1_lifted_lookup) == NULL,
                 "Bink-range target is not a main-module cache result");
 
     puts("AC1 main lookup cache fixture passed");

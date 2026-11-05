@@ -187,7 +187,6 @@ static void quantum_contract(void)
     reset_fixture(2);
     InitializeCriticalSection(&fixture.mutex);
     InitializeConditionVariable(&fixture.condition);
-    scheduler_return_slice_ns=1000000;
     fixture.threads[0].return_slice_deadline=guest_monotonic_ns()+1000000000;
     fixture.threads[0].checkpoint_cause=AC1_HANDOFF_IMPORT;
     scheduler_checkpoint(); /* eligible peer, but current quantum still valid */

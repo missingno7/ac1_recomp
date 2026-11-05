@@ -3773,14 +3773,13 @@ def flag_indirect_targets(bodies, functions, stored=frozenset()):
 def specialize_direct_calls(body: str, lifted: set[int]) -> tuple[str, set[int], int]:
     """Bind only successful main-image entries, after cached bodies are lifted.
 
-    Keep the CRT handoff in dispatch for its one-time diagnostic. Indirect
-    operands, imports, DLL entries and failed lifts retain the slow path.
+    Indirect operands, imports and failed lifts retain the slow path.
     """
     callees, count = set(), 0
     def replace(match):
         nonlocal count
         target = int(match.group(1), 16)
-        if target not in lifted or target == 0x00401375:
+        if target not in lifted:
             return match.group(0)
         callees.add(target)
         count += 1
@@ -4380,7 +4379,6 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
         "typedef struct { uint32_t guest_va; ac1_lifted_fn function; } ac1_lifted_entry;\n"
         "extern const ac1_lifted_entry ac1_lifted_functions[];\n"
         "extern const size_t ac1_lifted_function_count;\n"
-        "ac1_lifted_fn ac1_lifted_lookup(uint32_t guest_va);\n",
     )
     dispatch_path = output_dir / "initial_dispatch.c"
     dispatch_lines = [
@@ -4391,18 +4389,7 @@ def emit_lift(binary: Path, pcrecomp: Path, functions: list[dict], output_dir: P
     dispatch_lines.extend(f"void L_{address:08X}(CPU *);" for address in sorted(lifted))
     dispatch_lines.extend(("", "const ac1_lifted_entry ac1_lifted_functions[] = {"))
     dispatch_lines.extend(f"    {{ 0x{address:08X}u, L_{address:08X} }}," for address in sorted(lifted))
-    dispatch_lines.extend(("};", f"const size_t ac1_lifted_function_count = {len(lifted)}u;", "",
-        "ac1_lifted_fn ac1_lifted_lookup(uint32_t guest_va) {",
-        "    size_t lo = 0, hi = ac1_lifted_function_count;",
-        "    while (lo < hi) {",
-        "        size_t mid = lo + (hi - lo) / 2;",
-        "        uint32_t at = ac1_lifted_functions[mid].guest_va;",
-        "        if (at < guest_va) lo = mid + 1; else hi = mid;",
-        "    }",
-        "    return lo < ac1_lifted_function_count && ac1_lifted_functions[lo].guest_va == guest_va",
-        "        ? ac1_lifted_functions[lo].function : 0;",
-        "}",
-    ))
+    dispatch_lines.extend(("};", f"const size_t ac1_lifted_function_count = {len(lifted)}u;"))
     write_text_if_changed(dispatch_path, "\n".join(dispatch_lines) + "\n")
     return {
         "lifted": lifted,

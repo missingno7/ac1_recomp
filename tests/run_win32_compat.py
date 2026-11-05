@@ -21,8 +21,7 @@ STUB.mkdir(exist_ok=True)
     "typedef void (*ac1_lifted_fn)(CPU *);\n"
     "typedef struct { uint32_t guest_va; ac1_lifted_fn function; } ac1_lifted_entry;\n"
     "static const ac1_lifted_entry ac1_lifted_functions[1]={{0,0}};\n"
-    "static const size_t ac1_lifted_function_count=0;\n"
-    "static ac1_lifted_fn ac1_lifted_lookup(uint32_t a) { (void)a;return 0; }\n")
+    "static const size_t ac1_lifted_function_count=0;\n")
 (STUB / "ac1_fingerprint.h").write_text('#define AC1_EXPECTED_EXE_SHA256 "syntax-only"\n')
 
 
