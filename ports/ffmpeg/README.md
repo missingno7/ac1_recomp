@@ -1,7 +1,6 @@
-# AC1 native Bink prototype
+# AC1 native Bink
 
-The provider is integrated into the Windows host runtime behind
-`AC1_NATIVE_BINK` (default ON on Windows; the Android app now explicitly selects ON). The adaptation of recomp-kit `dx/bink.cpp` retains its MIT notice in
+Bink imports are decoded through FFmpeg on every target. The adaptation of recomp-kit `dx/bink.cpp` retains its MIT notice in
 `src/platform/ac1_bink_native.cpp`. FFmpeg remains a separate LGPL dependency.
 All executable-derived disassembly, media, decoder libraries, executables and
 test logs are private under ignored `work/bink_native/`.
@@ -10,7 +9,7 @@ test logs are private under ignored `work/bink_native/`.
 
 The executable SHA-256 is
 `2fa8d50c60398cc249c6d908de46b15f48e445dd0c605b5956e94fa2f445a713`.
-The DLL matches `config/binkw32.json`:
+The observed DLL has SHA-256
 `603d0a96d1f27422f88d78b20ca525975ebe5e0d7667e62b98a3db80766702b4`.
 Addresses below are preferred x86 virtual addresses. Capstone/pefile were run
 with the read-only reference venv's `python -B`. These are static observations,
@@ -244,9 +243,7 @@ milestone; see the integration execution evidence below.
 
 ## Host runtime switches and build
 
-`AC1_BINK_TRANSLATED=1` selects the original translated imports for A/B. Leave
-it unset for native decoding. The pinned DLL remains mapped and attached in
-both cases. `AC1_BINK_SILENT=1` explicitly disables native Bink sound. If opening
+`AC1_BINK_SILENT=1` explicitly disables native Bink sound. If opening
 the native DirectSound8 device fails, a diagnostic announces silent fallback;
 decoding continues. The guest DirectSound device argument is recognized as
 handshake metadata; audio uses an independent host device, not guest DS8 proxies.
@@ -282,9 +279,6 @@ $cmake = "$env:LOCALAPPDATA/Android/Sdk/cmake/3.22.1/bin/cmake.exe"
 & $cmake --build build/host-make-relwithdebinfo --parallel 16
 ```
 
-Android CMake configuration with NDK 28.2 defaults `AC1_NATIVE_BINK=OFF`; the
-Android runtime C translation unit compiled successfully in this mode. This
-preserves the translated Bink route until ARM64 FFmpeg libraries are supplied.
 
 
 ## Integration execution evidence (2026-10-29)

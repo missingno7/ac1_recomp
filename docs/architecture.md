@@ -1,27 +1,75 @@
-# First execution decision
+# Architecture
 
-Use the locally available DukeMP pcrecomp CPU-struct lifter for the first real AC1 DX9 startup path. Keep original x86 register/stack semantics in generated native C and resolve 32-bit guest addresses through checked host-memory mappings. Runtime dispatch calls statically compiled functions; there is no runtime x86 decoder or JIT. Keep game-derived source and reports under ignored `work/`.
+One pipeline turns one pinned executable into one native program.
 
-This avoids waiting for a new compiler toolchain while preserving ARM64 compatibility. Duke's local memory adapters are already portable. Reuse narrowly selected runtime services as the executed path requires them. Mafia composes those same Duke services; importing its entire Windows-oriented diagnostic application would add unnecessary dependencies.
+## Pipeline
 
-NFSU2 reference commit `927333d` contains a substantial ARM64 Android runtime and D3D9 COM bridge around DXVK Native. It remains the primary rendering reference. Its Android code is separate from its Windows-only root CMake project. Older Android status documents describe splash-only execution; a newer October 8 gameplay test documents an owner-confirmed race prototype. These are upstream claims, not AC1 execution evidence. Its lifter uses a different global-register ABI and 14 patches, so do not mix its generated runtime with the CPU-struct lifter. Reassess adoption if a concrete compiler or rendering blocker makes migration cheaper.
+1. **Discovery** (`tools/lift_ac1.py`, using the pinned pcrecomp disassembler).
+   Starts from the entry point, initializer tables and `startup_seeds` in
+   `config/ac1_dx9.json`. It follows calls, jump tables, code immediates, indexed
+   function tables and register-loaded switches, and validates each target.
+2. **Lifting.** Each recovered function becomes one C function, `L_<VA>`. Only
+   instructions in recovered blocks are lifted, so data between blocks stays out.
+3. **Passes**, applied to every function. A pass that cannot handle a function
+   leaves it unchanged; nothing is selected by configuration.
+   - Whole-program flag contracts: only flags a reader needs are computed.
+   - Native x87: the register stack lives in block-local doubles.
+   - GPR and XMM locals: registers live in locals between calls.
+   - Stack lane forwarding, and direct calls between lifted functions.
+4. **Emission** into 1,000 stable translation units under `work/lift_initial`.
+5. **Runtime preparation** (`tools/prepare_runtime.py`) copies pinned donor sources
+   and applies project transformations. `src/runtime/cpu.h` is its output, so
+   change the transformation rather than the header.
+6. **Compilation** with GCC on Windows or NDK Clang on Android, always with
+   `-fwrapv -fno-strict-aliasing -ffp-contract=off`.
 
-The launcher imports the user's game folder and runs the same native startup harness on a worker thread. The pinned Bink DLL uses a separate generated function table and shares the guest address space and runtime services with the EXE. Both modules load at their preferred guest addresses; Bink's original process initialization runs before EXE entry. No game data is packaged. It is a diagnostic build until original graphics, input and gameplay are working. Android NDK 28.2.13676358 is available; no ADB device was connected during initial inspection.
+## Guest state
 
-Parallel execution is a later runtime milestone. Separate CPU and TLS contexts are already in place, but removing the scheduler baton alone would expose races in the shared guest-memory lookup cache and mapping registry, scheduler state transitions, runtime handle tables, file-operation records, and the heap ownership index. Bridge object-map mutexes do not protect the guest-memory and heap callbacks they invoke. Explicit x86 atomic helpers use host atomics; ordinary translated memory accesses still require a deliberate concurrency and memory-ordering design. Guest priorities currently affect the cooperative scheduler, and guest affinity masks are recorded without binding native workers to cores. First stabilize original startup and frames, then make these shared services safe and measure the game's existing worker workloads before choosing a host scheduling policy.
+Each guest thread has a `CPU` struct, stack, TIB and TLS. Generated functions keep
+registers in locals and synchronize with the struct at calls, returns and any helper
+that takes the CPU. Guest memory is one reserved 4 GiB arena: guest address `a` is
+host address `arena + a`.
 
-Original game workers run on separate native threads with individual guest CPU, stack and TLS state. A scheduler serializes their execution of generated game code while memory and synchronization semantics are being established. Windows events use native event handles, including the event supplied by the original archive loader to `ReadFile`. The file adapter owns each native `OVERLAPPED` and a duplicated event handle; it keeps completed results available for repeated queries and cancels/drains pending reads before guest buffers are released. An otherwise idle scheduler polls at up to 10 ms only when an I/O event has a blocked waiter and file I/O is pending. The portable file backend currently completes these reads inline with real `pread`; it has compiled for Android, but device execution remains unverified.
+## Calls
 
-References were inspected as local working source. After resolving a sandbox launcher error, Git confirmed Duke `main` at `0c7f03a2e26e40c766ad1abc746f784f0385bd52` with no reported changes, and Mafia `main` at `6f0ee1d803ecc83d8b600602ca017ad536e8dc02` with substantial uncommitted runtime/graphics/audio/tooling changes. The actual files were used rather than substituting remote revisions. Neither prior project's sources nor the GOG installation are modified. Any executable normalization operates on a private copy. Generated output is replaceable; handwritten runtime changes remain separate.
+- **Direct guest calls** are C calls to `L_<VA>`.
+- **Everything else** goes through `dispatch`. Targets in the lifted range use a
+  small cache and a 16-byte line index. Imports have unique tokens and go to their
+  handlers. COM methods go to the D3D9, DirectInput or DirectSound bridges.
+- **Unknown targets stop** with a diagnostic. They are never treated as success.
 
-## Reuse: recomp-kit platform services
+## Runtime services
 
-[recomp-kit](https://github.com/veritr1x/recomp-kit) (MIT, already credited in `src/runtime/NOTICE.md`; local read-only copy at `D:\Prog\dukemp_recomp\.deps\recomp-kit`, commit `487b94a`, equal to upstream) contains portable guest-side implementations that overlap AC1's remaining work:
+`src/runtime/ac1_runtime.c` implements the Win32 surface the game imports, including
+files under a read-only install root, heap, threads and synchronization.
+`src/platform` holds window, input and audio services, and `src/graphics` the D3D9
+bridge. Bink imports are decoded natively through FFmpeg.
 
-- `dx/dsound.cpp`: complete `IDirectSound`/`IDirectSound8`, buffer, 3D buffer, 3D listener and `IDirectSoundNotify` method sets over a portable `host_audio_*` mixer. 3D parameters are stored and reported, not spatialized.
-- `runtime/kernel32.cpp`, `runtime/user32.cpp`: portable file enumeration, directory, time-conversion, wait, `MessageBoxA`, `SystemParametersInfoA`, `ToUnicode` and similar imports that AC1 does not implement yet.
-- `dx/xinput.cpp` (controllers) and `dx/bink.cpp` (FFmpeg-backed Bink imports; covers 10 of AC1's 14 Bink imports, missing `SetSoundTrack`, `ShouldSkip`, `SetVolume`, `SetMemory`, `GetFrameBuffersInfo`).
+Guest threads are native threads under a serializing baton, so only one runs guest
+code at a time. See [threading.md](threading.md).
 
-Bink is being moved toward that native provider. The original `binkw32.dll` decoder contains about 1,250 MMX instructions, which the lifter does not support generally, and translated decoding would also run as emulated-x86-shaped code on ARM64. FFmpeg 8.1 decodes all five AC1 videos (`BIKi`, 1280x720, up to four `binkaudio_dct` tracks). The translated DLL remains in use for attach and `BinkSetMemory` until the native provider is integrated and checked against AC1's actual call sites.
+Rendering goes through DXVK to Vulkan, with Turnip on Android.
 
-Decision: on Windows, AC1 keeps forwarding DirectSound to the native `dsound.dll`, which gives real 3D output and an oracle. Its method coverage is cross-checked against recomp-kit's argument tables. The Android audio backend should adopt recomp-kit's portable DirectSound model instead of writing a new one. Newly observed missing kernel32/user32 imports should be ported from recomp-kit's implementations, adapted to AC1's guest-memory and userdata write rules, rather than written from scratch. recomp-kit's `d3d9.cpp`/shader generators are a separate renderer and are not used; AC1 stays on its D3D9 bridge and DXVK. Its `d3dx9.cpp` does not cover the texture-requirement and constant-table calls AC1 uses.
+## Correctness contract
+
+The original game's observable behaviour is the contract. That covers guest memory
+writes and aliasing, registers and flags where something can read them, x87, MMX
+and SSE results, calls and stack effects, indirect branches and callbacks,
+synchronization and external API effects.
+
+Guest state may be dropped only where a static proof shows nothing can read it.
+Unknown effects are treated conservatively.
+
+Known limits:
+
+- Native x87 drops the tag word, FPU IP/DP/opcode and unmasked-exception
+  diagnostics. Functions that observe them keep the plain lifted form.
+- Guest SEH is not dispatched. `RaiseException` handles only the debugger
+  thread-name form, and other exceptions stop the guest.
+- NaN payloads can differ from x86, because host operand order differs.
+
+## Static first
+
+Prefer a compile-time fact over a run-time check, a direct call over dispatch, and
+deleting work over speeding it up. Keep real run-time behaviour, such as object
+lifetimes, unproven indirect targets, threads and external APIs, at run time.

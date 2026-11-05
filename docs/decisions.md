@@ -16,33 +16,34 @@ for CPU decisions. See `docs/cpu-audit.md` for where the main thread's time goes
 
 ## Decisions
 
-| Mechanism | Was | Decision | Evidence | What would reopen it |
-|---|---|---|---|---|
-| Native x87 lowering | Default | **KEEP**, as the only x87 path | Production default; project direction | - |
-| GPR and XMM locals | Default (`--local-regs all`) | **KEEP**, no option | Production default | - |
-| ABI flag liveness | Default (`--flag-liveness abi`) | **KEEP**, no option | Production default | - |
-| Direct guest calls | Default | **KEEP**, no option | Production default | - |
-| Fences on every branch | Default (`--branch-fences all`) | **KEEP**, no option | The fence protects polling loops; moving it needs a proof about what other threads observe | A proof covering threads and shared memory |
-| Whole-function x87 regions | Off | **BLOCKED** | Differentially exact, TOP traffic down, estimated 0.5-1% from static data. No cycle measurement | Cycles for equivalent work with waiting separated |
-| GPR speculation | Off | **REMOVE** | Exact, but bimodal on the X4 and no stable gain | - |
-| Private ABI | Off | **REMOVE** | Exact, static count neutral, APK +13%. Only A/B was a cutscene replay | A new design with measured gain on real gameplay |
-| Whole-program XMM contracts | Off | **BLOCKED** | Sound; below 1% as tested. Whole-program return facts are the right kind of evidence, but this form adds a separate analysis | A shared facts layer with a measured benefit |
-| Vector guest accesses | Off | **BLOCKED** | Exact except NaN payload and an access at the very top of the address space. Static count falls, but store-to-load hops on `0x428540` rise from 11 to 19 | ARM64 cycles on the hot leaves |
-| Native leaf overrides | Off, wrapper always paid | **REMOVE from production** | `ac1_native_invoke` costs 0.6-0.7% with overrides off, and plans run on every call. `0x428540` measured 110 against 27 cycles in isolation, but that excludes the plan | Static proof of each plan's preconditions, then selection at build time |
-| Native regions and journal | Off on ARM64; the palette region is on for the Windows x64 build only | **REMOVE from production** | Same selection and per-call cost, plus rollback machinery. The palette's -2.79% cycles per frame was measured on Windows only, never on ARM64. Removing it gives up that Windows gain | Static proof of the region's preconditions, and ARM64 cycles |
-| Native palette reuse | Off | **REMOVE** | Inconclusive in testing | - |
-| Modifier fusion | Off | **REMOVE** | Regressed 3.91% over ten Windows pairs | - |
-| Runtime guards with fallback bodies | Lab only | **REMOVE** | Per-call dispatch by design | - |
-| Separate LLVM IR backend | Lab only | **REMOVE** | Bypassing C showed no visible gain: mean -0.54 instructions over 63 functions | Measured advantage over C with the same facts |
-| Semantic IR lowering | Lab only | **BLOCKED** | Fails closed on x87 and lifts 24 of 74 corpus functions. Cycle benefit unknown | Forwarding as a C fact, then ARM64 cycles on `0x428540`, `0xAA83A0`, `0x4E6820`, `0x1176DE0` |
-| Dirty-register syncs at calls and returns (`d`) | Lab only | **BLOCKED** | Exact in 61,806 comparisons, with mutants caught, but 202 rewritten sites never ran and it has no cycle measurement | Implementation as a shared fact, full coverage, cycles |
-| `restrict` on the CPU pointer | Lab only | **REMOVE** | Unsound across calls: the runtime also reaches the CPU through its own pointers | - |
-| 64-bit guest addressing | Lab only | **REMOVE** | Cannot be proven for pointers; spill loads rose from 4.4 to about 17 | - |
-| Moving fences to backward branches | Option | **REMOVE** | No proof; see fences above | - |
+"Removed" code can be recovered from tag `baseline-consolidation`.
 
-The default path therefore stays what production already generates. This
-consolidation changes how much code exists, not what the game executes, apart from
-removing the native wrappers and the flag opt-outs they forced on six functions.
+| Mechanism | Decision | Evidence | What would reopen it |
+|---|---|---|---|
+| Native x87 lowering | **KEEP** | -10.6% main-thread cycles per frame on host, with a differential fixture and captured records | - |
+| GPR and XMM locals | **KEEP** | Measured on host gameplay; also shrinks code | - |
+| Whole-program flag contracts | **KEEP** | `.text` -17%, cycles per frame -3.7% on host | - |
+| Captured guest-memory arena | **KEEP** | -15.3% cycles per frame on host | - |
+| Direct guest calls | **KEEP** | Replaces dispatch for known targets | - |
+| Fences on every branch | **KEEP** | Protects polling loops; moving them needs a proof about what other threads observe | A proof covering threads and shared memory |
+| Native Bink through FFmpeg | **KEEP** | Covers all 14 imports the game uses | - |
+| Translated Bink DLL | **REMOVE** | Reachable only through a runtime switch; its `DllMain` ran only the DLL's own C runtime startup | - |
+| Checked guest memory | **REMOVE** | Direct memory was 1.7x faster at loading; one memory path | - |
+| x87 regions | **BLOCKED** | Exact, but no cycle measurement | Cycles for equivalent work with waiting separated |
+| XMM contracts | **BLOCKED** | Sound, under 1% as tested, and a separate analysis | A shared facts layer with a measured benefit |
+| Vector guest accesses | **BLOCKED** | Exact except NaN payload and an access at the top of the address space. Store-to-load hops on `0x428540` rise from 11 to 19 | ARM64 cycles on hot leaves |
+| Dirty-register syncs (`d`) | **BLOCKED** | Exact in 61,806 comparisons, but 202 rewritten sites never ran and it has no cycle measurement | A shared fact, full coverage, cycles |
+| Semantic IR lowering | **BLOCKED** | Lifts 24 of 74 corpus functions, no x87, cycle benefit unknown | Forwarding as a C fact, then ARM64 cycles |
+| GPR speculation | **REMOVE** | Exact, but bimodal on the X4 with no stable gain | - |
+| Private call ABI | **REMOVE** | Static count neutral, APK +13%, only tested on a cutscene | A new design measured on gameplay |
+| Native leaf overrides | **REMOVE** | The wrapper cost 0.6-0.7% with overrides off, and plans ran on each call. `0x428540` was 110 against 27 cycles in isolation, excluding its plan | Static proof of each plan, then selection at build time |
+| Native regions, journal, palette reuse | **REMOVE** | Same per-call cost. The palette's -2.79% cycles per frame was on Windows only | Static proof and ARM64 cycles |
+| Modifier fusion | **REMOVE** | Regressed 3.91% on Windows | - |
+| Runtime guards with fallback bodies | **REMOVE** | Per-call dispatch by design | - |
+| Separate LLVM IR backend | **REMOVE** | Bypassing C showed no gain: mean -0.54 instructions over 63 functions | Measured advantage over C with the same facts |
+| `restrict` on the CPU pointer | **REMOVE** | Unsound across calls | - |
+| 64-bit guest addressing | **REMOVE** | Unprovable for pointers; spill loads rose from 4.4 to about 17 | - |
+| Backward-only fences | **REMOVE** | No proof | - |
 
 ## Semantic facts
 
@@ -58,13 +59,9 @@ existing C lowering. The lifted result is:
   escape, read-only addresses.
 - Whole-program facts: flag demand, return readers, callers.
 
-This is direction, not yet code. `tools/function_facts.py` already holds the shared
-analysis to build it on.
+This is direction, not yet code.
 
-The experiment's code is private and unmerged, on the local branch
-`worktree-agent-afdc6961b28db1bce`, with results under its `work/semantic_ir/`.
-
-## Correction: an exact-looking fact was wrong twice
+## Testing a new fact
 
 Two rewrites passed early checks and were wrong. A flag rewrite changed control flow
 on `0x00AE11A0`, and it inflated a corpus figure. A register-sync rewrite lost jump

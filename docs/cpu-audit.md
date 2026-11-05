@@ -1,7 +1,7 @@
 # Where the main thread's cycles go
 
-Phase 0 of the consolidation: a read-only audit of profiles already on disk. No
-build, phone run or production change was involved.
+An audit of main-thread profiles. Costs predate the consolidation, so the native
+wrapper and Bink startup listed here are already gone.
 
 ## Evidence
 
@@ -27,7 +27,7 @@ Limits that apply to every number below:
 
 ## Live crowd capture, 2026-11-05
 
-A later capture changes the ranking below. It attached to the running game, on
+This capture sets the priorities. It attached to the running game, on
 the same build (c33daae, matched by build ID), during a crowd. It has stacks and
 PMU counters, but only 2,935 stack samples over 8 s of one scene, so treat its
 shares as rough.
@@ -79,9 +79,7 @@ Frame intervals stayed on 120 Hz multiples, at 25 and 33.3 ms in that scene.
 
 ## Exclusive categories
 
-Mcycles per frame. This replaces the "runtime" and "other host" split in
-`docs/cpu-state-assessment.md`, which was a regular-expression split that put
-`strcmp`, audio and D3D9 lookups under "other".
+Mcycles per frame.
 
 | Category | Crowd | Quiet | Share of crowd |
 |---|---|---|---|
@@ -107,8 +105,7 @@ else. Non-game cost is nearly flat per frame between the scenes.
 ## Ranked findings
 
 "Ceiling" is the sampled cost of the category: the most that could vanish, not an
-expected saving. These findings predate the live capture, whose wait split lowers
-the real ceilings of 1-3 sharply.
+expected saving. The live capture's wait split lowers the real ceilings of 1-3 sharply.
 
 ### 1. Imports are resolved at run time by comparing strings
 
@@ -203,7 +200,7 @@ the real ceilings of 1-3 sharply.
 
 ## Suggested order
 
-Updated for the live capture. None of this has been implemented.
+None of this has been implemented.
 
 | Order | Action | Why |
 |---|---|---|
@@ -218,4 +215,3 @@ Updated for the live capture. None of this has been implemented.
 Spinning less in the wait could still help indirectly, for example by leaving
 power and thermal budget for the GPU, but that is untested.
 
-Private scripts and data are in `work/phone/audit/`.

@@ -1,395 +1,82 @@
 # Assassin's Creed 1 native recompilation
 
-This repository builds and executes a statically translated portion of the original GOG DX9 executable on a 64-bit Windows host. The same runtime renders the original title screen and a 3D tutorial gameplay frame with the WALK prompt in the Android x86_64 emulator. See the [verified emulator evidence and commands](docs/android.md#optimized-native-apk-2026-10-30). The optimized native APK reaches the title prompt at the 591.747-second input-clock checkpoint (clear capture at 609.734 seconds), versus 907.573 seconds with Debug native code. The APK is 258.4 MB with symbols retained separately. The replay passes the former 4,096-mapping allocation limit; its gameplay capture is paired with `present=1175 ms=4940141`. Emulator runs predate the AAudio merge and were silent.
+A static recompilation of the GOG DX9 build of Assassin's Creed 1. Every recovered
+x86 function becomes C, compiled ahead of time. The primary target is Android
+ARM64; Windows x64 is the development host.
 
-## Generated-code efficiency (2026-10-30)
+This is one fixed game, not an emulator. The runtime accepts only the executable
+fingerprint in `config/ac1_dx9.json`. Original files, generated code, logs and
+build output stay local under ignored `work/`, `build/` and Android build folders,
+and must never be published.
 
-Three generator changes are now the default, each measured in a controlled
-gameplay comparison with the deterministic 30 Hz benchmark clock:
+## Status
 
-| change | main-thread cycles/frame | mean frame time | FPS |
-|---|---|---|---|
-| captured guest-memory arena per function | -15.3% [-22.2%, -8.5%] | | 23.6 -> 27.8 |
-| GPR+XMM register locals, x87 classification builtins | -1.8% (bimodal) | -4.0% [-7.0%, -1.0%] | 26.8 -> 28.4 |
-| native x87: stack in block-local doubles, no tag/env bookkeeping | -10.6% [-20.3%, -0.9%] | -11.3% [-17.6%, -4.9%] | 28.2 -> 31.0 |
+The translator recovers and lifts all 102,014 discovered functions, with two
+`RECOMP_TODO` sites left. The game runs to gameplay on Windows and on a Galaxy
+S24 Ultra (Snapdragon 8 Gen 3) with DXVK and Turnip.
 
-Directly against the previous main: mean frame time -28.0% [-31.1%, -24.9%],
-23.3 -> 32.9 FPS (+41.5%) in the benchmark window; the stripped executable
-shrank 250.7 -> 144.8 MB. Rollback switches: `tools/build.ps1
--LocalRegs off` and `-X87 exact` (lifter `--local-regs`, `--x87`). Native
-x87 keeps values, TOP, C0-C3, IE/PE and the control word; it drops the tag
-word, dirty mask, FPU IP/DP/opcode and unmasked-exception diagnostics. It is
-verified on 19,202 captured gameplay records, a 4,096-case differential
-fixture and gameplay to Present 5000; Bink/MMX videos, long play and AArch64
-hardware are not yet covered. Diagnosis, isolated results and the next step:
-[docs/perf-architecture.md](docs/perf-architecture.md).
+Evidence is tracked per milestone. A successful compile does not show that a
+feature runs, and a Windows run does not show that it works on the phone.
 
-Second step: SSE registers stay in host vector registers. The XMM union has
-vector members; packed operations are single vector expressions, every lane
-access goes through the vector members, and lane writes are whole-vector
-assignments. Instructions whose only memory accesses are on the stack no
-longer record the guest EIP (its store through the CPU pointer blocked GCC's
-forwarding of stack spills); heap accesses, transfers, calls and function
-entries still do, and fault reports add the host PC. The pose kernel runs
-1.72x faster (275 -> 160 ticks/bone, byte-identical on 19,202 records); in
-gameplay main-thread cycles/frame and mean frame time fall 5.0% [-6.9%,
--3.1%], 32.4 -> 34.3 FPS, eight of eight pairs. The benchmark now decides on
-window-mean cycles/frame; see the same document.
+## Build
 
-Third step: guest stack traffic. Push and pop move the local ESP instead of
-round-tripping it through the CPU struct; the guest EIP is recorded only at
-function entries, control transfers, division and after calls (2.42M ->
-0.97M stores; crash reports resolve the exact line from the host PC); and a
-16-byte stack load that reads lanes stored just before it in the same block
-takes their values instead of stalling on store forwarding (5,060 loads).
-The pose kernel runs 160 -> 118 ticks/bone (byte-identical); in gameplay
-main-thread cycles/frame -4.7% [-8.7%, -0.7%], mean frame time -4.8%, 33.7 ->
-35.1 FPS.
+Host tools: MSYS2 MinGW64 GCC, the Android SDK's CMake 3.22.1 and Ninja, and the
+DukeMP pcrecomp checkout and Python environment recorded in `config/ac1_dx9.json`.
+Python dependencies are in `requirements.txt`. Android uses NDK 28.2.13676358.
 
-Fourth step: flags across calls. The default flag pass (`-FlagLiveness abi`)
-is a whole-program analysis with one body per function: each function gets
-the flags it reads at entry and the flags its callers read after it returns,
-so calls and returns no longer keep every flag alive, and the 13,472
-exception-frame functions are masked too (the runtime never dispatches guest
-SEH). Logical operations now clear the undefined AF, as QEMU and Bochs do. No
-flag crosses an indirect call or jump; 55% of the 453,272 flag computations
-become dead and 34% keep only ZF (live lanes -88%); `.text` shrinks 17%. The
-pose kernel runs 118 -> 98.6 ticks/bone (byte-identical); in gameplay
-main-thread cycles/frame -3.7% [-5.3%, -2.2%] in the standard window and
--10.7% [-18.4%, -2.9%] after the scene change that the faster build reaches
-later (see [docs/benchmarking.md](docs/benchmarking.md)). `-FlagLiveness cfg`
-restores the per-function masks. Each function now also keeps the flags in a
-local (synced to the CPU struct only where a contract needs them) and shifts
-compute only demanded flags: the kernel runs 98.6 -> 94 ticks/bone, gameplay
-main-thread cycles/frame -4.7% [-8.8%, -0.7%] against the contract build
-(-6.3% before the scene change). Then: guest returns enter the scheduler
-checkpoint only every 64th time, the guest clock caches its frequency and the
-D3D9 bridge hashes its objects (-3.3% [-5.9%, -0.8%], 16 pairs); register
-locals now also cover the 13,472 exception-frame functions (-4.0% [-6.4%,
--1.6%]; 41.5 -> 43.3 FPS in the standard window); and a direct call checks the
-host stack against a per-thread floor and counts its return instead of the
-depth, budget and last-target bookkeeping (-2.1% [-3.5%, -0.6%], 22 pairs;
-`.text` -22%). The MinGW build resolves `_Thread_local` through its own
-`__emutls_get_address`, which reads a TEB slot instead of winpthreads' locked
-`pthread_getspecific` (~10% of the main thread under imports): -3.5% [-6.0%,
--0.9%], 43.3 -> 45.0 FPS. The hot import handlers (critical sections, clocks,
-guest TLS) classify each import once instead of comparing names per call, and
-the scheduler reads its slice clock every 256 returns or 64 imports instead of
-64 or 16: -8.5% [-10.1%, -6.8%], 45.2 -> 49.4 FPS.
-
-## Gamepad and Android touch controller (2026-10-30)
-
-The runtime now feeds AC1's original Xbox controller path from Windows XInput,
-Android physical pads, or a multitouch AC1 overlay. A DirectInput discovery node
-and the original controller-selection setting enable the game's own prompts.
-Host contracts and a tutorial replay verify raw state, packets, movement,
-camera and RT+A, with captures at `work/gamepad/replay2/`. ARM64 APK packaging
-passes; this input change has no phone/emulator verification. The 3120x1440
-layout preview is `work/gamepad/overlay.png`. See [bindings, settings and
-verification commands](docs/gamepad.md).
-
-Android profile creation now has a Keyboard button and committed-text input
-through the original PC key/ToUnicode path. A host replay visibly enters
-`Altaïr42`, corrects it with Backspace and confirms with Enter or pad A; see
-[profile text evidence and limits](docs/profile-text.md). Phone IME verification
-is still pending.
-
-## Android ARM64 hardware run (2026-10-30)
-
-On a Galaxy S24 Ultra (SM-S928B, Snapdragon 8 Gen 3, Adreno 750, Android 16) the ARM64 APK runs the original executable through the replay into the 3D tutorial: first present at ~4.4 s, present 1175 at ~34 s (host: 3.5 s / 7.1 s), full-screen 1560x720 render at the display aspect, AAudio output with 0 xruns. Rendering is incomplete: with the inherited DXVK-native 1.9.2b backend, characters and HUD draw but world geometry, shadows and the HUD Bink panel are missing (the host renders them correctly). The stock Qualcomm driver lacks `VK_KHR_maintenance5/6` and `VK_KHR_load_store_op_none` required by upstream DXVK 3.1 (`ports/dxvk_android/vulkan_probe.c`), so the Android backend is moving to DXVK 3.1 with Mesa Turnip loaded in-process via libadrenotools (Snapdragon/Adreno only for now). Gameplay runs at ~8 FPS at 1560x720 with 1.9.2b; the GPU is ~14% busy and the main guest thread is CPU-bound yet averaged 1.77 GHz (prime core 3.4 GHz), which `AC1_CPU_AFFINITY` (default: high-capacity cores) targets. The kernel resets that affinity whenever Android moves the app between cpusets (Home or screen off, then back: on the S24 the guest threads went to cores 0-1,5-6, then 0-7), so each guest thread checks it about once a second at a scheduler checkpoint and, if it was reset, pins every guest thread again; on the phone all six were back on 2-7 within 2 s of resuming, twice in a row. Phone diagnostics: `--es env "AC1_X=..,DXVK_Y=.."` sets runtime settings; `AC1_RENDER_SIZE=WxH` overrides the render size.
-
-On 2026-10-31 current main (`9856f52`) ran on the same phone with DXVK 3.1 and Turnip (Mesa 26.2.5) at 1560x720, alternated with the previously installed `911a6c4` build in the unchanged replay (old, new, new, old; USB-powered, thermal zone 0 between 38 and 58 °C). Presents 1300 to 2000 took 63.0 and 78.6 s with `911a6c4` (11.1 and 8.9 FPS) and 22.2 and 25.2 s with `9856f52` (31.5 and 27.8 FPS); first present moved from 4.8/5.8 s to 2.1/2.2 s. This measures all code-generation changes since `911a6c4` together (register, flag and XMM locals, native x87, the captured guest-memory arena, lean direct calls), not one commit; the packaged ARM64 `.text` is 75.5 MB instead of 222.8 MB. Both builds logged the same message kinds, with no guest stop, native crash or DXVK error, and AAudio reported 0 xruns. Captures show world geometry, NPCs and shadows; the HUD tutorial video panel appears partly drawn in captures from both builds. Frame-time percentiles and sustained, throttled play were not measured. Both builds log `VK_SUBOPTIMAL_KHR` and recreate the swapchain once per present; DXVK requests the identity pre-transform, so a mismatch with the rotated landscape surface is the likely cause (unconfirmed), and the recreation's cost is unmeasured. Private evidence: `work/phone/ab/`.
-
-Later that day a free-play session of `9856f52` crashed after 82 s with SIGSEGV in DXVK `DxvkMemoryAllocator::importImageResource`, called from `Presenter::createSwapChain` during a present. The fault address `0x0000002000000001` is the first word of a live imported allocation (use count 1, flag `Imported`): the unlocked allocation pool had handed one slot out twice. Upstream DXVK fixed this race in `0847af3`, which `ports/dxvk_android/prepare.py` now backports; the presenter also keeps a swapchain that is suboptimal only because of rotation, and a 30-minute free-play session created it once. A 10 s simpleperf profile of that session put DirectSound servicing at 35% of the main guest thread (`update` 22.8%, `ac1_ds8_service` 12.6%): every scheduler handoff updated every buffer under the mixer mutex, and the AAudio callback, which only try-locks that mutex, rendered silence for 350,953 of 907,613 2 ms callbacks (38.7%), the audible crackle. The service now visits only buffers with deferred events. Saves were lost on every platform: `GetFileType` reported file-service handles as unknown, so the game's CRT `_sopen` closed each profile or save file it had just created (0-byte `.hdr`, no `.sav`); they now report `FILE_TYPE_DISK`, and the host writes the same 18-byte header layout as a native save. On Android a back gesture finished the activity while the guest kept running headless, and each new surface got a new HWND that the D3D9 swapchain never presented to. Back now leaves the game like Home, the window keeps one HWND, and presenting waits for a surface, pausing the game while hidden. With all fixes (`8cb7d1e`) the phone user reported working profile saves and resume, with the crackle much reduced but not gone; headers left empty by the old bug list as unnamed profiles. That session still missed the mixer lock in 5.96% of callbacks (8-12% in busy gameplay), so the AAudio callback now mixes up to 20 ms ahead and plays from that ring on a miss, and the write cursor never falls inside frames the mixer has read (`62fed98`). Through the replay, 852 of 29,945 mixer attempts missed, with 960 silent output frames in total (20 ms), 0 late unlocks and 0 xruns; the user reported clean sound. Alternating `9856f52` and `62fed98` from a fresh save folder (USB-powered, warm phone after play, thermal zone 0 at 50-55 °C), presents 1300-2000 ran at 20.87 FPS with `9856f52` (p50/p95/p99 45.2/61.7/99.1 ms, main thread 42.1 ms CPU per frame, 2,075 swapchain rebuilds) and 24.53 and 24.25 FPS with `62fed98` (39.6/52.6/82.6 and 39.7/53.0/88.1 ms; 37.7 and 38.1 ms; 0 rebuilds). The second `9856f52` run crashed after 12 s in the DXVK CS thread (swapchain blit, Turnip image view of a reused allocation), so that comparison has one old run. Two follow-ups did not help: `AC1_CPU_AFFINITY=prime` (guest threads on the Cortex-X4 alone, mask `0x80`) reached present 1925 after 202 s where the default big-core mask `0xfc` reached 2000 in 56 s, since every baton handoff then waits for the single core; and a 64-entry cache in front of the D3D9 bridge's object map (`find_object`, 1.6% of the phone's main thread) was inconclusive on the host (six pairs, +0.31M main-thread cycles/frame, 95% interval -1.49M to +2.11M; median FPS 47.63 without, 47.22 with), so it is not merged. Private evidence: `work/phone/crash/`, `work/phone/session-1128/`, `work/phone/ab/` (`P-*`, `T-*`), `work/crash/host-savefix*/`.
-
-On 2026-11-01 a free-play session of the release build (`62fed98` code) stopped after 13.3 million main-thread dispatches: worker thread 4104 called `0x00E33AF0`, which had no generated function. `0x00E36BD0` sorts 0x60-byte records with `push (descending ? 0x00E33AF0 : 0x00E33AA0)`, and the code-immediate rule took every `PUSH imm32` directly before a `JMP` for a manual call (`push return; jmp callee`), so only the fall-through comparator was translated. Such a push is now a manual call only when its immediate lies inside the pushing function or its jump leaves the function; all 91 former rejections were joins, and the catalog gains 20 functions (102,014) with no discovery or lift failures. The session's progress was also never saved, and Windows never saved either: the game's file system mounts devices by drive or UNC prefix (`C:\`, `\`), and the special-folder path (`D:/...` on Windows, `/data/user/0/...` on Android) matched none, so `SaveGameWriter` skipped every save without a file call while CRT-written profile headers still appeared. The guest now sees userdata on a drive: `D:\...` on Windows and `C:\AC1Data` on Android, mapped to the private folder. A traced host replay to present 3250 now opens `Default.sav` and `Default.opt` at the main menu (not found) and creates `Default.sav` on New Game; before, neither file was ever opened. That file is empty because New Game saves with size 0 (`0x007A86D0` returns before writing); the replay ends before the first autosave, so a save with content is not yet verified. On the phone, a debug APK of `2b79186` (its ARM64 library has `L_00E33AF0`) ran the unchanged traced replay on the user's own saves: it listed both existing profiles from `C:\AC1Data\roaming\Ubisoft\Assassin's Creed\Saved Games`, looked up the selected profile's `.sav` and `.opt` there (not found), and on New Game rewrote its `.hdr` and created its empty `.sav` in the app's private folder, with no guest stop through present 1375 (45.6 s). The saves were backed up before and restored byte-identically after, and the non-debuggable release APK with the same native library is installed. The descending sort and a save with content still await free play. Private evidence: `work/phone/crash-1102/`, `work/phone/save-check-1102/`, `work/crash/save-probe-before/`, `work/crash/save-probe-after/`.
-
-That release then stopped at the first autosave, about two minutes after New Game: the engine's file worker (thread 4104, `0x007A4180`) passed `WriteFile` the first 64 KiB of a 177,299-byte save at `0x26B7B020`, the adapter rejected the range, and the `.sav` stayed empty. The game's dlmalloc (`Gear::MemAllocDl283`) merges adjacent 64 KiB VirtualAlloc segments, so its larger blocks cross guest region boundaries, as the 24-byte critical sections did, but `guest_memory_try_ptr` and `guest_ptr` accepted only a span inside one region. Every direct-arena region is backed at `arena + base`, so both now accept a span that exactly adjacent regions cover (`14b51ac`); holes, released neighbours and checked memory still fail, and a rejected import range logs its neighbouring regions. The unchanged host replay reproduced the stop at present 6150 (109.5 s); with the fix it wrote a 177,299-byte `Default.sav` whose header size field equals its length and ran 241 s without a stop, and a second replay opened that save at the main menu and resumed in the Abstergo lab without recreating it. On the phone, a debug APK of `14b51ac` ran the same replay from an empty save folder: the first autosave wrote a 177,299-byte `.sav` after 128 s, and a second, traced run opened it from `C:\AC1Data`, read its full size and resumed in the lab, with no guest stop in 147 s and 127 s. The user's saves were restored byte-identically and the non-debuggable `14b51ac` release is installed; the descending sort still awaits free play. Private evidence: `work/phone/crash-1102b/`, `work/phone/autosave-1102/`, `work/phone/continue-1102/`, `work/crash/autosave-before/`, `work/crash/autosave-after/`.
-
-On 2026-11-02, in a busy city scene on the same phone (~36 FPS), AC1's GPU-query spin turned out to be an occlusion-culling wait: `0x00ABB0E0` draws a list of items with occlusion queries and later in the same frame redraws only those that passed, spinning in `0x00AA40B0` (`GetData(FLUSH)` + `SwitchToThread`) for a result. About 35 results a second are waited for, ~1.7 ms each from the first GetData (3.5-6% of frame time); the GetData's own flush sends the end, `vkQueueSubmit` follows within ~0.1 ms, and the rest is GPU time. Interleaved phone runs rejected a cheaper `SwitchToThread` path (35.1 vs 36.5 FPS), earlier flushes (down to 9.8 FPS), and an opt-in nonblocking prototype: treating a pending result as visible cost 12% (+35% draws), and reusing the previous result cost 6% and culled Altaïr. The synchronous wait stays; `AC1_DXVK_QUERY_STATS=1` and `AC1_TRACE_QUERY_SITES=1` remain as diagnostics. Details: [occlusion-query wait](docs/occlusion-wait.md).
-
-Code-generation changes are evaluated with the [code-generation lab](docs/codegen-lab.md) (`tools/codegen_lab.py`) before any gameplay run: immutable snapshots of the hot corpus, compiled ARM64 and i686 machine code with LLVM remarks, an x86 round trip against the original functions, and isolated phone benchmarks counting executed instructions, cycles and stalls behind a correctness gate. Its first run reproduced the EIP-observer gain (x86 0x428540 -43% cycles), the x86 store-forwarding regression it causes in 0x1176DE0 (+94%), and the gap between instruction counts and cycles.
-
-Android preparation on `android-prep`: current runtime/platform/JNI ARM64 syntax checks and Java compilation pass; portable silent DS8 and keyboard/gamepad/touch/replay adapters are wired. Portable D3DX texture requirements and SM3 constant tables now pass native-DLL oracle contracts (80,425 matches, zero mismatches) and ARM64 bridge syntax. Texture tests used deterministic caps/format fixtures because native HAL caps were unavailable. No game-code build or device execution was performed. ARM64 FFmpeg archives and actual graphics/device validation remain required; see the [current Android audit and post-benchmark commands](docs/android.md#current-preparation-android-prep-2026-10-29) and [focused D3DX check command and limits](docs/android.md#portable-d3dx-2026-10-30).
-
-## Critical-section span investigation (2026-10-30)
-
-The intermittent loading stop at `0x007a568e` is a runtime bounds-check bug:
-the 24-byte critical section can cross two live adjacent guest allocations.
-The first local diagnostic replay reproduced it with all six words readable.
-The fix validates the entire guest span and initializes/deletes it with guest
-word writes. Native Windows, direct/checked-memory and scheduler contracts pass.
-Ten consecutive 60-second replays of one fixed RelWithDebInfo/direct-memory
-binary completed without a guest stop; tutorial-scene captures and a real
-cross-region Initialize/Enter/Leave sequence are retained under `work/cs/`.
-One final capture is white; the detailed evidence and validation limits are in
-[the investigation record](docs/critical-section-span.md).
-
-## Native leaf overrides and gameplay hotspots (2026-10-30)
-
-Gameplay CPU is flat: generated guest code is ~56% of sampled CPU, but the hottest single guest function is under 2%, and dispatch/import/scheduler overhead is a ~4.6% lower bound ([full breakdown](docs/hot-functions.md)). Three fingerprint-pinned native leaves (matrix product `0x00653400`, plane/AABB classification `0x01176DE0`, quaternion/vector transform `0x0042EE70`) preserve the guest CPU state and write sets; each passed 200,000 synthetic and 10,000 live differential checks. Interleaved 60-second A/B runs showed no overall FPS win, so overrides are **opt-in**: `AC1_NATIVE_OVERRIDES=1` (all) or a comma-separated hex VA list; unset or `0` runs the translated code. `AC1_NATIVE_VERIFY=N` compares the first N calls against the translated body. Compare with `tools/bench_gameplay.ps1 -Compare ... -EnvB @{ AC1_NATIVE_OVERRIDES='1' }`.
-
-The optional host [inclusive profiler](docs/inclusive-profile.md) now captures
-native call chains beneath guest functions, including synchronous host helpers,
-and supports separate selected-entry count builds. Normal generation adds no
-count hooks. The phase 1 menu/gameplay evidence and candidate ranking are kept
-privately under `work/engine_prof/`; no subsystem replacement is enabled by this
-profiling work.
-
-The [pinned native palette region](docs/native-regions.md) is now enabled for
-the measured Windows x64 direct-memory/trace-EIP configuration: twenty
-interleaved gameplay pairs measured +2.49% median paired FPS (95% bootstrap
-interval [+1.58%, +5.71%]) and -2.79% cycles/frame. Five unattended gameplay
-replays passed complete CPU, guest-memory and pending-upload comparisons.
-`AC1_NATIVE_REGIONS=0` disables it. Palette reuse remains opt-in after an
-inconclusive comparison; the Hinge/Compress modifier trial remains opt-in after
-a -3.91% regression. ARM64 compilation is verified; these regions have no ARM64
-hardware execution or performance evidence. Raw phase 2 evidence and patches
-remain private under `work/engine_prof/phase2/`.
-
-## Earlier host checkpoint: first original image (loading screen)
-
-Original code now renders AC1's loading screen on Windows. The translated Bink DLL decodes `videos\LoadingScreen.bik`, and the game draws its progress bar over it through the D3D9 bridge on DXVK. Back-buffer captures show loading progress from 4% at present 4 to 81% at present 64, with 81 original draw calls by then. Evidence: `work/startup_first_image_loading.log` (SHA-256 `77EBD97228EEF25CD839F887B44240EFFD52C690A353E51DF7CCE4D3A6BE0412`) and `work/captures/present_000064.bmp`. This verifies sustained original rendering of the loading screen. Menu, input, audio playback and gameplay are not yet verified.
-
-The catalog grew to about 83,900 main-executable functions and 292 Bink functions, from these systematic discovery sources:
-- decoded `MOV`/`PUSH` imm32 code pointers at function boundaries (`code_immediate` edges);
-- every RTTI-located vtable slot, primary and secondary, including `.?AU` struct bases and single-slot tables (`work/scan_all_rtti_vtables.py`);
-- Bink's relocation-proven function tables.
-
-The D3D9 bridge covers every `IDirect3DDevice9` slot and the resource interfaces. The DirectSound bridge covers every slot of the DS8, buffer, 3D buffer, 3D listener and notify interfaces. The newly covered but not yet reached MMX code produces 13 main-executable lift failures and 71 explicit `RECOMP_TODO`s. Bink has 165 MMX sites that its loading-screen decode has not reached so far. A native FFmpeg Bink provider adapted from recomp-kit is being integrated (see [architecture](docs/architecture.md)).
-
-Development run, windowed and skipping the intro videos as players do by deleting them:
+Generation needs the installed game and takes about 20 minutes. It reruns only when
+its inputs change.
 
 ```powershell
-$env:AC1_D3D9_LIBRARY = (Resolve-Path work\d3d9_dxvk_probe\d3d9.dll).Path
-$env:AC1_D3D9_FORCE_WINDOWED = '1'   # fullscreen request presented windowed; no mode switch
-$env:AC1_D3D9_TRACE_FRAME = '1'      # present/draw counts at power-of-two presents
-$env:AC1_D3D9_CAPTURE_DIR = (Resolve-Path work\captures).Path   # BMP back buffers
-$env:AC1_HIDE_FILES = 'videos\UBI_LOGO.bik;videos\Ubisoft_Presents.bik;videos\Warning_Disclaimer.bik;videos\DemoIntro.bik'
-.\tools\build.ps1 -BuildType RelWithDebInfo -Jobs 16 -Run
-```
-
-Without `AC1_HIDE_FILES`, the game plays all four intro videos in real time (about eight minutes) before loading.
-
-## Earlier saved host checkpoint (64,409 main + 65 Bink functions; historical)
-
-The generated catalog contains 64,409 main-executable functions and 65 Bink functions, with zero generation failures and an empty queue. Two `RECOMP_TODO` instructions remain: `FNSAVE` and `FRSTOR`. Work stopped at the user's request after the current callback change and one final verification run.
-
-The latest build passed in 126.05 seconds. Its run, [`work/startup_final.log`](work/startup_final.log), SHA-256 `CAD8DFC46715A44370B4DDE55ADAA7C9FBE43C6A8CDFE2F7B34BB719644C9733`, failed earlier than the preceding successful run: DXVK `CreateDevice` returned `D3DERR_NOTAVAILABLE` (`0x8876086A`), then original code attempted a scalar read at address zero. The new observed callback root `0x00415600` is compiled in commit `a06ee1f`, but this run did not reach it. No retry or further blocker work was performed after this final attempt.
-
-The furthest verified execution is [`work/startup_clipcursor.log`](work/startup_clipcursor.log), SHA-256 `FE3BCBB9FA5FCB526C9C688D6AC294D82AB0B85F7BADF573D3F39C0B0B835CC7`, using the preceding 64,402-function catalog. Original code made its first successful native `Present` call, with `present_calls=1` and `draw_calls=0`, then stopped at missing callback `0x00415600` through `0x00415CA0` at `0x00415CAA`. It took 32.854 seconds and 53,792,544 total guest dispatches; all five workers joined. This verifies presentation, not a rendered game image. No original draw, menu, interactive control, audio playback, gameplay, or Android device execution is verified.
-
-Graphics integration in `fde142c` covers vertex/index-buffer staging, frame boundaries, typed bindings and draws, render-target/depth-stencil selection, and occlusion queries. Native synthetic tests and four isolated CTest checks passed. The canonical graphics bridge also compiles for ARM64/API28 (553,904-byte object; source SHA-256 `DEED49C6D0E085EB602D787EE0BAD61AE8FB201DC2082C2098E8B24A0BF6668D`), with five unused-helper warnings. On resumption, first reproduce device creation and the saved presentation checkpoint, then validate execution through the newly translated callback.
-
-Generated functions are native C compiled ahead of time. Guest registers and 32-bit addresses preserve the original x86 program's semantics; there is no instruction decoder, JIT, Wine, or x86 interpreter in the runtime. Untranslated function targets and unimplemented imports stop with the original instruction address. The executable and its adjacent `binkw32.dll` must match the pinned fingerprints.
-
-Host dispatch uses a 1,024-entry exact-address cache for successful main-executable function lookups, adapted from Duke's `lifted_lookup.h`. It resets each run; Bink and import resolution remain independent, and unknown or interior addresses still go through exact binary search and fail normally. Set `AC1_LIFTED_LOOKUP_CACHE=0` to disable it. Collision/miss fixtures and ARM64 compilation pass. On the same executable (SHA-256 `E94C399AC7BB00BC1BD907D9B66B3844B25356338B6EAD10BCE4A05B9A1F9205`), cache-off took 47.028 s / 100,833,053 total calls and cache-on 31.515 s / 58,286,304, but main crypto work differed (59.7M vs 17.2M calls), so these runs do not establish a speedup.
-
-## Build and execute
-
-The current configuration uses the actual local DukeMP pcrecomp checkout and its Python environment, recorded in `config/ac1_dx9.json`. Runtime inputs copied from that working tree are pinned by content in `tools/prepare_runtime.py`. The GOG directory is read-only.
-
-```powershell
-# Analyze, generate, compile and run the real startup path.
-.\tools\build.ps1 -Generate -Run
-
-# Runtime edits only: incremental compile and execute.
+# Generate if needed, compile and run on Windows.
 .\tools\build.ps1 -Run
 
-# Optional optimized host build with symbols, in build/host-relwithdebinfo.
-# Generated instructions still retain their guest-address diagnostics.
-.\tools\build.ps1 -BuildType RelWithDebInfo -Jobs 16 -Run
+# Force generation.
+.\tools\build.ps1 -Generate -Run
 
-# Run twice in one process to check repeatability and worker cleanup.
-.\tools\build.ps1 -CheckRepeat
+# Optimized host build, in build/host-relwithdebinfo.
+.\tools\build.ps1 -BuildType RelWithDebInfo -Jobs 8 -Run
 
-# Build the local Android ARM64 diagnostic APK.
+# Android ARM64 APK.
 .\tools\build_android.ps1
 ```
 
-The current Windows Vulkan test uses the separately staged official DXVK x64 DLL through an explicit absolute path. With that local dependency present:
+The Windows renderer needs a staged DXVK DLL:
 
 ```powershell
 $env:AC1_D3D9_LIBRARY = (Resolve-Path work\d3d9_dxvk_probe\d3d9.dll).Path
-New-Item -ItemType Directory -Force work\host_dxvk_run | Out-Null
-$env:DXVK_LOG_PATH = (Resolve-Path work\host_dxvk_run).Path
-.\tools\build.ps1 -BuildType RelWithDebInfo -Jobs 16 -Run
 ```
 
-An explicit DLL load/export failure stops with its diagnostic; it does not fall back. Without `AC1_D3D9_LIBRARY`, the bridge uses System32 D3D9. This host DLL is separate from the Android DXVK Native build.
+See [docs/android.md](docs/android.md) for Android prerequisites, game data import
+and running on a device.
 
-Host tools: MSYS2 MinGW64 GCC and the Android SDK's CMake 3.22.1/Ninja. Python dependencies are in `requirements.txt`. Android uses NDK 28.2.13676358, SDK 35 and JDK 17 or 21. See [Android instructions](docs/android.md) for installation and user-supplied game data.
-
-`-Jobs` controls native compilation parallelism and defaults to 8; the optimized example uses 16 for this host's 16 physical cores. It does not change guest-thread scheduling.
-
-The generator assigns functions to 1,000 fixed groups by address and preserves unchanged files. Existing functions keep their group when the catalog grows, avoiding unnecessary recompilation; a runtime edit does not regenerate game code. Driver/config changes trigger generation automatically. It seeds the original C and C++ initializer tables (1,750 validated function pointers) from the bounds in `config/startup_initializers.json`, follows direct tail thunks, and recovers constant constructor/cleanup callbacks passed to the observed MSVC array-construction helper. Terminal direct jumps out of multi-instruction adapters are also followed after code-entry and instruction-overlap validation; internal, conditional, and indirect jumps are excluded from this rule. This closes the observed `0x004016D1` adapter's missing tail edge to `0x009D9600`. It also follows constant callbacks passed as argument 2 to the game's four-argument parser helpers at `0x00438EF0` and `0x009312F0`, including nested and recursive parser callbacks. These callback rules require bounded stack-argument evidence and executable entry validation. Add other observed indirect targets to `initial_discovery.startup_seeds`; `--seed` and `--seed-file` also support focused experiments. Unsupported instructions remain explicit runtime failures.
-
-Generation invalidates its previous success report before changing outputs and verifies input fingerprints again before publishing a new report. If inputs change during generation, the build stops and must regenerate. Instruction-overlap checks use a page index with the same exact boundaries as the earlier linear scan; a replay of 41,605 functions and 890 callback edges produced byte-identical C while reducing measured discovery time from 92.4 to 38.5 seconds. Reports now separate discovery and emission timings. Private equivalence evidence is in `work/lift_perf_index/`.
-
-Emitted function bodies are cached under `work/emission_cache/`, keyed by the binary, translator inputs, and each recovered function's contents. Discovery still runs on every regeneration; changing the root set can reuse bodies whose recovered instructions remain unchanged. Cache hits verify body hashes, and new entries become persistent only after the generation-input checks pass. Reports include hit/miss counts and publication timing. Pass `--no-emission-cache` directly to `tools/lift_ac1.py` to bypass it. Focused cold, warm, and bypass comparisons produce identical generated files and preserve unchanged file timestamps. A real regeneration reused 63,442 bodies and translated five new functions: emission took 4.4 seconds and generation including discovery took 79.3 seconds, with no cache errors.
-
-Configured roots also include 1,968 validated factory pointers from the game's WinMain registration graph, separate from the CRT initializer tables. Exact registrar calls identify named records whose factory field at `+0x68` feeds the observed object-creation dispatcher. A further 1,746 serialization entries come from unambiguous primary RTTI vtables for those registered `Object` types, using slot 2 as in the observed generic deserializers. Compiling these conditional callbacks avoids discovering each type in a separate run; it does not establish that every registered type has executed. Private provenance, entry-validation and isolated-build evidence is retained in `work/factory_seed_manifest_winmain_1968.json`, `work/factory_slot2_object_broad_rtti_scan.json` and `work/lift_factory_broad/`.
-
-The same registered-type tables also supply 14,601 method candidates after executable-entry and instruction-overlap checks. An adjacent `Pad` string following the nine-entry `PauseInfo` table was excluded: its bytes happen to resemble a code address, so section membership alone is insufficient to establish a table slot. The isolated closure generated about 41,500 functions with no discovery or translation failures; all generated C passed syntax-only compilation, with only the same two explicit x87 gaps described below. This is additional conditional coverage; runtime-created classes outside the registered-type set still need their own evidence. The frozen inputs, candidate provenance, exclusions, and syntax checks are retained in `work/lift_allmethods_snapshot/`.
-
-The root set now also includes 6,641 validated targets from broader Scimitar primary vtables, 1,338 methods from primary Havok `hkBaseObject` descendant tables, 251 Gear virtual methods, 2,020 Magma primary virtual methods, and 1,561 property getter/setter callbacks. The property callbacks come from 387 bounded descriptors passed at decoded calls to the original registrar; their record stride and callback fields match the actual `Component` and `RigidBodyComponent` startup stops. The combined generation covers over 63,500 functions with no discovery or translation failures and an empty work queue. This is conditional code coverage, not evidence that those functions all ran. Private provenance is in `work/scimitar_utility_vtables_final.json`, `work/havok_hkbase_rtti_coverage.json`, `work/gear_namespace_rtti_coverage.json`, `work/magma_primary_vtable_seeds_59995_reviewed_v2.json`, and `work/registered_property_callback_seed_manifest.json`.
-
-Constructor-proven primary and secondary Havok method-table batches add validated physics callbacks, and six exact loader callbacks pass entry and instruction-overlap checks. Their private evidence is in `work/havok_hkbase_rtti_coverage.json`, `work/havok_secondary_coverage/secondary_tables.json`, and `work/loader_registrar_callback_target_validation.json`.
-
-The 59 MMX operations previously left unsupported in two Havok leaf helpers now have scoped lowerings for those routines, validated against 552 generated-versus-native oracle cases including ABI and guard checks; their generated translation units also compile for ARM64. This does not add general MMX-alias support, which remains unsupported as described in `src/runtime/NOTICE.md`. To repeat the focused regression:
+## Test
 
 ```powershell
-& 'D:\Prog\dukemp_recomp\.venv\Scripts\python.exe' -B tests\run_mmx_havok.py `
-    --cc C:\msys64\mingw64\bin\gcc.exe `
-    --cxx C:\msys64\mingw64\bin\g++.exe
+& 'D:\Prog\dukemp_recomp\.venv\Scripts\python.exe' -B tests\run_all.py
 ```
 
-Two apparent `AAD` instructions were instead a decoding error: a four-entry switch table was read past its proven bound into a word pointing inside another instruction. The local lifter pins that exact dispatch's bound; its regression verifies the original table arms and excludes the false blocks.
+This runs the generated-code, instruction semantics and runtime contract checks.
+It does not run the game. It covers the host only, so an Android build and a run on
+hardware are separate gates.
 
-The same build also translates the required Bink DLL functions using `tools/lift_bink.py` and `config/binkw32.json`. Its 16 stable source groups have a separate dispatcher, and unchanged inputs skip generation. Add observed Bink targets to that configuration's `observed_seeds`. The original DLL remains user-supplied game data; the runtime verifies it and maps its data at the original guest address without loading x86 code into the host process.
+## Documentation
 
-```powershell
-& 'D:\Prog\dukemp_recomp\.venv\Scripts\python.exe' -B tools\lift_ac1.py --selftest
-& 'D:\Prog\dukemp_recomp\.venv\Scripts\python.exe' -B tools\inventory_ac1.py
+| Document | Covers |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | The pipeline, runtime and correctness contract |
+| [docs/decisions.md](docs/decisions.md) | Accepted and rejected mechanisms, with evidence |
+| [docs/cpu-audit.md](docs/cpu-audit.md) | Where main-thread time goes |
+| [docs/measurement-plan.md](docs/measurement-plan.md) | How CPU work is measured |
+| [docs/codegen-lab.md](docs/codegen-lab.md) | Inspecting generated machine code |
+| [docs/android.md](docs/android.md) | Android build and device runs |
+| [docs/graphics.md](docs/graphics.md) | D3D9 bridge, DXVK and Turnip |
+| [docs/occlusion-wait.md](docs/occlusion-wait.md) | The game's occlusion-query wait |
+| [docs/threading.md](docs/threading.md) | Guest threads and the scheduler |
+| [docs/gamepad.md](docs/gamepad.md) | Controller input |
+| [docs/profile-text.md](docs/profile-text.md) | Android profile-name entry |
+| [docs/binary.md](docs/binary.md) | The pinned executable |
 
-# Larger isolated compiler experiment, independent of the active startup slice.
-& 'D:\Prog\dukemp_recomp\.venv\Scripts\python.exe' -B tools\lift_ac1.py `
-    --initializer-group none --max-functions 3000 --max-depth 8 --output-dir work\lift_expanded
-```
+## Licences
 
-## Evidence and scope
-
-The Win32 import compatibility work has a separate focused check that does not
-regenerate or execute translated game functions:
-
-```powershell
-& 'D:\Prog\dukemp_recomp\.venv\Scripts\python.exe' -B tests\run_win32_compat.py
-```
-
-On 2026-10-29 this passed 280 adapter calls and 1,427 assertions, including
-native Windows comparisons, wildcard enumeration, PE string resources,
-userdata-only mutations, symlink/hard-link rejection, guest thread aliases,
-and suppression of accessibility setting changes. Existing file and profile
-contracts also passed. The complete runtime passed host syntax checking with
-the graphics/native Bink options enabled and Android ARM64 API 28 syntax
-checking with NDK 28.2. Empty lookup-header stubs are confined to
-`work/win32_compat/stubs`; these checks do not establish a runtime link, game
-execution, menu/save behavior, rendering, or Android hardware verification.
-Commands, output and the per-import disposition audit are preserved in
-`work/win32_compat/`.
-
-Against committed source, the installed PE has 114 imports absent from the
-string-literal scan: KERNEL32 68, USER32 7, ADVAPI32 3, OLEAUT32 1, WS2_32 26,
-EAX 1, DSOUND 2, XINPUT1_3 3, WINMM 1, WININET 2. The 14 Bink imports are
-already named; EAX #6 and DSOUND #2/#11 already have ordinal handlers.
-New coverage is KERNEL32 65 (including three controlled process stops),
-USER32 7, ADVAPI32 3, OLEAUT32 1, WS2_32 5 pure helpers, XINPUT1_3 3 and
-WINMM 1. Both installed XInput export tables confirm ordinals 2/3/4.
-
-The 21 remaining WS2_32 names and both WININET cookie functions stop with
-explicit offline diagnostics because their caller fallbacks are unverified;
-the audit lists each name. EAX retains its previously verified optional
-provider failure. `DebugBreak`, `RtlUnwind` and `UnhandledExceptionFilter`
-also stop explicitly. The runtime starts with an empty `FS:[0]` exception
-chain, stores but does not dispatch the unhandled filter, and recognizes
-only the debugger thread-name form of `RaiseException`. Full SEH needs
-guest exception/context structures, checked frame traversal, guest handler
-callbacks and dispositions, nested exceptions, target-frame unwind and
-nonlocal transfer across translated C frames. Native host unwinding cannot
-substitute for that work. Process termination drains through the existing
-stop/cleanup path with exit code and caller logged; the public host result
-remains 8. A distinct normal guest-exit result requires an outer run-loop
-change beyond the two-line import integration.
-
-Portable branches provide bounded filesystem and time operations plus an
-en-US/ASCII locale subset. Unsupported collation, custom date/time formats
-and keyboard translation diagnose their exact boundary. POSIX creation-time
-setting returns `ERROR_NOT_SUPPORTED`; timezone information describes the
-current host offset without transition rules. Android XInput returns
-`ERROR_DEVICE_NOT_CONNECTED`, wave output reports no device, and keyboard
-state/system-setting GET services return documented unavailability. Windows
-forwards those platform queries and NLS operations natively. Console control
-handlers are registered in guest state; host signal delivery is not routed
-into guest callbacks.
-
-The exact DX9 SHA-256 is `2fa8d50c60398cc249c6d908de46b15f48e445dd0c605b5956e94fa2f445a713`. The PE entry is `0x00F9F445`. Reports and generated C live under ignored `work/`; the latest preserved host boundary is fingerprinted above. The configured direct-call closure compiles, links and executes the startup path; it is not a whole-program port. Discovery now allows depth 32: the isolated closure audit reached actual depth 24 with no missing executable direct-call targets, and the broader build has passed host startup through the earlier parser callbacks. Validated virtual-method families are added as original execution reaches them, including the distinct `BlendCamera` and `BlendCameraSettings` tables. The discovered `RCPPS`, `RSQRTSS`, `RSQRTPS`, XMM `PMULUDQ` and XMM `PMAXSW` gaps now have portable lowerings and focused checks. The broader registered-type closure still contains two explicit instruction stops: `FNSAVE` at `0x00FA0EAD` and `FRSTOR` at `0x00FA0EB9`, a paired x87 context save/restore around a math helper. They have not been reached by the verified startup path and are not silently skipped. The diagnostic dispatch guard defaults to two hundred million calls per guest thread, counted as they return (imports and COM methods as they are dispatched); `AC1_DISPATCH_LIMIT` overrides it and `0` disables it. Guest calls nest on the host stack and stop with "guest call depth exceeded" 256 KiB before its end; the Windows executables reserve 8 MiB per thread. Lower limits of ten million and fifty million interrupted finite multi-precision arithmetic during original crypto initialization. An earlier retry with a 200-million limit passed that bounded multiply path; runtime costs vary between starts.
-
-The host trace confirms original entry execution, C/C++ initialization, and the CRT's handoff to the game's WinMain thunk at `0x00401375` (original return address `0x00F9F3DC`). The original worker entry at `0x00FA3B17` also executes on a native host thread with a separate guest CPU, stack, TIB and TLS. Guest execution is currently serialized for correctness; this is not yet parallel execution across CPU cores. A same-process repeat-run check passes through worker cleanup and runtime reinitialization. Game startup remains incomplete. The APK's library is ELF64 AArch64; no Android device execution has been verified.
-
-Earlier host graphics milestones (historical; the current boundary is above): `RegisterClassExA`, `CreateWindowExA`, and `Direct3DCreate9` succeeded in `work/startup_9e51f0_window_d3d.log`. A debugger run created the native HAL device and reached `SetRenderState` at `0x00AA6083`; later System32 D3D9 runs rejected device creation and original code dereferenced its null device at `0x00AA6078`. With the official DXVK v3.1 Windows x64 DLL selected, earlier runs passed device creation, state initialization, vertex/index buffer creation, surface setup and color fill, viewport setup, and vertex-declaration creation/readback. `work/startup_dxvk_getdecl.log` preserves the earlier continuation to `D3DXCheckTextureRequirements`; `work/host_dxvk_run/ac1_startup_d3d9.log` identifies the Vulkan device. See [graphics evidence](docs/graphics.md).
-
-The native D3D9 bridge now creates and uploads cube textures. The DirectInput bridge forwards the observed `Acquire` and `GetDeviceState` calls to native interfaces, with the forwarding behavior covered by contract tests; no successful interactive input session is verified. These API milestones do not verify a rendered frame. Optional services remain deferred while work focuses on running the game; a service may report documented unavailability only when the original caller's fallback is verified. Current backlog: `GetAdaptersInfo` enumeration returns `ERROR_NOT_SUPPORTED` (50) on each call, without changing the caller's buffers, length, or `LastError`; its diagnostic is logged once per run. The verified original branch cleans up, installs its built-in `127.0.0.1` fallback, and returns normally (`0x1156CCA` → `0x1156D45` → `0x1156D54` → `0x1156D8A`). This does not enumerate adapters. `inet_addr` is implemented as pure local address conversion and performs no network I/O. The native adapter-enumeration implementation and ABI oracle are preserved under ignored `work/deferred_network_adapters/`; the `iphlpapi` dependency has been removed.
-
-Cursor confinement is also deferred: `USER32!ClipCursor` returns `FALSE` with `ERROR_CALL_NOT_IMPLEMENTED` (120), logs once per process, and leaves native clipping unchanged. Original callers at `0x00A0B670` and `0x00A0B6C0` ignore failure on both confinement and release, and the live run passes this continuation. Native `GetCursorPos` and `ScreenToClient` are implemented and covered by the focused window smoke test. Restore confinement later if it is needed for interactive host controls.
-
-The original audio initialization now reads and writes `DARE.INI` through the profile APIs. Host configuration writes are restricted to `work/userdata/`; Android uses the application's private userdata directory. The GOG installation remains read-only. The lifter also bounds two-level switches using their guarded byte lookup tables, preventing lookup bytes from being mistaken for executable targets. `-Run` saves its complete diagnostics to `work/startup.log`.
-
-`GetPrivateProfileIntA` and the newly implemented `GetPrivateProfileSectionNamesA` use the shared portable profile parser. Thirteen native-oracle cases match both `GetPrivateProfileSectionNamesA` and the `GetPrivateProfileStringA(NULL, NULL, ...)` section-name query, including exact-fit buffers, truncation, and duplicate sections. The earlier trace in `work/startup_privateprofileint_415c60.log` passes the settings and object callback `0x00A4D580`; later host traces continue through graphics initialization as summarized above.
-
-The scalar CRT memory-copy path also exercises biased and negative jump-table indices. Its translated string operations now honor `STD`/`CLD` and the direction flag. The lifter self-test compiles that original function and compares 4,968 alignment, length, and overlap cases against native `memmove`, including stack and register preservation. Original table bytes and generated test code remain under ignored `work/`.
-
-Resource loading also exposed a concrete SIMD overread at original instruction `0x00974270`: `MOVQ xmm0, [eax+0x18]` reads eight bytes, while the donor translation requested sixteen. The local adapter now uses exact-width, bit-preserving reads and writes for XMM `MOVQ`, and corrects the same eight-byte source-width issue in `CVTDQ2PD`. Its executable regression test places the source at the last eight bytes of a guest mapping and checks lane results, signed conversion edges, register aliasing, and flag/register preservation. Guest mapping bounds remain enforced.
-
-Host startup has passed that fault site and continued through original Havok motion and shape methods, registered property setters, and Gear allocation methods. A later `TextureMap` factory failure exposed the donor's fixed 256-region bookkeeping limit. The runtime now allows 4,096 sparse mappings while preserving access bounds. This change lives in `tools/prepare_runtime.py`, so rebuilding the copied runtime preserves it; provenance records prepared-file hashes. Repeated preparation and a 300-region allocation check pass. Actual optimized startup passes the former null read at `0x00930E1D`; `work/startup_after_region_cap_gear_boundary_788190.log` records that earlier continuation and all five worker joins.
-
-A later CRT read at original instruction `0x00F9FCC8` spans guest address `0x1220FFFD` across two adjacent 128 KiB mappings with independent host backing. Checked scalar reads and writes now validate the complete operand before copying in region-sized pieces, reusing the approach from the local Mafia runtime. Holes and 32-bit wrap still fail before any partial copy; raw pointer requests retain their single-region requirement. The captured 3+1-byte case, integer/SSE accesses, holes, and wrap pass in `ac1_guest_memory_contract`, including optimized builds. The memory implementation and fixture also compile for AArch64. The real startup run passes this former fault. These changes are preserved by `tools/prepare_runtime.py`.
-
-Original memory-management code also queries an interior page of a tracked `VirtualAlloc` reservation. `VirtualQuery` now returns that page's base, the original allocation base, and the remaining committed region length in the 28-byte guest structure. Adjacent allocations stay distinct. The focused contract compares this subset against native Windows, and startup passes the captured query at `0x11AE0000` inside the allocation beginning at `0x11AD0000`. Other memory kinds remain explicit unsupported queries. Private evidence is in `work/virtualquery_provenance_11ae.gdb.log` and `work/startup_virtualquery_959870.log`.
-
-Guest executable paths use Windows separators because the original startup searches for a backslash. On Android, guest APIs expose `C:\AC1` while native file access retains the imported folder's POSIX path. Focused path checks cover the split roots, traversal rejection, and the separate userdata write boundary; the combined runtime compiles for AArch64. Android execution remains unverified.
-
-With `AC1_TRACE_IMPORTS=1`, failed dispatches capture checked receiver words and a possible vtable before teardown, alongside window and D3D milestone logs. Reachable `INT3` instructions now stop with their original guest address instead of silently continuing; a focused regression covers the original allocator assertion and verifies that the trap cannot fall through.
-
-The Magma expansion and bounded font/array callback seeds compiled and linked on the host, then passed the observed engine, file-factory, and font initialization stops. Two font callbacks come from a constructor-proven pair; four array constructors come from eight exact calls to the four-argument helper at `0x004020A0` through its `0x0040104B` thunk. Private evidence is in `work/array_helper_4020a0_callbacks.json`. A further audit recovered 76 exact virtual tail adapters from decoded constant pointer stores, including the observed FontFactory, AreaFactory, and WidgetFactory arrays; its frozen catalog and per-instruction evidence are in `work/stack_callback_audit_snapshot/report.json`. The following TimingStrategyManager stop supplied four constructor-registered singleton accessors. Subsequent traced runs passed these callbacks, the scalar-memory and allocation-query fixes, serialization callbacks, a record-sort comparator, and worker callback `0x0043FED0`. The captured continuation reaches missing target `0x009D9600` through startup thunk `0x004016D1`; `work/startup_crossregion_9d9600.log` preserves this boundary and five worker joins during teardown. No window or D3D device was observed.
-
-On Windows, the original code enumerates actual audio devices, follows its own fallback when optional EAX audio is unavailable, and creates a real DirectSound8 device, primary and secondary buffers, and a 3D listener. Guest COM proxies marshal 32-bit pointers into the native interfaces. Unsupported methods remain diagnostic stops. This Windows audio backend is not yet implemented on Android, and no audible playback is claimed.
-
-The original startup successfully probes `DataPC_Common.forge` and `videos\LoadingScreen.bik` through read-only file handles rooted in the installed game directory. Nested relative paths and absolute paths beneath the configured guest installation root are supported; the portable resolver handles the installation's `Videos` capitalization. `work/video_probe_verified.log` preserves the successful probes. The loader now reads actual bytes from `DataPC.forge`, including its `scimitar` header, and completes a 524,288-byte Gear `OVERLAPPED` read using a native completion event. Two original `GetOverlappedResult` calls return the same successful byte count. `GetFileSizeEx` reports 203,259,904 bytes; `work/archive_async_read_verified.log` records this execution and the next untranslated completion callback. Full asset loading and video decoding remain unverified. The optional `ac1_files_contract` target checks path mapping and real I/O against temporary fixtures without game assets; set `AC1_FILES_TEST_ROOT` to the repository's `work/` directory when running it.
-
-DirectInput8W mouse and keyboard creation, object enumeration, and data-format setup all return native success. The original callback handles 11 mouse and 127 keyboard records with Unicode names. Native attached-controller enumeration also succeeds (zero controllers on this host). The observed `SetCooperativeLevel(NULL, 6)` call returns the native failure `0x80070006`, which the original code handles. The bridge forwards `Acquire` and `GetDeviceState` to native interfaces; contract tests cover the forwarding path, but successful interactive input remains unverified.
-
-The pinned Bink 1.8i DLL has SHA-256 `603d0a96d1f27422f88d78b20ca525975ebe5e0d7667e62b98a3db80766702b4`. Its recompiled entry at `0x180017F0` completes `DLL_PROCESS_ATTACH` before EXE execution. The game then calls the original `_BinkSetMemory@8` export at `0x1800DB80`, which stores guest allocator/free callbacks `0x009E8D90` and `0x009E90D0`; the runtime verifies those writes. The preserved host trace is `work/bink_attach_setmemory_verified.log`. Video decoding and playback remain unverified.
-
-The original random-number initialization acquires the real Windows Base Cryptographic Provider, fills a 32-byte buffer through `CryptGenRandom`, and releases the provider successfully. Opaque guest tokens keep native provider handles out of guest memory. `work/crypto_startup_verified.log` preserves this actual execution. The portable adapter uses OS entropy for the same observed random-only context; it has compiled for ARM64 but has not run on Android.
-
-The standalone Android DXVK Native dependency builds with `ports/dxvk_android/build.ps1`, producing an AArch64 shared library with all 54 built-in shaders validated. Android CMake links the D3D9 bridge, and the Java/JNI `SurfaceView` handoff has passed compile checks; the latest runtime C source also compiles to an ARM64 object. No new APK has been assembled from these updates, and Android has not been run on a device. The only APK is the older frozen checkpoint documented in [Android instructions](docs/android.md). See [graphics integration](docs/graphics.md), [binary findings](docs/binary.md), [architecture decision](docs/architecture.md), [NFSU2 reuse findings](docs/nfs-reuse.md), and [runtime source notices](src/runtime/NOTICE.md). Duke and Mafia sources were inspected locally, including Mafia's uncommitted changes. NFSU2 provides the primary reference for the D3D9 COM bridge and DXVK Native integration.
-
-Original executables, `.forge` assets, generated game translations and local binaries/APKs are excluded from Git. The APK contains translated proprietary code and is a private diagnostic build; no game data is packaged. No existing reference project or original game source files are modified by the build.
-
-## Benchmarking
-
-Run `tools/bench_gameplay.ps1` for the host gameplay benchmark; its default window is fixed at successful Presents 1800–2200 in the replay's steady WALK segment. `-Seconds` is a safety timeout. It pins the game to CCD0 mask `0x0000FFFF`, disables DXVK vsync, captures both boundaries, and stops the game at EndPresent. Frame stats include wall time, main-thread/process CPU milliseconds, Windows thread-cycle deltas, processor number, guest clock and replay command index. Windows CPU milliseconds remain 16-Present rolling averages; cycle deltas are per-frame and are not retired-instruction counts. FPS is retained last as context. See [benchmarking details](docs/benchmarking.md).
-
-For A/B comparisons, pass `-Compare` and `-Binary`/`-BinaryB`; the harness takes `D:\ac1_bench.lock` exclusively. Pairs alternate AB/BA. Replay command progression, guest-visible elapsed time, and boundary captures establish workload comparability; internal operation counts and cycle changes are optimization effects and never exclude a pair. The adaptive CI uses paired main-thread CPU ms/frame; per-frame cycle distributions are reported alongside it. Use `-Exploratory` to bypass the lock and label the run exploratory. A/A calibration uses the same executable for both binaries; see the exact command in [benchmarking details](docs/benchmarking.md).
-
-Example using existing stripped binaries:
-
-```powershell
-& tools/bench_gameplay.ps1 -Compare -MinPairs 3 -MaxPairs 3 -Seconds 30 `
-  -Binary 'work/bench/bin/67a86f7de563-25a4476d867c/ac1_startup.exe' `
-  -BinaryB 'work/bench/bin/67a86f7de563-25a4476d867c/ac1_startup.exe' `
-  -Env @{ AC1_DISPATCH_FAST = '0' }
-```
-
-The two-side environment overrides can also be supplied as `-EnvB @{ AC1_DISPATCH_FAST = '0' }`. Use `tools/bench_report.py <comparison-directory>` to print an existing comparison.
-
-Codegen flag liveness is selected with `tools/build.ps1 -BuildType RelWithDebInfo -Jobs 10 -FlagLiveness abi`
-(default `abi`; `cfg`, `straight` and `off` are also available), or the lifter's `--flag-liveness` option.
-`abi` gives every function whole-program entry and return flag contracts (one body per function); `cfg`
-restores the per-function masks that keep every flag at calls and returns.
-`-LocalRegs` selects function-gated GPR and XMM locals; its default is now `all` (`off` restores
-CPU-struct registers), and an eight-digit hexadecimal list such as `-LocalRegs '0051DD60,00428540'`
-selects individual functions. The lifter accepts the same selection with `--local-regs`.
-`-X87 native` (default) keeps the x87 stack in block-local doubles; `-X87 exact` restores the full
-x87 model. Preparation checks the selected modes in its report.
-`-X87Inline` independently force-inlines the audited integer-conversion helper (default off).
-The benchmark stops its own game at EndPresent and flushes frame stats at that boundary;
-incomplete fixed ranges or missing replay/guest-time evidence fail its audit. See [codegen evidence](docs/codegen.md)
-for the accepted +5.97% CFG-flags experiment and original -53.19% locals result.
-The [follow-up evidence](docs/codegen-followup.md) diagnoses cadence-dependent tutorial progression,
-records the FLAGABI comparison (+3.77%) and revised locals comparison (+7.35%), and corrects the old x87 call counter.
-Integer-helper inlining is bit-exact in the new oracle but shows no paired FPS win (-0.07% median); it stays off.
-These are separate three-pair replay measurements on a shared PC; their FPS changes must not be added.
-`-UserdataSeed work/<private-seed>` optionally restores identical workspace-only saves before every benchmark side.
-CFG flags remain the default and ABI stays opt-in; register locals and native x87 became defaults after the
-controlled comparisons in [docs/perf-architecture.md](docs/perf-architecture.md).
+Third-party provenance and notices are in `src/runtime/NOTICE.md`.

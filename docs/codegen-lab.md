@@ -86,7 +86,6 @@ Each optimisation is an independent switch:
 |---|---|---|
 | Lifter option | `--xmm-abi`, `--flag-liveness`, `--x87`, `--local-regs` | full generation (15-25 min) |
 | Prepared-header macro | `AC1_TRACE_EIP` (EIP observer) | recompile only |
-| Runtime environment | `AC1_NATIVE_OVERRIDES`, `AC1_NATIVE_REGIONS` | none |
 
 A snapshot is immutable: the generated units holding the corpus functions,
 the prepared headers, the lifter commit and options, and the compiler
@@ -175,74 +174,10 @@ Details that matter for trusting a number:
 - `AC1_EIP_OBSERVER` restores the accessor barrier on its own (without EIP
   tracing's stores), so the 5c0308c change stays measurable.
 
-## First results (snapshot c33daae, crowd-scene weights)
-
-The lab reproduces the earlier findings with gates passing (20,000 calls per
-leaf on each architecture):
-
-| | without observer (as shipped) | with observer | |
-|---|---|---|---|
-| ARM64 static instructions, weighted | 243.8 | 254.6 | -4.2% |
-| ARM64 missed store-to-load forwards, weighted | 2.8 | 5.1 | -44% |
-| GVN loads blocked by the observer asm | 0 | 4,503 | |
-| x86 0x428540 cycles (25 reps, min) | 35.0 | 61.4 | improved -43% |
-| x86 0x1176DE0 cycles | 85.4 | 44.1 | REGRESSED +94% (store forwarding) |
-| x86 originals (controls) | 34.9 / 14.7 / 93.4 | 34.7 / 14.6 / 93.9 | unchanged |
-
-Recompilation efficiency on x86 (original/lifted cycles) as shipped:
-0x428540 1.00, 0x653400 0.50, 0x1176DE0 1.09.
-
-ARM64, Cortex-X4 prime core, per call net of the harness (runs q1 with A/A
-q2, 7 repetitions; gates passed):
-
-| | instructions | cycles | backend stalls |
-|---|---|---|---|
-| 0x428540 with / without observer | 232 / 230 (-0.9%) | 155 / 110 (-29%) | 102 / 60 (-42%) |
-| 0x653400 | 125 / 116 (-7%) | 33 / 30 (within noise) | 18 / 16 (within noise) |
-| 0x1176DE0 | 133 / 130 (-3%) | 77 / 35 (-55%) | 60 / 18 (-70%) |
-| native leaves (controls) | unchanged | within 1.5% | within noise |
-
-Executed instructions barely move while cycles drop by up to 55%, nearly all
-of it backend stalls; 0x1176DE0 moves in opposite directions on the two
-architectures (-55% ARM64, +94% x86). The exact native 0x428540 executes 177
-instructions in 27 cycles (3 stalls) against the lifted 230 in 110: the
-remaining gap is stalls, not instruction count. The A/A pair also shows why
-calibration is mandatory: wall-clock time of identical builds differed by
-4-21% from clock changes while cycles and instructions agreed within a few
-percent, so on the phone cycles and instructions decide and nanoseconds are
-context.
-
-What the hot corpus says to do next (weighted static mix of the shipped
-build, and LLVM's reasons for loads it kept):
-
-1. Call boundaries. CPU-struct loads and stores are 24% of the instructions;
-   guest calls clobber 60% of the loads GVN could not remove (the callee is
-   opaque, and the syncs around it). XMM contracts (`--xmm-abi on`) are the
-   first piece; general-register preservation and x87 TOP are next.
-2. Branch fences. The `""::: "memory"` on every `goto` blocks 11% of the kept
-   loads once the observer is gone; fencing only backward branches keeps the
-   polling guarantee.
-3. 32-bit address arithmetic: 14% of the instructions are `add/sub w` forming
-   guest addresses. 64-bit addressing alone helped 0x653400 and hurt 0x428540
-   (narrow loads from wide stores) in the earlier study, so it goes with
-   stack-slot forwarding, measured here before any gameplay run.
-
-Lifter variants need one generation each (a new snapshot); header and
-runtime switches reuse a snapshot. Still to come: recorded real-game inputs,
-a full-state x86 thunk (all registers, flags, XMM and scratch), benchmarks
-for non-leaf hot functions, and a corpus-only fast path for lifter variants.
-
 ## Cost model of lifted code shapes (phone)
 
-`tools/codegen_lab/microbench_run.py` builds `microbench_arm64.c` with the
-game's ARM64 flags, runs every kernel under `simpleperf stat` on the X4
-(cpu7) and an A720 (cpu2), and keeps raw counts in
-`work/codegen_lab/experiments/microbench/raw.json`. Each kernel repeats one
-shape the lifter emits; compiler barriers stand in for the calls and escapes
-that keep values in the CPU struct, and the machine code of every kernel was
-checked to contain the intended loads and stores. Cycles per iteration with
-the empty loop subtracted, median of 5, 20M iterations (spread under 2%
-unless noted):
+Measured on the phone with isolated kernels (removed after use; see tag
+`baseline-consolidation`). Each kernel repeated one code shape.
 
 | shape | insns | X4 cycles | A720 cycles |
 |---|---|---|---|
@@ -283,4 +218,3 @@ reload (kernels `gpr_byte_chain`, `gpr_byte_merge_chain`, `pair_2x8_v16_chain`
 are in the source; the run was stopped when the phone was needed).
 
 Where CPU state is still materialized, measured on the phone, and the resulting
-priorities: [cpu-state-assessment.md](cpu-state-assessment.md).
